@@ -1,8 +1,8 @@
-using Cadthingo.Assets3D;
-using Cadthingo.Assets3D.Geometry;
-using CadThingo.Rendering;
+using CadThingo.Graphics.Assets3D;
+using CadThingo.Graphics.Assets3D.Geometry;
+using CadThingo.Graphics.Rendering;
 
-namespace CadThingo.Assets3D.Shapes3D;
+namespace CadThingo.Graphics.Assets3D.Shapes3D;
 
 public abstract class Shape3D : Object3DBase, IRenderable3D
 {

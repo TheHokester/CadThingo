@@ -1,8 +1,8 @@
-using CadThingo;
-using System.Numerics;
-using CadThingo.Assets3D;
 
-namespace Cadthingo.Assets3D;
+using System.Numerics;
+
+
+namespace CadThingo.Graphics.Assets3D;
 
 public abstract class Object3DBase : IObject3D
 {

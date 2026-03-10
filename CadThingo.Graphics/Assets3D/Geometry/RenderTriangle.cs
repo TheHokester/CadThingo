@@ -1,7 +1,7 @@
 using System.Drawing;
 using System.Numerics;
 
-namespace Cadthingo.Assets3D.Geometry;
+namespace CadThingo.Graphics.Assets3D.Geometry;
 
 public struct RenderTriangle
 {

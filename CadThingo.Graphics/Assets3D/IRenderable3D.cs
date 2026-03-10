@@ -1,7 +1,7 @@
-using Cadthingo.Assets3D.Geometry;
-using CadThingo.Rendering;
+using CadThingo.Graphics.Assets3D.Geometry;
+using CadThingo.Graphics.Rendering;
 
-namespace Cadthingo.Assets3D;
+namespace CadThingo.Graphics.Assets3D;
 
 public interface IRenderable3D
 {

@@ -1,7 +1,7 @@
 ﻿using System.Numerics;
-using Cadthingo.Assets3D;
+using CadThingo.Graphics.Assets3D;
 
-namespace CadThingo.Assets3D;
+namespace CadThingo.Graphics.Assets3D;
 
 public sealed class Camera : Object3DBase
 {
