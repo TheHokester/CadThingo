@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace CadThingo.Assets3D;
+namespace CadThingo.Graphics.Assets3D;
 
 public readonly struct  Bounds3D
 {

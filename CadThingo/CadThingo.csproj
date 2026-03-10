@@ -6,6 +6,8 @@
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
         <UseWPF>true</UseWPF>
+        <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+        <UseSharedCompilation>false</UseSharedCompilation>
     </PropertyGroup>
 
     <ItemGroup>
@@ -22,6 +24,10 @@
         <XamlRuntime>Wpf</XamlRuntime>
         <SubType>Designer</SubType>
       </Page>
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\CadThingo.Graphics\CadThingo.Graphics.csproj" />
     </ItemGroup>
 
 </Project>

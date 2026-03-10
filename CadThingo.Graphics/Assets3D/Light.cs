@@ -1,6 +1,6 @@
-﻿using Cadthingo.Assets3D;
+﻿using CadThingo.Graphics.Assets3D;
 
-namespace CadThingo.Assets3D;
+namespace CadThingo.Graphics.Assets3D;
 
 public class Light : Object3DBase
 {

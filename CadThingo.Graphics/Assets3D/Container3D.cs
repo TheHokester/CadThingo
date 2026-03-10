@@ -1,6 +1,6 @@
-using CadThingo.Assets3D;
+using CadThingo.Graphics.Assets3D;
 
-namespace Cadthingo.Assets3D;
+namespace CadThingo.Graphics.Assets3D;
 
 public class Container3D : Object3DBase
 {

@@ -1,5 +1,5 @@
 using System.Numerics;
-namespace CadThingo.Assets3D;
+namespace CadThingo.Graphics.Assets3D;
 
 public interface IObject3D
 {

@@ -1,12 +1,12 @@
 using System.Drawing;
 using System.Numerics;
 using System.Runtime.InteropServices.Java;
-using CadThingo.Assets3D;
-using Cadthingo.Assets3D.Geometry;
-using CadThingo.Assets3D.Shapes3D;
-using CadThingo.Rendering;
+using CadThingo.Graphics.Assets3D;
+using CadThingo.Graphics.Assets3D.Geometry;
+using CadThingo.Graphics.Assets3D.Shapes3D;
+using CadThingo.Graphics.Rendering;
 
-namespace Cadthingo.Assets3D.Shapes3D.Prisms;
+namespace CadThingo.Graphics.Assets3D.Shapes3D.Prisms;
 
 public abstract class Prism3D : Shape3D
 {

@@ -1,6 +1,6 @@
 ﻿using System.Drawing;
 
-namespace CadThingo.Rendering;
+namespace CadThingo.Graphics.Rendering;
 
 public class FrameBuffer
 {

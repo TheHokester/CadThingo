@@ -1,7 +1,7 @@
-﻿using CadThingo.Assets3D;
+﻿using CadThingo.Graphics.Assets3D;
 using Color = System.Drawing.Color;
-using Cadthingo.Assets3D.Geometry;
-namespace CadThingo.Rendering;
+using CadThingo.Graphics.Assets3D.Geometry;
+namespace CadThingo.Graphics.Rendering;
 using System.Numerics;
 public class Renderer
 {

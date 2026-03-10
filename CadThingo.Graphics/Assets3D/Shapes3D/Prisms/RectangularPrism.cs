@@ -1,7 +1,7 @@
 ﻿using System.Numerics;
-using Cadthingo.Assets3D.Shapes3D.Prisms;
+using CadThingo.Graphics.Assets3D.Shapes3D.Prisms;
 
-namespace CadThingo.Assets3D.shapes3D.Prisms;
+namespace CadThingo.Graphics.Assets3D.shapes3D.Prisms;
 
 public sealed class RectangularPrism : Prism3D
 

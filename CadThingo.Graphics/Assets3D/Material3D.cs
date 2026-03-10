@@ -1,6 +1,6 @@
 using System.Drawing;
 
-namespace Cadthingo.Assets3D;
+namespace CadThingo.Graphics.Assets3D;
 
 public sealed class Material3D
 {
