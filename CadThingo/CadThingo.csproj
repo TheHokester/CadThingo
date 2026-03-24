@@ -1,33 +1,45 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <OutputType>WinExe</OutputType>
-        <TargetFramework>net10.0-windows</TargetFramework>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
-        <UseWPF>true</UseWPF>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+<!--        <UseWPF>true</UseWPF>-->
         <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
         <UseSharedCompilation>false</UseSharedCompilation>
     </PropertyGroup>
 
-    <ItemGroup>
-      <ApplicationDefinition Include="Launcher\App.xaml">
-        <Generator>MSBuild:Compile</Generator>
-        <XamlRuntime>Wpf</XamlRuntime>
-        <SubType>Designer</SubType>
-      </ApplicationDefinition>
-    </ItemGroup>
+<!--    <ItemGroup>-->
+<!--      <ApplicationDefinition Include="Launcher\App.xaml">-->
+<!--        <Generator>MSBuild:Compile</Generator>-->
+<!--        <XamlRuntime>Wpf</XamlRuntime>-->
+<!--        <SubType>Designer</SubType>-->
+<!--      </ApplicationDefinition>-->
+<!--    </ItemGroup>-->
 
-    <ItemGroup>
-      <Page Update="Launcher\MainWindow.xaml">
-        <Generator>MSBuild:Compile</Generator>
-        <XamlRuntime>Wpf</XamlRuntime>
-        <SubType>Designer</SubType>
-      </Page>
-    </ItemGroup>
+<!--    <ItemGroup>-->
+<!--      <Page Update="Launcher\MainWindow.xaml">-->
+<!--        <Generator>MSBuild:Compile</Generator>-->
+<!--        <XamlRuntime>Wpf</XamlRuntime>-->
+<!--        <SubType>Designer</SubType>-->
+<!--      </Page>-->
+<!--    </ItemGroup>-->
 
     <ItemGroup>
       <ProjectReference Include="..\CadThingo.Graphics\CadThingo.Graphics.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
+      <PackageReference Include="Silk.NET.Core" Version="2.23.0" />
+      <PackageReference Include="Silk.NET.Input" Version="2.23.0" />
+      <PackageReference Include="Silk.NET.Maths" Version="2.23.0" />
+      <PackageReference Include="Silk.NET.Vulkan" Version="2.23.0" />
+      <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.23.0" />
+      <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.23.0" />
+      <PackageReference Include="Silk.NET.Windowing" Version="2.23.0" />
     </ItemGroup>
 
 </Project>

@@ -14,6 +14,6 @@ public sealed class Camera : Object3DBase
     public float far = 100f;
     
     public Matrix4x4 ViewMatrix => Matrix4x4.CreateLookAt(Position, Target, Vector3.UnitY);
-    public Matrix4x4 ProjectionMatrix(float aspect) => 
+    public Matrix4x4 ProjectionMatrix(float aspect) =>
         Matrix4x4.CreatePerspectiveFieldOfView(FOV, aspect, near, far);
 }
