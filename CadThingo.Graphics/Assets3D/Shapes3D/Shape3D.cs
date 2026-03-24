@@ -1,5 +1,6 @@
-using CadThingo.Graphics.Assets3D;
+using CadThingo.Graphics.Assets3D.Material;
 using CadThingo.Graphics.Assets3D.Geometry;
+using CadThingo.Graphics.Assets3D.Surfaces;
 using CadThingo.Graphics.Rendering;
 
 namespace CadThingo.Graphics.Assets3D.Shapes3D;
