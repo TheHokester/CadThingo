@@ -13,6 +13,11 @@ public unsafe class VulkanContext
     [
         "VK_LAYER_KHRONOS_validation"
     ];
+
+    public readonly string[] DeviceExtensions = 
+    [
+        KhrSwapchain.ExtensionName
+    ];
     
     public ExtDebugUtils? DebugUtils;
     public DebugUtilsMessengerEXT DebugMessenger;
@@ -27,10 +32,24 @@ public unsafe class VulkanContext
     public Queue GraphicsQueue;
     public Queue PresentQueue;
     
-    public KhrSwapchain? KhrSwapchain;
-    public SwapchainKHR Swapchain;
-    public Image[]? SwapchainImages;
-    public Format swapchainImageFormat;
-    public Extent2D swapchainExtent;
+    public KhrSwapchain? KhrSwapChain;
+    public SwapchainKHR SwapChain;
+    public Image[]? SwapChainImages;
+    public Format SwapChainImageFormat;
+    public Extent2D SwapChainExtent;
+    public ImageView[]? SwapChainImageViews;
+    public Framebuffer[]? SwapChainFramebuffers;
     
+    public RenderPass RenderPass;
+    public PipelineLayout PipelineLayout;
+    public Pipeline Pipeline;
+
+    public CommandPool CommandPool;
+    public CommandBuffer[]? CommandBuffers;
+    
+    public Semaphore[]? ImageAvailableSemaphores;
+    public Semaphore[]? RenderFinishedSemaphores;
+    public Fence[]? InFlightFences;
+    public Fence[]? ImagesInFlight;
+    public uint CurrentFrame = 0;
 }

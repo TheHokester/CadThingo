@@ -11,21 +11,10 @@
         <UseSharedCompilation>false</UseSharedCompilation>
     </PropertyGroup>
 
-<!--    <ItemGroup>-->
-<!--      <ApplicationDefinition Include="Launcher\App.xaml">-->
-<!--        <Generator>MSBuild:Compile</Generator>-->
-<!--        <XamlRuntime>Wpf</XamlRuntime>-->
-<!--        <SubType>Designer</SubType>-->
-<!--      </ApplicationDefinition>-->
-<!--    </ItemGroup>-->
-
-<!--    <ItemGroup>-->
-<!--      <Page Update="Launcher\MainWindow.xaml">-->
-<!--        <Generator>MSBuild:Compile</Generator>-->
-<!--        <XamlRuntime>Wpf</XamlRuntime>-->
-<!--        <SubType>Designer</SubType>-->
-<!--      </Page>-->
-<!--    </ItemGroup>-->
+    <ItemGroup>
+       <VertexShader Include="Assets/Shaders/**/*.vert"/>
+       <FragmentShader Include="Assets/Shaders/**/*.frag"/>
+    </ItemGroup>
 
     <ItemGroup>
       <ProjectReference Include="..\CadThingo.Graphics\CadThingo.Graphics.csproj" />

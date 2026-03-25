@@ -9,7 +9,7 @@ namespace CadThingo;
 
 public unsafe class VulkanInstance
 {
-    private static Vk _vk = Globals.vk;
+    private static Vk? _vk = Globals.vk;
     private static readonly IWindow? Window = App.window;
     
     
@@ -67,7 +67,7 @@ public unsafe class VulkanInstance
         }
         
 
-        if (_vk.CreateInstance(&createInfo, null, out ctx.Instance) != Result.Success)
+        if (_vk!.CreateInstance(&createInfo, null, out ctx.Instance) != Result.Success)
             throw new Exception("Failed to create Vulkan instance");
 
         // free memory
@@ -82,7 +82,7 @@ public unsafe class VulkanInstance
     {
          if(!enableValidation) return;
 
-        if (!_vk.TryGetInstanceExtension(ctx.Instance, out ctx.DebugUtils)) return;
+        if (!_vk!.TryGetInstanceExtension(ctx.Instance, out ctx.DebugUtils)) return;
         // ✅ CREATE DEBUG MESSENGER HERE
         var createInfo = new DebugUtilsMessengerCreateInfoEXT
         {
@@ -108,10 +108,10 @@ public unsafe class VulkanInstance
     private static unsafe bool CheckValidationLayer()
     {
         uint layerCount = 0;
-        _vk.EnumerateInstanceLayerProperties(&layerCount, null);
+        _vk!.EnumerateInstanceLayerProperties(&layerCount, null);
 
         var layers = stackalloc LayerProperties[(int)layerCount];
-        _vk.EnumerateInstanceLayerProperties(&layerCount, layers);
+        _vk!.EnumerateInstanceLayerProperties(&layerCount, layers);
 
         for (int i = 0; i < layerCount; i++)
         {
@@ -134,12 +134,7 @@ public unsafe class VulkanInstance
         Console.WriteLine($"[VULKAN] {message}");
         return Vk.False;
     }
-    public unsafe void DestroyInstance()
-    {   
-        
-        ctx.DebugUtils!.DestroyDebugUtilsMessenger(ctx.Instance, ctx.DebugMessenger, null);    
-        
-    }
+   
     private string[] GetRequiredExtensions()
     {
         
