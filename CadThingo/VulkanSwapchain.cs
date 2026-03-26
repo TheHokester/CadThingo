@@ -1,6 +1,9 @@
-﻿using Silk.NET.Vulkan;
+﻿using CadThingo.GraphicsPipeline;
+using Silk.NET.Maths;
+using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Vulkan.Extensions.EXT;
+using Silk.NET.Windowing;
 
 
 namespace CadThingo;
@@ -91,6 +94,52 @@ public class VulkanSwapchain
         Console.WriteLine($"Created swapchain with {ctx.SwapChainImages.Length} images");
     }
 
+    public void RecreateSwapChain(IWindow? window, VulkanPipeline? pipeline, VulkanRenderer? renderer)
+    {
+        
+        Vector2D<int> framebufferSize = window!.FramebufferSize;
+
+        while (framebufferSize.X == 0 || framebufferSize.Y == 0)
+        {
+            framebufferSize = window.FramebufferSize;
+            window.DoEvents();
+        }
+        vk!.DeviceWaitIdle(ctx.Device);
+        
+        CleanupSwapChain();
+        
+        CreateSwapChain();
+        CreateImageViews();
+        pipeline!.CreateRenderPass();
+        pipeline.CreateGraphicsPipeline();
+        CreateFrameBuffer();
+        renderer!.CreateCommandBuffers();
+        
+        ctx.ImagesInFlight = new Fence[ctx.SwapChainImages!.Length];
+    }
+
+    public unsafe void CleanupSwapChain()
+    {
+        foreach (var frameBuffer in ctx.SwapChainFramebuffers!)
+        {
+            vk!.DestroyFramebuffer(ctx.Device, frameBuffer, null);
+        }
+
+        fixed (CommandBuffer* commandBuffers = ctx.CommandBuffers)
+        {
+            vk!.FreeCommandBuffers(ctx.Device, ctx.CommandPool, (uint)ctx.CommandBuffers!.Length, commandBuffers);
+        }
+        
+        vk!.DestroyRenderPass(ctx.Device, ctx.RenderPass, null);
+        vk!.DestroyPipeline(ctx.Device, ctx.Pipeline, null);
+        vk!.DestroyPipelineLayout(ctx.Device, ctx.PipelineLayout, null);
+        
+        foreach (var imageView in ctx.SwapChainImageViews!)
+        {
+            vk!.DestroyImageView(ctx.Device, imageView, null);
+        }
+        ctx.KhrSwapChain!.DestroySwapchain(ctx.Device, ctx.SwapChain, null);
+    }
     private Extent2D ChooseSwapExtent(SurfaceCapabilitiesKHR capabilities)
     {
         if (capabilities.CurrentExtent.Width != uint.MaxValue)

@@ -1,27 +1,30 @@
 ﻿global using Semaphore = Silk.NET.Vulkan.Semaphore;
+using System.Numerics;
+using CadThingo.GraphicsPipeline;
 using Silk.NET.Windowing;
 using Silk.NET.Vulkan;
 
-using CadThingo.GraphicsPipeline;
+using Silk.NET.Maths;
 using Silk.NET.Vulkan.Extensions.KHR;
 
 namespace CadThingo;
 
-
 public class VulkanRenderer
 {
-    private static IWindow window;
     
+    private static IWindow window;
+    private bool FrameBufferResized = false;
     public VulkanRenderer(IWindow _window)
         => window = _window;
     
     
-    private static Vk? vk;
+    private static Vk vk;
     private VulkanContext ctx;
     private VulkanInstance VKInstance;
     private VulkanDevice VKDevice;
     private VulkanSwapchain VKSwapChain;
     private VulkanPipeline VKPipeline;
+    private VkBuffers _vkBuffers;
     
     
     public unsafe void InitVulkan()
@@ -32,24 +35,30 @@ public class VulkanRenderer
         VKDevice = new VulkanDevice(ctx);
         VKSwapChain = new VulkanSwapchain(ctx);
         VKPipeline = new VulkanPipeline(ctx);
+        _vkBuffers = new VkBuffers(ctx);
+        ctx.Vertices = new VkVertex[]
+        {
+            new VkVertex { pos = new Vector2(-0.5f, -0.5f), color = new Vector3(1.0f, 0.0f, 0.0f) },
+            new VkVertex { pos = new Vector2(0.5f, -0.5f), color = new Vector3(0.0f, 1.0f, 0.0f) },
+            new VkVertex { pos = new Vector2(0.5f, 0.5f), color = new Vector3(0.0f, 0.0f, 1.0f) },
+            new VkVertex { pos = new Vector2(-0.5f, 0.5f), color = new Vector3(1.0f, 1.0f, 1.0f) }
+        };
+        
+        ctx.Indices = [0, 1, 2, 2, 3, 0];
         
         VKInstance.CreateInstance(out ctx.EnableValidation);
         VKInstance.SetupDebugMessenger(ctx.EnableValidation);
-        // --- surface ---
         VKInstance.CreateSurface();
-        // --- physical device ---
         VKDevice.PickPhysicalDevice();
-        // --- logical device ---
         VKDevice.CreateLogicalDevice();
-        // --- swap chain ---
         VKSwapChain.CreateSwapChain();
         VKSwapChain.CreateImageViews();
-        // --- create pipeline ---
         VKPipeline.CreateRenderPass();
         VKPipeline.CreateGraphicsPipeline();
         VKSwapChain.CreateFrameBuffer();
-        // --- command rendering pool ---
         CreateCommandPool();
+        _vkBuffers.CreateVertexBuffers();
+        _vkBuffers.CreateIndexBuffer();
         CreateCommandBuffers();
         CreateSyncObjects();
         Console.WriteLine("Vulkan initialized");
@@ -62,19 +71,22 @@ public class VulkanRenderer
     }
     public unsafe void OnClose()
     {
+        VKSwapChain.CleanupSwapChain();
+        
+        vk!.DestroyBuffer(ctx.Device, ctx.VertexBuffer, null);
+        vk!.FreeMemory(ctx.Device, ctx.VertexBufferMemory, null);
+        
+        vk!.DestroyBuffer(ctx.Device, ctx.IndexBuffer, null);
+        vk!.FreeMemory(ctx.Device, ctx.IndexBufferMemory, null);
+        
         for (int i = 0; i < App.MAX_FRAMES_IN_FLIGHT; i++)
         {
             vk!.DestroySemaphore(ctx.Device, ctx.RenderFinishedSemaphores![i], null);
             vk!.DestroySemaphore(ctx.Device, ctx.ImageAvailableSemaphores![i], null);
             vk!.DestroyFence(ctx.Device, ctx.InFlightFences![i], null);
         }
+        
         vk!.DestroyCommandPool(ctx.Device, ctx.CommandPool, null);
-        VKSwapChain.DestroyFrameBuffers();
-        vk!.DestroyPipeline(ctx.Device, ctx.Pipeline, null);
-        vk.DestroyPipelineLayout(ctx.Device, ctx.PipelineLayout, null);
-        vk.DestroyRenderPass(ctx.Device, ctx.RenderPass, null);
-        VKSwapChain.DestroyImageViews();
-        ctx.KhrSwapChain!.DestroySwapchain(ctx.Device, ctx.SwapChain, null);
         vk.DestroyDevice(ctx.Device, null);
         if(ctx.EnableValidation)
             ctx.DebugUtils!.DestroyDebugUtilsMessenger(ctx.Instance, ctx.DebugMessenger, null);
@@ -103,7 +115,7 @@ public class VulkanRenderer
         }
     }
 
-    private unsafe void CreateCommandBuffers()
+    public unsafe void CreateCommandBuffers()
     {
         ctx.CommandBuffers = new CommandBuffer[ctx.SwapChainImages!.Length];
         CommandBufferAllocateInfo allocateInfo = new()
@@ -113,16 +125,7 @@ public class VulkanRenderer
             Level = CommandBufferLevel.Primary,
             CommandBufferCount = 1
         };
-        // fixed (CommandBuffer* commandBuffers = ctx.CommandBuffers)
-        // {
-        //     
-        //     {
-        //         if (vk!.AllocateCommandBuffers(ctx.Device, &allocateInfo, commandBuffers) != Result.Success)
-        //         {
-        //             throw new Exception("Failed to allocate command buffers");
-        //         }
-        //     }
-        // }
+        
 
         for (int i = 0; i < ctx.CommandBuffers.Length; i++)
         {
@@ -165,8 +168,15 @@ public class VulkanRenderer
             vk!.CmdBeginRenderPass(ctx.CommandBuffers![i], &renderPassInfo, SubpassContents.Inline);
             
             vk!.CmdBindPipeline(ctx.CommandBuffers[i], PipelineBindPoint.Graphics, ctx.Pipeline);
-            
-            vk!.CmdDraw(ctx.CommandBuffers[i], 3, 1, 0, 0);
+            var vertexBuffers = new Buffer[] { ctx.VertexBuffer };
+            var offsets = new ulong[] { 0 };
+            fixed(ulong* offsetsPtr = offsets)
+            fixed (Buffer* vertexBuffersPtr = vertexBuffers)
+            {
+                vk!.CmdBindVertexBuffers(ctx.CommandBuffers[i], 0, 1, vertexBuffersPtr, offsetsPtr);
+                vk!.CmdBindIndexBuffer(ctx.CommandBuffers[i], ctx.IndexBuffer, 0, IndexType.Uint32);
+            }
+            vk!.CmdDrawIndexed(ctx.CommandBuffers[i], (uint)ctx.Indices.Length, 1, 0, 0, 0);
             
             vk!.CmdEndRenderPass(ctx.CommandBuffers[i]);
             
@@ -208,9 +218,21 @@ public class VulkanRenderer
         vk!.WaitForFences(ctx.Device, 1, in ctx.InFlightFences![ctx.CurrentFrame], true, ulong.MaxValue);
 
         uint imageIndex = 0;
-        ctx.KhrSwapChain!.AcquireNextImage(ctx.Device, ctx.SwapChain, ulong.MaxValue,
+        // --- acquire next image ---
+        //verify that the image has not changed
+        var result = ctx.KhrSwapChain!.AcquireNextImage(ctx.Device, ctx.SwapChain, ulong.MaxValue,
             ctx.ImageAvailableSemaphores![ctx.CurrentFrame], default, &imageIndex);
-
+        if (result == Result.ErrorOutOfDateKhr)//recreates swapchain if its out of date
+        {
+            VKSwapChain.RecreateSwapChain(window, VKPipeline, this);
+            return;
+        } else if (result != Result.Success && result != Result.SuboptimalKhr)
+        {
+            throw new Exception("Failed to acquire swap chain image");
+        }
+        
+        
+        
         if (ctx.ImagesInFlight![imageIndex].Handle != 0)
         {
             vk!.WaitForFences(ctx.Device, 1, in ctx.ImagesInFlight[imageIndex], true, ulong.MaxValue);
@@ -265,8 +287,21 @@ public class VulkanRenderer
             PImageIndices = &imageIndex,
 
         };
-        ctx.KhrSwapChain.QueuePresent(ctx.PresentQueue, &presentInfo);
+        //verify that the image has not changed if it has update the swapchain
+        result = ctx.KhrSwapChain.QueuePresent(ctx.PresentQueue, &presentInfo);
+        if (result == Result.ErrorOutOfDateKhr || result == Result.SuboptimalKhr || FrameBufferResized)
+        {
+            FrameBufferResized = false;
+            VKSwapChain.RecreateSwapChain(window, VKPipeline, this);
+        }else if (result != Result.Success)
+            throw new Exception("Failed to present swap chain image");
+        
         
         ctx.CurrentFrame = (ctx.CurrentFrame + 1) % App.MAX_FRAMES_IN_FLIGHT;
+    }
+
+    public void FramebufferResizeCallback(Vector2D<int> obj)
+    {
+        FrameBufferResized = true;
     }
 }

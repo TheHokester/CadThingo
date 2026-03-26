@@ -26,7 +26,7 @@ public class App
         renderer.MainLoop();
         window.Closing += renderer.OnClose;
 
-        
+        window.Resize += renderer.FramebufferResizeCallback;
 
     }
 }
