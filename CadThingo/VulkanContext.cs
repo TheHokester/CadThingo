@@ -1,4 +1,6 @@
-﻿using Silk.NET.Vulkan;
+﻿using CadThingo.Graphics.Assets3D.Geometry;
+using CadThingo.GraphicsPipeline;
+using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Windowing;
 using Silk.NET.Vulkan.Extensions.EXT;
@@ -45,6 +47,12 @@ public unsafe class VulkanContext
     public Pipeline Pipeline;
 
     public CommandPool CommandPool;
+    
+    public Buffer VertexBuffer;
+    public DeviceMemory VertexBufferMemory;
+    public Buffer IndexBuffer;
+    public DeviceMemory IndexBufferMemory;
+    
     public CommandBuffer[]? CommandBuffers;
     
     public Semaphore[]? ImageAvailableSemaphores;
@@ -52,4 +60,7 @@ public unsafe class VulkanContext
     public Fence[]? InFlightFences;
     public Fence[]? ImagesInFlight;
     public uint CurrentFrame = 0;
+    
+    public VkVertex[] Vertices;
+    public uint[] Indices;
 }

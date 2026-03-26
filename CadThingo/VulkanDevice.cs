@@ -1,4 +1,5 @@
 ﻿using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -38,12 +39,15 @@ public class VulkanDevice
 
         if (ctx.PhysicalDevice.Handle == 0)
             throw new Exception("No suitable GPU found"); // throw new Exception("No suitable Vulkan device found");
-        
+        vk!.GetPhysicalDeviceProperties(ctx.PhysicalDevice, out var deviceProperties);
+        string gpuName = Marshal.PtrToStringAnsi((IntPtr)deviceProperties.DeviceName)!;
+        Console.WriteLine("device:" + gpuName );
     }
     private bool IsDeviceSuitable(PhysicalDevice device)
     {
         var indices = FindQueueFamilies(device, ctx.Surface, ctx.KhrSurface);
         var extensionsSupported = CheckDeviceExtensionSupport(device);
+        
         var swapChainAdequate = false;
         if (extensionsSupported)
         {
