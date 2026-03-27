@@ -54,7 +54,10 @@ public class VulkanDevice
             VulkanSwapchain.SwapChainSupportDetails SwapChainSupport = VulkanSwapchain.QuerySwapChainSupport(device, ctx.Surface, ctx.KhrSurface);
             swapChainAdequate = SwapChainSupport.Formats.Length != 0 && SwapChainSupport.PresentModes.Length != 0;
         }
-        return indices.IsComplete() && extensionsSupported && swapChainAdequate;
+
+        vk!.GetPhysicalDeviceFeatures(device, out var supported);
+        
+        return indices.IsComplete() && extensionsSupported && swapChainAdequate && supported.SamplerAnisotropy;
     }
     
     private unsafe bool CheckDeviceExtensionSupport(PhysicalDevice device)
@@ -94,7 +97,10 @@ public class VulkanDevice
             };
         }
 
-        PhysicalDeviceFeatures features = new();
+        PhysicalDeviceFeatures features = new()
+        {
+            SamplerAnisotropy = true,
+        };
         
         
         var deviceCreateInfo = new DeviceCreateInfo
@@ -107,6 +113,8 @@ public class VulkanDevice
             
             EnabledExtensionCount = (uint)ctx.DeviceExtensions.Length,
             PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(ctx.DeviceExtensions)
+            
+            
         };
         if (ctx.EnableValidation)
         {

@@ -1,4 +1,5 @@
-﻿using CadThingo.Graphics.Assets3D.Geometry;
+﻿using System.Numerics;
+using CadThingo.Graphics.Assets3D.Geometry;
 using CadThingo.GraphicsPipeline;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
@@ -43,24 +44,40 @@ public unsafe class VulkanContext
     public Framebuffer[]? SwapChainFramebuffers;
     
     public RenderPass RenderPass;
+    public DescriptorSetLayout DescriptorSetLayout;
+    public DescriptorPool DescriptorPool;
+    public DescriptorSet[]? DescriptorSets;
     public PipelineLayout PipelineLayout;
     public Pipeline Pipeline;
 
     public CommandPool CommandPool;
     
+    
+    public VkImage TextureImage;
+    public ImageView TextureImageView;
+    public Sampler TextureSampler;
+    public DeviceMemory TextureImageMemory;
+    
     public Buffer VertexBuffer;
     public DeviceMemory VertexBufferMemory;
+    
     public Buffer IndexBuffer;
     public DeviceMemory IndexBufferMemory;
     
+    public Buffer[]? UniformBuffers;
+    public DeviceMemory[]? UniformBuffersMemory;
+    public void*[]? UniformBuffersMemoryPtrs;
+    
     public CommandBuffer[]? CommandBuffers;
+    
+    
     
     public Semaphore[]? ImageAvailableSemaphores;
     public Semaphore[]? RenderFinishedSemaphores;
     public Fence[]? InFlightFences;
     public Fence[]? ImagesInFlight;
     public uint CurrentFrame = 0;
-    
-    public VkVertex[] Vertices;
-    public uint[] Indices;
+    //TODO: possibly move this to a different class, as an API for interfacing between the renderer and the assets
+    public VkVertex[]? Vertices;
+    public uint[]? Indices;
 }
