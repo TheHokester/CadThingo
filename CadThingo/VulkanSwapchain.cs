@@ -113,7 +113,7 @@ public class VulkanSwapchain
         pipeline!.CreateRenderPass();
         pipeline.CreateGraphicsPipeline();
         CreateFrameBuffer();
-        renderer!.CreateCommandBuffers();
+        VulkanRenderer._Commands.CreateCommandBuffers();
         
         ctx.ImagesInFlight = new Fence[ctx.SwapChainImages!.Length];
     }
@@ -228,27 +228,34 @@ public class VulkanSwapchain
 
         for (int i = 0; i < ctx.SwapChainImages.Length; i++)
         {
-            ImageViewCreateInfo createInfo = new()
-            {
-                SType = StructureType.ImageViewCreateInfo,
-                Image = ctx.SwapChainImages[i],
-
-                ViewType = ImageViewType.Type2D,
-                Format = ctx.SwapChainImageFormat,
-                Components = new ComponentMapping(ComponentSwizzle.R,
-                    ComponentSwizzle.G,
-                    ComponentSwizzle.B,
-                    ComponentSwizzle.A),
-                SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1)
-            };
-
-            if (vk!.CreateImageView(ctx.Device, &createInfo, null, out ctx.SwapChainImageViews[i]) != Result.Success)
-            {
-                throw new Exception("Failed to create image view");
-            }
+            ctx.SwapChainImageViews[i] = CreateImageView(ctx.SwapChainImages[i], ctx.SwapChainImageFormat);
         }
         Console.WriteLine("Created image views");
     }
+    
+    public unsafe ImageView CreateImageView(VkImage image, Format format)
+    {
+        ImageViewCreateInfo createInfo = new()
+        {
+            SType = StructureType.ImageViewCreateInfo,
+            Image = image,
+    
+            ViewType = ImageViewType.Type2D,
+            Format = format,
+            // Components = new ComponentMapping(ComponentSwizzle.R,
+            //     ComponentSwizzle.G,
+            //     ComponentSwizzle.B,
+            //     ComponentSwizzle.A),
+            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1)
+        };
+        ImageView imageView;
+        if (vk!.CreateImageView(ctx.Device, &createInfo, null, out imageView) != Result.Success)
+        {
+            throw new Exception("Failed to create image view");
+        }
+        return imageView;
+    }
+
 
     public unsafe void CreateFrameBuffer()
     {

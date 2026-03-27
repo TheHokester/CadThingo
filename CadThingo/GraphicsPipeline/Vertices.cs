@@ -1,4 +1,5 @@
 ﻿global using Buffer = Silk.NET.Vulkan.Buffer;
+global using VkImage = Silk.NET.Vulkan.Image;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -13,8 +14,7 @@ public struct VkVertex
     
     public Vector2 pos;
     public Vector3 color;
-    
-    
+    public Vector2 uv; //texCoord
     public static VertexInputBindingDescription GetBindingDescription()
     {
         VertexInputBindingDescription bindingDescription = new()
@@ -43,18 +43,32 @@ public struct VkVertex
                 Location = 1,
                 Format = Format.R32G32B32Sfloat,
                 Offset = (uint)Marshal.OffsetOf<VkVertex>(nameof(color))
+            },
+            new VertexInputAttributeDescription()
+            {
+                Binding = 0,
+                Location = 2,
+                Format = Format.R32G32Sfloat,
+                Offset = (uint)Marshal.OffsetOf<VkVertex>(nameof(uv))
             }
         };
         
         return attributeDescriptions;
     }
+    
+}
+public struct UniformBufferObject
+{
+    public Matrix4x4 Model;
+    public Matrix4x4 View;  
+    public Matrix4x4 Proj; 
 }
 
 public class VkBuffers(VulkanContext ctx)
 {
     Vk? vk = Globals.vk;
 
-    private unsafe void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags properties, Buffer* buffer,
+    public unsafe void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags properties, Buffer* buffer,
         DeviceMemory* bufferMemory)
     {
         BufferCreateInfo bufferInfo = new BufferCreateInfo()
@@ -102,7 +116,8 @@ public class VkBuffers(VulkanContext ctx)
         
         fixed(DeviceMemory* vertexBfrMemPtr = &ctx.VertexBufferMemory)
         fixed(Buffer* vertexBfrPtr = &ctx.VertexBuffer)
-            CreateBuffer(size, BufferUsageFlags.VertexBufferBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, vertexBfrPtr, vertexBfrMemPtr);
+            CreateBuffer(size, BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, vertexBfrPtr, vertexBfrMemPtr);
         
         CopyBuffer(stagingBuffer, ctx.VertexBuffer, size);
         
@@ -127,7 +142,8 @@ public class VkBuffers(VulkanContext ctx)
         
         fixed(DeviceMemory* indexBfrMemPtr = &ctx.IndexBufferMemory)
         fixed(Buffer* indexBfrPtr = &ctx.IndexBuffer)
-            CreateBuffer(size, BufferUsageFlags.IndexBufferBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, indexBfrPtr, indexBfrMemPtr);
+            CreateBuffer(size, BufferUsageFlags.TransferDstBit | BufferUsageFlags.IndexBufferBit, 
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, indexBfrPtr, indexBfrMemPtr);
         
         CopyBuffer(stagingBuffer, ctx.IndexBuffer, size);
         
@@ -175,8 +191,8 @@ public class VkBuffers(VulkanContext ctx)
         
         vk!.FreeCommandBuffers(ctx.Device, ctx.CommandPool, 1, &commandBuffer);
     }
-    
-    private uint FindMemoryType(uint typeFilter, MemoryPropertyFlags properties)
+
+    public uint FindMemoryType(uint typeFilter, MemoryPropertyFlags properties)
     {
         vk!.GetPhysicalDeviceMemoryProperties(ctx.PhysicalDevice, out PhysicalDeviceMemoryProperties memProperties);
 
@@ -189,5 +205,45 @@ public class VkBuffers(VulkanContext ctx)
         }
 
         throw new Exception("failed to find suitable memory type!");
+    }
+
+    public unsafe void CreateUniformBuffers()
+    {
+        var bufferSize = (uint)sizeof(UniformBufferObject);
+
+        ctx.UniformBuffers = new Buffer[ctx.SwapChainImages!.Length];
+        ctx.UniformBuffersMemory = new DeviceMemory[ctx.SwapChainImages!.Length];
+        ctx.UniformBuffersMemoryPtrs = new void*[ctx.SwapChainImages!.Length];
+        for (int i = 0; i < ctx.SwapChainImages!.Length; i++)
+        {
+            fixed(Buffer* bufferPtr = &ctx.UniformBuffers[i])
+            fixed(DeviceMemory* bufferMemoryPtr = &ctx.UniformBuffersMemory[i])
+                CreateBuffer(bufferSize, BufferUsageFlags.UniformBufferBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,bufferPtr, bufferMemoryPtr);
+                
+            void* mappedMemory = null;
+            vk!.MapMemory(ctx.Device, ctx.UniformBuffersMemory[i], 0, bufferSize, 0, &mappedMemory);
+            ctx.UniformBuffersMemoryPtrs[i] = mappedMemory;
+        }
+    }
+
+    public unsafe void UpdateUniformBuffers(uint currentFrame)
+    {
+        //silk window has time information so skipping this
+        var time = (float)App.window!.Time;
+
+        UniformBufferObject ubo = new()
+        {
+            Model = Matrix4x4.Identity * Matrix4x4.CreateFromAxisAngle(new Vector3(0, 0, 1), time * Radians(90f)),
+            View = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), new Vector3(0, 0, 0), new Vector3(0, 0, 1)),
+            Proj = Matrix4x4.CreatePerspectiveFieldOfView(Radians(45f),
+                (float)ctx.SwapChainExtent.Width / ctx.SwapChainExtent.Height, 0.1f, 10.0f)
+        };
+        
+        
+        ubo.Proj.M22 *= -1;
+        var data = ctx.UniformBuffersMemoryPtrs![currentFrame];
+        new Span<UniformBufferObject>(data, 1).Fill(ubo);
+        
+        static float Radians(float angle) => angle * MathF.PI / 180f;
     }
 }

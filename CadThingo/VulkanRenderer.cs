@@ -1,4 +1,5 @@
 ﻿global using Semaphore = Silk.NET.Vulkan.Semaphore;
+global using ImageSharp = SixLabors.ImageSharp;
 using System.Numerics;
 using CadThingo.GraphicsPipeline;
 using Silk.NET.Windowing;
@@ -14,52 +15,65 @@ public class VulkanRenderer
     
     private static IWindow window;
     private bool FrameBufferResized = false;
+
     public VulkanRenderer(IWindow _window)
-        => window = _window;
+    {
+        window = _window;
+        vk = Globals.vk;
+        ctx = new VulkanContext();
+        _Instance = new VulkanInstance(ctx);
+        _Device = new VulkanDevice(ctx);
+        _SwapChain = new VulkanSwapchain(ctx);
+        _Pipeline = new VulkanPipeline(ctx);
+        _Commands = new VulkanCommands(ctx);
+        _Buffers = new VkBuffers(ctx);
+        _Texturing = new Texturing(ctx);
+        ctx.Vertices = new VkVertex[]
+        {
+            new VkVertex { pos = new Vector2(-0.5f, -0.5f), color = new Vector3(1.0f, 0.0f, 0.0f), uv = new Vector2(1.0f, 0.0f)},
+            new VkVertex { pos = new Vector2(0.5f, -0.5f), color = new Vector3(0.0f, 1.0f, 0.0f), uv = new Vector2(0.0f, 0.0f) },
+            new VkVertex { pos = new Vector2(0.5f, 0.5f), color = new Vector3(0.0f, 0.0f, 1.0f), uv = new Vector2(0.0f, 1.0f)},
+            new VkVertex { pos = new Vector2(-0.5f, 0.5f), color = new Vector3(1.0f, 1.0f, 1.0f), uv = new Vector2(1.0f, 1.0f) }
+        };
+        ctx.Indices = [0, 1, 2, 2, 3, 0];
+    }
+        
     
     
     private static Vk vk;
-    private VulkanContext ctx;
-    private VulkanInstance VKInstance;
-    private VulkanDevice VKDevice;
-    private VulkanSwapchain VKSwapChain;
-    private VulkanPipeline VKPipeline;
-    private VkBuffers _vkBuffers;
+    private static VulkanContext ctx;
+    public static VulkanInstance _Instance;
+    public static VulkanDevice _Device;
+    public static VulkanSwapchain _SwapChain;
+    public static VulkanPipeline _Pipeline;
+    public static VulkanCommands _Commands;
+    public static VkBuffers _Buffers;
+    public static Texturing _Texturing;
     
     
     public unsafe void InitVulkan()
     {
-        vk = Globals.vk;
-        ctx = new VulkanContext();
-        VKInstance = new VulkanInstance(ctx);
-        VKDevice = new VulkanDevice(ctx);
-        VKSwapChain = new VulkanSwapchain(ctx);
-        VKPipeline = new VulkanPipeline(ctx);
-        _vkBuffers = new VkBuffers(ctx);
-        ctx.Vertices = new VkVertex[]
-        {
-            new VkVertex { pos = new Vector2(-0.5f, -0.5f), color = new Vector3(1.0f, 0.0f, 0.0f) },
-            new VkVertex { pos = new Vector2(0.5f, -0.5f), color = new Vector3(0.0f, 1.0f, 0.0f) },
-            new VkVertex { pos = new Vector2(0.5f, 0.5f), color = new Vector3(0.0f, 0.0f, 1.0f) },
-            new VkVertex { pos = new Vector2(-0.5f, 0.5f), color = new Vector3(1.0f, 1.0f, 1.0f) }
-        };
-        
-        ctx.Indices = [0, 1, 2, 2, 3, 0];
-        
-        VKInstance.CreateInstance(out ctx.EnableValidation);
-        VKInstance.SetupDebugMessenger(ctx.EnableValidation);
-        VKInstance.CreateSurface();
-        VKDevice.PickPhysicalDevice();
-        VKDevice.CreateLogicalDevice();
-        VKSwapChain.CreateSwapChain();
-        VKSwapChain.CreateImageViews();
-        VKPipeline.CreateRenderPass();
-        VKPipeline.CreateGraphicsPipeline();
-        VKSwapChain.CreateFrameBuffer();
-        CreateCommandPool();
-        _vkBuffers.CreateVertexBuffers();
-        _vkBuffers.CreateIndexBuffer();
-        CreateCommandBuffers();
+        _Instance.CreateInstance(out ctx.EnableValidation);
+        _Instance.SetupDebugMessenger(ctx.EnableValidation);
+        _Instance.CreateSurface();
+        _Device.PickPhysicalDevice();
+        _Device.CreateLogicalDevice();
+        _SwapChain.CreateSwapChain();
+        _SwapChain.CreateImageViews();
+        _Pipeline.CreateRenderPass();
+        _Pipeline.CreateDescriptorSetLayout();
+        _Pipeline.CreateGraphicsPipeline();
+        _SwapChain.CreateFrameBuffer();
+        _Commands.CreateCommandPool();
+        _Texturing.CreateTextureImage();
+        _Texturing.CreateTextureImageView();
+        _Texturing.CreateTextureSampler();
+        _Buffers.CreateVertexBuffers();
+        _Buffers.CreateIndexBuffer();
+        _Buffers.CreateUniformBuffers();
+        _Pipeline.CreateDescriptorPool();
+        _Pipeline.CreateDescriptorSets();
+        _Commands.CreateCommandBuffers();
         CreateSyncObjects();
         Console.WriteLine("Vulkan initialized");
     }
@@ -71,7 +85,20 @@ public class VulkanRenderer
     }
     public unsafe void OnClose()
     {
-        VKSwapChain.CleanupSwapChain();
+        _SwapChain.CleanupSwapChain();
+        
+        vk!.DestroySampler(ctx.Device, ctx.TextureSampler, null);
+        vk!.DestroyImageView(ctx.Device, ctx.TextureImageView, null);
+        vk!.DestroyImage(ctx.Device, ctx.TextureImage, null);
+        vk!.FreeMemory(ctx.Device, ctx.TextureImageMemory, null);
+        
+        for (var i = 0; i < App.MAX_FRAMES_IN_FLIGHT; i++)
+        {
+            vk!.DestroyBuffer(ctx.Device, ctx.UniformBuffers![i], null);
+            vk!.FreeMemory(ctx.Device, ctx.UniformBuffersMemory![i], null);
+        }
+        vk!.DestroyDescriptorPool(ctx.Device, ctx.DescriptorPool, null);
+        vk!.DestroyDescriptorSetLayout(ctx.Device, ctx.DescriptorSetLayout, null);
         
         vk!.DestroyBuffer(ctx.Device, ctx.VertexBuffer, null);
         vk!.FreeMemory(ctx.Device, ctx.VertexBufferMemory, null);
@@ -79,7 +106,7 @@ public class VulkanRenderer
         vk!.DestroyBuffer(ctx.Device, ctx.IndexBuffer, null);
         vk!.FreeMemory(ctx.Device, ctx.IndexBufferMemory, null);
         
-        for (int i = 0; i < App.MAX_FRAMES_IN_FLIGHT; i++)
+        for (var i = 0; i < App.MAX_FRAMES_IN_FLIGHT; i++)
         {
             vk!.DestroySemaphore(ctx.Device, ctx.RenderFinishedSemaphores![i], null);
             vk!.DestroySemaphore(ctx.Device, ctx.ImageAvailableSemaphores![i], null);
@@ -88,6 +115,7 @@ public class VulkanRenderer
         
         vk!.DestroyCommandPool(ctx.Device, ctx.CommandPool, null);
         vk.DestroyDevice(ctx.Device, null);
+        
         if(ctx.EnableValidation)
             ctx.DebugUtils!.DestroyDebugUtilsMessenger(ctx.Instance, ctx.DebugMessenger, null);
         
@@ -98,93 +126,9 @@ public class VulkanRenderer
         
     }
     
-    private void CreateCommandPool()
-    {
-        unsafe
-        {
-            var queueFamilyIndices = VulkanDevice.FindQueueFamilies(ctx.PhysicalDevice, ctx.Surface, ctx.KhrSurface);
-
-            CommandPoolCreateInfo commandPoolInfo = new()
-            {
-                SType = StructureType.CommandPoolCreateInfo,
-                QueueFamilyIndex = queueFamilyIndices.graphicsFamily!.Value,
-                Flags = CommandPoolCreateFlags.ResetCommandBufferBit
-            };
-            if(vk!.CreateCommandPool(ctx.Device, &commandPoolInfo, null, out ctx.CommandPool) != Result.Success)
-                throw new Exception("Failed to create command pool");
-        }
-    }
-
-    public unsafe void CreateCommandBuffers()
-    {
-        ctx.CommandBuffers = new CommandBuffer[ctx.SwapChainImages!.Length];
-        CommandBufferAllocateInfo allocateInfo = new()
-        {
-            SType = StructureType.CommandBufferAllocateInfo,
-            CommandPool = ctx.CommandPool,
-            Level = CommandBufferLevel.Primary,
-            CommandBufferCount = 1
-        };
-        
-
-        for (int i = 0; i < ctx.CommandBuffers.Length; i++)
-        {
-            if (vk!.AllocateCommandBuffers(ctx.Device, &allocateInfo, out ctx.CommandBuffers[i]) != Result.Success)
-            {
-                throw new Exception("Failed to allocate command buffers");
-            } 
-        }
-
-        for (var i = 0; i < ctx.CommandBuffers.Length; i++)
-        {
-            CommandBufferBeginInfo beginInfo = new()
-            {
-                SType = StructureType.CommandBufferBeginInfo,
-            };
-            if (vk!.BeginCommandBuffer(ctx.CommandBuffers[i], &beginInfo) != Result.Success)
-            {
-                throw new Exception("Failed to begin recording command buffer");
-            }
-
-            RenderPassBeginInfo renderPassInfo = new()
-            {
-                SType = StructureType.RenderPassBeginInfo,
-                RenderPass = ctx.RenderPass,
-                Framebuffer = ctx.SwapChainFramebuffers[i],
-                RenderArea =
-                {
-                    Offset = { X = 0, Y = 0 },
-                    Extent = ctx.SwapChainExtent
-                }
-            };
-            ClearValue clearColor = new()
-            {
-                Color = new() { Float32_0 = 0.0f, Float32_1 = 0.0f, Float32_2 = 0f, Float32_3 = 1.0f }
-            };
-
-            renderPassInfo.ClearValueCount = 1;
-            renderPassInfo.PClearValues = &clearColor;
-            
-            vk!.CmdBeginRenderPass(ctx.CommandBuffers![i], &renderPassInfo, SubpassContents.Inline);
-            
-            vk!.CmdBindPipeline(ctx.CommandBuffers[i], PipelineBindPoint.Graphics, ctx.Pipeline);
-            var vertexBuffers = new Buffer[] { ctx.VertexBuffer };
-            var offsets = new ulong[] { 0 };
-            fixed(ulong* offsetsPtr = offsets)
-            fixed (Buffer* vertexBuffersPtr = vertexBuffers)
-            {
-                vk!.CmdBindVertexBuffers(ctx.CommandBuffers[i], 0, 1, vertexBuffersPtr, offsetsPtr);
-                vk!.CmdBindIndexBuffer(ctx.CommandBuffers[i], ctx.IndexBuffer, 0, IndexType.Uint32);
-            }
-            vk!.CmdDrawIndexed(ctx.CommandBuffers[i], (uint)ctx.Indices.Length, 1, 0, 0, 0);
-            
-            vk!.CmdEndRenderPass(ctx.CommandBuffers[i]);
-            
-            if(vk!.EndCommandBuffer(ctx.CommandBuffers[i]) != Result.Success)
-                throw new Exception("Failed to end recording command buffer");
-        }
-    }
-
+    
+    
+    
     private unsafe void CreateSyncObjects()
     {
         ctx.ImageAvailableSemaphores = new Semaphore[App.MAX_FRAMES_IN_FLIGHT];
@@ -224,7 +168,7 @@ public class VulkanRenderer
             ctx.ImageAvailableSemaphores![ctx.CurrentFrame], default, &imageIndex);
         if (result == Result.ErrorOutOfDateKhr)//recreates swapchain if its out of date
         {
-            VKSwapChain.RecreateSwapChain(window, VKPipeline, this);
+            _SwapChain.RecreateSwapChain(window, _Pipeline, this);
             return;
         } else if (result != Result.Success && result != Result.SuboptimalKhr)
         {
@@ -239,7 +183,9 @@ public class VulkanRenderer
         }
 
         ctx.ImagesInFlight[imageIndex] = ctx.InFlightFences[ctx.CurrentFrame];
-
+        
+        _Buffers.UpdateUniformBuffers(imageIndex);
+        
         SubmitInfo submitInfo = new()
         {
             SType = StructureType.SubmitInfo,
@@ -292,7 +238,7 @@ public class VulkanRenderer
         if (result == Result.ErrorOutOfDateKhr || result == Result.SuboptimalKhr || FrameBufferResized)
         {
             FrameBufferResized = false;
-            VKSwapChain.RecreateSwapChain(window, VKPipeline, this);
+            _SwapChain.RecreateSwapChain(window, _Pipeline, this);
         }else if (result != Result.Success)
             throw new Exception("Failed to present swap chain image");
         
