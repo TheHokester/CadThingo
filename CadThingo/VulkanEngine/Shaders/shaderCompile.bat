@@ -1,0 +1,1 @@
+D:\VulkanSDK\Bin\slangc.exe TexturedMesh.slang -target spirv -o ../../Assets/Shaders/TexturedMesh.spv

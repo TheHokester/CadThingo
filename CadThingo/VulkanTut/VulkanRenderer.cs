@@ -28,14 +28,23 @@ public class VulkanRenderer
         _Commands = new VulkanCommands(ctx);
         _Buffers = new VkBuffers(ctx);
         _Texturing = new Texturing(ctx);
-        ctx.Vertices = new VkVertex[]
-        {
-            new VkVertex { pos = new Vector2(-0.5f, -0.5f), color = new Vector3(1.0f, 0.0f, 0.0f), uv = new Vector2(1.0f, 0.0f)},
-            new VkVertex { pos = new Vector2(0.5f, -0.5f), color = new Vector3(0.0f, 1.0f, 0.0f), uv = new Vector2(0.0f, 0.0f) },
-            new VkVertex { pos = new Vector2(0.5f, 0.5f), color = new Vector3(0.0f, 0.0f, 1.0f), uv = new Vector2(0.0f, 1.0f)},
-            new VkVertex { pos = new Vector2(-0.5f, 0.5f), color = new Vector3(1.0f, 1.0f, 1.0f), uv = new Vector2(1.0f, 1.0f) }
-        };
-        ctx.Indices = [0, 1, 2, 2, 3, 0];
+        _DepthResources = new DepthResources(ctx);
+        // ctx.Vertices = new VkVertex[]
+        // {
+        //     new VkVertex { pos = new Vector3(-0.5f, -0.5f, 0), color = new Vector3(1.0f, 0.0f, 0.0f), uv = new Vector2(1.0f, 0.0f)},
+        //     new VkVertex { pos = new Vector3(0.5f, -0.5f, 0), color = new Vector3(0.0f, 1.0f, 0.0f), uv = new Vector2(0.0f, 0.0f) },
+        //     new VkVertex { pos = new Vector3(0.5f, 0.5f, 0), color = new Vector3(0.0f, 0.0f, 1.0f), uv = new Vector2(0.0f, 1.0f)},
+        //     new VkVertex { pos = new Vector3(-0.5f, 0.5f, 0), color = new Vector3(1.0f, 1.0f, 1.0f), uv = new Vector2(1.0f, 1.0f) },
+        //     
+        //     new VkVertex { pos = new Vector3(-0.5f, -0.5f, -0.5f), color = new Vector3(1.0f, 0.0f, 0.0f), uv = new Vector2(1.0f, 0.0f)},
+        //     new VkVertex { pos = new Vector3(0.5f, -0.5f, -0.5f), color = new Vector3(0.0f, 1.0f, 0.0f), uv = new Vector2(0.0f, 0.0f) },
+        //     new VkVertex { pos = new Vector3(0.5f, 0.5f, -0.5f), color = new Vector3(0.0f, 0.0f, 1.0f), uv = new Vector2(0.0f, 1.0f)},
+        //     new VkVertex { pos = new Vector3(-0.5f, 0.5f, -0.5f), color = new Vector3(1.0f, 1.0f, 1.0f), uv = new Vector2(1.0f, 1.0f) }
+        // };
+        // ctx.Indices = [
+        //     0, 1, 2, 2, 3, 0,
+        //     4, 5, 6, 6, 7, 4
+        // ];
     }
         
     
@@ -49,6 +58,7 @@ public class VulkanRenderer
     public static VulkanCommands _Commands;
     public static VkBuffers _Buffers;
     public static Texturing _Texturing;
+    public static DepthResources _DepthResources;
     
     
     public unsafe void InitVulkan()
@@ -63,11 +73,15 @@ public class VulkanRenderer
         _Pipeline.CreateRenderPass();
         _Pipeline.CreateDescriptorSetLayout();
         _Pipeline.CreateGraphicsPipeline();
-        _SwapChain.CreateFrameBuffer();
         _Commands.CreateCommandPool();
+        _Texturing.CreateColorResources();
+        _DepthResources.CreateDepthResources();
+        _SwapChain.CreateFrameBuffer();
         _Texturing.CreateTextureImage();
         _Texturing.CreateTextureImageView();
         _Texturing.CreateTextureSampler();
+        ModelLoader.LoadObjModel(ctx,
+            "C:\\Users\\jamie\\RiderProjects\\CadThingo\\CadThingo\\Assets\\Models\\viking_room.obj");
         _Buffers.CreateVertexBuffers();
         _Buffers.CreateIndexBuffer();
         _Buffers.CreateUniformBuffers();
@@ -194,7 +208,7 @@ public class VulkanRenderer
         var waitStages = stackalloc[] { PipelineStageFlags.ColorAttachmentOutputBit };
         
         var buffer = ctx.CommandBuffers![imageIndex];
-
+        
         submitInfo = submitInfo with
         {
             WaitSemaphoreCount = 1,

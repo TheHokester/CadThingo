@@ -30,6 +30,7 @@ public unsafe class VulkanContext
     public Instance Instance;
     
     public PhysicalDevice PhysicalDevice;
+    public SampleCountFlags MsaaSamples = SampleCountFlags.Count1Bit;
     public Device Device;
     
     public Queue GraphicsQueue;
@@ -52,7 +53,15 @@ public unsafe class VulkanContext
 
     public CommandPool CommandPool;
     
+    public VkImage ColorImage;
+    public DeviceMemory ColorImageMemory;
+    public ImageView ColorImageView;
     
+    public VkImage DepthImage;
+    public DeviceMemory DepthImageMemory;
+    public ImageView DepthImageView;
+    
+    public uint MipLevels;
     public VkImage TextureImage;
     public ImageView TextureImageView;
     public Sampler TextureSampler;

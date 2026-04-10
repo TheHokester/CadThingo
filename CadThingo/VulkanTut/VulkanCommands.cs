@@ -73,13 +73,15 @@ public class VulkanCommands(VulkanContext ctx)
                     Extent = ctx.SwapChainExtent
                 }
             };
-            ClearValue clearColor = new()
-            {
-                Color = new() { Float32_0 = 1.0f, Float32_1 = 1.0f, Float32_2 = 1f, Float32_3 = 1.0f }
-            };
+            var clearValues = new ClearValue[2];
+            clearValues[0].Color = new() { Float32_0 = 1.0f, Float32_1 = 1.0f, Float32_2 = 1f, Float32_3 = 1.0f };
+            clearValues[1].DepthStencil = new() { Depth = 1.0f, Stencil = 0 };
 
-            renderPassInfo.ClearValueCount = 1;
-            renderPassInfo.PClearValues = &clearColor;
+            fixed (ClearValue* clearValuesPtr = clearValues)
+            {
+                renderPassInfo.ClearValueCount = (uint)clearValues.Length;
+                renderPassInfo.PClearValues = clearValuesPtr;
+            }
             
             vk!.CmdBeginRenderPass(ctx.CommandBuffers![i], &renderPassInfo, SubpassContents.Inline);
             

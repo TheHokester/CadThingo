@@ -33,6 +33,7 @@ public class VulkanDevice
             if (IsDeviceSuitable(device))
             {
                 ctx.PhysicalDevice = device;
+                ctx.MsaaSamples = GetMaxUsableSampleCount();
                 break;
             }
         }
@@ -179,5 +180,24 @@ public class VulkanDevice
         }
 
         return indices;
+    }
+    
+    
+    private unsafe SampleCountFlags GetMaxUsableSampleCount()
+    {
+        PhysicalDeviceProperties deviceProperties;
+        vk!.GetPhysicalDeviceProperties(ctx.PhysicalDevice, &deviceProperties);
+        
+        
+        SampleCountFlags c = deviceProperties.Limits.FramebufferColorSampleCounts &
+                             deviceProperties.Limits.FramebufferDepthSampleCounts;
+        if ((c & SampleCountFlags.Count64Bit) != 0) return SampleCountFlags.Count64Bit;
+        if((c & SampleCountFlags.Count32Bit) != 0) return SampleCountFlags.Count32Bit;
+        if((c &  SampleCountFlags.Count16Bit) != 0) return SampleCountFlags.Count16Bit;
+        if((c & SampleCountFlags.Count8Bit) != 0) return SampleCountFlags.Count8Bit;
+        if((c & SampleCountFlags.Count4Bit) != 0) return SampleCountFlags.Count4Bit;
+        if((c & SampleCountFlags.Count2Bit) != 0) return SampleCountFlags.Count2Bit;
+
+        return SampleCountFlags.Count1Bit;
     }
 }
