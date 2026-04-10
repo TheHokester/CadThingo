@@ -12,7 +12,7 @@ namespace CadThingo.GraphicsPipeline;
 public struct VkVertex
 {
     
-    public Vector2 pos;
+    public Vector3 pos;
     public Vector3 color;
     public Vector2 uv; //texCoord
     public static VertexInputBindingDescription GetBindingDescription()
@@ -34,7 +34,7 @@ public struct VkVertex
             {
                 Binding = 0,
                 Location = 0,
-                Format = Format.R32G32Sfloat,
+                Format = Format.R32G32B32Sfloat,
                 Offset = (uint)Marshal.OffsetOf<VkVertex>(nameof(pos))
             },
             new VertexInputAttributeDescription()
@@ -233,12 +233,12 @@ public class VkBuffers(VulkanContext ctx)
 
         UniformBufferObject ubo = new()
         {
-            Model = Matrix4x4.Identity * Matrix4x4.CreateFromAxisAngle(new Vector3(0, 0, 1), time * Radians(90f)),
+            Model = Matrix4x4.Identity * Matrix4x4.CreateFromAxisAngle(new Vector3(0, 0, 1), (float)Math.Sin(time * Radians(10f))),
             View = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), new Vector3(0, 0, 0), new Vector3(0, 0, 1)),
             Proj = Matrix4x4.CreatePerspectiveFieldOfView(Radians(45f),
                 (float)ctx.SwapChainExtent.Width / ctx.SwapChainExtent.Height, 0.1f, 10.0f)
         };
-        
+
         
         ubo.Proj.M22 *= -1;
         var data = ctx.UniformBuffersMemoryPtrs![currentFrame];

@@ -112,7 +112,12 @@ public class VulkanSwapchain
         CreateImageViews();
         pipeline!.CreateRenderPass();
         pipeline.CreateGraphicsPipeline();
+        VulkanRenderer._Texturing.CreateColorResources();
+        VulkanRenderer._DepthResources.CreateDepthResources();
         CreateFrameBuffer();
+        VulkanRenderer._Buffers.CreateUniformBuffers();
+        VulkanRenderer._Pipeline.CreateDescriptorPool();
+        VulkanRenderer._Pipeline.CreateDescriptorSets();
         VulkanRenderer._Commands.CreateCommandBuffers();
         
         ctx.ImagesInFlight = new Fence[ctx.SwapChainImages!.Length];
@@ -120,6 +125,15 @@ public class VulkanSwapchain
 
     public unsafe void CleanupSwapChain()
     {
+        vk!.DestroyImageView(ctx.Device, ctx.DepthImageView, null);
+        vk!.DestroyImage(ctx.Device, ctx.DepthImage, null);
+        vk!.FreeMemory(ctx.Device, ctx.DepthImageMemory, null);
+        
+        vk!.DestroyImageView(ctx.Device, ctx.ColorImageView, null);
+        vk!.DestroyImage(ctx.Device, ctx.ColorImage, null );
+        vk!.FreeMemory(ctx.Device, ctx.ColorImageMemory, null);
+        
+        
         foreach (var frameBuffer in ctx.SwapChainFramebuffers!)
         {
             vk!.DestroyFramebuffer(ctx.Device, frameBuffer, null);
@@ -138,7 +152,15 @@ public class VulkanSwapchain
         {
             vk!.DestroyImageView(ctx.Device, imageView, null);
         }
+        
         ctx.KhrSwapChain!.DestroySwapchain(ctx.Device, ctx.SwapChain, null);
+
+        for (int i = 0; i < ctx.SwapChainImages.Length; i++)
+        {
+            vk!.DestroyBuffer(ctx.Device, ctx.UniformBuffers![i], null);
+            vk!.FreeMemory(ctx.Device, ctx.UniformBuffersMemory![i], null);
+        }
+        vk!.DestroyDescriptorPool(ctx.Device, ctx.DescriptorPool, null);
     }
     private Extent2D ChooseSwapExtent(SurfaceCapabilitiesKHR capabilities)
     {
@@ -228,25 +250,25 @@ public class VulkanSwapchain
 
         for (int i = 0; i < ctx.SwapChainImages.Length; i++)
         {
-            ctx.SwapChainImageViews[i] = CreateImageView(ctx.SwapChainImages[i], ctx.SwapChainImageFormat);
+            ctx.SwapChainImageViews[i] = CreateImageView(ctx.SwapChainImages[i], ctx.SwapChainImageFormat, ImageAspectFlags.ColorBit, ctx.MipLevels);
         }
         Console.WriteLine("Created image views");
     }
     
-    public unsafe ImageView CreateImageView(VkImage image, Format format)
+    public unsafe ImageView CreateImageView(VkImage image, Format format, ImageAspectFlags aspectFlags, uint mipLevels)
     {
         ImageViewCreateInfo createInfo = new()
         {
             SType = StructureType.ImageViewCreateInfo,
             Image = image,
-    
+            
             ViewType = ImageViewType.Type2D,
             Format = format,
             // Components = new ComponentMapping(ComponentSwizzle.R,
             //     ComponentSwizzle.G,
             //     ComponentSwizzle.B,
             //     ComponentSwizzle.A),
-            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1)
+            SubresourceRange = new ImageSubresourceRange(aspectFlags, 0, mipLevels > 1 ? mipLevels : 1, 0, 1)
         };
         ImageView imageView;
         if (vk!.CreateImageView(ctx.Device, &createInfo, null, out imageView) != Result.Success)
@@ -263,20 +285,27 @@ public class VulkanSwapchain
 
         for (var i = 0; i < ctx.SwapChainImageViews!.Length; i++)
         {
-            var attachment = ctx.SwapChainImageViews[i];
-            
-            FramebufferCreateInfo framebufferInfo = new()
+            var attachments = new[]
             {
-                SType = StructureType.FramebufferCreateInfo,
-                RenderPass = ctx.RenderPass,
-                AttachmentCount = 1,
-                PAttachments = &attachment,
-                Width = ctx.SwapChainExtent.Width,
-                Height = ctx.SwapChainExtent.Height,
-                Layers = 1
+                ctx.ColorImageView,
+                ctx.DepthImageView,
+                ctx.SwapChainImageViews[i],
             };
-            if(vk!.CreateFramebuffer(ctx.Device, &framebufferInfo, null, out ctx.SwapChainFramebuffers[i]) != Result.Success)
-                throw new Exception("Failed to create framebuffer");
+            fixed (ImageView* attachmentsPtr = attachments)
+            {
+                FramebufferCreateInfo framebufferInfo = new()
+                {
+                    SType = StructureType.FramebufferCreateInfo,
+                    RenderPass = ctx.RenderPass,
+                    AttachmentCount = (uint)attachments.Length,
+                    PAttachments = attachmentsPtr,
+                    Width = ctx.SwapChainExtent.Width,
+                    Height = ctx.SwapChainExtent.Height,
+                    Layers = 1
+                };
+                if(vk!.CreateFramebuffer(ctx.Device, &framebufferInfo, null, out ctx.SwapChainFramebuffers[i]) != Result.Success)
+                    throw new Exception("Failed to create framebuffer");
+            }
         }
     }
 

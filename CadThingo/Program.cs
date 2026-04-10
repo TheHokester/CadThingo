@@ -1,4 +1,5 @@
-﻿using Silk.NET.Core;
+﻿using CadThingo.VulkanEngine;
+using Silk.NET.Core;
 using Silk.NET.Core.Native;
 
 namespace CadThingo;
@@ -15,7 +16,7 @@ public class Program
 
     private static void Main()
     {
-        var app = new App();
+        var app = new Engine();
         app.Run();
     }
 

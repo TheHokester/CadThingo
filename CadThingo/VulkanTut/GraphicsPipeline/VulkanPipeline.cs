@@ -102,7 +102,23 @@ public class VulkanPipeline
             {
                 SType = StructureType.PipelineMultisampleStateCreateInfo,
                 SampleShadingEnable = false,
-                RasterizationSamples = SampleCountFlags.Count1Bit
+                RasterizationSamples = ctx.MsaaSamples
+            };
+            PipelineDepthStencilStateCreateInfo depthStencilState = new()
+            {
+                SType = StructureType.PipelineDepthStencilStateCreateInfo,
+                DepthTestEnable = true,
+                DepthWriteEnable = true,
+                
+                DepthCompareOp = CompareOp.Less,
+               
+                DepthBoundsTestEnable = false,
+                MinDepthBounds = 0,
+                MaxDepthBounds = 1,
+
+                StencilTestEnable = false,
+                Front = new StencilOpState(),
+                Back = new StencilOpState(),
             };
 
             PipelineColorBlendAttachmentState colorBlendAttachmentState = new()
@@ -150,6 +166,7 @@ public class VulkanPipeline
                 PViewportState = &viewportStateInfo,
                 PRasterizationState = &rasterizationStateInfo,
                 PMultisampleState = &multisampleStateInfo,
+                PDepthStencilState = &depthStencilState,
                 PColorBlendState = &colorBlending,
                 Layout = ctx.PipelineLayout,
                 RenderPass = ctx.RenderPass,
@@ -174,12 +191,49 @@ public class VulkanPipeline
     }
     public unsafe void CreateRenderPass()
     {
-        AttachmentDescription attachment = new()
+        AttachmentDescription colorAttachment = new()
         {
             Format = ctx.SwapChainImageFormat,
-            Samples = SampleCountFlags.Count1Bit,
+            Samples = ctx.MsaaSamples,
 
             LoadOp = AttachmentLoadOp.Clear,
+            StoreOp = AttachmentStoreOp.Store,
+            
+            StencilLoadOp = AttachmentLoadOp.DontCare,
+            StencilStoreOp = AttachmentStoreOp.DontCare,
+
+            InitialLayout = ImageLayout.Undefined,
+            FinalLayout = ImageLayout.ColorAttachmentOptimal,
+        };
+        AttachmentReference colorAttachmentRef = new()
+        {
+            Attachment = 0,
+            Layout = ImageLayout.ColorAttachmentOptimal
+        };
+        
+        AttachmentDescription depthAttachment = new()
+        {
+            Format = VulkanRenderer._DepthResources.FindDepthFormat(),
+            Samples = ctx.MsaaSamples,
+            LoadOp = AttachmentLoadOp.Clear,
+            StoreOp = AttachmentStoreOp.DontCare,
+            StencilLoadOp = AttachmentLoadOp.DontCare,
+            StencilStoreOp = AttachmentStoreOp.DontCare,
+            InitialLayout = ImageLayout.Undefined,
+            FinalLayout = ImageLayout.DepthStencilAttachmentOptimal,
+        };
+        AttachmentReference depthAttachmentRef = new()
+        {
+            Attachment = 1,
+            Layout = ImageLayout.DepthStencilAttachmentOptimal,
+        };
+        
+        AttachmentDescription colorAttachmentResolve = new()
+        {
+            Format = ctx.SwapChainImageFormat,
+            Samples = ctx.MsaaSamples,
+
+            LoadOp = AttachmentLoadOp.DontCare,
             StoreOp = AttachmentStoreOp.Store,
 
             StencilLoadOp = AttachmentLoadOp.DontCare,
@@ -188,30 +242,48 @@ public class VulkanPipeline
             InitialLayout = ImageLayout.Undefined,
             FinalLayout = ImageLayout.PresentSrcKhr,
         };
-
-        AttachmentReference colorAttachmentRef = new()
+        AttachmentReference colorAttachmentResolveRef = new()
         {
-            Attachment = 0,
-            Layout = ImageLayout.ColorAttachmentOptimal
+            Attachment = 2,
+            Layout = ImageLayout.ColorAttachmentOptimal,
         };
+        
         SubpassDescription subpass = new()
         {
             PipelineBindPoint = PipelineBindPoint.Graphics,
             ColorAttachmentCount = 1,
-            PColorAttachments = &colorAttachmentRef
+            PColorAttachments = &colorAttachmentRef,
+            PDepthStencilAttachment = &depthAttachmentRef,
+            PResolveAttachments =  &colorAttachmentResolveRef,
         };
-
-        RenderPassCreateInfo renderPassInfo = new()
+        SubpassDependency dependency = new()
         {
-            SType = StructureType.RenderPassCreateInfo,
-            AttachmentCount = 1,
-            PAttachments = &attachment,
-            SubpassCount = 1,
-            PSubpasses = &subpass
+            SrcSubpass = Vk.SubpassExternal,
+            DstSubpass = 0,
+            SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit,
+            SrcAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.DepthStencilAttachmentWriteBit,
+            DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit,
+            DstAccessMask = AccessFlags.ColorAttachmentReadBit | AccessFlags.DepthStencilAttachmentWriteBit,
+            
         };
-        if (vk!.CreateRenderPass(ctx.Device, &renderPassInfo, null, out ctx.RenderPass) != Result.Success)
+        
+        var attachments = new[]{colorAttachment, depthAttachment, colorAttachmentResolve};
+        fixed (AttachmentDescription* attachmentsPtr = attachments)
         {
-            throw new Exception("Failed to create render pass");
+            RenderPassCreateInfo renderPassInfo = new()
+            {
+                SType = StructureType.RenderPassCreateInfo,
+                AttachmentCount = (uint)attachments.Length,
+                PAttachments = attachmentsPtr,
+                SubpassCount = 1,
+                PSubpasses = &subpass,
+                DependencyCount = 1,
+                PDependencies = &dependency,
+            };
+            if (vk!.CreateRenderPass(ctx.Device, &renderPassInfo, null, out ctx.RenderPass) != Result.Success)
+            {
+                throw new Exception("Failed to create render pass");
+            }
         }
         Console.WriteLine("Created render pass");
     }
