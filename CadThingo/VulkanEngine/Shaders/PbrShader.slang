@@ -22,10 +22,10 @@ struct LightingUBO {
 [[vk::push_constant]] PushConstants material;
 
 // GBuffer inputs — Set 1 in your descriptor layout
-[[vk::binding(0, 1)]] Sampler2D gbufferPositionSampler;
-[[vk::binding(1, 1)]] Sampler2D gbufferNormalSampler;
-[[vk::binding(2, 1)]] Sampler2D gbufferAlbedoSampler;
-[[vk::binding(3, 1)]] Sampler2D gbufferMaterialSampler;
+[[vk::binding(0, 1)]] Sampler2D gBufferPositionSampler;
+[[vk::binding(1, 1)]] Sampler2D gBufferNormalSampler;
+[[vk::binding(2, 1)]] Sampler2D gBufferAlbedoSampler;
+[[vk::binding(3, 1)]] Sampler2D gBufferMaterialSampler;
 
 
 [[shader("vertex")]]

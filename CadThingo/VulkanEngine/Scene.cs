@@ -1,5 +1,6 @@
 ﻿using System.Numerics;
 using CadThingo.VulkanEngine.Renderer;
+using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine;
 
@@ -45,14 +46,20 @@ public unsafe struct Material
 
 public class Scene
 {
+    
     private Entity[] _entities;
     private List<ResourceHandle<MaterialResource>> _materials;
     private List<ResourceHandle<TextureResource>> _textures;
 
     private static Camera Cam;
 
-    private RenderGraph renderGraph;
+    public RenderGraph renderGraph;
 
+    public Scene(Vk vk, Device device)
+    {
+        renderGraph = new RenderGraph(vk, device);
+        Cam = new Camera();
+    }
     public bool RayCast(Ray ray, ref RayCastHit hit, float rayLength)
     {
         return false;
