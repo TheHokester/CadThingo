@@ -71,6 +71,8 @@ public unsafe partial class Renderer
     //pipelines 
     PipelineLayout pipelineLayout;
     Pipeline graphicsPipeline;
+    PipelineLayout geometryPipelineLayout;
+    Pipeline geometryPipeline;
     PipelineLayout pbrPipelineLayout;
     Pipeline pbrLightingPipeline;
     Pipeline pbrBlendGraphicsPipeline;
@@ -95,6 +97,7 @@ public unsafe partial class Renderer
     
     //PipelineRenderingCreateInfos for lifetime management
     PipelineRenderingCreateInfo mainPipelineRenderingCreateInfo;
+    PipelineRenderingCreateInfo geometryPipelineRenderingCreateInfo;
     PipelineRenderingCreateInfo pbrPipelineRenderingCreateInfo; 
     PipelineRenderingCreateInfo lightingPipelineRenderingCreateInfo; 
     PipelineRenderingCreateInfo compositePipelineRenderingCreateInfo;  
@@ -168,7 +171,10 @@ public unsafe partial class Renderer
         CreateImageViews();
         SetupDynamicRendering();
         CreateDescriptorSetLayout();
+        CreateGeometryDescriptorSetLayout();
+        CreatePBRDescriptorSetLayout();
         CreateGraphicsPipeline();
+        CreateGeometryPipeline();
         CreatePBRPipeline();
         //create command pool
         CreateCommandPool();
@@ -180,6 +186,7 @@ public unsafe partial class Renderer
         //Create descriptor pool
         CreateDescriptorPool();
         CreateDescriptorSets();
+        
 
         //Create command buffers
         CreateCommandBuffers();
