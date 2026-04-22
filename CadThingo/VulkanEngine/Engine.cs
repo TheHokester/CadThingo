@@ -22,6 +22,11 @@ public class Engine
     //singleton resource manager
     public static AsyncResourceManager ResourceManager = new();
 
+
+    public Engine()
+    {
+        
+    }
     public void Start()
     {
         WindowOptions options = new()
@@ -71,6 +76,7 @@ public class Engine
         {
             //do stuff part of regular operations
             //process events
+            window!.DoEvents(); 
             EventBus.ProcessEvents();
             //render frame
             renderer.Update();

@@ -117,7 +117,6 @@ public unsafe partial class Renderer
     CommandPool commandPool;
     CommandBuffer[] commandBuffers;
     
-    RenderPassManager renderPassManager;
     CullingSystem cullingSystem;
     
     //Camera
@@ -208,7 +207,7 @@ public unsafe partial class Renderer
 
     public void Update()
     {
-        Render()
+        DrawFrame();
     }
 
     public void Cleanup()

@@ -317,14 +317,6 @@ public unsafe partial class Renderer
     }
 }
 
-class PostProcessEffect
-{
-    public virtual void Apply(CommandBuffer cmd)
-    {
-        
-    }
-}
-
 struct UniformBufferObject
 {
     public Matrix4x4 model;

@@ -185,7 +185,13 @@ public class EventBus
     private object eventQueueLock;
     private bool immediateMode = true;
 
-
+    public EventBus()
+    {
+        listeners = new Dictionary<IEventListener, EventCategory>();
+        eventQueue = new Queue<Event>();
+        eventQueueLock = new object();
+    }
+    
     public void SetImmediateMode(bool immediate) => immediateMode = immediate;
     
     public void AddListener(IEventListener listener, EventCategory category) => listeners.Add(listener, category);
