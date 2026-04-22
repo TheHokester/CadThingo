@@ -377,8 +377,7 @@ public unsafe partial class Renderer
                 RecreateSwapChain();
             }
         }
-            
-        }
+    }
     
     
     
@@ -388,38 +387,30 @@ public unsafe partial class Renderer
     /// Comprehensive deferred renderer setup demonstrating rendergraph resource management<br/>
     /// this implementation shows how to efficiently organise resources for multiple passes<br/>
     /// </summary>
-    /// <param name="renderGraph"></param>
+    /// <param name="graph"></param>
     /// <param name="width"></param>
     /// <param name="height"></param>
     private void SetupDeferredRenderer(RenderGraph graph, uint width, uint height)
     {
         //configure posiiton buffer for world-space vertex positions
         //High precision format preserves positional accuracy for lighting calculations
-        graph.AddResource("GBuffer_Position", Format.R32G32B32Sfloat, new Extent2D(width, height),
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        graph.AddResource(gBufferPosition);
         
         
         //Configure normal buffer for surface orientation data
         //High precision normals enable accurate lighting and reflections
-        graph.AddResource("GBuffer_Normal", Format.R32G32B32A32Sfloat, new Extent2D(width, height),
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        graph.AddResource(gBufferNormal);
         
         
         //configure albedo buffer for surface color information
         //standard 8bit precision sufficient for color data with gamma encoding
-        graph.AddResource("GBuffer_Albedo", Format.R8G8B8A8Unorm, new Extent2D(width, height),
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        graph.AddResource(gBufferAlbedo);
         
         
+        graph.AddResource(gBufferMaterial);
         //configure depth buffer for accurate depth information
         //standard 32bit depth format preserves accurate depth information
-        graph.AddResource("Depth", Format.D32Sfloat, new Extent2D(width, height),
-            ImageUsageFlags.DepthStencilAttachmentBit | ImageUsageFlags.InputAttachmentBit,
-            ImageLayout.Undefined, ImageLayout.DepthStencilAttachmentOptimal);
-        
+        graph.AddResource(depthImageResource);
         
         //configure finalcolor buffer for the completed lighting results
         //standard color format with transfer capability for presentation or post processing
@@ -435,7 +426,7 @@ public unsafe partial class Renderer
             {
                 //Configure multiple render target attachments for GBuffer output
                 //each attachment corresponds to a seperate geometric property
-                RenderingAttachmentInfoKHR* colorAttachments = stackalloc RenderingAttachmentInfoKHR[3];
+                RenderingAttachmentInfoKHR* colorAttachments = stackalloc RenderingAttachmentInfoKHR[4];
                 colorAttachments[0] = new()
                 {
                     ImageView = graph.GetResource("GBuffer_Position").ImageView,
@@ -457,6 +448,13 @@ public unsafe partial class Renderer
                     LoadOp = AttachmentLoadOp.Clear,
                     StoreOp = AttachmentStoreOp.Store
                 };
+                colorAttachments[3] = new()
+                {
+                    ImageView = graph.GetResource("GBuffer_Material").ImageView,
+                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
+                    LoadOp = AttachmentLoadOp.Clear,
+                    StoreOp = AttachmentStoreOp.Store
+                };
                 //Configure depth attachment for occlusion culling
                 RenderingAttachmentInfoKHR depthAttachment = new()
                 {
@@ -471,7 +469,7 @@ public unsafe partial class Renderer
                 {
                     RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
                     LayerCount = 1,
-                    ColorAttachmentCount = 3,
+                    ColorAttachmentCount = 4,
                     PColorAttachments = (RenderingAttachmentInfo*)colorAttachments,
                     PDepthAttachment = (RenderingAttachmentInfo*)&depthAttachment
                 };
@@ -527,6 +525,10 @@ public unsafe partial class Renderer
     }
 
 
+
+    
+    
+    
     /// <summary>
     /// 
     /// </summary>

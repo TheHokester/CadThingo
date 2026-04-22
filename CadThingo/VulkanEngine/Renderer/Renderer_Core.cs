@@ -40,7 +40,8 @@ public unsafe partial class Renderer
     KhrSwapchain.ExtensionName];
     private Device device; 
     
-    
+    //world scene
+    private Scene scene;
     
     private QueueFamilyIndices queueFamilyIndices;
     private Queue graphicsQueue;
@@ -68,6 +69,8 @@ public unsafe partial class Renderer
     RenderingInfo renderingInfo;
     List<RenderingAttachmentInfo> colorAttachments;
     RenderingAttachmentInfo depthAttachment;
+    
+    
     //pipelines 
     PipelineLayout pipelineLayout;
     Pipeline graphicsPipeline;
@@ -133,10 +136,12 @@ public unsafe partial class Renderer
     //tracks last timeline value that was submitted
     volatile uint lastTimelineValue;
     
-    //Depth buffer
-    Image depthImage;
-    DeviceMemory depthImageAlloc;
-    ImageView depthImageView;
+    //Depth buffer + Images
+    ImageResource depthImageResource;
+    private ImageResource gBufferPosition;
+    private ImageResource gBufferNormal;
+    private ImageResource gBufferAlbedo;
+    private ImageResource gBufferMaterial;
     
     //store for lifetime management
     DescriptorSetLayout descriptorSetLayout;
@@ -181,21 +186,30 @@ public unsafe partial class Renderer
         
         //Create depth resources
         CreateDepthResources();
+        //Create GBuffer resources
+        CreateGBufferResources();
         //Create uniform buffers
         CreateUniformBuffers();
         //Create descriptor pool
         CreateDescriptorPool();
         CreateDescriptorSets();
-        
+        //create scene 
+        scene = new Scene(vk, device);
 
         //Create command buffers
         CreateCommandBuffers();
         //Create sync objects
         CreateSyncObjects();
+        //setup deffered rendering
+        SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);
         
         initialized = true;
     }
 
+    public void Update()
+    {
+        Render()
+    }
 
     public void Cleanup()
     {

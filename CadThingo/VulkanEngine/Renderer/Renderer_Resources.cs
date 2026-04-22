@@ -8,9 +8,36 @@ public unsafe partial class Renderer
 {
     private void CreateDepthResources()
     {
-        
+        var width = swapChainExtent.Width;
+        var height = swapChainExtent.Height;
+
+        depthImageResource = new ImageResource(vk, device, "Depth", Format.D32Sfloat, new Extent2D(width, height),
+            ImageUsageFlags.DepthStencilAttachmentBit | ImageUsageFlags.InputAttachmentBit,
+            ImageLayout.Undefined, ImageLayout.DepthStencilAttachmentOptimal);
     }
 
+    private void CreateGBufferResources()
+    {
+        var width = swapChainExtent.Width;
+        var height = swapChainExtent.Height;
+        gBufferPosition = new ImageResource(vk, device, "GBuffer_Position", Format.R32G32B32Sfloat,
+            new Extent2D(width, height),
+            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit,
+            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        gBufferNormal = new ImageResource(vk, device, "GBuffer_Normal", Format.R32G32B32A32Sfloat,
+            new Extent2D(width, height),
+            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit,
+            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        gBufferAlbedo = new ImageResource(vk, device, "GBuffer_Albedo", Format.R8G8B8A8Unorm,
+            new Extent2D(width, height),
+            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit,
+            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        gBufferMaterial = new ImageResource(vk, device, "GBuffer_Material", Format.R8G8B8A8Unorm,
+            new Extent2D(width, height),
+            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit,
+            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        
+    }
     private void CreateUniformBuffers()
     {
         int bufferSize = sizeof(UniformBufferObject);

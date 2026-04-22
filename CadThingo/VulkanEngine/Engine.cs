@@ -1,4 +1,5 @@
-﻿using Silk.NET.Input;
+﻿using System.Net.Sockets;
+using Silk.NET.Input;
 using Silk.NET.Maths;
 using Silk.NET.Windowing;
 using Renderer = CadThingo.VulkanEngine.Renderer.Renderer;
@@ -33,7 +34,6 @@ public class Engine
         };
         
         window = Window.Create(options);
-        
         window.Initialize();
 
         input = window.CreateInput();
@@ -47,11 +47,34 @@ public class Engine
         
         renderer = new( window);
         renderer.Initialize();
+        
+        window.Closing += Shutdown;
+        
     }
-    
-    
+
+    private void Shutdown()
+    {
+        renderer.Cleanup();
+        window!.Dispose();
+    }
+
+
     public void Run()
     {
         Start();
+        MainLoop();
+    }
+
+    private void MainLoop()
+    {
+        while (true)
+        {
+            //do stuff part of regular operations
+            //process events
+            EventBus.ProcessEvents();
+            //render frame
+            renderer.Update();
+            
+        }
     }
 }
