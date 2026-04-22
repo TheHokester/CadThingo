@@ -237,20 +237,7 @@ public unsafe partial class Renderer
             }
         }
     }
-
-    private void SetupRenderPasses()
-    {
-        //Create geometry pass
-        var gPassName = "GeometryPass";
-        var geometryPass = renderPassManager.AddRenderPass<GeometryPass>(gPassName,(string name) => new GeometryPass(device, name, cullingSystem));
-        //Create lighting pass
-        var lPassName = "LightingPass";
-        var lightingPass = renderPassManager.AddRenderPass<LightingPass>(lPassName,(string name) =>  new LightingPass(device, name, geometryPass));
-        //Create postprocess pass
-        var ppPassName = "PostProcessPass";
-        var postProcessPass = renderPassManager.AddRenderPass<PostProcessPass>(ppPassName, (string name) => new PostProcessPass(device, name, lightingPass));
-        
-    }
+    
     
     private void CleanupSwapChain()
     {
@@ -261,123 +248,46 @@ public unsafe partial class Renderer
     {
         
     }
-    /// <summary>
-    /// DO NOT LIKE this as is, but it's a start.
-    /// </summary>
-    /// <param name="entities"></param>
-    public void Render(List<Entity> entities)
-    {
-        vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
-        vk!.ResetFences(device, 1, ref inFlightFences[currentFrame]);
-        
-        vk!.ResetCommandBuffer(commandBuffers[0], CommandBufferResetFlags.ReleaseResourcesBit);
-        
-        //perform culling
-        cullingSystem.CullScene(entities);
-        
-        //record commands
-        CommandBufferBeginInfo beginInfo = new();
-        vk!.BeginCommandBuffer(commandBuffers[0], &beginInfo);
-        
-        //execute render passes
-        renderPassManager.Execute(commandBuffers[0]);
 
-        vk!.EndCommandBuffer(commandBuffers[0]);
-        Semaphore imageAvailableSemaphore = imageAvailableSemaphores[currentFrame];
-        Semaphore renderFinishedSemaphore = renderFinishedSemaphores[currentFrame];
-        var waitStages = stackalloc []{ PipelineStageFlags.ColorAttachmentOutputBit };
-        fixed (CommandBuffer* pCmdBuffer = &commandBuffers[0])
+
+    public void DrawFrame()
+    {
+        // 1. CPU/GPU sync for this slot
+        vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
+
+        // 2. Acquire swapchain image
+        uint imageIndex = 0;
+        var result = swapChainKhr.AcquireNextImage(device, swapChain, ulong.MaxValue,
+            imageAvailableSemaphores[currentFrame], default, &imageIndex);
+        if (result == Result.ErrorOutOfDateKhr) { RecreateSwapChain(); return; }
+
+        vk!.ResetFences(device, 1, ref inFlightFences[currentFrame]);
+
+        // 3. Transition swapchain image to transfer dst before blit from FinalColor
+        // <barrier: Undefined → TransferDstOptimal for swapChainImages[imageIndex]>
+
+        // 4. Drive the render graph — geometry pass, lighting pass, post-process
+        scene.renderGraph.Execute(commandBuffers[currentFrame], graphicsQueue);
+
+        // 5. Blit FinalColor resource into swapChainImages[imageIndex]
+        // 6. Transition swapchain image to PresentSrcKhr
+        // 7. Present
+        fixed (SwapchainKHR* pSwap = &swapChain)
         {
-            var submitInfo = new SubmitInfo()
+            var presentInfo = new PresentInfoKHR
             {
-                SType = StructureType.SubmitInfo,
-                CommandBufferCount = 1,
-                PCommandBuffers = pCmdBuffer,
                 WaitSemaphoreCount = 1,
-                PWaitSemaphores = &imageAvailableSemaphore,
-                PWaitDstStageMask = waitStages,
-                SignalSemaphoreCount = 1,
-                PSignalSemaphores = &renderFinishedSemaphore
+                PWaitSemaphores    = &renderFinishedSemaphores[currentFrame],
+                SwapchainCount     = 1,
+                PSwapchains        = pSwap,
+                PImageIndices      = &imageIndex
             };
-            vk!.QueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]);
+            swapChainKhr.QueuePresent(presentQueue, &presentInfo);
         }
-        
-        
+
+        currentFrame = (currentFrame + 1) % MAX_CONCURRENT_FRAMES;
     }
     
-    public void RenderFrame(Device device, Queue graphicsQueue, Queue presentQueue)
-    {
-        //Synchronise with previos frame completion
-        //prevent cpu from submitting work faster than gpu can process it
-        Result result = vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame] , true, ulong.MaxValue);
-        
-        //Reset fence for this frames completion tracking
-        //prepare the fence to signal when this frames gpu work completes
-        vk.ResetFences(device,1, ref inFlightFences[currentFrame]);
-        
-        //acquire next available image from the swapchain
-        //This operation coordinates with the presentation engine and display system
-        uint imageIndex = 0;
-        result = swapChainKhr.AcquireNextImage(device, swapChain, long.MaxValue, imageAvailableSemaphores[currentFrame], default, &imageIndex);
-        if (result == Result.ErrorOutOfDateKhr)
-        {
-            RecreateSwapChain();
-        }
-        else if (result != Result.Success && result != Result.SuboptimalKhr)
-        {
-            throw new Exception("Failed to acquire swap chain image");
-        }
-        //record commands for this frames rendering
-
-        
-        
-        
-        SubmitInfo submitInfo = new()
-        {
-            SType = StructureType.SubmitInfo,
-        };
-        var waitSemaphores = stackalloc[] { imageAvailableSemaphores[currentFrame] };
-        var waitStages = stackalloc[] { PipelineStageFlags.ColorAttachmentOutputBit };
-        
-        var buffer = commandBuffers![imageIndex];
-        
-        submitInfo = submitInfo with
-        {
-            WaitSemaphoreCount = 1,
-            PWaitSemaphores = waitSemaphores,
-            PWaitDstStageMask = waitStages,
-
-            CommandBufferCount = 1,
-            PCommandBuffers = &buffer
-        };
-
-        var signalSemaphores = stackalloc[] { renderFinishedSemaphores![currentFrame] };
-        submitInfo = submitInfo with
-        {
-            SignalSemaphoreCount = 1,
-            PSignalSemaphores = signalSemaphores
-        };
-        //submit work to gpu with fence-based completion tracking
-        //the fence allows cpu to know when this frames gpu work is complete
-        vk!.QueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]);
-        fixed (SwapchainKHR* pSwapChain = &swapChain)
-        {
-            PresentInfoKHR presentInfo = new()
-            {
-                WaitSemaphoreCount = 1,
-                PWaitSemaphores = waitSemaphores,
-                SwapchainCount = 1,
-                PSwapchains = pSwapChain,
-                PImageIndices = &imageIndex,
-            };
-            //submit presentation request to the presentation queue
-            result = swapChainKhr.QueuePresent(presentQueue, &presentInfo);
-            if (result == Result.ErrorOutOfDateKhr || result == Result.SuboptimalKhr)
-            {
-                RecreateSwapChain();
-            }
-        }
-    }
     
     
     
@@ -532,124 +442,7 @@ public unsafe partial class Renderer
     /// <summary>
     /// 
     /// </summary>
-    class RenderPassManager
-    {
-        private readonly Vk _vk;
-        private readonly Device _device;
-        private readonly PhysicalDevice _physicalDevice;
-        
-        Dictionary<string, RenderPass> renderPasses = new();
-        List<RenderPass> sortedPasses = new(); 
-        bool dirty = true;
-        
-        public RenderPassManager(Vk vk, Device device, PhysicalDevice physicalDevice)
-        {
-            _vk = vk;
-            _device = device;
-            _physicalDevice = physicalDevice;
-        }
-        /// <summary>
-        /// Creates a new render pass and adds it to the render pass manager
-        /// </summary>
-        /// <param name="name">Pass name</param>
-        /// <param name="factory"> Constructor for the renderpass object of desired subtype</param>
-        /// <typeparam name="T">Render pass subtype</typeparam>
-        /// <returns>Pointer to new render pass</returns>
-        public T* AddRenderPass<T>(string name, Func<string, T> factory) where T : RenderPass
-        {
-            if (renderPasses.TryGetValue(name, out var pass))
-            {
-                return (T*)&pass;
-            }
-            var newPass = factory(name);
-            renderPasses[name] = newPass;
-            dirty = true;
-            
-            return (T*)&newPass;
-        }
-
-
-        public RenderPass* GetRenderPass(string name)
-        {
-            if (!renderPasses.TryGetValue(name, out var pass))
-            {
-                return null;
-            }
-            return (RenderPass*)&pass;
-        }
-
-        public void RemoveRenderPass(string name)
-        {
-           renderPasses.Remove(name); 
-        }
-        
-        
-        /// <summary>
-        /// Compile passes into render pipelines, passes are executed in dependency order <br/>
-        /// 
-        /// </summary>
-        /// <param name="buffer">Buffer to execute commands with</param>
-        public void Execute(CommandBuffer buffer)
-        {
-            if (dirty)
-            {
-                SortPasses();
-                dirty = false;
-            }
-
-            foreach (var pass in sortedPasses)
-            {
-                pass.Execute(buffer);
-            }
-        }
-
-        private void SortPasses()
-        {
-            //topologically sort render passes based on dependencies
-            sortedPasses.Clear();
-            
-            //create a copy of render passes for sorting
-            var passMap = new Dictionary<string, RenderPass>(renderPasses);
-            
-            //perform topological sort
-            HashSet<string> visited = new();
-            HashSet<string> visiting = new();
-
-            foreach (var pair in passMap)
-            {
-                if (visited.Contains(pair.Key))
-                {
-                    TopologicalSort(pair.Key, passMap, ref visited, ref visiting);
-                }
-            }
-
-            void TopologicalSort(string name, Dictionary<string, RenderPass> map,ref HashSet<string> visited,
-                ref HashSet<string> visiting)
-            {
-                //Cycle detected
-                if (visiting.Contains(name))
-                {
-                    throw new InvalidOperationException($"Cycle detected at {name}");
-                }
-
-                // Already processed
-                if (visited.Contains(name))
-                    return;
-
-                visiting.Add(name);
-
-                var pass = map[name];
-                foreach (var dependency in pass.GetDependencies())
-                {
-                    TopologicalSort(dependency, map, ref visited, ref visiting);
-                }
-
-                visiting.Remove(name);
-                visited.Add(name);
-                sortedPasses.Add(pass);
-            }
-        }
-    }
+   
 }
 
 /// <summary>
@@ -681,6 +474,10 @@ public unsafe class RenderGraph : IDisposable
     {
         _vk = vk;
         _device = device;
+        passes = new();
+        executionOrder = new();
+        semaphores = new();
+        semaphorePairs = new();
     }
 
 
@@ -1110,340 +907,7 @@ unsafe class CullingSystem(Camera camera)
     public List<Entity> GetVisibleEntities() => visibleEntities;
 }
 
-unsafe class RenderPass : IDisposable
-{
-    protected Vk vk = Vk.GetApi();
-    private Device device;
-    
-    private readonly string _name;
-    private readonly List<string> dependencies;
-    private RenderTarget* _renderTarget = null;
-    bool enabled = true;
 
-    public RenderPass(Device device, string name)
-    {
-        this.device = device;
-        _name = name;
-    }
-
-    public string GetName() => _name;
-    public RenderTarget* GetRenderTarget() => _renderTarget;
-    public void SetRenderTarget(RenderTarget* renderTarget) => _renderTarget = renderTarget;
-    public void SetEnabled(bool enabled) => this.enabled = enabled; 
-    public bool IsEnabled() => enabled;
-    public List<string> GetDependencies() => dependencies;
-    
-    public void AddDependency(string dependency) => dependencies.Add(dependency);
-
-    public virtual void Execute(CommandBuffer buffer)
-    {
-        if(!enabled) return;
-
-        BeginPass(buffer);
-        Render(buffer);
-        EndPass(buffer);
-    }
-    //With dynamic rendering, beginpass call vkCmdBeginRendering isntead of CmdBeginRenderPass
-    protected virtual void BeginPass(CommandBuffer buffer){}
-    protected virtual void Render(CommandBuffer buffer){}
-    //with dynamic rendering, endpass call vkCmdEndRendering instead of CmdEndRenderPass
-    protected virtual void EndPass(CommandBuffer buffer){}
-    
-    
-    
-    
-    
-    public virtual void Dispose()
-    {
-    }
-}
-
-/// <summary>
-/// Geometry pass for deferred rendering
-/// </summary>
-unsafe class GeometryPass : RenderPass
-{
-    private readonly Vk _vk = Vk.GetApi();
-    CullingSystem _cullingSystem;
-    
-    RenderTarget gBuffer;
-    public GeometryPass(Device device, string name, CullingSystem culling) : base(device, name)
-    {
-        //Create gbuffer render target
-        gBuffer = new RenderTarget(device, 1920, 1080);//example resolution
-        fixed(RenderTarget* pGBuffer = &gBuffer)
-            SetRenderTarget(pGBuffer);
-    }
-
-    public override void Dispose()
-    {
-        base.Dispose();
-        gBuffer.Dispose();
-        
-        GC.SuppressFinalize(this);
-    }
-
-    protected override void BeginPass(CommandBuffer buffer)
-    {
-        //begin rendering with dynamic rendering
-        RenderingInfoKHR renderingInfo;
-        
-        //Color attachment
-        RenderingAttachmentInfoKHR colorAttachmentInfo = new()
-        {
-            ImageView = gBuffer.GetColorImageView(),
-            ImageLayout = ImageLayout.ColorAttachmentOptimal,
-            LoadOp = AttachmentLoadOp.Clear,
-            StoreOp = AttachmentStoreOp.Store,
-            ClearValue = new ClearValue() { Color = new ClearColorValue(0, 0, 0, 1) }
-        };
-        
-        //Depth attachment
-        RenderingAttachmentInfoKHR depthAttachmentInfo = new()
-        {
-            ImageView = gBuffer.GetDepthImageView(),
-            ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
-            LoadOp = AttachmentLoadOp.Clear,
-            StoreOp = AttachmentStoreOp.Store,
-            ClearValue = new ClearValue() { DepthStencil = new ClearDepthStencilValue(1, 0) }
-        };
-
-        renderingInfo = new()
-        {
-            RenderArea = new Rect2D(){Offset = {X = 0, Y = 0}, Extent = {Width = 1920, Height = 1080}},
-            LayerCount = 1,
-            ColorAttachmentCount = 1,
-            PColorAttachments = (RenderingAttachmentInfo*)&colorAttachmentInfo,
-            PDepthAttachment = (RenderingAttachmentInfo*)&depthAttachmentInfo
-        };
-        //begin dynamic rendering
-        vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-    }
-
-    protected override void Render(CommandBuffer buffer)
-    {
-        //Get visisble entities
-        var visibleEntities = _cullingSystem.GetVisibleEntities();
-        foreach (var entity in visibleEntities)
-        {
-            var meshComponent = entity.GetComponent<MeshComponent>();
-            var transformComponent = entity.GetComponent<TransformComponent>();
-
-            if (meshComponent != null && transformComponent != null) 
-            {
-                //bind pipeline for Gbuffer rendering
-                //...
-                
-                //Set model matrix
-                //...
-                
-                //Draw mesh
-                //...
-            }
-        }
-    }
-
-    protected override void EndPass(CommandBuffer buffer)
-    {
-        //End dynamic rendering
-        vk!.CmdEndRendering(buffer);
-    }
-}
-//lighting pass for deferred rendering
-unsafe class LightingPass : RenderPass
-{
-    private GeometryPass* _geometryPass;
-    
-    private List<Light> lights;
-    public LightingPass(Device device, string name, GeometryPass* gPass) : base(device, name)
-    {
-        //add dependency to geometry pass
-        AddDependency(gPass->GetName());
-    }
-    public void AddLight(Light light) => lights.Add(light);
-    public void RemoveLight(Light light) => lights.Remove(light);
-
-    protected override void BeginPass(CommandBuffer buffer)
-    {
-        //Begin rendering with dynamic rendering
-        RenderingInfoKHR renderingInfo;
-        //setup color attachment
-        RenderingAttachmentInfoKHR colorAttachment = new()
-        {
-            ImageView = GetRenderTarget()->GetColorImageView(),
-            ImageLayout = ImageLayout.ColorAttachmentOptimal,
-            LoadOp = AttachmentLoadOp.Clear,
-            StoreOp = AttachmentStoreOp.Store,
-            ClearValue = new ClearValue() { Color = new ClearColorValue(0, 0, 0, 1) }
-        };
-        
-        //configure rendering info
-        renderingInfo = new()
-        {
-            RenderArea = new Rect2D(){Offset = {X = 0, Y = 0}, Extent = {Width = 1920, Height = 1080}},
-            LayerCount = 1,
-            ColorAttachmentCount = 1,
-            PColorAttachments = (RenderingAttachmentInfo*)&colorAttachment
-        };
-        //begin dynamic rendering
-        vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-        
-        
-    }
-
-    protected override void Render(CommandBuffer buffer)
-    {
-        //bind gbuffer textures from the geometry pass
-        var gBuffer = _geometryPass->GetRenderTarget();
-        
-        //set up descriptor sets for gbuffer textures
-        //With dynamic rendering we access the gbuffer textures directly as shader resources
-        //rather than subpass inputs
-        
-        //Render fullscreen quad with lighting shader
-        
-        //for each light 
-        foreach (var light in lights)
-        {
-            //set light properties
-            //...
-            
-            //draw light volume
-            //...
-        }
-    }
-
-    protected override void EndPass(CommandBuffer buffer)
-    {
-        //end dynamic rendering
-        vk!.CmdEndRendering(buffer);
-    }
-}
-
-unsafe class PostProcessPass : RenderPass
-{
-    LightingPass* _lightingPass;
-    List<PostProcessEffect> postProcessEffects;
-    public PostProcessPass(Device device, string name, LightingPass* lPass) : base(device, name)
-    {
-        //add dependency to lighting pass
-        AddDependency(lPass->GetName());
-    }
-    
-    public void AddEffect(PostProcessEffect effect) => postProcessEffects.Add(effect);
-    public void RemoveEffect(PostProcessEffect effect) => postProcessEffects.Remove(effect);
-
-    protected override void BeginPass(CommandBuffer buffer)
-    {
-        //begin rednering with dynamic rendering
-        RenderingInfoKHR renderingInfo;
-        
-        //Set up color attachment
-        RenderingAttachmentInfoKHR colorAttachment = new()
-        {
-            ImageView = GetRenderTarget()->GetColorImageView(),
-            ImageLayout = ImageLayout.ColorAttachmentOptimal,
-            LoadOp = AttachmentLoadOp.Clear,
-            StoreOp = AttachmentStoreOp.Store,
-            ClearValue = new ClearValue() { Color = new ClearColorValue(0, 0, 0, 1) }
-        };
-        
-        //configure rendering info
-        renderingInfo = new()
-        {
-            RenderArea = new Rect2D() { Offset = { X = 0, Y = 0 }, Extent = { Width = 1920, Height = 1080 } },
-            LayerCount = 1,
-            ColorAttachmentCount = 1,
-            PColorAttachments = (RenderingAttachmentInfo*)&colorAttachment
-        };
-        
-        //begin dynamic rendering
-        vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-    }
-
-    protected override void Render(CommandBuffer buffer)
-    {
-        //with dynamic rendering each effect can set up its own rendering state
-        //and access input textures directly as shader resources
-        
-        //apply each post process effect
-        foreach (var effect in postProcessEffects)
-        {
-            effect.Apply(buffer);
-        }
-    }
-
-    protected override void EndPass(CommandBuffer buffer)
-    {
-        //end dynamic rendering
-        vk!.CmdEndRendering(buffer);
-    }
-}
-
-unsafe class RenderTarget : IDisposable
-{
-    private Vk? vk = Vk.GetApi();
-    Device device;
-    
-    
-    private Image colorImage = default;
-    private DeviceMemory colorImageMemory = default;
-    private ImageView colorImageView = default;
-    
-    private Image depthImage = default;
-    private DeviceMemory depthImageMemory = default;
-    private ImageView depthImageView = default;
-
-    private uint width;
-    private uint height;
-
-    public RenderTarget(Device device, uint w, uint h)
-    {
-        this.device = device; 
-        width = w;
-        height = h;
-        //Create color and depth images
-        CreateColorResources();
-        CreateDepthResources();
-        
-        //Note: with dynamic rendering we dont need to create VkRenderPass or VkFrameBuffer objects.
-        //Instead we just create the images and imageviews that will be used directly with vkCmdBeginRendering
-        
-    }
-    
-    public ImageView GetColorImageView() => colorImageView;
-    public ImageView GetDepthImageView() => depthImageView;
-    
-    uint GetWidth() => width;
-    uint GetHeight() => height;
-
-    //TODO: implement Image creations here later
-    private void CreateColorResources()
-    {
-        
-    }
-
-    private void CreateDepthResources()
-    {
-        
-    }
-    
-    
-    
-    
-    
-    public void Dispose()
-    {
-        if(colorImageView.Handle != 0) vk.DestroyImageView(device, colorImageView, null); 
-        if(colorImageMemory.Handle != 0) vk.FreeMemory(device, colorImageMemory, null); 
-        if(colorImage.Handle != 0) vk.DestroyImage(device, colorImage, null); 
-        
-        if(depthImageView.Handle != 0) vk.DestroyImageView(device, depthImageView, null); 
-        if(depthImageMemory.Handle != 0) vk.FreeMemory(device, depthImageMemory, null); 
-        if(depthImage.Handle != 0) vk.DestroyImage(device, depthImage, null); 
-        
-    }
-}
 
 
 [StructLayout(LayoutKind.Sequential)]
