@@ -73,6 +73,7 @@ public class Camera : IEventListener
     /// <param name="farPlane">Far plane distance</param>
     /// <returns></returns>
     public Mat4 GetProjectionMatrix(float aspectRatio, float nearPlane, float farPlane)
+    
     {
         return Mat4.CreatePerspectiveFieldOfView(ToRadians(zoom), aspectRatio, nearPlane, farPlane);
     }

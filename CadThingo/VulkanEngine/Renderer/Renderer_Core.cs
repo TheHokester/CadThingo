@@ -20,6 +20,8 @@ public unsafe partial class Renderer
     /// Renderer fields
     /// </summary>
     Vk? vk = Globals.vk;
+    public bool initialized = false;
+    
     private bool enableValidationLayers = true;
     private readonly string[] ValidationLayers =
     [
@@ -70,7 +72,7 @@ public unsafe partial class Renderer
     PipelineLayout pipelineLayout;
     Pipeline graphicsPipeline;
     PipelineLayout pbrPipelineLayout;
-    Pipeline pbrGraphicsPipeline;
+    Pipeline pbrLightingPipeline;
     Pipeline pbrBlendGraphicsPipeline;
     //transparent pbr pipeline for premultiplied alpha
     Pipeline pbrPremulPipeline;
@@ -135,6 +137,9 @@ public unsafe partial class Renderer
     
     //store for lifetime management
     DescriptorSetLayout descriptorSetLayout;
+    DescriptorSetLayout geometryDescriptorSetLayout;
+    DescriptorSetLayout PBRDescriptorSetLayout; //Set 0 - Lighting UBO
+    DescriptorSetLayout PBRGBufferDescriptorSetLayout;//Set 1 - G buffer descriptors
     DescriptorPool descriptorPool;
     private DescriptorSet[] descriptorSets;
      
@@ -164,7 +169,7 @@ public unsafe partial class Renderer
         SetupDynamicRendering();
         CreateDescriptorSetLayout();
         CreateGraphicsPipeline();
-        
+        CreatePBRPipeline();
         //create command pool
         CreateCommandPool();
         
@@ -181,7 +186,7 @@ public unsafe partial class Renderer
         //Create sync objects
         CreateSyncObjects();
         
-        
+        initialized = true;
     }
 
 
