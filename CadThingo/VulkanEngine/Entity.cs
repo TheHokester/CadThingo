@@ -22,7 +22,8 @@ public unsafe struct Entity : IDisposable
     // managed array resizing entirely.
     // Each slot holds the raw IntPtr of a GCHandle (stored as ulong).
     private const int MaxComponents = 64;
-
+      
+    
     private fixed ulong _componentSlots[MaxComponents];
     private int _componentCount;
 

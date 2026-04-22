@@ -277,16 +277,13 @@ public unsafe class TextureResource(string id) : Resource(id)
 
 public unsafe class MeshResource : Resource
 {
-    private Buffer vertexBuffer;
-    DeviceMemory vertexBufferMemory;
-    uint vertexCount = 0;
-    
-    Buffer indexBuffer;
-    DeviceMemory indexBufferMemory;
-    uint indexCount = 0;
+    int _offset = 0;
+    int _stride = 0;
 
-    public MeshResource(string id) : base(id)
+    public MeshResource(string id, int offset, int stride) : base(id)
     {
+        _offset = offset;
+        _stride = stride;
     }
     ~MeshResource()
     {
@@ -299,19 +296,10 @@ public unsafe class MeshResource : Resource
         //construct file path
         string filePath = "models/" + GetId() + ".gltf";
         //Parse GLTF file and extract vertex and index buffers
-        List<VkVertex> vertices;
-        List<uint> indices;
-        if(!LoadMeshData(filePath, out vertices, out indices))
-            return false;
+        
+     
         
         //transform cpu data into GPU resources
-        CreateVertexBuffer(vertices);
-        CreateIndexBuffer(indices);
-        
-        //cache metadata for efficient access
-        vertexCount = (uint)vertices.Count;
-        indexCount = (uint)indices.Count;
-        
         
         return base.Load(); 
     }
@@ -326,26 +314,19 @@ public unsafe class MeshResource : Resource
             
             //Destroy Buffers and free gpu resources
             //index buffers destroyed first to maintain dependency order
-            vk.DestroyBuffer(device, indexBuffer, null);
-            vk.FreeMemory(device, indexBufferMemory, null);
-            vk.DestroyBuffer(device, vertexBuffer, null);
-            vk.FreeMemory(device, vertexBufferMemory, null);
             
         }
         base.Unload();
     }
     
-    Buffer GetVertexBuffer() => vertexBuffer;
-    Buffer GetIndexBuffer() => indexBuffer;
-    uint GetVertexCount() => vertexCount;
-    uint GetIndexCount() => indexCount;
+    
     
     private Device GetDevice()
     {
         return default;
     }
 
-    private bool LoadMeshData(string path, out List<VkVertex> vertices, out List<uint> indices)
+    private bool LoadMeshData(string path, out List<Vertex> vertices, out List<uint> indices)
     {
         //Implementation using bla bla bla
         // This method handles the complex task of:
@@ -382,6 +363,16 @@ public unsafe class MeshResource : Resource
         // - Index format validation (16-bit vs 32-bit indices)
         // ...
     }
+}
+
+public unsafe class MaterialResource(string id) : Resource(id)
+{
+    Material material;
+    ~MaterialResource()
+    {
+        Unload();
+    }
+    
 }
 
 public unsafe class ShaderResource(string id) : Resource(id)

@@ -20,7 +20,7 @@ struct VertexOutput{
     float4 Position : SV_POSITION;
     float3 WorldPos;
     float3 Normal: NORMAL;
-    float2 TexCoord: TEXCOORD;
+    float2 TexCoord: TEXCOORD0;
     float4 Tangent: TANGENT;
    
 }

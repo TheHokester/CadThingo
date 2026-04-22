@@ -350,26 +350,26 @@ public unsafe struct Vertex
 public sealed unsafe class MeshComponent : Component
 {
     public Mesh* mesh;
-    public Material* material;
+    public int materialIndex = -1;
     public BoundingBox* boundingBox;
     
     public MeshComponent() { }
 
-    public MeshComponent(Mesh* mesh, Material* material)
+    public MeshComponent(Mesh* mesh, int matIndex)
     {
         this.mesh = mesh;
-        this.material = material;
+        this.materialIndex = matIndex;
     }
     
     public override void Render()
     {
-        if (mesh == null || material == null) return;
+        if (mesh == null || materialIndex != -1) return;
         
         TransformComponent* transform = Owner->GetComponent<TransformComponent>();
         if (transform == null) return;
 
         material->Bind();
-        material->SetUniform("modelMatrix", transform->GetTransformMatrix());
+        material->SetUniform("modelMatrix", transform->GetModelMatrix());
         mesh->Render();
     }
     public BoundingBox GetBoundingBox()
@@ -424,36 +424,4 @@ public unsafe struct BoundingBox
         this = new BoundingBox(min, max);
     }
     
-}
-/// <summary>
-/// Mesh allocated in unmanaged memory so MeshComponent can hold a raw Mesh*.
-/// </summary>
-public unsafe struct Mesh
-{
-    public void Render()
-    {
-        
-    }
-}
- 
-/// <summary>
-/// Material allocated in unmanaged memory.
-/// SetUniform takes a Matrix4x4* to avoid a 64-byte copy on every draw call.
-/// </summary>
-public unsafe struct Material
-{
-    public void Bind()
-    {
-        
-    }
-
-    public void SetUniform(string name, Matrix4x4* value)
-    {
-        
-    }
-
-    public void SetUniform(string name, float value)
-    {
-        
-    }
 }

@@ -61,7 +61,7 @@ public sealed unsafe class TransformComponent : Component
     /// The pointer is valid for component lifetime
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public Matrix4x4* GetTransformMatrix()
+    public Matrix4x4* GetModelMatrix()
     {
         if (_dirty)
         {

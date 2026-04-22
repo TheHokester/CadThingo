@@ -483,6 +483,8 @@ public unsafe partial class Renderer
                 //each draw call populates position normal and albedo for visible fragments
                 //implement here -------------------------------------------------------------
                 
+                
+                
                 vk!.CmdEndRendering(buffer);
             });
         
@@ -523,426 +525,7 @@ public unsafe partial class Renderer
         
         graph.Compile();
     }
-    
-    
-    
-    
-    
-    
-    
-    /// <summary>
-    /// Workflow<br/>
-    /// 1. AddResource() - declare all images the graph will use <br/>
-    /// 2. AddPass() - declare all passes and there read/write sets<br/>
-    /// 3. Compile() - topological sort + allocate gpu resources<br/>
-    /// 4. Execute() - record all passes into the command buffer in order<br/>
-    /// 5. Dispose() - free all gpu resources <br/>
-    /// </summary>
-    class RenderGraph : IDisposable
-    {
-        private readonly Vk _vk;
-        private readonly Device _device;
-        private readonly PhysicalDevice _physicalDevice;
-        private bool _disposed;
-        private bool _compiled;
 
-        private readonly Dictionary<string, ImageResource> _imageResources = new();
-        private List<Pass> passes;
-        private List<int> executionOrder;
-
-        //Automatic synchronization management
-        //these objects ensure correct GPU execution order without manual barriers
-        private List<Semaphore> semaphores;
-        private List<SemaphorePair> semaphorePairs;
-
-        public RenderGraph(Vk vk, Device device)
-        {
-            _vk = vk;
-            _device = device;
-        }
-
-
-        /// <summary>
-        /// Creates a new image resource and adds it to the render graph
-        /// </summary>
-        /// <param name="name"></param>
-        /// <param name="format"></param>
-        /// <param name="extent"></param>
-        /// <param name="usage"></param>
-        /// <param name="initialLayout"></param>
-        /// <param name="finalLayout"></param>
-        public void AddResource(string name, Format format, Extent2D extent, ImageUsageFlags usage,
-            ImageLayout initialLayout = ImageLayout.Undefined,
-            ImageLayout finalLayout = ImageLayout.ShaderReadOnlyOptimal)
-        {
-            ImageResource resource = new(_vk, _device, name, format, extent, usage, initialLayout, finalLayout);
-            AddResource(resource);
-
-        }
-
-        /// <summary>
-        /// Add a resource to the render graph
-        /// </summary>
-        /// <param name="resource"></param>
-        public void AddResource(ImageResource resource)
-        {
-            _imageResources[resource._name] = resource;
-
-        }
-
-        public ImageResource GetResource(string name) 
-        {
-            if (!_imageResources.TryGetValue(name, out var resource))
-            {
-                throw new Exception($"Resource {name} not found");
-            }
-            return resource;
-        }
-        /// <summary>
-        /// Add a pass to the render graph
-        /// </summary>
-        /// <param name="pass"></param>
-        public void AddPass(Pass pass) => passes.Add(pass);
-
-        /// <summary>
-        /// Creates a new pass and adds it to the render graph
-        /// </summary>
-        /// <param name="name"></param>
-        /// <param name="inputs"></param>
-        /// <param name="outputs"></param>
-        /// <param name="executeFunc"></param>
-        public void AddPass(string name, List<string> inputs, List<string> outputs, Action<CommandBuffer> executeFunc)
-        {
-            Pass pass = new(name, inputs, outputs)
-            {
-                ExecuteFunc = executeFunc
-            };
-            AddPass(pass);
-        }
-
-        /// <summary>
-        /// Rendergraph compilation - Transforms declarative descriptions into executable pipelines<br/>
-        /// This method performs dependency analysis, resource allocation, and execution planning<br/>
-        /// </summary>
-        public void Compile()
-        {
-            if (_compiled)
-            {
-                throw new InvalidOperationException("RenderGraph already compiled");
-            }
-
-            int n = passes.Count;
-
-            // adjacency[i] = list of pass indices that depend on pass i
-            var adjacency = new List<int>[n];
-            var inDegree = new int[n];
-            for (int i = 0; i < n; i++) adjacency[i] = new List<int>();
-
-            // Build edges: for each resource, find (writer → reader) pairs
-            for (var i = 0; i < n; i++)
-            {
-                foreach (var output in passes[i]._outputs)
-                {
-                    for (int j = 0; j < n; j++)
-                    {
-                        if (i == j) continue;
-                        if (passes[j]._inputs.Contains(output))
-                        {
-                            adjacency[i].Add(j);
-                            inDegree[j]++;
-                        }
-                    }
-                }
-            }
-
-            //Topological sort for optimal execution order
-            //this is done by Kahn's algorithm
-            //BFS from all zero-in-degree nodes
-            var queue = new Queue<int>();
-            for (var i = 0; i < n; i++)
-                if (inDegree[i] == 0)
-                    queue.Enqueue(i);
-
-            while (queue.Count > 0)
-            {
-                int node = queue.Dequeue();
-                executionOrder.Add(node);
-                foreach (var adj in adjacency[node])
-                {
-                    if (--inDegree[adj] == 0)
-                        queue.Enqueue(adj);
-                }
-            }
-
-            if (executionOrder.Count == 0)
-            {
-                throw new Exception("RenderGraph contains a cycle, check pass dependencies");
-            }
-
-            //Automatic Synchronization object creations
-            //Generate semaphore for all dependencies identified
-            var semaphoreInfo = new SemaphoreCreateInfo()
-            {
-                SType = StructureType.SemaphoreCreateInfo
-            };
-            for (int i = 0; i < passes.Count; i++)
-            {
-                foreach (var output in passes[i]._outputs)
-                {
-                    for (int j = 0; j < passes.Count; j++)
-                    {
-                        if (i == j) continue;
-                        if (!passes[j]._inputs.Contains(output)) continue;
-
-                        if (_vk.CreateSemaphore(_device, ref semaphoreInfo, null, out var semaphore) != Result.Success)
-                        {
-                            throw new Exception("Failed to create render graph semaphore");
-                        }
-
-                        semaphores.Add(semaphore);
-                        semaphorePairs.Add(new SemaphorePair()
-                        {
-                            SignalPassIndex = i,
-                            WaitPassIndex = j,
-                        });
-
-                    }
-                }
-            }
-            
-            foreach (var resource in _imageResources.Values)
-                resource.Allocate(_physicalDevice);
-
-            _compiled = true;
-        }
-
-        public void Execute(CommandBuffer cmd, Queue queue)
-        {
-            if (!_compiled)
-                throw new InvalidOperationException("Call Compile() before Execute().");
-            //pre pass temporaries
-            var waitSemaphores = new List<Semaphore>();
-            var waitStages = new List<PipelineStageFlags>();
-            var signalSemaphores = new List<Semaphore>();
-
-
-            foreach (var passIndex in executionOrder)
-            {
-                var pass = passes[passIndex];
-
-                //------------collect wait semaphores for this pass----------------------
-                waitSemaphores.Clear();
-                waitStages.Clear();
-
-                for (int i = 0; i < semaphorePairs.Count; i++)
-                {
-                    if (semaphorePairs[i].WaitPassIndex == passIndex)
-                    {
-                        waitSemaphores.Add(semaphores[i]);
-                        waitStages.Add(PipelineStageFlags.ColorAttachmentOutputBit);
-                    }
-                }
-
-                //---------collect signal semaphores for this pass-----------------------
-                signalSemaphores.Clear();
-
-                for (int i = 0; i < semaphorePairs.Count; i++)
-                    if (semaphorePairs[i].SignalPassIndex == passIndex)
-                        signalSemaphores.Add(semaphores[i]);
-
-
-                //------------begin command recording ------------------------------
-
-                var beginInfo = new CommandBufferBeginInfo()
-                {
-                    SType = StructureType.CommandBufferBeginInfo,
-                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
-
-                };
-                if (_vk.BeginCommandBuffer(cmd, ref beginInfo) != Result.Success)
-                    throw new Exception("Failed to begin command buffer");
-
-                // ----- Barrier transition inputs -> ShaderReadOnlyOptimal
-                foreach (var inputName in pass._inputs)
-                {
-                    ImageResource resource = _imageResources[inputName];
-                    bool isDepth =
-                        resource._format is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16UnormS8Uint;
-                    if (_imageResources[inputName].IsAllocated)
-                    {
-                        var barrier = new ImageMemoryBarrier()
-                        {
-                            SType = StructureType.ImageMemoryBarrier,
-                            OldLayout = resource._initialLayout,
-                            NewLayout = ImageLayout.ShaderReadOnlyOptimal,
-                            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                            Image = resource.Image,
-                            SrcAccessMask = AccessFlags.MemoryReadBit,
-                            DstAccessMask = AccessFlags.ShaderReadBit,
-                            SubresourceRange = new ImageSubresourceRange()
-                            {
-                                AspectMask = isDepth ? ImageAspectFlags.ColorBit : ImageAspectFlags.DepthBit,
-                                BaseMipLevel = 0,
-                                LevelCount = 1,
-                                BaseArrayLayer = 0,
-                                LayerCount = 1
-                            }
-                        };
-
-                        _vk.CmdPipelineBarrier(cmd,
-                            PipelineStageFlags.AllCommandsBit,
-                            PipelineStageFlags.FragmentShaderBit,
-                            DependencyFlags.ByRegionBit,
-                            0, null,
-                            0, null,
-                            1, ref barrier);
-                    }
-                }
-
-                // ----- Barrier transition outputs -> ColorAttachmentOptimal
-                foreach (var outputName in pass._outputs)
-                {
-                    if (_imageResources[outputName].IsAllocated)
-                    {
-                        ImageResource resource = _imageResources[outputName];
-                        bool isDepth =
-                            resource._format is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16UnormS8Uint;
-                        var barrier = new ImageMemoryBarrier()
-                        {
-                            SType = StructureType.ImageMemoryBarrier,
-                            OldLayout = resource._initialLayout,
-                            NewLayout = ImageLayout.ColorAttachmentOptimal,
-                            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                            Image = resource.Image,
-                            SrcAccessMask = AccessFlags.MemoryReadBit,
-                            DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
-                            SubresourceRange = new ImageSubresourceRange()
-                            {
-                                AspectMask = isDepth ? ImageAspectFlags.ColorBit : ImageAspectFlags.DepthBit,
-                                BaseMipLevel = 0,
-                                LevelCount = 1,
-                                BaseArrayLayer = 0,
-                                LayerCount = 1
-                            }
-                        };
-
-                        _vk.CmdPipelineBarrier(cmd,
-                            PipelineStageFlags.AllCommandsBit,
-                            PipelineStageFlags.ColorAttachmentOutputBit,
-                            DependencyFlags.ByRegionBit,
-                            0, null,
-                            0, null,
-                            1, ref barrier);
-                    }
-                }
-
-                //----- Execute pass-------------------
-                pass.ExecuteFunc(cmd);
-
-                //----- Barrier: transition outputs -> resource._finalLayout
-                foreach (var outputName in pass._outputs)
-                {
-                    if (!_imageResources[outputName].IsAllocated) continue;
-                    ImageResource resource = _imageResources[outputName];
-                    bool isDepth = resource._format is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16UnormS8Uint;
-                    var barrier = new ImageMemoryBarrier
-                    {
-                        SType = StructureType.ImageMemoryBarrier,
-                        OldLayout = ImageLayout.ColorAttachmentOptimal,
-                        NewLayout = resource._finalLayout,
-                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                        Image = resource.Image,
-                        SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
-                        DstAccessMask = AccessFlags.MemoryReadBit,
-                        SubresourceRange = new ImageSubresourceRange()
-                        {
-                            AspectMask = isDepth ? ImageAspectFlags.ColorBit : ImageAspectFlags.DepthBit,
-                            BaseMipLevel = 0,
-                            LevelCount = 1,
-                            BaseArrayLayer = 0,
-                            LayerCount = 1
-                        }
-                    };
-
-                    _vk.CmdPipelineBarrier(
-                        cmd,
-                        PipelineStageFlags.ColorAttachmentOutputBit,
-                        PipelineStageFlags.AllCommandsBit, // before any subsequent work
-                        DependencyFlags.ByRegionBit,
-                        0, null, 0, null, 1, barrier);
-                }
-                //----- End command recording ------------------------------
-                if (_vk.EndCommandBuffer(cmd) != Result.Success)
-                {
-                    throw new Exception("Failed to end command buffer for pass name" + pass._name);
-                };
-                
-                
-                //---- Submit with semaphore wiring --------------------
-                int waitCount = waitSemaphores.Count;
-                int signalCount = signalSemaphores.Count;
-
-                Span<Semaphore> waitSemSpan = stackalloc Semaphore[waitCount];
-                Span<PipelineStageFlags> waitStageSpan = stackalloc PipelineStageFlags[waitCount];
-                Span<Semaphore> sigSemSpan = stackalloc Semaphore[signalCount];
-                
-                
-                for(int i = 0; i < waitCount; i++) waitSemSpan[i] = waitSemaphores[i];
-                for(int i = 0; i < waitCount; i++) waitStageSpan[i] = waitStages[i];
-                for(int i = 0 ; i < signalCount; i++) sigSemSpan[i] = signalSemaphores[i];
-                
-                fixed(Semaphore* pWaitSem = waitSemSpan)
-                fixed(PipelineStageFlags* pWaitStage = waitStageSpan)
-                fixed (Semaphore* pSigSem = sigSemSpan)
-                {
-                    var cb = cmd; //local copy so we can take its address
-
-                    var submitInfo = new SubmitInfo()
-                    {
-                        SType = StructureType.SubmitInfo,
-                        WaitSemaphoreCount = (uint)waitCount,
-                        PWaitSemaphores = pWaitSem,
-                        PWaitDstStageMask = pWaitStage,
-                        CommandBufferCount = 1,
-                        PCommandBuffers = &cb,
-                        SignalSemaphoreCount = (uint)signalCount,
-                        PSignalSemaphores = pSigSem,
-                    };
-                    //queue submit
-                    if (_vk.QueueSubmit(queue, 1, submitInfo, default) != Result.Success)
-                    {
-                        throw new Exception("Queue submit failed for pass: " + pass._name);
-                    }
-                    
-                }
-            } 
-            
-        }
-    
-
-
-//IDisposable ------------------
-        public void Dispose()
-        {
-            if (_disposed) return;
-            foreach (var sem in semaphores)
-            {
-                _vk.DestroySemaphore(_device, sem, null);
-            }
-            semaphores.Clear();
-            
-            foreach (var resource in _imageResources.Values)
-                resource.Dispose();
-            _imageResources.Clear();
-            
-            _disposed = true;
-            GC.SuppressFinalize(this);
-        }
-        
-    }
 
     /// <summary>
     /// 
@@ -1067,6 +650,419 @@ public unsafe partial class Renderer
     }
 }
 
+/// <summary>
+/// Workflow<br/>
+/// 1. AddResource() - declare all images the graph will use <br/>
+/// 2. AddPass() - declare all passes and there read/write sets<br/>
+/// 3. Compile() - topological sort + allocate gpu resources<br/>
+/// 4. Execute() - record all passes into the command buffer in order<br/>
+/// 5. Dispose() - free all gpu resources <br/>
+/// </summary>
+public unsafe class RenderGraph : IDisposable
+{
+    private readonly Vk _vk;
+    private readonly Device _device;
+    private readonly PhysicalDevice _physicalDevice;
+    private bool _disposed;
+    private bool _compiled;
+
+    private readonly Dictionary<string, ImageResource> _imageResources = new();
+    private List<Pass> passes;
+    private List<int> executionOrder;
+
+    //Automatic synchronization management
+    //these objects ensure correct GPU execution order without manual barriers
+    private List<Semaphore> semaphores;
+    private List<SemaphorePair> semaphorePairs;
+
+    public RenderGraph(Vk vk, Device device)
+    {
+        _vk = vk;
+        _device = device;
+    }
+
+
+    /// <summary>
+    /// Creates a new image resource and adds it to the render graph
+    /// </summary>
+    /// <param name="name"></param>
+    /// <param name="format"></param>
+    /// <param name="extent"></param>
+    /// <param name="usage"></param>
+    /// <param name="initialLayout"></param>
+    /// <param name="finalLayout"></param>
+    public void AddResource(string name, Format format, Extent2D extent, ImageUsageFlags usage,
+        ImageLayout initialLayout = ImageLayout.Undefined,
+        ImageLayout finalLayout = ImageLayout.ShaderReadOnlyOptimal)
+    {
+        ImageResource resource = new(_vk, _device, name, format, extent, usage, initialLayout, finalLayout);
+        AddResource(resource);
+    }
+
+    /// <summary>
+    /// Add a resource to the render graph
+    /// </summary>
+    /// <param name="resource"></param>
+    public void AddResource(ImageResource resource)
+    {
+        _imageResources[resource._name] = resource;
+    }
+
+    public ImageResource GetResource(string name)
+    {
+        if (!_imageResources.TryGetValue(name, out var resource))
+        {
+            throw new Exception($"Resource {name} not found");
+        }
+
+        return resource;
+    }
+
+    /// <summary>
+    /// Add a pass to the render graph
+    /// </summary>
+    /// <param name="pass"></param>
+    public void AddPass(Pass pass) => passes.Add(pass);
+
+    /// <summary>
+    /// Creates a new pass and adds it to the render graph
+    /// </summary>
+    /// <param name="name"></param>
+    /// <param name="inputs"></param>
+    /// <param name="outputs"></param>
+    /// <param name="executeFunc"></param>
+    public void AddPass(string name, List<string> inputs, List<string> outputs, Action<CommandBuffer> executeFunc)
+    {
+        Pass pass = new(name, inputs, outputs)
+        {
+            ExecuteFunc = executeFunc
+        };
+        AddPass(pass);
+    }
+
+    /// <summary>
+    /// Rendergraph compilation - Transforms declarative descriptions into executable pipelines<br/>
+    /// This method performs dependency analysis, resource allocation, and execution planning<br/>
+    /// </summary>
+    public void Compile()
+    {
+        if (_compiled)
+        {
+            throw new InvalidOperationException("RenderGraph already compiled");
+        }
+
+        int n = passes.Count;
+
+        // adjacency[i] = list of pass indices that depend on pass i
+        var adjacency = new List<int>[n];
+        var inDegree = new int[n];
+        for (int i = 0; i < n; i++) adjacency[i] = new List<int>();
+
+        // Build edges: for each resource, find (writer → reader) pairs
+        for (var i = 0; i < n; i++)
+        {
+            foreach (var output in passes[i]._outputs)
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    if (i == j) continue;
+                    if (passes[j]._inputs.Contains(output))
+                    {
+                        adjacency[i].Add(j);
+                        inDegree[j]++;
+                    }
+                }
+            }
+        }
+
+        //Topological sort for optimal execution order
+        //this is done by Kahn's algorithm
+        //BFS from all zero-in-degree nodes
+        var queue = new Queue<int>();
+        for (var i = 0; i < n; i++)
+            if (inDegree[i] == 0)
+                queue.Enqueue(i);
+
+        while (queue.Count > 0)
+        {
+            int node = queue.Dequeue();
+            executionOrder.Add(node);
+            foreach (var adj in adjacency[node])
+            {
+                if (--inDegree[adj] == 0)
+                    queue.Enqueue(adj);
+            }
+        }
+
+        if (executionOrder.Count == 0)
+        {
+            throw new Exception("RenderGraph contains a cycle, check pass dependencies");
+        }
+
+        //Automatic Synchronization object creations
+        //Generate semaphore for all dependencies identified
+        var semaphoreInfo = new SemaphoreCreateInfo()
+        {
+            SType = StructureType.SemaphoreCreateInfo
+        };
+        for (int i = 0; i < passes.Count; i++)
+        {
+            foreach (var output in passes[i]._outputs)
+            {
+                for (int j = 0; j < passes.Count; j++)
+                {
+                    if (i == j) continue;
+                    if (!passes[j]._inputs.Contains(output)) continue;
+
+                    if (_vk.CreateSemaphore(_device, ref semaphoreInfo, null, out var semaphore) != Result.Success)
+                    {
+                        throw new Exception("Failed to create render graph semaphore");
+                    }
+
+                    semaphores.Add(semaphore);
+                    semaphorePairs.Add(new SemaphorePair()
+                    {
+                        SignalPassIndex = i,
+                        WaitPassIndex = j,
+                    });
+                }
+            }
+        }
+
+        foreach (var resource in _imageResources.Values)
+            resource.Allocate(_physicalDevice);
+
+        _compiled = true;
+    }
+
+    public void Execute(CommandBuffer cmd, Queue queue)
+    {
+        if (!_compiled)
+            throw new InvalidOperationException("Call Compile() before Execute().");
+        //pre pass temporaries
+        var waitSemaphores = new List<Semaphore>();
+        var waitStages = new List<PipelineStageFlags>();
+        var signalSemaphores = new List<Semaphore>();
+
+
+        foreach (var passIndex in executionOrder)
+        {
+            var pass = passes[passIndex];
+
+            //------------collect wait semaphores for this pass----------------------
+            waitSemaphores.Clear();
+            waitStages.Clear();
+
+            for (int i = 0; i < semaphorePairs.Count; i++)
+            {
+                if (semaphorePairs[i].WaitPassIndex == passIndex)
+                {
+                    waitSemaphores.Add(semaphores[i]);
+                    waitStages.Add(PipelineStageFlags.ColorAttachmentOutputBit);
+                }
+            }
+
+            //---------collect signal semaphores for this pass-----------------------
+            signalSemaphores.Clear();
+
+            for (int i = 0; i < semaphorePairs.Count; i++)
+                if (semaphorePairs[i].SignalPassIndex == passIndex)
+                    signalSemaphores.Add(semaphores[i]);
+
+
+            //------------begin command recording ------------------------------
+
+            var beginInfo = new CommandBufferBeginInfo()
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+            };
+            if (_vk.BeginCommandBuffer(cmd, ref beginInfo) != Result.Success)
+                throw new Exception("Failed to begin command buffer");
+
+            // ----- Barrier transition inputs -> ShaderReadOnlyOptimal
+            foreach (var inputName in pass._inputs)
+            {
+                ImageResource resource = _imageResources[inputName];
+                bool isDepth =
+                    resource._format is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16UnormS8Uint;
+                if (_imageResources[inputName].IsAllocated)
+                {
+                    var barrier = new ImageMemoryBarrier()
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        OldLayout = resource._initialLayout,
+                        NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = resource.Image,
+                        SrcAccessMask = AccessFlags.MemoryReadBit,
+                        DstAccessMask = AccessFlags.ShaderReadBit,
+                        SubresourceRange = new ImageSubresourceRange()
+                        {
+                            AspectMask = isDepth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit,
+                            BaseMipLevel = 0,
+                            LevelCount = 1,
+                            BaseArrayLayer = 0,
+                            LayerCount = 1
+                        }
+                    };
+
+                    _vk.CmdPipelineBarrier(cmd,
+                        PipelineStageFlags.AllCommandsBit,
+                        PipelineStageFlags.FragmentShaderBit,
+                        DependencyFlags.ByRegionBit,
+                        0, null,
+                        0, null,
+                        1, ref barrier);
+                }
+            }
+
+            // ----- Barrier transition outputs -> ColorAttachmentOptimal
+            foreach (var outputName in pass._outputs)
+            {
+                if (_imageResources[outputName].IsAllocated)
+                {
+                    ImageResource resource = _imageResources[outputName];
+                    bool isDepth =
+                        resource._format is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16UnormS8Uint;
+                    var barrier = new ImageMemoryBarrier()
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        OldLayout = resource._initialLayout,
+                        NewLayout = ImageLayout.ColorAttachmentOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = resource.Image,
+                        SrcAccessMask = AccessFlags.MemoryReadBit,
+                        DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                        SubresourceRange = new ImageSubresourceRange()
+                        {
+                            AspectMask = isDepth ? ImageAspectFlags.ColorBit : ImageAspectFlags.DepthBit,
+                            BaseMipLevel = 0,
+                            LevelCount = 1,
+                            BaseArrayLayer = 0,
+                            LayerCount = 1
+                        }
+                    };
+
+                    _vk.CmdPipelineBarrier(cmd,
+                        PipelineStageFlags.AllCommandsBit,
+                        PipelineStageFlags.ColorAttachmentOutputBit,
+                        DependencyFlags.ByRegionBit,
+                        0, null,
+                        0, null,
+                        1, ref barrier);
+                }
+            }
+
+            //----- Execute pass-------------------
+            pass.ExecuteFunc(cmd);
+
+            //----- Barrier: transition outputs -> resource._finalLayout
+            foreach (var outputName in pass._outputs)
+            {
+                if (!_imageResources[outputName].IsAllocated) continue;
+                ImageResource resource = _imageResources[outputName];
+                bool isDepth =
+                    resource._format is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16UnormS8Uint;
+                var barrier = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    OldLayout = ImageLayout.ColorAttachmentOptimal,
+                    NewLayout = resource._finalLayout,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = resource.Image,
+                    SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                    DstAccessMask = AccessFlags.MemoryReadBit,
+                    SubresourceRange = new ImageSubresourceRange()
+                    {
+                        AspectMask = isDepth ? ImageAspectFlags.ColorBit : ImageAspectFlags.DepthBit,
+                        BaseMipLevel = 0,
+                        LevelCount = 1,
+                        BaseArrayLayer = 0,
+                        LayerCount = 1
+                    }
+                };
+
+                _vk.CmdPipelineBarrier(
+                    cmd,
+                    PipelineStageFlags.ColorAttachmentOutputBit,
+                    PipelineStageFlags.AllCommandsBit, // before any subsequent work
+                    DependencyFlags.ByRegionBit,
+                    0, null, 0, null, 1, barrier);
+            }
+
+            //----- End command recording ------------------------------
+            if (_vk.EndCommandBuffer(cmd) != Result.Success)
+            {
+                throw new Exception("Failed to end command buffer for pass name" + pass._name);
+            }
+
+            ;
+
+
+            //---- Submit with semaphore wiring --------------------
+            int waitCount = waitSemaphores.Count;
+            int signalCount = signalSemaphores.Count;
+
+            Span<Semaphore> waitSemSpan = stackalloc Semaphore[waitCount];
+            Span<PipelineStageFlags> waitStageSpan = stackalloc PipelineStageFlags[waitCount];
+            Span<Semaphore> sigSemSpan = stackalloc Semaphore[signalCount];
+
+
+            for (int i = 0; i < waitCount; i++) waitSemSpan[i] = waitSemaphores[i];
+            for (int i = 0; i < waitCount; i++) waitStageSpan[i] = waitStages[i];
+            for (int i = 0; i < signalCount; i++) sigSemSpan[i] = signalSemaphores[i];
+
+            fixed (Semaphore* pWaitSem = waitSemSpan)
+            fixed (PipelineStageFlags* pWaitStage = waitStageSpan)
+            fixed (Semaphore* pSigSem = sigSemSpan)
+            {
+                var cb = cmd; //local copy so we can take its address
+
+                var submitInfo = new SubmitInfo()
+                {
+                    SType = StructureType.SubmitInfo,
+                    WaitSemaphoreCount = (uint)waitCount,
+                    PWaitSemaphores = pWaitSem,
+                    PWaitDstStageMask = pWaitStage,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &cb,
+                    SignalSemaphoreCount = (uint)signalCount,
+                    PSignalSemaphores = pSigSem,
+                };
+                //queue submit
+                if (_vk.QueueSubmit(queue, 1, submitInfo, default) != Result.Success)
+                {
+                    throw new Exception("Queue submit failed for pass: " + pass._name);
+                }
+            }
+        }
+    }
+
+
+//IDisposable ------------------
+    public void Dispose()
+    {
+        if (_disposed) return;
+        foreach (var sem in semaphores)
+        {
+            _vk.DestroySemaphore(_device, sem, null);
+        }
+
+        semaphores.Clear();
+
+        foreach (var resource in _imageResources.Values)
+            resource.Dispose();
+        _imageResources.Clear();
+
+        _disposed = true;
+        GC.SuppressFinalize(this);
+    }
+}
+
 unsafe class CullingSystem(Camera camera)
 {
     private Camera camera;
@@ -1099,7 +1095,7 @@ unsafe class CullingSystem(Camera camera)
             //Get bouding box of the mesh
             BoundingBox boundingBox = meshComponent->GetBoundingBox();
             //transform the bounding box by entity transform
-            boundingBox.Transform(transformComponent->GetTransformMatrix());
+            boundingBox.Transform(transformComponent->GetModelMatrix());
 
             //check if bounding box is visible
             if (frustum.Intersects(boundingBox))
