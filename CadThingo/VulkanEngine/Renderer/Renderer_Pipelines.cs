@@ -443,7 +443,7 @@ public unsafe partial class Renderer
             RasterizerDiscardEnable = false, //dont discard primitives before rasterization
             PolygonMode = PolygonMode.Fill, //fill triangles
             LineWidth = 1, //line width (only relevant for wireframe)
-            CullMode = CullModeFlags.BackBit, //Cull backfacing triangles
+            CullMode = CullModeFlags.BackBit, // TEMP option A: disable culling to verify cube renders
             FrontFace = FrontFace.CounterClockwise, //Counter clockwise winding
             DepthBiasEnable = false, //no depth bias
         };
@@ -485,7 +485,7 @@ public unsafe partial class Renderer
         //TODO: create the push constant struct
         PushConstantRange pushConstantRange = new()
         {
-            StageFlags = ShaderStageFlags.VertexBit,
+            StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
             Offset = 0,
             Size = 128
         };
@@ -518,7 +518,7 @@ public unsafe partial class Renderer
             PDepthStencilState = &depthStencil,
             PColorBlendState = &colorBlendInfo,
             PDynamicState = &dynamicStateInfo,
-            Layout = pbrPipelineLayout,
+            Layout = geometryPipelineLayout,
             RenderPass = default,
             Subpass = 0,
             BasePipelineHandle = default,
@@ -534,6 +534,7 @@ public unsafe partial class Renderer
 
         geometryPipelineRenderingCreateInfo = new()
         {
+            SType = StructureType.PipelineRenderingCreateInfo,
             ColorAttachmentCount = 4,
             PColorAttachmentFormats = colorFormats,
             DepthAttachmentFormat = FindDepthFormat(),
@@ -774,7 +775,7 @@ public unsafe partial class Renderer
         //TODO: create the push constant struct
         PushConstantRange pushConstantRange = new()
         {
-            StageFlags = ShaderStageFlags.VertexBit,
+            StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
             Offset = 0,
             Size = 128
         };
@@ -814,16 +815,15 @@ public unsafe partial class Renderer
             Subpass = 0,
             BasePipelineHandle = default,
         };
-        //config for dynamic rendering
-        fixed (Format* pColorAttcFormat = &swapChainImageFormat)
+        //config for dynamic rendering — lighting pass writes to FinalColor (R8G8B8A8Unorm), no depth.
+        Format finalColorFormat = Format.R8G8B8A8Unorm;
+        pbrPipelineRenderingCreateInfo = new()
         {
-            pbrPipelineRenderingCreateInfo = new()
-            {
-                ColorAttachmentCount = 1,
-                PColorAttachmentFormats = pColorAttcFormat,
-                DepthAttachmentFormat = FindDepthFormat(),
-            };
-        }
+            SType = StructureType.PipelineRenderingCreateInfo,
+            ColorAttachmentCount = 1,
+            PColorAttachmentFormats = &finalColorFormat,
+            DepthAttachmentFormat = Format.Undefined,
+        };
 
         fixed (PipelineRenderingCreateInfo* pRenderingInfo = &pbrPipelineRenderingCreateInfo)
         {

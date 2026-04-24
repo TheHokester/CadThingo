@@ -54,12 +54,12 @@ LightingVSOutput VSMain(uint vertexID : SV_VertexID)
 float4 PSMain(LightingVSOutput input) : SV_TARGET
 { 
     //unpack GBUFFER
-    float3 WorldPos = gbufferPositionSampler.Sample(input.UV).xyz;
-    float3 N = normalize(gbufferNormalSampler.Sample(input.UV)).xyz;
-    float4 albedoMet = gbufferAlbedoSampler.Sample(input.UV);
+    float3 WorldPos = gBufferPositionSampler.Sample(input.UV).xyz;
+    float3 N = normalize(gBufferNormalSampler.Sample(input.UV)).xyz;
+    float4 albedoMet = gBufferAlbedoSampler.Sample(input.UV);
     float3 baseColor = albedoMet.rgb;
     float metallic = albedoMet.w;
-    float2 mat = gbufferMaterialSampler.Sample(input.UV).xy;
+    float2 mat = gBufferMaterialSampler.Sample(input.UV).xy;
     float roughness = mat.x;
     float ao = mat.y;
     // === LIGHTING SETUP ===

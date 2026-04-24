@@ -24,8 +24,8 @@ public class Camera : IEventListener
     private float roll;//roll rotation around camera world z axis
     
     //User interaction and behaviour parameters
-    private float movementSpeed; //units per second for translation movement
-    private float mouseSensitivity;//multiplier for mouse input to rotation angle conversion
+    private float movementSpeed = 1; //units per second for translation movement
+    private float mouseSensitivity = 100f;//multiplier for mouse input to rotation angle conversion
     private float zoom = 45.0f;//field of view control for perspective projection
     
     
@@ -49,12 +49,13 @@ public class Camera : IEventListener
 
     public Camera()
     {
-        //Sensible defaults
-        position = new Vec3(0.0f, 0.0f, 0.0f);//start at world origin
-        up = new Vec3(0.0f, 1.0f, 0.0f);//y axis is up
-        yaw = -90f;//Look along negative Z axis
-        pitch = 0.0f;//level horizon
-        roll = 0.0f;//no roll
+        position = new Vec3(0.0f, 0.0f, 3.0f);
+        up = new Vec3(0.0f, 1.0f, 0.0f);
+        yaw = -90f;
+        pitch = 0.0f;
+        roll = 0.0f;
+        Engine.EventBus.AddListener(this, EventCategory.Input);
+        UpdateCameraVectors();
     }
     /// <summary>
     /// Returns the view matrix for the camera.
@@ -121,10 +122,10 @@ public class Camera : IEventListener
     public void ProcessMouseMovement(float xOffset, float yOffset, bool constrainPitch = true)
     {
         xOffset *= mouseSensitivity;
-        yOffset *= mouseSensitivity;
-        
-        yaw +=xOffset;
-        pitch += yOffset;
+        yOffset *= mouseSensitivity * -1;
+         
+        yaw = xOffset;
+        pitch = yOffset;
         
         //Constrain pitch to avoid flipping
         if (constrainPitch)
@@ -154,7 +155,41 @@ public class Camera : IEventListener
 
     public void OnEvent(Event evt)
     {
-        throw new NotImplementedException();
+        if (evt is KeyPressEvent @KPevt)
+        {
+            var key = @KPevt.GetKeyCode();
+            switch (key)
+            {
+                case 'W' or 'w' :
+                    ProcessKeyboard(CameraMovement.FORWARD, 0.1f);
+                    break;
+                case 'S' or 's':
+                    ProcessKeyboard(CameraMovement.BACKWARD, 0.1f);
+                    break;
+                case 'A' or 'a' :
+                    ProcessKeyboard(CameraMovement.LEFT, 0.1f);
+                    break;
+                case 'D' or 'd':
+                    ProcessKeyboard(CameraMovement.RIGHT, 0.1f);
+                    break;
+                case ' ':
+                    ProcessKeyboard(CameraMovement.UP, 0.1f);
+                    break;
+                case 340:
+                    ProcessKeyboard(CameraMovement.DOWN, 0.1f);
+                    break;
+            };
+        }
+
+        if (evt is MouseScrollEvent)
+        {
+            
+        }
+
+        if (evt is MouseMoveEvent @MMevt)
+        {
+            ProcessMouseMovement(@MMevt.GetX(), MMevt.GetY(), true);
+        }
     }
 }
 

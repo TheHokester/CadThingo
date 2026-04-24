@@ -122,11 +122,11 @@ public unsafe struct Entity : IDisposable
     /// Caller must not store the pointer beyond the Entity's lifetime.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public T* GetComponent<T>() where T : Component
+    public T? GetComponent<T>() where T : Component
     {
         if (!ComponentMap.TryGetValue(typeof(T), out int slot))
             return null;
-        return GetTypedPointer<T>(slot);
+        return (T)GetComponentAtSlot(slot)!;
     }
  
     /// <summary>Detaches and disposes the component of type T.</summary>
