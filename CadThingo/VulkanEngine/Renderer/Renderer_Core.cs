@@ -42,6 +42,7 @@ public unsafe partial class Renderer
     
     //world scene
     private Scene scene;
+    private Entity* testEntity;
     
     private QueueFamilyIndices queueFamilyIndices;
     private Queue graphicsQueue;
@@ -121,8 +122,9 @@ public unsafe partial class Renderer
     
     //Camera
     Camera camera;
-    //Uniform buffers
-    private UboBuffer[] UniformBuffers = new UboBuffer[2];
+    //Uniform buffers — split per pass (Geometry pass writes model/view/proj; Lighting pass writes lights + camPos + tone-mapping params)
+    private UboBuffer[] GeometryUniformBuffers = new UboBuffer[2];
+    private UboBuffer[] LightingUniformBuffers = new UboBuffer[2];
     
     //Sync objects
     Semaphore[] imageAvailableSemaphores;
@@ -142,13 +144,22 @@ public unsafe partial class Renderer
     private ImageResource gBufferAlbedo;
     private ImageResource gBufferMaterial;
     
+    private Sampler gBufferSampler;
+
+    // Dummy 1x1 white texture for unbound PBR sampler slots (bindings 1-5 of geometry set)
+    private Image dummyWhiteImage;
+    private DeviceMemory dummyWhiteImageMemory;
+    private ImageView dummyWhiteImageView;
+    private Sampler dummyWhiteSampler;
     //store for lifetime management
     DescriptorSetLayout descriptorSetLayout;
     DescriptorSetLayout geometryDescriptorSetLayout;
     DescriptorSetLayout PBRDescriptorSetLayout; //Set 0 - Lighting UBO
     DescriptorSetLayout PBRGBufferDescriptorSetLayout;//Set 1 - G buffer descriptors
     DescriptorPool descriptorPool;
-    private DescriptorSet[] descriptorSets;
+    private DescriptorSet[] geometryDescriptorSets;
+    private DescriptorSet[] lightingDescriptorSets;   // per-frame, binds LightingUBO (set 0)
+    private DescriptorSet gBufferDescriptorSet;       // shared, binds G-buffer samplers (set 1)
      
     
     private static unsafe uint DebugCallBack(
@@ -183,30 +194,52 @@ public unsafe partial class Renderer
         //create command pool
         CreateCommandPool();
         
-        //Create depth resources
+        //Creates image resources, no gpu alloc yet
         CreateDepthResources();
-        //Create GBuffer resources
+        //same
         CreateGBufferResources();
-        //Create uniform buffers
+        //Create both geo and lighting uniform buffers
         CreateUniformBuffers();
+        
+        scene = new Scene(vk, device, physicalDevice);//initialise scene
+        SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);//adds resources to render graph & compiles
+        CreateGBufferSampler();
+        CreateDummyWhiteTexture();
         //Create descriptor pool
         CreateDescriptorPool();
         CreateDescriptorSets();
-        //create scene 
-        scene = new Scene(vk, device);
+        CreateLightingDescriptorSets();
 
         //Create command buffers
         CreateCommandBuffers();
         //Create sync objects
         CreateSyncObjects();
         //setup deffered rendering
-        SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);
-        
+
+        CreateTestEntity();
+
         initialized = true;
     }
 
-    public void Update()
+    private void CreateTestEntity()
     {
+        // Wire ResourceManager → upload cube → create entity with transform + mesh.
+        Engine.ResourceManager.Initialize(this);
+
+        Engine.ResourceManager.Load<MeshResource>(
+            "cube", id => new ProceduralCubeResource(id, Engine.ResourceManager));
+
+        Mesh* meshPtr = Engine.ResourceManager.GetMesh("cube");
+
+        testEntity = Entity.Create("TestCube");
+        testEntity->AddComponent(new TransformComponent());
+        testEntity->AddComponent(new MeshComponent(meshPtr, -1));
+        scene.AddEntity(testEntity);
+    }
+
+    public void Update(double d)
+    {
+        
         DrawFrame();
     }
 

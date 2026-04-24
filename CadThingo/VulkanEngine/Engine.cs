@@ -20,7 +20,7 @@ public class Engine
     public static EventBus EventBus = new();
     
     //singleton resource manager
-    public static AsyncResourceManager ResourceManager = new();
+    public static ResourceManager ResourceManager = new();
 
 
     public Engine()
@@ -29,14 +29,13 @@ public class Engine
     }
     public void Start()
     {
-        WindowOptions options = new()
-        {
-            API = GraphicsAPI.DefaultVulkan,
-            Title = "CadThingo",
-            Size = new Vector2D<int>(1280, 720),
-            VSync = true,
+        var options = WindowOptions.Default;
 
-        };
+        options.API = GraphicsAPI.DefaultVulkan;
+        options.Title = "CadThingo";
+        options.Size = new Vector2D<int>(1280, 720);
+        options.VSync = true;
+
         
         window = Window.Create(options);
         window.Initialize();
@@ -45,7 +44,10 @@ public class Engine
         keyboard = input.Keyboards.First();
         mouse = input.Mice.First();
 
-        mouse.MouseMove += (sender, e) => EventBus.PublishEvent(new MouseMoveEvent(e.X, e.Y));
+        keyboard.KeyDown += (sender, e, keyCode) => EventBus.PublishEvent(new KeyPressEvent((int)e));
+        keyboard.KeyUp += (sender, e, keyCode) => EventBus.PublishEvent(new KeyReleaseEvent((int)e));
+        
+        mouse.MouseMove += (sender, e) => EventBus.PublishEvent(new MouseMoveEvent(e.X/(window.Size.X/2) -1, e.Y/(window.Size.Y/2) -1));
         mouse.MouseDown += (sender, e) =>EventBus.PublishEvent(new MouseKeyDownEvent(e));
         mouse.MouseUp += (sender, e) => EventBus.PublishEvent(new MouseKeyReleaseEvent(e));
         // mouse.Scroll += (sender, e) => EventBus.PublishEvent(new )
@@ -72,15 +74,16 @@ public class Engine
 
     private void MainLoop()
     {
-        while (true)
+        // Silk.NET's IWindow.Run() is blocking and pumps events + fires
+        // Update/Render events until the window closes. Hook once then Run once.
+        window!.Update += delta =>
         {
-            //do stuff part of regular operations
-            //process events
-            window!.DoEvents(); 
             EventBus.ProcessEvents();
-            //render frame
-            renderer.Update();
-            
-        }
+        };
+        window!.Render += delta =>
+        {
+            renderer.Update(delta);
+        };
+        window.Run();
     }
 }

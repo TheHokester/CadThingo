@@ -237,18 +237,35 @@ public unsafe partial class Renderer
             }
         }
     }
-    
-    
+
+
     private void CleanupSwapChain()
     {
+        // depthImageResource.Dispose();
+        // gBufferPosition.Dispose();
+        // gBufferNormal.Dispose();
+        // gBufferAlbedo.Dispose();
+        // gBufferMaterial.Dispose();
+        //
+        // fixed (CommandBuffer* cmdBfrsP = commandBuffers)
+        // {
+        //     vk!.FreeCommandBuffers(device, commandPool, (uint)commandBuffers.Length, cmdBfrsP);
+        // }
+        //
+        // foreach (var imageview in swapChainImageViews)
+        // {
+        //     vk!.DestroyImageView(device, imageview, null);
+        // }
+        //
+        // swapChainKhr.DestroySwapchain(device, swapChain, null);
+        
         
     }
 
     private void RecreateSwapChain()
     {
-        
+        CleanupSwapChain();
     }
-
 
     public void DrawFrame()
     {
@@ -257,30 +274,134 @@ public unsafe partial class Renderer
 
         // 2. Acquire swapchain image
         uint imageIndex = 0;
-        var result = swapChainKhr.AcquireNextImage(device, swapChain, ulong.MaxValue,
+        var acquireResult = swapChainKhr.AcquireNextImage(device, swapChain, ulong.MaxValue,
             imageAvailableSemaphores[currentFrame], default, &imageIndex);
-        if (result == Result.ErrorOutOfDateKhr) { RecreateSwapChain(); return; }
+        if (acquireResult == Result.ErrorOutOfDateKhr) { RecreateSwapChain(); return; }
 
+        // 3. Reset fence — we're about to submit work that will signal it
         vk!.ResetFences(device, 1, ref inFlightFences[currentFrame]);
 
-        // 3. Transition swapchain image to transfer dst before blit from FinalColor
-        // <barrier: Undefined → TransferDstOptimal for swapChainImages[imageIndex]>
+        // 4. Reset + begin command buffer
+        var cmd = commandBuffers[currentFrame];
+        vk!.ResetCommandBuffer(cmd, 0);
+        var beginInfo = new CommandBufferBeginInfo
+        {
+            SType = StructureType.CommandBufferBeginInfo,
+            Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+        };
+        if (vk!.BeginCommandBuffer(cmd, &beginInfo) != Result.Success)
+            throw new Exception("Failed to begin command buffer");
 
-        // 4. Drive the render graph — geometry pass, lighting pass, post-process
-        scene.renderGraph.Execute(commandBuffers[currentFrame], graphicsQueue);
+        // 5. Update per-frame UBOs
+        // UpdateGeometryUBO is per-entity — wired in Phase 5/6 once entities exist.
+        UpdateLightingUBO(currentFrame, camera);
 
-        // 5. Blit FinalColor resource into swapChainImages[imageIndex]
-        // 6. Transition swapchain image to PresentSrcKhr
-        // 7. Present
+        // 6. Record all render-graph passes (geometry → lighting), record-only.
+        scene.renderGraph.Execute(cmd);
+
+        // 7. Blit FinalColor → swapchain image
+        var swapImage = swapChainImages[imageIndex];
+
+        // 7a. Swapchain Undefined → TransferDstOptimal
+        var toTransferDst = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.Undefined,
+            NewLayout = ImageLayout.TransferDstOptimal,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = swapImage,
+            SrcAccessMask = 0,
+            DstAccessMask = AccessFlags.TransferWriteBit,
+            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
+        };
+        vk!.CmdPipelineBarrier(cmd,
+            PipelineStageFlags.TopOfPipeBit,
+            PipelineStageFlags.TransferBit,
+            0, 0, null, 0, null, 1, &toTransferDst);
+
+        // 7b. Blit FinalColor (TransferSrcOptimal — set by render-graph final-layout barrier) → swapchain
+        var finalColor = scene.renderGraph.GetResource("FinalColor");
+        var blit = new ImageBlit
+        {
+            SrcSubresource = new ImageSubresourceLayers
+            {
+                AspectMask = ImageAspectFlags.ColorBit,
+                MipLevel = 0,
+                BaseArrayLayer = 0,
+                LayerCount = 1,
+            },
+            DstSubresource = new ImageSubresourceLayers
+            {
+                AspectMask = ImageAspectFlags.ColorBit,
+                MipLevel = 0,
+                BaseArrayLayer = 0,
+                LayerCount = 1,
+            },
+        };
+        blit.SrcOffsets[0] = new Offset3D(0, 0, 0);
+        blit.SrcOffsets[1] = new Offset3D((int)swapChainExtent.Width, (int)swapChainExtent.Height, 1);
+        blit.DstOffsets[0] = new Offset3D(0, 0, 0);
+        blit.DstOffsets[1] = new Offset3D((int)swapChainExtent.Width, (int)swapChainExtent.Height, 1);
+
+        vk!.CmdBlitImage(cmd,
+            finalColor.Image, ImageLayout.TransferSrcOptimal,
+            swapImage, ImageLayout.TransferDstOptimal,
+            1, &blit, Filter.Linear);
+
+        // 7c. Swapchain TransferDstOptimal → PresentSrcKhr
+        var toPresent = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.TransferDstOptimal,
+            NewLayout = ImageLayout.PresentSrcKhr,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = swapImage,
+            SrcAccessMask = AccessFlags.TransferWriteBit,
+            DstAccessMask = 0,
+            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
+        };
+        vk!.CmdPipelineBarrier(cmd,
+            PipelineStageFlags.TransferBit,
+            PipelineStageFlags.BottomOfPipeBit,
+            0, 0, null, 0, null, 1, &toPresent);
+
+        // 8. End command buffer
+        if (vk!.EndCommandBuffer(cmd) != Result.Success)
+            throw new Exception("Failed to end command buffer");
+
+        // 9. Submit: wait imageAvailable @ Transfer (blit consumes swapchain), signal renderFinished, fence inFlight
+        var waitSem = imageAvailableSemaphores[currentFrame];
+        var sigSem = renderFinishedSemaphores[currentFrame];
+        var waitStage = PipelineStageFlags.TransferBit;
+        var submitCmd = cmd;
+        var submitInfo = new SubmitInfo
+        {
+            SType = StructureType.SubmitInfo,
+            WaitSemaphoreCount = 1,
+            PWaitSemaphores = &waitSem,
+            PWaitDstStageMask = &waitStage,
+            CommandBufferCount = 1,
+            PCommandBuffers = &submitCmd,
+            SignalSemaphoreCount = 1,
+            PSignalSemaphores = &sigSem,
+        };
+        if (vk!.QueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != Result.Success)
+            throw new Exception("Queue submit failed");
+
+        // 10. Present — wait on renderFinished
         fixed (SwapchainKHR* pSwap = &swapChain)
         {
+            var presentSig = renderFinishedSemaphores[currentFrame];
             var presentInfo = new PresentInfoKHR
             {
+                SType = StructureType.PresentInfoKhr,
                 WaitSemaphoreCount = 1,
-                PWaitSemaphores    = &renderFinishedSemaphores[currentFrame],
+                PWaitSemaphores    = &presentSig,
                 SwapchainCount     = 1,
                 PSwapchains        = pSwap,
-                PImageIndices      = &imageIndex
+                PImageIndices      = &imageIndex,
             };
             swapChainKhr.QueuePresent(presentQueue, &presentInfo);
         }
@@ -332,13 +453,14 @@ public unsafe partial class Renderer
         //configure geometry pass for G-buffer population
         //this pass renders all geometry and stores intermediate data for lighting calculations
         graph.AddPass("GeometryPass", default,
-            new List<string> { "GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "Depth" }, buffer =>
+            new List<string> { "GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "Depth" }, buffer =>
             {
                 //Configure multiple render target attachments for GBuffer output
                 //each attachment corresponds to a seperate geometric property
                 RenderingAttachmentInfoKHR* colorAttachments = stackalloc RenderingAttachmentInfoKHR[4];
                 colorAttachments[0] = new()
                 {
+                    SType = StructureType.RenderingAttachmentInfoKhr,
                     ImageView = graph.GetResource("GBuffer_Position").ImageView,
                     ImageLayout = ImageLayout.ColorAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
@@ -346,6 +468,7 @@ public unsafe partial class Renderer
                 };
                 colorAttachments[1] = new()
                 {
+                    SType = StructureType.RenderingAttachmentInfoKhr,
                     ImageView = graph.GetResource("GBuffer_Normal").ImageView,
                     ImageLayout = ImageLayout.ColorAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
@@ -353,6 +476,7 @@ public unsafe partial class Renderer
                 };
                 colorAttachments[2] = new()
                 {
+                    SType = StructureType.RenderingAttachmentInfoKhr,
                     ImageView = graph.GetResource("GBuffer_Albedo").ImageView,
                     ImageLayout = ImageLayout.ColorAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
@@ -360,6 +484,7 @@ public unsafe partial class Renderer
                 };
                 colorAttachments[3] = new()
                 {
+                    SType = StructureType.RenderingAttachmentInfoKhr,
                     ImageView = graph.GetResource("GBuffer_Material").ImageView,
                     ImageLayout = ImageLayout.ColorAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
@@ -368,6 +493,7 @@ public unsafe partial class Renderer
                 //Configure depth attachment for occlusion culling
                 RenderingAttachmentInfoKHR depthAttachment = new()
                 {
+                    SType = StructureType.RenderingAttachmentInfoKhr,
                     ImageView = graph.GetResource("Depth").ImageView,
                     ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
@@ -377,6 +503,7 @@ public unsafe partial class Renderer
                 //assemble complete rendering config
                 RenderingInfoKHR renderingInfo = new()
                 {
+                    SType = StructureType.RenderingInfoKhr,
                     RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
                     LayerCount = 1,
                     ColorAttachmentCount = 4,
@@ -386,13 +513,73 @@ public unsafe partial class Renderer
                 
                 //execute geometry rendering with dynamic rendering
                 vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-                
-                //Bind geometry pipeline and render all scene objects
-                //each draw call populates position normal and albedo for visible fragments
-                //implement here -------------------------------------------------------------
-                
-                
-                
+
+                // Pipeline + dynamic state
+                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, geometryPipeline);
+
+                Viewport vp = new()
+                {
+                    X = 0, Y = 0,
+                    Width = width, Height = height,
+                    MinDepth = 0.0f, MaxDepth = 1.0f,
+                };
+                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
+                vk!.CmdSetViewport(buffer, 0, 1, &vp);
+                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
+
+                // Bind per-frame geometry descriptor set (UBO + dummy samplers)
+                var dset = geometryDescriptorSets[currentFrame];
+                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
+                    geometryPipelineLayout, 0, 1, &dset, 0, null);
+
+                // Bind global VB/IB once — every mesh is packed into these
+                var vb = Engine.ResourceManager.GlobalVertexBuffer;
+                var ib = Engine.ResourceManager.GlobalIndexBuffer;
+                ulong vbOffset = 0;
+                vk!.CmdBindVertexBuffers(buffer, 0, 1, &vb, &vbOffset);
+                vk!.CmdBindIndexBuffer(buffer, ib, 0, IndexType.Uint32);
+
+                // Default PBR push constants — textures disabled, fall back to factors
+                PbrPushConstants pcDefaults = new()
+                {
+                    BaseColorFactor = new Vector4(1, 1, 1, 1),
+                    MetallicFactor = 0.3f,
+                    RoughnessFactor = 0.7f,
+                    BaseColorTextureSet = -1,
+                    PhysicalDescriptorTextureSet = -1,
+                    NormalTextureSet = -1,
+                    OcclusionTextureSet = -1,
+                    EmissiveTextureSet = -1,
+                    AlphaMask = 0f,
+                    AlphaMaskCutoff = 0f,
+                };
+
+                // Iterate entities with MeshComponent. Model matrix is pushed via the mapped UBO
+                // (single-entity correct; multi-entity = last-write-wins until push-constant model lands).
+                for (int i = 0; i < scene.EntityCount; i++)
+                {
+                    Entity* e = scene.GetEntity(i);
+                    if (e == null) continue;
+                    var meshComp = e->GetComponent<MeshComponent>();
+                    if (meshComp == null) continue;
+                    if (currentFrame == 0)
+                    {
+                        
+                    }
+                    var meshPtr = meshComp.mesh;
+                    if (meshPtr == null) continue;
+
+                    UpdateGeometryUBO(currentFrame, e, camera);
+
+                    PbrPushConstants pc = pcDefaults;
+                    vk!.CmdPushConstants(buffer, geometryPipelineLayout,
+                        ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
+                        0, (uint)sizeof(PbrPushConstants), &pc);
+
+                    Mesh m = *meshComp.mesh;
+                    vk!.CmdDrawIndexed(buffer, (uint)m.count, 1, (uint)m.offset, 0, 0);
+                }
+
                 vk!.CmdEndRendering(buffer);
             });
         
@@ -403,6 +590,7 @@ public unsafe partial class Renderer
                 //configure single color output for final lighting result
                 RenderingAttachmentInfoKHR colorAttachment = new()
                 {
+                    SType = StructureType.RenderingAttachmentInfoKhr,
                     ImageView = graph.GetResource("FinalColor").ImageView,
                     ImageLayout = ImageLayout.ColorAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
@@ -414,6 +602,7 @@ public unsafe partial class Renderer
                 //unnecessary since we're processing each pixel exactly once
                 RenderingInfoKHR renderingInfo = new()
                 {
+                    SType = StructureType.RenderingInfoKhr,
                     RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
                     LayerCount = 1,
                     ColorAttachmentCount = 1,
@@ -422,12 +611,50 @@ public unsafe partial class Renderer
                 
                 //execute screen space lighting calcs.
                 vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-                
-                //Bind lighting pipeline and render all visible fragments
-                //fragment shader reads gbuffer textures and computes lighting for each
-                // all scene lights are processed in a single screenspace render pass
-                //implement here ---------------------------------------------------------
-                
+
+                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, pbrLightingPipeline);
+
+                Viewport vp = new()
+                {
+                    X = 0, Y = 0,
+                    Width = width, Height = height,
+                    MinDepth = 0.0f, MaxDepth = 1.0f,
+                };
+                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
+                vk!.CmdSetViewport(buffer, 0, 1, &vp);
+                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
+
+                // Set 0 = per-frame LightingUBO, Set 1 = shared G-buffer samplers
+                var sets = stackalloc DescriptorSet[2]
+                {
+                    lightingDescriptorSets[currentFrame],
+                    gBufferDescriptorSet,
+                };
+                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
+                    pbrPipelineLayout, 0, 2, sets, 0, null);
+
+                // Shader declares PushConstants but PSMain doesn't read it in the lighting pass;
+                // push defaults so the range is initialized.
+                PbrPushConstants pc = new()
+                {
+                    BaseColorFactor = new Vector4(1, 1, 1, 1),
+                    MetallicFactor = 0.3f,
+                    RoughnessFactor = 0.7f,
+                    BaseColorTextureSet = -1,
+                    PhysicalDescriptorTextureSet = -1,
+                    NormalTextureSet = -1,
+                    OcclusionTextureSet = -1,
+                    EmissiveTextureSet = -1,
+                    AlphaMask = 0f,
+                    AlphaMaskCutoff = 0f,
+                };
+                vk!.CmdPushConstants(buffer, pbrPipelineLayout,
+                    ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
+                    0, (uint)sizeof(PbrPushConstants), &pc);
+
+                // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
+                vk!.CmdDraw(buffer, 3, 1, 0, 0);
+
                 vk!.CmdEndRendering(buffer);
             });
         
@@ -465,19 +692,13 @@ public unsafe class RenderGraph : IDisposable
     private List<Pass> passes;
     private List<int> executionOrder;
 
-    //Automatic synchronization management
-    //these objects ensure correct GPU execution order without manual barriers
-    private List<Semaphore> semaphores;
-    private List<SemaphorePair> semaphorePairs;
-
-    public RenderGraph(Vk vk, Device device)
+    public RenderGraph(Vk vk, Device device, PhysicalDevice physicalDevice)
     {
         _vk = vk;
         _device = device;
+        _physicalDevice = physicalDevice;
         passes = new();
         executionOrder = new();
-        semaphores = new();
-        semaphorePairs = new();
     }
 
 
@@ -598,35 +819,8 @@ public unsafe class RenderGraph : IDisposable
             throw new Exception("RenderGraph contains a cycle, check pass dependencies");
         }
 
-        //Automatic Synchronization object creations
-        //Generate semaphore for all dependencies identified
-        var semaphoreInfo = new SemaphoreCreateInfo()
-        {
-            SType = StructureType.SemaphoreCreateInfo
-        };
-        for (int i = 0; i < passes.Count; i++)
-        {
-            foreach (var output in passes[i]._outputs)
-            {
-                for (int j = 0; j < passes.Count; j++)
-                {
-                    if (i == j) continue;
-                    if (!passes[j]._inputs.Contains(output)) continue;
-
-                    if (_vk.CreateSemaphore(_device, ref semaphoreInfo, null, out var semaphore) != Result.Success)
-                    {
-                        throw new Exception("Failed to create render graph semaphore");
-                    }
-
-                    semaphores.Add(semaphore);
-                    semaphorePairs.Add(new SemaphorePair()
-                    {
-                        SignalPassIndex = i,
-                        WaitPassIndex = j,
-                    });
-                }
-            }
-        }
+        // Single command buffer / single queue: pipeline barriers between passes (in Execute)
+        // handle ordering — no semaphores needed inside the graph.
 
         foreach (var resource in _imageResources.Values)
             resource.Allocate(_physicalDevice);
@@ -634,50 +828,19 @@ public unsafe class RenderGraph : IDisposable
         _compiled = true;
     }
 
-    public void Execute(CommandBuffer cmd, Queue queue)
+    /// <summary>
+    /// Records all passes (input barriers → pass callback → output barriers → final-layout barriers)
+    /// into the provided command buffer. Caller owns Begin/End/Submit and the
+    /// imageAvailable/renderFinished semaphores.
+    /// </summary>
+    public void Execute(CommandBuffer cmd)
     {
         if (!_compiled)
             throw new InvalidOperationException("Call Compile() before Execute().");
-        //pre pass temporaries
-        var waitSemaphores = new List<Semaphore>();
-        var waitStages = new List<PipelineStageFlags>();
-        var signalSemaphores = new List<Semaphore>();
-
 
         foreach (var passIndex in executionOrder)
         {
             var pass = passes[passIndex];
-
-            //------------collect wait semaphores for this pass----------------------
-            waitSemaphores.Clear();
-            waitStages.Clear();
-
-            for (int i = 0; i < semaphorePairs.Count; i++)
-            {
-                if (semaphorePairs[i].WaitPassIndex == passIndex)
-                {
-                    waitSemaphores.Add(semaphores[i]);
-                    waitStages.Add(PipelineStageFlags.ColorAttachmentOutputBit);
-                }
-            }
-
-            //---------collect signal semaphores for this pass-----------------------
-            signalSemaphores.Clear();
-
-            for (int i = 0; i < semaphorePairs.Count; i++)
-                if (semaphorePairs[i].SignalPassIndex == passIndex)
-                    signalSemaphores.Add(semaphores[i]);
-
-
-            //------------begin command recording ------------------------------
-
-            var beginInfo = new CommandBufferBeginInfo()
-            {
-                SType = StructureType.CommandBufferBeginInfo,
-                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
-            };
-            if (_vk.BeginCommandBuffer(cmd, ref beginInfo) != Result.Success)
-                throw new Exception("Failed to begin command buffer");
 
             // ----- Barrier transition inputs -> ShaderReadOnlyOptimal
             foreach (var inputName in pass._inputs)
@@ -717,7 +880,7 @@ public unsafe class RenderGraph : IDisposable
                 }
             }
 
-            // ----- Barrier transition outputs -> ColorAttachmentOptimal
+            // ----- Barrier transition outputs -> ColorAttachmentOptimal / DepthStencilAttachmentOptimal
             foreach (var outputName in pass._outputs)
             {
                 if (_imageResources[outputName].IsAllocated)
@@ -729,15 +892,19 @@ public unsafe class RenderGraph : IDisposable
                     {
                         SType = StructureType.ImageMemoryBarrier,
                         OldLayout = resource._initialLayout,
-                        NewLayout = ImageLayout.ColorAttachmentOptimal,
+                        NewLayout = isDepth
+                            ? ImageLayout.DepthStencilAttachmentOptimal
+                            : ImageLayout.ColorAttachmentOptimal,
                         SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         Image = resource.Image,
                         SrcAccessMask = AccessFlags.MemoryReadBit,
-                        DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                        DstAccessMask = isDepth
+                            ? AccessFlags.DepthStencilAttachmentWriteBit
+                            : AccessFlags.ColorAttachmentWriteBit,
                         SubresourceRange = new ImageSubresourceRange()
                         {
-                            AspectMask = isDepth ? ImageAspectFlags.ColorBit : ImageAspectFlags.DepthBit,
+                            AspectMask = isDepth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit,
                             BaseMipLevel = 0,
                             LevelCount = 1,
                             BaseArrayLayer = 0,
@@ -747,7 +914,9 @@ public unsafe class RenderGraph : IDisposable
 
                     _vk.CmdPipelineBarrier(cmd,
                         PipelineStageFlags.AllCommandsBit,
-                        PipelineStageFlags.ColorAttachmentOutputBit,
+                        isDepth
+                            ? PipelineStageFlags.EarlyFragmentTestsBit
+                            : PipelineStageFlags.ColorAttachmentOutputBit,
                         DependencyFlags.ByRegionBit,
                         0, null,
                         0, null,
@@ -768,16 +937,20 @@ public unsafe class RenderGraph : IDisposable
                 var barrier = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
-                    OldLayout = ImageLayout.ColorAttachmentOptimal,
+                    OldLayout = isDepth
+                        ? ImageLayout.DepthStencilAttachmentOptimal
+                        : ImageLayout.ColorAttachmentOptimal,
                     NewLayout = resource._finalLayout,
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = resource.Image,
-                    SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                    SrcAccessMask = isDepth
+                        ? AccessFlags.DepthStencilAttachmentWriteBit
+                        : AccessFlags.ColorAttachmentWriteBit,
                     DstAccessMask = AccessFlags.MemoryReadBit,
                     SubresourceRange = new ImageSubresourceRange()
                     {
-                        AspectMask = isDepth ? ImageAspectFlags.ColorBit : ImageAspectFlags.DepthBit,
+                        AspectMask = isDepth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit,
                         BaseMipLevel = 0,
                         LevelCount = 1,
                         BaseArrayLayer = 0,
@@ -787,56 +960,12 @@ public unsafe class RenderGraph : IDisposable
 
                 _vk.CmdPipelineBarrier(
                     cmd,
-                    PipelineStageFlags.ColorAttachmentOutputBit,
+                    isDepth
+                        ? PipelineStageFlags.LateFragmentTestsBit
+                        : PipelineStageFlags.ColorAttachmentOutputBit,
                     PipelineStageFlags.AllCommandsBit, // before any subsequent work
                     DependencyFlags.ByRegionBit,
-                    0, null, 0, null, 1, barrier);
-            }
-
-            //----- End command recording ------------------------------
-            if (_vk.EndCommandBuffer(cmd) != Result.Success)
-            {
-                throw new Exception("Failed to end command buffer for pass name" + pass._name);
-            }
-
-            ;
-
-
-            //---- Submit with semaphore wiring --------------------
-            int waitCount = waitSemaphores.Count;
-            int signalCount = signalSemaphores.Count;
-
-            Span<Semaphore> waitSemSpan = stackalloc Semaphore[waitCount];
-            Span<PipelineStageFlags> waitStageSpan = stackalloc PipelineStageFlags[waitCount];
-            Span<Semaphore> sigSemSpan = stackalloc Semaphore[signalCount];
-
-
-            for (int i = 0; i < waitCount; i++) waitSemSpan[i] = waitSemaphores[i];
-            for (int i = 0; i < waitCount; i++) waitStageSpan[i] = waitStages[i];
-            for (int i = 0; i < signalCount; i++) sigSemSpan[i] = signalSemaphores[i];
-
-            fixed (Semaphore* pWaitSem = waitSemSpan)
-            fixed (PipelineStageFlags* pWaitStage = waitStageSpan)
-            fixed (Semaphore* pSigSem = sigSemSpan)
-            {
-                var cb = cmd; //local copy so we can take its address
-
-                var submitInfo = new SubmitInfo()
-                {
-                    SType = StructureType.SubmitInfo,
-                    WaitSemaphoreCount = (uint)waitCount,
-                    PWaitSemaphores = pWaitSem,
-                    PWaitDstStageMask = pWaitStage,
-                    CommandBufferCount = 1,
-                    PCommandBuffers = &cb,
-                    SignalSemaphoreCount = (uint)signalCount,
-                    PSignalSemaphores = pSigSem,
-                };
-                //queue submit
-                if (_vk.QueueSubmit(queue, 1, submitInfo, default) != Result.Success)
-                {
-                    throw new Exception("Queue submit failed for pass: " + pass._name);
-                }
+                    0, null, 0, null, 1, ref barrier);
             }
         }
     }
@@ -846,12 +975,6 @@ public unsafe class RenderGraph : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        foreach (var sem in semaphores)
-        {
-            _vk.DestroySemaphore(_device, sem, null);
-        }
-
-        semaphores.Clear();
 
         foreach (var resource in _imageResources.Values)
             resource.Dispose();
@@ -892,9 +1015,9 @@ unsafe class CullingSystem(Camera camera)
             if (transformComponent == null) continue;
 
             //Get bouding box of the mesh
-            BoundingBox boundingBox = meshComponent->GetBoundingBox();
+            BoundingBox boundingBox = meshComponent.GetBoundingBox();
             //transform the bounding box by entity transform
-            boundingBox.Transform(transformComponent->GetModelMatrix());
+            boundingBox.Transform(transformComponent.GetModelMatrix());
 
             //check if bounding box is visible
             if (frustum.Intersects(boundingBox))
@@ -1123,7 +1246,7 @@ public unsafe struct Frustum
 }
 
 [StructLayout(LayoutKind.Sequential)]
-public unsafe struct ImageResource : IDisposable
+public unsafe class ImageResource : IDisposable
 {
     private readonly Vk     _vk;
     private readonly Device _device;
@@ -1239,8 +1362,8 @@ public unsafe struct ImageResource : IDisposable
  
         // Destroy in reverse-creation order — mirrors C++ RAII destruction
         if (ImageView.Handle   != 0) _vk.DestroyImageView(_device, ImageView,   null);
-        if (ImageMemory.Handle != 0) _vk.FreeMemory      (_device, ImageMemory, null);
         if (Image.Handle  != 0)      _vk.DestroyImage    (_device, Image,  null);
+        if (ImageMemory.Handle != 0) _vk.FreeMemory      (_device, ImageMemory, null);
  
         _disposed = true;
     }
@@ -1256,8 +1379,8 @@ public unsafe struct Pass
     public Pass(string name, List<string> inputs, List<string> outputs)
     {
         _name = name;
-        _inputs = inputs;
-        _outputs = outputs;
+        _inputs = inputs ?? new List<string>();
+        _outputs = outputs ?? new List<string>();
     }
     
     public void AddInput(string input) => _inputs.Add(input);
@@ -1270,13 +1393,4 @@ public unsafe struct Pass
     public Pass ReadsFrom (string resourceName) { _inputs .Add(resourceName); return this; }
     public Pass WritesTo  (string resourceName) { _outputs.Add(resourceName); return this; }
     public Pass Executes  (Action<CommandBuffer> fn) { ExecuteFunc = fn; return this; }
-}
-
-/// <summary>
-/// Stores which pass signals the semaphore and which pass waits on it.
-/// </summary>
-public readonly struct SemaphorePair
-{
-    public int SignalPassIndex { get; init; }
-    public int WaitPassIndex   { get; init; }
 }

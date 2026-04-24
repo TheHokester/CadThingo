@@ -317,7 +317,7 @@ public unsafe struct Vertex
             {
                 Binding = 0,
                 Location = 0,
-                Format = Format.R32G32B32A32Sfloat,
+                Format = Format.R32G32B32Sfloat,
                 Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(Position)),
             },
             new()
@@ -347,6 +347,7 @@ public unsafe struct Vertex
 }
 
 
+[StructLayout(LayoutKind.Sequential)]
 public sealed unsafe class MeshComponent : Component
 {
     public Mesh* mesh;
@@ -363,14 +364,8 @@ public sealed unsafe class MeshComponent : Component
     
     public override void Render()
     {
-        if (mesh == null || materialIndex != -1) return;
-        
-        TransformComponent* transform = Owner->GetComponent<TransformComponent>();
-        if (transform == null) return;
-
-        material->Bind();
-        material->SetUniform("modelMatrix", transform->GetModelMatrix());
-        mesh->Render();
+        // Deferred path: drawing is driven by the geometry-pass callback in the render graph,
+        // which iterates MeshComponents directly. This per-component Render() is unused.
     }
     public BoundingBox GetBoundingBox()
     {

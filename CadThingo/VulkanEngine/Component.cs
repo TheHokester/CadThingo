@@ -1,5 +1,8 @@
-﻿namespace CadThingo.VulkanEngine;
+﻿using System.Runtime.InteropServices;
 
+namespace CadThingo.VulkanEngine;
+
+[StructLayout(LayoutKind.Sequential)]
 public abstract unsafe class Component : IDisposable
 {
     public enum State { Uninitialized, Initializing, Active, Destroying, Destroyed }

@@ -6,3 +6,5 @@ obj/
 *.suo
 *.userosscache
 *.sln.docstates
+.claude/
+CLAUDE.md

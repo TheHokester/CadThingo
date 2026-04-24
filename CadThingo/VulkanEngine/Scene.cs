@@ -46,7 +46,7 @@ public unsafe struct Material
 
 public class Scene
 {
-    
+
     private Entity[] _entities;
     private List<ResourceHandle<MaterialResource>> _materials;
     private List<ResourceHandle<TextureResource>> _textures;
@@ -55,11 +55,21 @@ public class Scene
 
     public RenderGraph renderGraph;
 
-    public Scene(Vk vk, Device device)
+    // Entity* stored as nint so the managed List doesn't need pinning.
+    private readonly List<nint> _entityList = new();
+
+    public int EntityCount => _entityList.Count;
+
+    public Scene(Vk vk, Device device, PhysicalDevice physicalDevice)
     {
-        renderGraph = new RenderGraph(vk, device);
+        renderGraph = new RenderGraph(vk, device, physicalDevice);
         Cam = new Camera();
     }
+
+    public unsafe void AddEntity(Entity* entity) => _entityList.Add((nint)entity);
+
+    public unsafe Entity* GetEntity(int index) => (Entity*)_entityList[index];
+
     public bool RayCast(Ray ray, ref RayCastHit hit, float rayLength)
     {
         return false;

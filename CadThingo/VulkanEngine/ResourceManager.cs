@@ -1,5 +1,7 @@
 ﻿using System.ComponentModel;
+using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using CadThingo.GraphicsPipeline;
 using CadThingo.VulkanEngine;
 using Silk.NET.Vulkan;
@@ -83,7 +85,7 @@ public unsafe class ResourceManager
 {
     //2 level storage system, organise by type then unique identifier
     Dictionary<Type, Dictionary<string, Resource>> _resources = new();
-    
+
     // Two-level reference counting system for automatic resource lifecycle management
     // First level maps resource type, second level maps resource IDs to their data
     public struct ResourceData
@@ -92,6 +94,81 @@ public unsafe class ResourceManager
         public int refCount;// Reference count for this resource
     }
     Dictionary<Type, Dictionary<string, ResourceData>> _refCounts = new();
+
+    // Global vertex/index buffers — all meshes are packed into these shared device-local buffers.
+    // Indices are rebased by the current vertex-write offset on upload so draws use vertexOffset=0.
+    private Renderer.Renderer _renderer;
+
+    private Buffer globalVertexBuffer;
+    private DeviceMemory globalVertexBufferMemory;
+    private int vertexWriteOffset;   // in vertices
+
+    private Buffer globalIndexBuffer;
+    private DeviceMemory globalIndexBufferMemory;
+    private int indexWriteOffset;    // in indices
+
+    private const int MAX_VERTICES = 1 << 20;   // 1M vertices
+    private const int MAX_INDICES  = 1 << 22;   // 4M indices
+
+    public Buffer GlobalVertexBuffer => globalVertexBuffer;
+    public Buffer GlobalIndexBuffer  => globalIndexBuffer;
+
+    public void Initialize(Renderer.Renderer renderer)
+    {
+        _renderer = renderer;
+
+        ulong vbSize = (ulong)(MAX_VERTICES * sizeof(Vertex));
+        ulong ibSize = (ulong)(MAX_INDICES  * sizeof(uint));
+
+        renderer.CreateBuffer(vbSize,
+            BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit,
+            MemoryPropertyFlags.DeviceLocalBit,
+            out globalVertexBuffer, out globalVertexBufferMemory);
+
+        renderer.CreateBuffer(ibSize,
+            BufferUsageFlags.IndexBufferBit | BufferUsageFlags.TransferDstBit,
+            MemoryPropertyFlags.DeviceLocalBit,
+            out globalIndexBuffer, out globalIndexBufferMemory);
+    }
+
+    public Mesh UploadMesh(Vertex[] vertices, uint[] indices)
+    {
+        if (_renderer == null)
+            throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called");
+        if (vertexWriteOffset + vertices.Length > MAX_VERTICES)
+            throw new Exception($"Global vertex buffer full: {vertexWriteOffset + vertices.Length} > {MAX_VERTICES}");
+        if (indexWriteOffset + indices.Length > MAX_INDICES)
+            throw new Exception($"Global index buffer full: {indexWriteOffset + indices.Length} > {MAX_INDICES}");
+
+        uint baseVertex = (uint)vertexWriteOffset;
+        var rebased = new uint[indices.Length];
+        for (int i = 0; i < indices.Length; i++) rebased[i] = indices[i] + baseVertex;
+
+        ulong vbBytes     = (ulong)(vertices.Length * sizeof(Vertex));
+        ulong ibBytes     = (ulong)(indices.Length  * sizeof(uint));
+        ulong vbDstOffset = (ulong)(vertexWriteOffset * sizeof(Vertex));
+        ulong ibDstOffset = (ulong)(indexWriteOffset  * sizeof(uint));
+
+        fixed (Vertex* vPtr = vertices)
+            _renderer.UploadBufferData(globalVertexBuffer, vbDstOffset, vPtr, vbBytes);
+        fixed (uint* iPtr = rebased)
+            _renderer.UploadBufferData(globalIndexBuffer, ibDstOffset, iPtr, ibBytes);
+
+        var mesh = new Mesh { offset = indexWriteOffset, count = indices.Length };
+        vertexWriteOffset += vertices.Length;
+        indexWriteOffset  += indices.Length;
+        return mesh;
+    }
+
+    public void Dispose()
+    {
+        ReleaseAll();
+        if (_renderer != null)
+        {
+            _renderer.DestroyBuffer(globalVertexBuffer, globalVertexBufferMemory);
+            _renderer.DestroyBuffer(globalIndexBuffer,  globalIndexBufferMemory);
+        }
+    }
     
     
     
@@ -102,9 +179,13 @@ public unsafe class ResourceManager
     /// <param name="factory">Factory function to create the resource</param>
     public ResourceHandle<T> Load<T>(string resourceID, Func<string, T> factory) where T : Resource
     {
-        var typeResources = _resources[typeof(T)];
-        
-        
+        // Lazy-init type bucket so first-time Load of a type doesn't throw KeyNotFoundException.
+        if (!_resources.TryGetValue(typeof(T), out var typeResources))
+        {
+            typeResources = new Dictionary<string, Resource>();
+            _resources[typeof(T)] = typeResources;
+        }
+
         //Check the existing resource cache to avoid redundant loading
         if (typeResources.TryGetValue(resourceID, out var existing))
         {
@@ -118,8 +199,17 @@ public unsafe class ResourceManager
         }
         //Cache successful resource and initialize tracking
         typeResources[resourceID] = resource;
-        
+
         return new ResourceHandle<T>(this, resourceID);
+    }
+
+    public Mesh* GetMesh(string id)
+    {
+        if (!_resources.TryGetValue(typeof(MeshResource), out var typeDict))
+            throw new InvalidOperationException($"No MeshResource bucket — nothing loaded yet");
+        if (!typeDict.TryGetValue(id, out var res))
+            throw new KeyNotFoundException($"MeshResource '{id}' not found");
+        return ((MeshResource)res).GetMesh();
     }
     /// <summary>
     /// Gets a resource of type T with the given ID inside the resource manager
@@ -277,91 +367,116 @@ public unsafe class TextureResource(string id) : Resource(id)
 
 public unsafe class MeshResource : Resource
 {
-    int _offset = 0;
-    int _stride = 0;
+    protected Mesh* mesh;  // unmanaged so MeshComponent can hold a stable Mesh*
+    protected ResourceManager manager;
 
-    public MeshResource(string id, int offset, int stride) : base(id)
+    public MeshResource(string id, ResourceManager manager) : base(id)
     {
-        _offset = offset;
-        _stride = stride;
+        this.manager = manager;
+        mesh = (Mesh*)NativeMemory.AllocZeroed((nuint)sizeof(Mesh));
     }
     ~MeshResource()
     {
         Unload();
     }
 
+    public Mesh* GetMesh() => mesh;
 
     public override bool Load()
     {
-        //construct file path
-        string filePath = "models/" + GetId() + ".gltf";
-        //Parse GLTF file and extract vertex and index buffers
-        
-     
-        
-        //transform cpu data into GPU resources
-        
-        return base.Load(); 
+        if (!LoadMeshData(out var vertices, out var indices))
+            return false;
+        *mesh = manager.UploadMesh(vertices, indices);
+        return base.Load();
     }
 
     public override void Unload()
     {
-        //only proceed if loaded
-        if (IsLoaded())
+        // Per-mesh destruction (GPU data) is not yet implemented — global VB/IB is grow-only
+        // until compaction/free-list is added. Refcounts still drive logical lifetime.
+        if (mesh != null)
         {
-            Vk? vk = Vk.GetApi();
-            Device device = GetDevice();
-            
-            //Destroy Buffers and free gpu resources
-            //index buffers destroyed first to maintain dependency order
-            
+            NativeMemory.Free(mesh);
+            mesh = null;
         }
         base.Unload();
     }
-    
-    
-    
-    private Device GetDevice()
+
+    // Subclasses override to supply vertex/index data (file, procedural, etc.).
+    protected virtual bool LoadMeshData(out Vertex[] vertices, out uint[] indices)
     {
-        return default;
+        vertices = Array.Empty<Vertex>();
+        indices  = Array.Empty<uint>();
+        return false;
+    }
+}
+
+public static class CubeMesh
+{
+    /// Returns 24 vertices + 36 indices for a unit cube centered at origin.
+    /// Each face has its own 4 vertices so per-face normals/UVs are correct.
+    public static (Vertex[] vertices, uint[] indices) Generate()
+    {
+        const float h = 0.5f; // half-extent
+        var vertices = new Vertex[24];
+        var indices  = new uint[36];
+
+        // +X (right)
+        AddFace(vertices, indices, 0,
+            new Vector3( h,-h, h), new Vector3( h,-h,-h), new Vector3( h, h,-h), new Vector3( h, h, h),
+            new Vector3( 1, 0, 0), new Vector4( 0, 0,-1, 1));
+        // -X (left)
+        AddFace(vertices, indices, 1,
+            new Vector3(-h,-h,-h), new Vector3(-h,-h, h), new Vector3(-h, h, h), new Vector3(-h, h,-h),
+            new Vector3(-1, 0, 0), new Vector4( 0, 0, 1, 1));
+        // +Y (up)
+        AddFace(vertices, indices, 2,
+            new Vector3(-h, h, h), new Vector3( h, h, h), new Vector3( h, h,-h), new Vector3(-h, h,-h),
+            new Vector3( 0, 1, 0), new Vector4( 1, 0, 0, 1));
+        // -Y (down)
+        AddFace(vertices, indices, 3,
+            new Vector3(-h,-h,-h), new Vector3( h,-h,-h), new Vector3( h,-h, h), new Vector3(-h,-h, h),
+            new Vector3( 0,-1, 0), new Vector4( 1, 0, 0, 1));
+        // +Z (front)
+        AddFace(vertices, indices, 4,
+            new Vector3(-h,-h, h), new Vector3( h,-h, h), new Vector3( h, h, h), new Vector3(-h, h, h),
+            new Vector3( 0, 0, 1), new Vector4( 1, 0, 0, 1));
+        // -Z (back)
+        AddFace(vertices, indices, 5,
+            new Vector3( h,-h,-h), new Vector3(-h,-h,-h), new Vector3(-h, h,-h), new Vector3( h, h,-h),
+            new Vector3( 0, 0,-1), new Vector4(-1, 0, 0, 1));
+
+        return (vertices, indices);
     }
 
-    private bool LoadMeshData(string path, out List<Vertex> vertices, out List<uint> indices)
+    private static void AddFace(Vertex[] vertices, uint[] indices, int faceIndex,
+        Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3,
+        Vector3 normal, Vector4 tangent)
     {
-        //Implementation using bla bla bla
-        // This method handles the complex task of:
-        // - Opening and validating the mesh file format
-        // - Parsing vertex attributes (positions, normals, UVs, etc.)
-        // - Extracting index data that defines triangle connectivity
-        // - Converting from file format to engine-specific vertex structures
-        // - Performing validation to ensure data integrity
-        // ...
-        vertices = [];
-        indices = [];
-        return true;//placeholder
-    }
+        int v = faceIndex * 4;
+        vertices[v + 0] = new Vertex { Position = p0, Normal = normal, TexCoord = new Vector2(0, 0), Tangent = tangent };
+        vertices[v + 1] = new Vertex { Position = p1, Normal = normal, TexCoord = new Vector2(1, 0), Tangent = tangent };
+        vertices[v + 2] = new Vertex { Position = p2, Normal = normal, TexCoord = new Vector2(1, 1), Tangent = tangent };
+        vertices[v + 3] = new Vertex { Position = p3, Normal = normal, TexCoord = new Vector2(0, 1), Tangent = tangent };
 
-    private void CreateVertexBuffer(List<VkVertex> vertices)
-    {
-        // Implementation to create Vulkan buffer, allocate memory, and upload data
-        // This involves several complex Vulkan operations:
-        // - Calculating buffer size requirements based on vertex count and structure
-        // - Creating buffer with appropriate usage flags (vertex buffer usage)
-        // - Allocating GPU memory with optimal memory type selection
-        // - Uploading data via staging buffer for efficient transfer
-        // - Setting up memory barriers to ensure data availability
-        // ...
+        int i = faceIndex * 6;
+        indices[i + 0] = (uint)(v + 0);
+        indices[i + 1] = (uint)(v + 1);
+        indices[i + 2] = (uint)(v + 2);
+        indices[i + 3] = (uint)(v + 0);
+        indices[i + 4] = (uint)(v + 2);
+        indices[i + 5] = (uint)(v + 3);
     }
+}
 
-    private void CreateIndexBuffer(List<uint> indices)
+public unsafe class ProceduralCubeResource : MeshResource
+{
+    public ProceduralCubeResource(string id, ResourceManager manager) : base(id, manager) { }
+
+    protected override bool LoadMeshData(out Vertex[] vertices, out uint[] indices)
     {
-        // Implementation to create Vulkan buffer, allocate memory, and upload data
-        // Similar to vertex buffer creation but optimized for index data:
-        // - Buffer creation with index buffer specific usage flags
-        // - Memory allocation optimized for read-heavy access patterns
-        // - Efficient data transfer using appropriate staging mechanisms
-        // - Index format validation (16-bit vs 32-bit indices)
-        // ...
+        (vertices, indices) = CubeMesh.Generate();
+        return true;
     }
 }
 
