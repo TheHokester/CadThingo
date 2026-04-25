@@ -1,4 +1,5 @@
 ﻿using CadThingo.VulkanEngine.Renderer;
+using Silk.NET.Input;
 
 namespace CadThingo.VulkanEngine;
 using Vec3 = System.Numerics.Vector3;
@@ -24,8 +25,8 @@ public class Camera : IEventListener
     private float roll;//roll rotation around camera world z axis
     
     //User interaction and behaviour parameters
-    private float movementSpeed = 1; //units per second for translation movement
-    private float mouseSensitivity = 100f;//multiplier for mouse input to rotation angle conversion
+    private float movementSpeed = 3f; //units per second for translation movement
+    private float mouseSensitivity = 0.15f;//degrees of rotation per pixel of raw mouse delta
     private float zoom = 45.0f;//field of view control for perspective projection
     
     
@@ -114,26 +115,36 @@ public class Camera : IEventListener
         }
     }
     /// <summary>
-    /// Processes mouse input and adjusts camera orientation.
+    /// Processes raw mouse delta (pixels since last frame) and rotates the camera.
+    /// yaw/pitch accumulate — each frame adds its delta to the running orientation.
+    /// Y axis is inverted so moving the mouse up pitches up.
     /// </summary>
-    /// <param name="xOffset"></param>
-    /// <param name="yOffset"></param>
-    /// <param name="constrainPitch"></param>
     public void ProcessMouseMovement(float xOffset, float yOffset, bool constrainPitch = true)
     {
-        xOffset *= mouseSensitivity;
-        yOffset *= mouseSensitivity * -1;
-         
-        yaw = xOffset;
-        pitch = yOffset;
-        
-        //Constrain pitch to avoid flipping
+        yaw   += xOffset * mouseSensitivity;
+        pitch -= yOffset * mouseSensitivity;
+
         if (constrainPitch)
         {
             pitch = Math.Clamp(pitch, -89.0f, 89.0f);
         }
-        
+
         UpdateCameraVectors();
+    }
+
+    /// <summary>
+    /// Per-frame poll of held movement keys. Must be called once per Update tick
+    /// with the real frame delta so movement speed is framerate-independent and
+    /// holding a key moves continuously.
+    /// </summary>
+    public void Tick(IKeyboard kb, float deltaSeconds)
+    {
+        if (kb.IsKeyPressed(Key.W))         ProcessKeyboard(CameraMovement.FORWARD,  deltaSeconds);
+        if (kb.IsKeyPressed(Key.S))         ProcessKeyboard(CameraMovement.BACKWARD, deltaSeconds);
+        if (kb.IsKeyPressed(Key.A))         ProcessKeyboard(CameraMovement.LEFT,     deltaSeconds);
+        if (kb.IsKeyPressed(Key.D))         ProcessKeyboard(CameraMovement.RIGHT,    deltaSeconds);
+        if (kb.IsKeyPressed(Key.Space))     ProcessKeyboard(CameraMovement.UP,       deltaSeconds);
+        if (kb.IsKeyPressed(Key.ShiftLeft)) ProcessKeyboard(CameraMovement.DOWN,     deltaSeconds);
     }
     /// <summary>
     /// Processes mouse scroll input and adjusts camera zoom.
@@ -155,35 +166,11 @@ public class Camera : IEventListener
 
     public void OnEvent(Event evt)
     {
-        if (evt is KeyPressEvent @KPevt)
-        {
-            var key = @KPevt.GetKeyCode();
-            switch (key)
-            {
-                case 'W' or 'w' :
-                    ProcessKeyboard(CameraMovement.FORWARD, 0.1f);
-                    break;
-                case 'S' or 's':
-                    ProcessKeyboard(CameraMovement.BACKWARD, 0.1f);
-                    break;
-                case 'A' or 'a' :
-                    ProcessKeyboard(CameraMovement.LEFT, 0.1f);
-                    break;
-                case 'D' or 'd':
-                    ProcessKeyboard(CameraMovement.RIGHT, 0.1f);
-                    break;
-                case ' ':
-                    ProcessKeyboard(CameraMovement.UP, 0.1f);
-                    break;
-                case 340:
-                    ProcessKeyboard(CameraMovement.DOWN, 0.1f);
-                    break;
-            };
-        }
-
+        // Movement keys are polled per-frame in Tick() so holding a key works —
+        // event-driven KeyPressEvent only fires on the press edge.
         if (evt is MouseScrollEvent)
         {
-            
+            // TODO: zoom on scroll
         }
 
         if (evt is MouseMoveEvent @MMevt)

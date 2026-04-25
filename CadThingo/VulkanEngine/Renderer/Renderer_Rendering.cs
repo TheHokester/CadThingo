@@ -239,32 +239,63 @@ public unsafe partial class Renderer
     }
 
 
+    // Tears down only the swap chain itself + its image views. Size-dependent
+    // attachments (depth, g-buffers, FinalColor) are owned elsewhere and torn
+    // down by RecreateSwapChain / Cleanup.
     private void CleanupSwapChain()
     {
-        // depthImageResource.Dispose();
-        // gBufferPosition.Dispose();
-        // gBufferNormal.Dispose();
-        // gBufferAlbedo.Dispose();
-        // gBufferMaterial.Dispose();
-        //
-        // fixed (CommandBuffer* cmdBfrsP = commandBuffers)
-        // {
-        //     vk!.FreeCommandBuffers(device, commandPool, (uint)commandBuffers.Length, cmdBfrsP);
-        // }
-        //
-        // foreach (var imageview in swapChainImageViews)
-        // {
-        //     vk!.DestroyImageView(device, imageview, null);
-        // }
-        //
-        // swapChainKhr.DestroySwapchain(device, swapChain, null);
-        
-        
+        if (swapChainImageViews != null)
+        {
+            foreach (var iv in swapChainImageViews)
+                if (iv.Handle != 0) vk!.DestroyImageView(device, iv, null);
+            swapChainImageViews = Array.Empty<ImageView>();
+        }
+
+        if (swapChain.Handle != 0)
+        {
+            swapChainKhr.DestroySwapchain(device, swapChain, null);
+            swapChain = default;
+        }
     }
 
+    // Rebuilds everything tied to the surface extent: swap chain, attachment
+    // images, render graph (which captures width/height in its pass closures),
+    // and the lighting pass's g-buffer descriptor writes.
     private void RecreateSwapChain()
     {
+        // Block while the window is minimized (zero framebuffer). DoEvents pumps
+        // the message loop so we still respond to restore.
+        var fb = window!.FramebufferSize;
+        while (fb.X == 0 || fb.Y == 0)
+        {
+            window.DoEvents();
+            fb = window.FramebufferSize;
+        }
+
+        vk!.DeviceWaitIdle(device);
+
+        // Order matters: render graph holds references to depth + g-buffer
+        // ImageResources, so dispose it first. The ImageResource Dispose guard
+        // makes the explicit calls below idempotent.
+        scene.renderGraph.Dispose();
+        depthImageResource.Dispose();
+        gBufferPosition.Dispose();
+        gBufferNormal.Dispose();
+        gBufferAlbedo.Dispose();
+        gBufferMaterial.Dispose();
+
         CleanupSwapChain();
+
+        CreateSwapChain();
+        CreateImageViews();
+        CreateDepthResources();
+        CreateGBufferResources();
+
+        scene.renderGraph = new RenderGraph(vk!, device, physicalDevice);
+        SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);
+
+        // G-buffer ImageViews are fresh — re-bind them on the lighting pass set.
+        UpdateGBufferDescriptorSet();
     }
 
     public void DrawFrame()
@@ -539,13 +570,15 @@ public unsafe partial class Renderer
                 vk!.CmdBindVertexBuffers(buffer, 0, 1, &vb, &vbOffset);
                 vk!.CmdBindIndexBuffer(buffer, ib, 0, IndexType.Uint32);
 
-                // Default PBR push constants — textures disabled, fall back to factors
+                // Default PBR push constants. Binding 1 is wired to a real base color
+                // texture at descriptor-set creation time, so BaseColorTextureSet = 0.
+                // Remaining texture slots fall back to dummy whites and stay disabled.
                 PbrPushConstants pcDefaults = new()
                 {
                     BaseColorFactor = new Vector4(1, 1, 1, 1),
                     MetallicFactor = 0.3f,
                     RoughnessFactor = 0.7f,
-                    BaseColorTextureSet = -1,
+                    BaseColorTextureSet = 0,
                     PhysicalDescriptorTextureSet = -1,
                     NormalTextureSet = -1,
                     OcclusionTextureSet = -1,
@@ -1282,6 +1315,32 @@ public unsafe class ImageResource : IDisposable
         _initialLayout = initialLayout;
         _finalLayout = finalLayout;
     }
+
+    /// <summary>
+    /// Adopts already-allocated image handles. Used for resources whose creation
+    /// flow doesn't fit the graph's <see cref="Allocate"/> path (e.g. textures
+    /// uploaded from disk via a staging buffer). Dispose semantics match the
+    /// allocate path — handles are destroyed on Dispose().
+    /// </summary>
+    public ImageResource(
+        Vk vk, Device device,
+        string name, Format format, Extent2D extent,
+        ImageUsageFlags usage,
+        VkImage image, DeviceMemory memory, ImageView view)
+    {
+        _vk = vk;
+        _device = device;
+        _name = name;
+        _format = format;
+        _extent = extent;
+        _usage = usage;
+        _initialLayout = ImageLayout.ShaderReadOnlyOptimal;
+        _finalLayout   = ImageLayout.ShaderReadOnlyOptimal;
+        Image = image;
+        ImageMemory = memory;
+        ImageView = view;
+        IsAllocated = true;
+    }
     public void Allocate(PhysicalDevice physicalDevice)
     {
         //configure image creation info based on resource properties
@@ -1368,6 +1427,41 @@ public unsafe class ImageResource : IDisposable
         _disposed = true;
     }
 
+}
+
+/// <summary>
+/// Composes an <see cref="ImageResource"/> + <see cref="Sampler"/> as a single
+/// shader-readable texture object. Use for sampled textures (loaded from disk,
+/// dummy fallbacks, baked LUTs); <see cref="ImageResource"/> alone is reserved
+/// for render-graph attachments.
+/// </summary>
+public unsafe class Texture : IDisposable
+{
+    private readonly Vk _vk;
+    private readonly Device _device;
+    private bool _disposed;
+
+    public ImageResource Resource { get; }
+    public Sampler Sampler { get; }
+
+    public VkImage Image     => Resource.Image;
+    public ImageView View    => Resource.ImageView;
+
+    public Texture(Vk vk, Device device, ImageResource resource, Sampler sampler)
+    {
+        _vk = vk;
+        _device = device;
+        Resource = resource;
+        Sampler = sampler;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        if (Sampler.Handle != 0) _vk.DestroySampler(_device, Sampler, null);
+        Resource?.Dispose();
+        _disposed = true;
+    }
 }
 
 public unsafe struct Pass

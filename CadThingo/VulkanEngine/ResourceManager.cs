@@ -480,6 +480,99 @@ public unsafe class ProceduralCubeResource : MeshResource
     }
 }
 
+// Loads a mesh from any Assimp-supported format (.obj, .fbx, ...) into the engine's
+// Vertex layout. Generates smooth normals + tangents when missing, joins identical
+// verts, flips V so Vulkan-style top-left UV origin works.
+public unsafe class ObjMeshResource : MeshResource
+{
+    private readonly string _filePath;
+
+    public ObjMeshResource(string id, ResourceManager manager, string filePath) : base(id, manager)
+    {
+        _filePath = filePath;
+    }
+
+    protected override bool LoadMeshData(out Vertex[] vertices, out uint[] indices)
+    {
+        using var assimp = Silk.NET.Assimp.Assimp.GetApi();
+
+        var flags = (uint)(Silk.NET.Assimp.PostProcessSteps.Triangulate
+                           | Silk.NET.Assimp.PostProcessSteps.JoinIdenticalVertices
+                           | Silk.NET.Assimp.PostProcessSteps.GenerateSmoothNormals
+                           | Silk.NET.Assimp.PostProcessSteps.CalculateTangentSpace
+                           | Silk.NET.Assimp.PostProcessSteps.FlipUVs);
+
+        var scene = assimp.ImportFile(_filePath, flags);
+        if (scene == null || scene->MRootNode == null)
+        {
+            Console.Error.WriteLine($"[ObjMeshResource] Assimp failed to load '{_filePath}'");
+            vertices = Array.Empty<Vertex>();
+            indices  = Array.Empty<uint>();
+            return false;
+        }
+
+        var vertexMap = new Dictionary<Vertex, uint>();
+        var vertexList = new List<Vertex>();
+        var indexList  = new List<uint>();
+
+        VisitNode(scene->MRootNode);
+
+        assimp.ReleaseImport(scene);
+
+        vertices = vertexList.ToArray();
+        indices  = indexList.ToArray();
+        Console.WriteLine($"[ObjMeshResource] Loaded '{_filePath}': {vertices.Length} verts, {indices.Length} indices");
+        return true;
+
+        void VisitNode(Silk.NET.Assimp.Node* node)
+        {
+            for (var m = 0; m < node->MNumMeshes; m++)
+            {
+                var aMesh = scene->MMeshes[node->MMeshes[m]];
+                bool hasNormals  = aMesh->MNormals  != null;
+                bool hasTangents = aMesh->MTangents != null;
+                bool hasUv       = aMesh->MTextureCoords[0] != null;
+
+                for (var f = 0; f < aMesh->MNumFaces; f++)
+                {
+                    var face = aMesh->MFaces[f];
+                    for (var i = 0; i < face.MNumIndices; i++)
+                    {
+                        var idx = face.MIndices[i];
+                        var p   = aMesh->MVertices[idx];
+                        var n   = hasNormals  ? aMesh->MNormals[idx]          : default;
+                        var uv  = hasUv       ? aMesh->MTextureCoords[0][idx] : default;
+                        var t   = hasTangents ? aMesh->MTangents[idx]         : default;
+
+                        Vertex v = new()
+                        {
+                            Position = new Vector3(p.X, p.Y, p.Z),
+                            Normal   = hasNormals  ? new Vector3(n.X, n.Y, n.Z) : new Vector3(0, 1, 0),
+                            TexCoord = hasUv       ? new Vector2(uv.X, uv.Y)    : new Vector2(0, 0),
+                            Tangent  = hasTangents ? new Vector4(t.X, t.Y, t.Z, 1.0f) : new Vector4(1, 0, 0, 1),
+                        };
+
+                        if (vertexMap.TryGetValue(v, out var existing))
+                        {
+                            indexList.Add(existing);
+                        }
+                        else
+                        {
+                            uint newIdx = (uint)vertexList.Count;
+                            indexList.Add(newIdx);
+                            vertexMap[v] = newIdx;
+                            vertexList.Add(v);
+                        }
+                    }
+                }
+            }
+
+            for (var c = 0; c < node->MNumChildren; c++)
+                VisitNode(node->MChildren[c]);
+        }
+    }
+}
+
 public unsafe class MaterialResource(string id) : Resource(id)
 {
     Material material;
