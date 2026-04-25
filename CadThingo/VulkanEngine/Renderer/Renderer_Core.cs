@@ -122,6 +122,7 @@ public unsafe partial class Renderer
     
     //Camera
     Camera camera;
+    public Camera Camera => camera;
     //Uniform buffers — split per pass (Geometry pass writes model/view/proj; Lighting pass writes lights + camPos + tone-mapping params)
     private UboBuffer[] GeometryUniformBuffers = new UboBuffer[2];
     private UboBuffer[] LightingUniformBuffers = new UboBuffer[2];
@@ -146,11 +147,11 @@ public unsafe partial class Renderer
     
     private Sampler gBufferSampler;
 
-    // Dummy 1x1 white texture for unbound PBR sampler slots (bindings 1-5 of geometry set)
-    private Image dummyWhiteImage;
-    private DeviceMemory dummyWhiteImageMemory;
-    private ImageView dummyWhiteImageView;
-    private Sampler dummyWhiteSampler;
+    // BaseColor texture for the test entity (viking_room). Single-texture setup until
+    // per-entity material bindings land. Bindings 2-5 of the geometry descriptor set
+    // also point at this texture as a stand-in (the shader samples them unconditionally;
+    // proper per-slot material wiring is a follow-up).
+    private Texture? baseColor;
     //store for lifetime management
     DescriptorSetLayout descriptorSetLayout;
     DescriptorSetLayout geometryDescriptorSetLayout;
@@ -204,7 +205,11 @@ public unsafe partial class Renderer
         scene = new Scene(vk, device, physicalDevice);//initialise scene
         SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);//adds resources to render graph & compiles
         CreateGBufferSampler();
-        CreateDummyWhiteTexture();
+        // Load the base color texture for the test entity. Must precede CreateDescriptorSets
+        // so the geometry set's sampler bindings point at the real texture from the start.
+        baseColor = CreateTexture2D(
+            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Textures\viking_room.png",
+            Format.R8G8B8A8Srgb);
         //Create descriptor pool
         CreateDescriptorPool();
         CreateDescriptorSets();
@@ -223,16 +228,22 @@ public unsafe partial class Renderer
 
     private void CreateTestEntity()
     {
-        // Wire ResourceManager → upload cube → create entity with transform + mesh.
+        // Wire ResourceManager → upload viking_room mesh → create entity with transform + mesh.
         Engine.ResourceManager.Initialize(this);
 
         Engine.ResourceManager.Load<MeshResource>(
-            "cube", id => new ProceduralCubeResource(id, Engine.ResourceManager));
+            "viking_room",
+            id => new ObjMeshResource(id, Engine.ResourceManager,
+                @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\viking_room.obj"));
 
-        Mesh* meshPtr = Engine.ResourceManager.GetMesh("cube");
+        Mesh* meshPtr = Engine.ResourceManager.GetMesh("viking_room");
 
-        testEntity = Entity.Create("TestCube");
-        testEntity->AddComponent(new TransformComponent());
+        testEntity = Entity.Create("VikingRoom");
+        var transform = new TransformComponent();
+        // viking_room.obj is Z-up; rotate -90° around X to stand it upright under a Y-up camera.
+        transform.SetRotation(System.Numerics.Quaternion.CreateFromAxisAngle(
+            System.Numerics.Vector3.UnitX, -MathF.PI / 2f));
+        testEntity->AddComponent(transform);
         testEntity->AddComponent(new MeshComponent(meshPtr, -1));
         scene.AddEntity(testEntity);
     }
@@ -243,17 +254,97 @@ public unsafe partial class Renderer
         DrawFrame();
     }
 
+    // Full teardown in reverse-creation order. Safe to call once after Initialize.
+    // Globals.vk is a process-wide singleton — never Dispose it here. The window
+    // is owned by Engine and disposed by Engine.Shutdown.
     public void Cleanup()
     {
-        
-        vk!.DestroyDevice(device, null);
-        if(enableValidationLayers)
+        if (!initialized) return;
+
+        // Drain GPU work so nothing references resources we're about to destroy.
+        vk!.DeviceWaitIdle(device);
+
+        // ── Frame sync ──────────────────────────────────────────
+        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            if (renderFinishedSemaphores[i].Handle != 0)
+                vk.DestroySemaphore(device, renderFinishedSemaphores[i], null);
+            if (imageAvailableSemaphores[i].Handle != 0)
+                vk.DestroySemaphore(device, imageAvailableSemaphores[i], null);
+            if (inFlightFences[i].Handle != 0)
+                vk.DestroyFence(device, inFlightFences[i], null);
+        }
+
+        // ── ECS-owned native memory ─────────────────────────────
+        if (testEntity != null)
+        {
+            Entity.Destroy(testEntity);
+            testEntity = null;
+        }
+
+        // ── Mesh pool (global VB/IB) ────────────────────────────
+        Engine.ResourceManager.Dispose();
+
+        // ── Render graph + size-dependent attachments ───────────
+        // RenderGraph.Dispose disposes resources it owns; ImageResource.Dispose
+        // is idempotent so the explicit calls below are safe redundant cleanup.
+        scene?.renderGraph?.Dispose();
+        depthImageResource?.Dispose();
+        gBufferPosition?.Dispose();
+        gBufferNormal?.Dispose();
+        gBufferAlbedo?.Dispose();
+        gBufferMaterial?.Dispose();
+
+        // ── G-buffer sampler ────────────────────────────────────
+        if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
+
+        // ── Standalone textures (image + memory + view + sampler) ─
+        baseColor?.Dispose();
+
+        // ── Per-frame uniform buffers (FreeMemory implicitly unmaps) ─
+        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            if (GeometryUniformBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, GeometryUniformBuffers[i].buffer, null);
+            if (GeometryUniformBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, GeometryUniformBuffers[i].memory, null);
+            if (LightingUniformBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, LightingUniformBuffers[i].buffer, null);
+            if (LightingUniformBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, LightingUniformBuffers[i].memory, null);
+        }
+
+        // ── Pipelines + layouts ─────────────────────────────────
+        if (pbrLightingPipeline.Handle != 0) vk.DestroyPipeline(device, pbrLightingPipeline, null);
+        if (geometryPipeline.Handle    != 0) vk.DestroyPipeline(device, geometryPipeline,    null);
+        if (graphicsPipeline.Handle    != 0) vk.DestroyPipeline(device, graphicsPipeline,    null);
+
+        if (pbrPipelineLayout.Handle      != 0) vk.DestroyPipelineLayout(device, pbrPipelineLayout,      null);
+        if (geometryPipelineLayout.Handle != 0) vk.DestroyPipelineLayout(device, geometryPipelineLayout, null);
+        if (pipelineLayout.Handle         != 0) vk.DestroyPipelineLayout(device, pipelineLayout,         null);
+
+        // ── Descriptor pool (frees sets) + layouts ──────────────
+        if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
+
+        if (PBRGBufferDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, PBRGBufferDescriptorSetLayout, null);
+        if (PBRDescriptorSetLayout.Handle        != 0) vk.DestroyDescriptorSetLayout(device, PBRDescriptorSetLayout,        null);
+        if (geometryDescriptorSetLayout.Handle   != 0) vk.DestroyDescriptorSetLayout(device, geometryDescriptorSetLayout,   null);
+        if (descriptorSetLayout.Handle           != 0) vk.DestroyDescriptorSetLayout(device, descriptorSetLayout,           null);
+
+        // ── Command pool (frees buffers) ────────────────────────
+        if (commandPool.Handle != 0) vk.DestroyCommandPool(device, commandPool, null);
+
+        // ── Swap chain + image views ────────────────────────────
+        CleanupSwapChain();
+
+        // ── Device, debug, surface, instance ────────────────────
+        vk.DestroyDevice(device, null);
+        if (enableValidationLayers && debugUtils != null)
             debugUtils.DestroyDebugUtilsMessenger(instance, debugMessenger, null);
-        
-        khrSurface.DestroySurface(instance, surface, null);
-        vk!.DestroyInstance(instance, null);
-        vk!.Dispose();
-        window.Dispose();
+        khrSurface?.DestroySurface(instance, surface, null);
+        vk.DestroyInstance(instance, null);
+
+        initialized = false;
     }
     
     private void CreateInstance()
@@ -473,19 +564,19 @@ public unsafe partial class Renderer
         KhrGetPhysicalDeviceProperties2.ExtensionName,
         KhrDynamicRenderingLocalRead.ExtensionName,
         KhrDeferredHostOperations.ExtensionName,
+        KhrDeferredHostOperations.ExtensionName,
         KhrAccelerationStructure.ExtensionName,
+        KhrRayTracingPipeline.ExtensionName,
         
-        
-        "VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME",
-        "VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME",
+        "VK_KHR_depth_stencil_resolve",
+        "VK_EXT_descriptor_indexing",
         // Robustness and safety
-        "VK_EXT_ROBUSTNESS_2_EXTENSION_NAME",
+        "VK_EXT_ROBUSTNESS_2",
         // Tile/local memory friendly dynamic rendering readback
         // Shader tile image for fast tile access
-        "VK_EXT_SHADER_TILE_IMAGE_EXTENSION_NAME",
+        "VK_EXT_SHADER_TILE_IMAGE",
         // Ray query support for ray-traced rendering
-        "VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME",
-        "VK_KHR_RAY_QUERY_EXTENSION_NAME"
+        "VK_KHR_ray_query"
     };
     
     private void AddSupportedOptionalExtensions()

@@ -135,73 +135,58 @@ public unsafe partial class Renderer
         if (memory.Handle != 0) vk!.FreeMemory(device, memory, null);
     }
 
-    private void CreateDummyWhiteTexture()
+    // Load a 2D RGBA texture from disk into a device-local image + linear sampler,
+    // returned as a single Texture (image + memory + view + sampler bundle).
+    private Texture CreateTexture2D(string path, Format format)
     {
-        // 1x1 RGBA white for unbound PBR sampler slots. Shader ignores samples when
-        // PbrPushConstants.*TextureSet = -1, so this is just a valid fallback.
-        const int pixelBytes = 4;
+        var img = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgba32>(path);
+        ulong imageSize = (ulong)img.Width * (ulong)img.Height * 4UL;
 
-        // Staging buffer (inline — CreateBuffer helper comes in 4a)
-        BufferCreateInfo stagingInfo = new()
-        {
-            SType = StructureType.BufferCreateInfo,
-            Size = pixelBytes,
-            Usage = BufferUsageFlags.TransferSrcBit,
-            SharingMode = SharingMode.Exclusive,
-        };
-        vk!.CreateBuffer(device, &stagingInfo, null, out var stagingBuffer);
-        vk!.GetBufferMemoryRequirements(device, stagingBuffer, out var stagingReqs);
-        MemoryAllocateInfo stagingAlloc = new()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = stagingReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, stagingReqs.MemoryTypeBits,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit),
-        };
-        vk!.AllocateMemory(device, &stagingAlloc, null, out var stagingMemory);
-        vk!.BindBufferMemory(device, stagingBuffer, stagingMemory, 0);
+        // Stage pixels in a host-visible buffer.
+        CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out var staging, out var stagingMem);
+
         void* mapped = null;
-        vk!.MapMemory(device, stagingMemory, 0, pixelBytes, 0, ref mapped);
-        ((byte*)mapped)[0] = 0xFF;
-        ((byte*)mapped)[1] = 0xFF;
-        ((byte*)mapped)[2] = 0xFF;
-        ((byte*)mapped)[3] = 0xFF;
-        vk!.UnmapMemory(device, stagingMemory);
+        vk!.MapMemory(device, stagingMem, 0, imageSize, 0, ref mapped);
+        img.CopyPixelDataTo(new Span<SixLabors.ImageSharp.PixelFormats.Rgba32>(mapped, img.Width * img.Height));
+        vk!.UnmapMemory(device, stagingMem);
 
-        // Device-local 1x1 image
+        const ImageUsageFlags usage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit;
+        var extent = new Extent2D((uint)img.Width, (uint)img.Height);
+
+        // Device-local image.
         ImageCreateInfo imageInfo = new()
         {
             SType = StructureType.ImageCreateInfo,
             ImageType = ImageType.Type2D,
-            Format = Format.R8G8B8A8Unorm,
-            Extent = new Extent3D(1, 1, 1),
+            Format = format,
+            Extent = new Extent3D(extent.Width, extent.Height, 1),
             MipLevels = 1,
             ArrayLayers = 1,
             Samples = SampleCountFlags.Count1Bit,
             Tiling = ImageTiling.Optimal,
-            Usage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
+            Usage = usage,
             SharingMode = SharingMode.Exclusive,
             InitialLayout = ImageLayout.Undefined,
         };
-        if (vk!.CreateImage(device, &imageInfo, null, out dummyWhiteImage) != Result.Success)
-            throw new Exception("Failed to create dummy white image");
+        if (vk!.CreateImage(device, &imageInfo, null, out var image) != Result.Success)
+            throw new Exception($"Failed to create image for texture '{path}'");
 
-        vk!.GetImageMemoryRequirements(device, dummyWhiteImage, out var imgReqs);
-        MemoryAllocateInfo imgAlloc = new()
+        vk!.GetImageMemoryRequirements(device, image, out var memReqs);
+        MemoryAllocateInfo alloc = new()
         {
             SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = imgReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, imgReqs.MemoryTypeBits,
+            AllocationSize = memReqs.Size,
+            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
                 MemoryPropertyFlags.DeviceLocalBit),
         };
-        vk!.AllocateMemory(device, &imgAlloc, null, out dummyWhiteImageMemory);
-        vk!.BindImageMemory(device, dummyWhiteImage, dummyWhiteImageMemory, 0);
+        vk!.AllocateMemory(device, &alloc, null, out var memory);
+        vk!.BindImageMemory(device, image, memory, 0);
 
-        // Transition → copy → transition
+        // Transition → copy → transition (single-time command).
         var cmd = BeginSingleTimeCommands();
-        TransitionImageLayout(cmd, dummyWhiteImage, Format.R8G8B8A8Unorm,
-            ImageLayout.Undefined, ImageLayout.TransferDstOptimal);
-
+        TransitionImageLayout(cmd, image, format, ImageLayout.Undefined, ImageLayout.TransferDstOptimal);
         BufferImageCopy region = new()
         {
             BufferOffset = 0,
@@ -215,25 +200,22 @@ public unsafe partial class Renderer
                 LayerCount = 1,
             },
             ImageOffset = new Offset3D(0, 0, 0),
-            ImageExtent = new Extent3D(1, 1, 1),
+            ImageExtent = new Extent3D(extent.Width, extent.Height, 1),
         };
-        vk!.CmdCopyBufferToImage(cmd, stagingBuffer, dummyWhiteImage,
-            ImageLayout.TransferDstOptimal, 1, &region);
-
-        TransitionImageLayout(cmd, dummyWhiteImage, Format.R8G8B8A8Unorm,
-            ImageLayout.TransferDstOptimal, ImageLayout.ShaderReadOnlyOptimal);
+        vk!.CmdCopyBufferToImage(cmd, staging, image, ImageLayout.TransferDstOptimal, 1, &region);
+        TransitionImageLayout(cmd, image, format, ImageLayout.TransferDstOptimal, ImageLayout.ShaderReadOnlyOptimal);
         EndSingleTimeCommands(cmd);
 
-        vk!.DestroyBuffer(device, stagingBuffer, null);
-        vk!.FreeMemory(device, stagingMemory, null);
+        vk!.DestroyBuffer(device, staging, null);
+        vk!.FreeMemory(device, stagingMem, null);
+        img.Dispose();
 
-        // Image view
         ImageViewCreateInfo viewInfo = new()
         {
             SType = StructureType.ImageViewCreateInfo,
-            Image = dummyWhiteImage,
+            Image = image,
             ViewType = ImageViewType.Type2D,
-            Format = Format.R8G8B8A8Unorm,
+            Format = format,
             SubresourceRange = new ImageSubresourceRange
             {
                 AspectMask = ImageAspectFlags.ColorBit,
@@ -241,25 +223,32 @@ public unsafe partial class Renderer
                 BaseArrayLayer = 0, LayerCount = 1,
             },
         };
-        vk!.CreateImageView(device, &viewInfo, null, out dummyWhiteImageView);
+        vk!.CreateImageView(device, &viewInfo, null, out var view);
 
-        // Sampler
+        vk!.GetPhysicalDeviceProperties(physicalDevice, out var props);
         SamplerCreateInfo samplerInfo = new()
         {
             SType = StructureType.SamplerCreateInfo,
-            MagFilter = Filter.Nearest,
-            MinFilter = Filter.Nearest,
-            AddressModeU = SamplerAddressMode.ClampToEdge,
-            AddressModeV = SamplerAddressMode.ClampToEdge,
-            AddressModeW = SamplerAddressMode.ClampToEdge,
-            MipmapMode = SamplerMipmapMode.Nearest,
-            AnisotropyEnable = false,
+            MagFilter = Filter.Linear,
+            MinFilter = Filter.Linear,
+            AddressModeU = SamplerAddressMode.Repeat,
+            AddressModeV = SamplerAddressMode.Repeat,
+            AddressModeW = SamplerAddressMode.Repeat,
+            AnisotropyEnable = true,
+            MaxAnisotropy = props.Limits.MaxSamplerAnisotropy,
+            BorderColor = BorderColor.FloatOpaqueBlack,
             UnnormalizedCoordinates = false,
             CompareEnable = false,
+            CompareOp = CompareOp.Always,
+            MipmapMode = SamplerMipmapMode.Linear,
             MinLod = 0.0f,
             MaxLod = 0.0f,
+            MipLodBias = 0.0f,
         };
-        vk!.CreateSampler(device, &samplerInfo, null, out dummyWhiteSampler);
+        vk!.CreateSampler(device, &samplerInfo, null, out var sampler);
+
+        var resource = new ImageResource(vk, device, path, format, extent, usage, image, memory, view);
+        return new Texture(vk, device, resource, sampler);
     }
 
     private void CreateGBufferSampler()
@@ -454,12 +443,14 @@ public unsafe partial class Renderer
             vk!.UpdateDescriptorSets(device, 1, &descriptorWrite, 0, null);
         }
 
-        // Write dummy white texture to bindings 1-5 (baseColor, physical, normal, occlusion, emissive).
-        // Shader ignores these when PbrPushConstants.*TextureSet = -1.
-        DescriptorImageInfo dummyImgInfo = new()
+        // Bindings 1-5 are PBR samplers (baseColor, physical, normal, occlusion, emissive).
+        // The shader samples 1, 2, 4, 5 unconditionally, so every slot needs a valid descriptor.
+        // For now, point all five at the loaded baseColor texture as scaffolding — proper
+        // per-slot material wiring lands when entities carry their own material textures.
+        DescriptorImageInfo baseColorImgInfo = new()
         {
-            ImageView = dummyWhiteImageView,
-            Sampler = dummyWhiteSampler,
+            ImageView = baseColor!.View,
+            Sampler   = baseColor.Sampler,
             ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
         };
         var textureWrites = stackalloc WriteDescriptorSet[5];
@@ -475,7 +466,7 @@ public unsafe partial class Renderer
                     DstArrayElement = 0,
                     DescriptorType = DescriptorType.CombinedImageSampler,
                     DescriptorCount = 1,
-                    PImageInfo = &dummyImgInfo,
+                    PImageInfo = &baseColorImgInfo,
                 };
             }
             vk!.UpdateDescriptorSets(device, 5, textureWrites, 0, null);
@@ -534,6 +525,14 @@ public unsafe partial class Renderer
         if (vk!.AllocateDescriptorSets(device, &gBufAlloc, out gBufferDescriptorSet) != Result.Success)
             throw new Exception("Failed to allocate G-buffer descriptor set");
 
+        UpdateGBufferDescriptorSet();
+    }
+
+    // Writes current G-buffer ImageViews into the lighting-pass g-buffer descriptor set.
+    // Called on initial setup and again after swap chain recreation (which re-allocates
+    // the g-buffer images at the new extent).
+    private void UpdateGBufferDescriptorSet()
+    {
         var imageInfos = stackalloc DescriptorImageInfo[4]
         {
             new() { ImageView = gBufferPosition.ImageView, Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
@@ -590,18 +589,16 @@ public unsafe partial class Renderer
     private void UpdateLightingUBO(uint frameIndex, Camera camera)
     {
         LightingUBO ubo = new();
-        // light 1 white from above
+        // Single neutral white key light above & slightly in front — readable textures,
+        // minimal color bias. Extra slots zeroed so they contribute nothing.
         ubo.lightPosition0 = new Vector4(0.0f, 5.0f, 5.0f, 1.0f);
-        ubo.lightColor0 = new Vector4(300.0f, 300.0f, 300.0f, 1.0f);
-        // light 2 blue from the left
-        ubo.lightPosition1 = new Vector4(-5.0f, 0f, 0f, 1.0f);
-        ubo.lightColor1 = new Vector4(0.0f, 0.0f, 300.0f, 1.0f);
-        // light 3 red from the right
-        ubo.lightPosition2 = new Vector4(5.0f, 0f, 0f, 1.0f);
-        ubo.lightColor2 = new Vector4(300.0f, 0.0f, 0.0f, 1.0f);
-        // light 4 green from behind
-        ubo.lightPosition3 = new Vector4(0.0f, -5.0f, 0f, 1.0f);
-        ubo.lightColor3 = new Vector4(0.0f, 300.0f, 0.0f, 1.0f);
+        ubo.lightColor0    = new Vector4(50.0f, 50.0f, 50.0f, 1.0f);
+        ubo.lightPosition1 = default;
+        ubo.lightColor1    = default;
+        ubo.lightPosition2 = default;
+        ubo.lightColor2    = default;
+        ubo.lightPosition3 = default;
+        ubo.lightColor3    = default;
 
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
         ubo.exposure = 4.5f;
