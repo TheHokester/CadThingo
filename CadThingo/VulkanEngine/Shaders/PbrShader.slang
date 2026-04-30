@@ -19,6 +19,7 @@ struct LightingUBO {
 
 // Resource bindings - Connect CPU resources to GPU shader registers
 [[vk::binding(0, 0)]] ConstantBuffer<LightingUBO> ubo;
+[[vk::binding(1, 0)]] RaytracingAccelerationStructure tlas;   // scene TLAS for ray-traced shadows
 [[vk::push_constant]] PushConstants material;
 
 // GBuffer inputs — Set 1 in your descriptor layout
@@ -26,6 +27,28 @@ struct LightingUBO {
 [[vk::binding(1, 1)]] Sampler2D gBufferNormalSampler;
 [[vk::binding(2, 1)]] Sampler2D gBufferAlbedoSampler;
 [[vk::binding(3, 1)]] Sampler2D gBufferMaterialSampler;
+
+// Self-shadow bias — pushes the shadow ray origin off the surface along N so
+// floating-point error in the gbuffer position doesn't make the surface
+// shadow itself. Tune up if you see acne, down if you see "peter-panning."
+static const float SHADOW_RAY_EPS = 0.002;
+
+// Returns true iff a ray from `origin` toward `dir` hits any geometry within
+// `tMax`. Uses ACCEPT_FIRST_HIT_AND_END_SEARCH so the traversal exits on the
+// first intersection — perfect for binary visibility.
+bool isOccluded(float3 origin, float3 dir, float tMax)
+{
+    RayDesc ray;
+    ray.Origin    = origin;
+    ray.Direction = dir;
+    ray.TMin      = 0.0;
+    ray.TMax      = tMax;
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
+    q.Proceed();
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
 
 
 [[shader("vertex")]]
@@ -56,6 +79,7 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     //unpack GBUFFER
     float3 WorldPos = gBufferPositionSampler.Sample(input.UV).xyz;
     float3 N = normalize(gBufferNormalSampler.Sample(input.UV)).xyz;
+    
     float4 albedoMet = gBufferAlbedoSampler.Sample(input.UV);
     float3 baseColor = albedoMet.rgb;
     float metallic = albedoMet.w;
@@ -79,16 +103,26 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     float3 Lo = float3(0.0, 0.0, 0.0);
 
     // === DIRECT LIGHTING LOOP ===
-    // Calculate contribution from each light source
+    // Calculate contribution from each light source. Each light's BRDF result is
+    // gated on a shadow-ray visibility test — occluded lights contribute nothing.
     for (int i = 0; i < 4; i++) {
         float3 lightPos = ubo.lightPositions[i].xyz;
         float3 lightColor = ubo.lightColors[i].rgb;
+
+        // Skip zero-intensity slots (we hand-wired only light 0 right now).
+        if (dot(lightColor, lightColor) <= 0.0) continue;
 
         // Calculate light direction and attenuation
         float3 L = normalize(lightPos - WorldPos);      // Light direction
         float distance = length(lightPos - WorldPos);   // Distance for falloff
         float attenuation = 1.0 / (distance * distance);     // Inverse square falloff
         float3 radiance = lightColor * attenuation;           // Attenuated light color
+
+        // Shadow ray: WorldPos -> light, with self-shadow bias along N.
+        // Stop the ray a hair short of the light so we don't hit the light itself
+        // (zero-area in this scene, but cheap insurance).
+        float3 shadowOrigin = WorldPos + N * SHADOW_RAY_EPS;
+        if (isOccluded(shadowOrigin, L, distance - SHADOW_RAY_EPS)) continue;
 
         // Calculate half vector (between view and light directions)
         float3 H = normalize(V + L);

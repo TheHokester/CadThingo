@@ -28,6 +28,11 @@ public class Camera : IEventListener
     private float movementSpeed = 3f; //units per second for translation movement
     private float mouseSensitivity = 0.15f;//degrees of rotation per pixel of raw mouse delta
     private float zoom = 45.0f;//field of view control for perspective projection
+
+    // Held-state for movement keys, driven by KeyPressEvent/KeyReleaseEvent.
+    // Tick() reads these per frame so holding a key keeps moving — pure event
+    // dispatch only fires on the press edge, which alone wouldn't sustain motion.
+    private bool moveForward, moveBack, moveLeft, moveRight, moveUp, moveDown;
     
     
     //Internal coordinate system maintenance
@@ -133,18 +138,18 @@ public class Camera : IEventListener
     }
 
     /// <summary>
-    /// Per-frame poll of held movement keys. Must be called once per Update tick
-    /// with the real frame delta so movement speed is framerate-independent and
-    /// holding a key moves continuously.
+    /// Per-frame movement application. Reads held-key flags maintained by
+    /// OnEvent and translates the camera. Must be called once per Update tick
+    /// with the real frame delta so motion is framerate-independent.
     /// </summary>
-    public void Tick(IKeyboard kb, float deltaSeconds)
+    public void Tick(float deltaSeconds)
     {
-        if (kb.IsKeyPressed(Key.W))         ProcessKeyboard(CameraMovement.FORWARD,  deltaSeconds);
-        if (kb.IsKeyPressed(Key.S))         ProcessKeyboard(CameraMovement.BACKWARD, deltaSeconds);
-        if (kb.IsKeyPressed(Key.A))         ProcessKeyboard(CameraMovement.LEFT,     deltaSeconds);
-        if (kb.IsKeyPressed(Key.D))         ProcessKeyboard(CameraMovement.RIGHT,    deltaSeconds);
-        if (kb.IsKeyPressed(Key.Space))     ProcessKeyboard(CameraMovement.UP,       deltaSeconds);
-        if (kb.IsKeyPressed(Key.ShiftLeft)) ProcessKeyboard(CameraMovement.DOWN,     deltaSeconds);
+        if (moveForward) ProcessKeyboard(CameraMovement.FORWARD,  deltaSeconds);
+        if (moveBack)    ProcessKeyboard(CameraMovement.BACKWARD, deltaSeconds);
+        if (moveLeft)    ProcessKeyboard(CameraMovement.LEFT,     deltaSeconds);
+        if (moveRight)   ProcessKeyboard(CameraMovement.RIGHT,    deltaSeconds);
+        if (moveUp)      ProcessKeyboard(CameraMovement.UP,       deltaSeconds);
+        if (moveDown)    ProcessKeyboard(CameraMovement.DOWN,     deltaSeconds);
     }
     /// <summary>
     /// Processes mouse scroll input and adjusts camera zoom.
@@ -166,16 +171,33 @@ public class Camera : IEventListener
 
     public void OnEvent(Event evt)
     {
-        // Movement keys are polled per-frame in Tick() so holding a key works —
-        // event-driven KeyPressEvent only fires on the press edge.
-        if (evt is MouseScrollEvent)
+        switch (evt)
         {
-            // TODO: zoom on scroll
+            case KeyPressEvent kp:
+                SetMovementKey((Key)kp.GetKeyCode, true);
+                break;
+            case KeyReleaseEvent kr:
+                SetMovementKey((Key)kr.GetKeyCode, false);
+                break;
+            case MouseMoveEvent mm:
+                ProcessMouseMovement(mm.GetX(), mm.GetY(), true);
+                break;
+            case MouseScrollEvent:
+                // TODO: zoom on scroll
+                break;
         }
+    }
 
-        if (evt is MouseMoveEvent @MMevt)
+    private void SetMovementKey(Key key, bool down)
+    {
+        switch (key)
         {
-            ProcessMouseMovement(@MMevt.GetX(), MMevt.GetY(), true);
+            case Key.W:         moveForward = down; break;
+            case Key.S:         moveBack    = down; break;
+            case Key.A:         moveLeft    = down; break;
+            case Key.D:         moveRight   = down; break;
+            case Key.Space:     moveUp      = down; break;
+            case Key.ShiftLeft: moveDown    = down; break;
         }
     }
 }

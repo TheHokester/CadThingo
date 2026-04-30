@@ -113,6 +113,12 @@ public unsafe class ResourceManager
     public Buffer GlobalVertexBuffer => globalVertexBuffer;
     public Buffer GlobalIndexBuffer  => globalIndexBuffer;
 
+    public DeviceMemory GlobalVertexBufferMemory => globalVertexBufferMemory;
+    public DeviceMemory GlobalIndexBufferMemory  => globalIndexBufferMemory;
+
+    // Total vertices uploaded so far. Used as a conservative MaxVertex for AS builds —
+    // safe because every mesh's index range is rebased into [0, VertexHighWater).
+    public int VertexHighWater => vertexWriteOffset;
     public void Initialize(Renderer.Renderer renderer)
     {
         _renderer = renderer;
@@ -121,12 +127,14 @@ public unsafe class ResourceManager
         ulong ibSize = (ulong)(MAX_INDICES  * sizeof(uint));
 
         renderer.CreateBuffer(vbSize,
-            BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit,
+            BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
+            BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
             out globalVertexBuffer, out globalVertexBufferMemory);
 
         renderer.CreateBuffer(ibSize,
-            BufferUsageFlags.IndexBufferBit | BufferUsageFlags.TransferDstBit,
+            BufferUsageFlags.IndexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
+            BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
             out globalIndexBuffer, out globalIndexBufferMemory);
     }
@@ -150,9 +158,9 @@ public unsafe class ResourceManager
         ulong ibDstOffset = (ulong)(indexWriteOffset  * sizeof(uint));
 
         fixed (Vertex* vPtr = vertices)
-            _renderer.UploadBufferData(globalVertexBuffer, vbDstOffset, vPtr, vbBytes);
+            _renderer.UploadBufferData(globalVertexBuffer, (long)vbDstOffset, vPtr, vbBytes);
         fixed (uint* iPtr = rebased)
-            _renderer.UploadBufferData(globalIndexBuffer, ibDstOffset, iPtr, ibBytes);
+            _renderer.UploadBufferData(globalIndexBuffer, (long)ibDstOffset, iPtr, ibBytes);
 
         var mesh = new Mesh { offset = indexWriteOffset, count = indices.Length };
         vertexWriteOffset += vertices.Length;

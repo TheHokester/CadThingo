@@ -50,8 +50,14 @@ public class Engine
         keyboard = input.Keyboards.First();
         mouse = input.Mice.First();
 
-        keyboard.KeyDown += (sender, e, keyCode) => EventBus.PublishEvent(new KeyPressEvent((int)e));
-        keyboard.KeyUp += (sender, e, keyCode) => EventBus.PublishEvent(new KeyReleaseEvent((int)e));
+        keyboard.KeyDown += (sender, e, keyCode) =>
+        {
+            EventBus.PublishEvent(new KeyPressEvent(sender, (int)e));
+        };
+        keyboard.KeyUp += (sender, e, keyCode) =>
+        {
+            EventBus.PublishEvent(new KeyReleaseEvent(sender, (int)e));
+        };
 
         mouse.MouseMove += (sender, e) =>
         {
@@ -64,12 +70,24 @@ public class Engine
             var dx = e.X - _lastMousePos.X;
             var dy = e.Y - _lastMousePos.Y;
             _lastMousePos = e;
-            EventBus.PublishEvent(new MouseMoveEvent(dx, dy));
+            EventBus.PublishEvent(new MouseMoveEvent(sender, e.X, e.Y, dx, dy));
         };
-        mouse.MouseDown += (sender, e) =>EventBus.PublishEvent(new MouseKeyDownEvent(e));
-        mouse.MouseUp += (sender, e) => EventBus.PublishEvent(new MouseKeyReleaseEvent(e));
 
-        // mouse.Scroll += (sender, e) => EventBus.PublishEvent(new )
+        mouse.MouseDown += (sender, e) =>
+        {
+            EventBus.PublishEvent(new MouseKeyDownEvent(sender, e));
+        };
+        mouse.MouseUp += (sender, e) =>
+        {
+            EventBus.PublishEvent(new MouseKeyReleaseEvent(sender, e));
+        };
+
+        // Silk's IMouse.Scroll fires once per wheel tick with a ScrollWheel struct
+        // (X = horizontal, Y = vertical). Forward both axes; ImGui consumes both.
+        mouse.Scroll += (sender, e) =>
+        {
+            EventBus.PublishEvent(new MouseScrollEvent(sender, e.X, e.Y));
+        };
 
         renderer = new( window);
         renderer.Initialize();
@@ -97,9 +115,9 @@ public class Engine
         // Update/Render events until the window closes. Hook once then Run once.
         window!.Update += delta =>
         {
-            // Poll continuous inputs (keyboard-hold). Discrete inputs (presses,
-            // mouse moves/clicks) already fire via the EventBus on the event thread.
-            renderer.Camera.Tick(keyboard!, (float)delta);
+            // Camera maintains its own held-key state from KeyPress/KeyRelease events;
+            // Tick(delta) just applies movement using that state for framerate independence.
+            renderer.Camera.Tick((float)delta);
             EventBus.ProcessEvents();
         };
         window!.Render += delta =>

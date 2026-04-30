@@ -128,7 +128,23 @@ public unsafe struct Entity : IDisposable
             return null;
         return (T)GetComponentAtSlot(slot)!;
     }
- 
+    /// <summary>
+    /// Returns a list of all components of type T.
+    /// </summary>
+    /// <typeparam name="T"></typeparam>
+    /// <returns></returns>
+    public List<T?> GetComponents<T>() where T : Component
+    {
+        var list = new List<T?>();
+        foreach (var slot in ComponentMap.Values)
+        {
+            var component = GetComponentAtSlot(slot);
+            if (component is T typed)
+                list.Add(typed);
+        }
+        return list;
+    }
+    
     /// <summary>Detaches and disposes the component of type T.</summary>
     public bool RemoveComponent<T>() where T : Component
     {

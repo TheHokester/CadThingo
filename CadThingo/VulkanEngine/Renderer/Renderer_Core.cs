@@ -1,4 +1,5 @@
 ﻿using CadThingo.Graphics.Rendering;
+using CadThingo.VulkanEngine.ImGui;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -35,17 +36,22 @@ public unsafe partial class Renderer
     private KhrSurface? khrSurface;
     private SurfaceKHR surface;
     
-    private PhysicalDevice physicalDevice;
-    private string[]? deviceExtensions = [
-    KhrSwapchain.ExtensionName];
-    private Device device; 
+    internal PhysicalDevice physicalDevice;
+    // List (not array) so AddSupportedOptionalExtensions can actually mutate it.
+    // Required swapchain seeds the list; optional extensions append after device pick.
+    private readonly List<string> deviceExtensions = new() { KhrSwapchain.ExtensionName };
+    internal Device device;
+
+    // Silk.NET 2.23 ships no KhrRayQuery wrapper (ray-query has zero host functions —
+    // it's a pure SPIR-V capability), so we hardcode the extension string ourselves.
+    private const string KhrRayQueryExtensionName = "VK_KHR_ray_query";
     
     //world scene
     private Scene scene;
     private Entity* testEntity;
     
     private QueueFamilyIndices queueFamilyIndices;
-    private Queue graphicsQueue;
+    internal Queue graphicsQueue;
     private Queue presentQueue;
     private Queue computeQueue;
     private Queue transferQueue;
@@ -54,6 +60,13 @@ public unsafe partial class Renderer
     private bool accelerationStructureEnabled = false;
     private bool rayQueryEnabled = false;
 
+    /// <summary>
+    /// True iff both KHR_acceleration_structure and KHR_ray_query are enabled with their
+    /// device features active. Gates the ray-traced shadow path; callers should fall back
+    /// to a non-shadowed code path when false.
+    /// </summary>
+    public bool RayShadowsSupported => rayQueryEnabled && accelerationStructureEnabled;
+
     
     //swapchain fields
     private const uint MAX_CONCURRENT_FRAMES = 2;
@@ -61,10 +74,14 @@ public unsafe partial class Renderer
     private KhrSwapchain swapChainKhr;
     private SwapchainKHR swapChain;
     private Image[] swapChainImages;
-    private Format swapChainImageFormat;
+    internal Format swapChainImageFormat;
     private Extent2D swapChainExtent;
-    private ImageView[] swapChainImageViews;
+    internal ImageView[] swapChainImageViews;
     private ImageLayout[] swapChainImageLayouts;
+
+    // UI overlay drawn after the FinalColor blit, before the present transition.
+    // Lifetime/instantiation owned externally; null when UI is disabled.
+    public ImGuiVulkanUtils? imGuiUtils;
     
     //dynamic rendering fields
     RenderingInfo renderingInfo;
@@ -204,10 +221,14 @@ public unsafe partial class Renderer
         
         scene = new Scene(vk, device, physicalDevice);//initialise scene
         SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);//adds resources to render graph & compiles
+        imGuiUtils = new ImGuiVulkanUtils(this, (uint)queueFamilyIndices.graphicsFamily! );
+        imGuiUtils?.init(swapChainExtent.Width, swapChainExtent.Height);
+        
+        
         CreateGBufferSampler();
         // Load the base color texture for the test entity. Must precede CreateDescriptorSets
         // so the geometry set's sampler bindings point at the real texture from the start.
-        baseColor = CreateTexture2D(
+        baseColor = Texture.CreateTextureFromPath(this,
             @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Textures\viking_room.png",
             Format.R8G8B8A8Srgb);
         //Create descriptor pool
@@ -222,6 +243,12 @@ public unsafe partial class Renderer
         //setup deffered rendering
 
         CreateTestEntity();
+
+        // Build BLAS / TLAS for ray-traced shadows. Gated on RayShadowsSupported
+        // inside InitRayQuery — safe to call even when ray queries aren't available.
+        InitRayQuery();
+        // Bind the TLAS into the lighting descriptor set (one write per frame).
+        UpdateLightingTlasDescriptor();
 
         initialized = true;
     }
@@ -281,6 +308,11 @@ public unsafe partial class Renderer
             Entity.Destroy(testEntity);
             testEntity = null;
         }
+
+        // ── Ray-query AS handles + scratch + instance buffer ────
+        // Must come before ResourceManager.Dispose so the BLAS storage destroys cleanly
+        // (BLAS doesn't reference VB/IB after build, but order is least-surprising this way).
+        CleanupRayQuery();
 
         // ── Mesh pool (global VB/IB) ────────────────────────────
         Engine.ResourceManager.Dispose();
@@ -558,52 +590,49 @@ public unsafe partial class Renderer
     }
 
 
-    private string[] optionalDeviceExtensions =
+    // Optional device extensions tried at device-create time. Each entry is the *real*
+    // VK extension string (lowercase, no _EXTENSION_NAME macro suffix). Anything Silk.NET
+    // wraps as a class exposes ExtensionName; ray-query has no wrapper so we use the const.
+    private readonly string[] optionalDeviceExtensions =
     {
         KhrDynamicRendering.ExtensionName,
         KhrGetPhysicalDeviceProperties2.ExtensionName,
         KhrDynamicRenderingLocalRead.ExtensionName,
-        KhrDeferredHostOperations.ExtensionName,
-        KhrDeferredHostOperations.ExtensionName,
+        KhrDeferredHostOperations.ExtensionName,           // required by acceleration_structure
         KhrAccelerationStructure.ExtensionName,
         KhrRayTracingPipeline.ExtensionName,
-        
+        KhrRayQueryExtensionName,                          // pure SPIR-V cap, no Silk wrapper
         "VK_KHR_depth_stencil_resolve",
         "VK_EXT_descriptor_indexing",
-        // Robustness and safety
-        "VK_EXT_ROBUSTNESS_2",
-        // Tile/local memory friendly dynamic rendering readback
-        // Shader tile image for fast tile access
-        "VK_EXT_SHADER_TILE_IMAGE",
-        // Ray query support for ray-traced rendering
-        "VK_KHR_ray_query"
+        "VK_EXT_robustness2",
+        "VK_EXT_shader_tile_image",
     };
     
     private void AddSupportedOptionalExtensions()
     {
-        
+        // Two-call pattern: first call returns the count, second populates the array.
         uint extensionCount = 0;
         vk!.EnumerateDeviceExtensionProperties(physicalDevice, (byte*)null, &extensionCount, null);
-        ExtensionProperties[] available = [];
-        vk!.EnumerateDeviceExtensionProperties(physicalDevice, (byte*)null, &extensionCount, available);
-        
-        HashSet<string> avail = new HashSet<string>();
+        var available = new ExtensionProperties[extensionCount];
+        fixed (ExtensionProperties* pAvailable = available)
+            vk!.EnumerateDeviceExtensionProperties(physicalDevice, (byte*)null, &extensionCount, pAvailable);
+
+        var avail = new HashSet<string>();
         foreach (var ext in available)
-        {
             avail.Add(SilkMarshal.PtrToString((nint)ext.ExtensionName));
-        }
 
         foreach (var ext in optionalDeviceExtensions)
         {
             if (avail.Contains(ext))
             {
-                deviceExtensions!.Append(ext);
+                deviceExtensions.Add(ext);
                 Console.WriteLine("----> Added optional extension: " + ext);
             }
             else
-                Console.WriteLine("----> Failed to add optional extension: " + ext);
+            {
+                Console.WriteLine("----> Optional extension not supported: " + ext);
+            }
         }
-        
     }
     
     private void CreateLogicalDevice()
@@ -790,7 +819,7 @@ public unsafe partial class Renderer
         }
         
         //prepare robustness2 featureset if the extension is enabled
-        var hasRobust2 = hasExtension("VK_EXT_ROBUSTNESS_2_EXTENSION_NAME");
+        var hasRobust2 = hasExtension("VK_EXT_robustness2");
         PhysicalDeviceRobustness2FeaturesEXT robust2Enable = new() {SType = StructureType.PhysicalDeviceRobustness2FeaturesExt};
         if (hasRobust2)
         {
@@ -803,7 +832,7 @@ public unsafe partial class Renderer
         }
         
         //prepare acceleration structure features if extension is enabled and supported
-        var hasAccelerationStructure = hasExtension("VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME");
+        var hasAccelerationStructure = hasExtension(KhrAccelerationStructure.ExtensionName);
         PhysicalDeviceAccelerationStructureFeaturesKHR accelerationstructureEnable = new(){SType = StructureType.PhysicalDeviceAccelerationStructureFeaturesKhr};
         if (hasAccelerationStructure)
         {
@@ -811,7 +840,7 @@ public unsafe partial class Renderer
         }
         
         //prepare rayQuery features if extension is enabled and supported
-        var hasRayQuery = hasExtension("VK_KHR_RAY_QUERY_EXTENSION_NAME");
+        var hasRayQuery = hasExtension(KhrRayQueryExtensionName);
         PhysicalDeviceRayQueryFeaturesKHR rayQueryEnable = new(){SType = StructureType.PhysicalDeviceRayQueryFeaturesKhr};
         if (hasRayQuery)
         {
@@ -856,6 +885,9 @@ public unsafe partial class Renderer
         robustness2Enabled = hasRobust2 && (robust2Enable.RobustBufferAccess2 || robust2Enable.RobustImageAccess2 || robust2Enable.NullDescriptor);
         accelerationStructureEnabled = hasAccelerationStructure && accelerationstructureEnable.AccelerationStructure;
         rayQueryEnabled = hasRayQuery && rayQueryEnable.RayQuery;
+
+        Console.WriteLine($"----> RayShadowsSupported: {RayShadowsSupported} " +
+                          $"(rayQuery={rayQueryEnabled}, accelStruct={accelerationStructureEnabled})");
         
         bool printFeatures = false;
         if (printFeatures)
@@ -894,8 +926,8 @@ public unsafe partial class Renderer
                 PNext = &features,
                 QueueCreateInfoCount = (uint)queueCreateInfos.Count,
                 PQueueCreateInfos = queueInfoPtr,
-                EnabledExtensionCount = (uint)deviceExtensions.Length,
-                PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(deviceExtensions),
+                EnabledExtensionCount = (uint)deviceExtensions.Count,
+                PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(deviceExtensions.ToArray()),
                 PEnabledFeatures = null //using pNext for features
             };
             if (vk!.CreateDevice(physicalDevice, &deviceCreateInfo, null, out device) != Result.Success)

@@ -380,28 +380,27 @@ public unsafe partial class Renderer
             swapImage, ImageLayout.TransferDstOptimal,
             1, &blit, Filter.Linear);
 
-        // 7c. Swapchain TransferDstOptimal → PresentSrcKhr
-        var toPresent = new ImageMemoryBarrier
+        // 7c. Swapchain TransferDstOptimal → ColorAttachmentOptimal so the UI overlay
+        //     can render on top of the blitted scene.
+        TransitionImageLayout(cmd, swapImage, swapChainImageFormat,
+            ImageLayout.TransferDstOptimal, ImageLayout.ColorAttachmentOptimal);
+
+        // 7d. UI overlay (no-op when imGuiUtils is unwired).
+        if (imGuiUtils != null)
         {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.TransferDstOptimal,
-            NewLayout = ImageLayout.PresentSrcKhr,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = swapImage,
-            SrcAccessMask = AccessFlags.TransferWriteBit,
-            DstAccessMask = 0,
-            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
-        };
-        vk!.CmdPipelineBarrier(cmd,
-            PipelineStageFlags.TransferBit,
-            PipelineStageFlags.BottomOfPipeBit,
-            0, 0, null, 0, null, 1, &toPresent);
+            imGuiUtils.newFrame();
+            imGuiUtils.updateBuffers();
+        }
+        imGuiUtils?.DrawFrame(cmd, swapChainImageViews[imageIndex]);
+
+        // 7e. Swapchain ColorAttachmentOptimal → PresentSrcKhr.
+        TransitionImageLayout(cmd, swapImage, swapChainImageFormat,
+            ImageLayout.ColorAttachmentOptimal, ImageLayout.PresentSrcKhr);
 
         // 8. End command buffer
         if (vk!.EndCommandBuffer(cmd) != Result.Success)
             throw new Exception("Failed to end command buffer");
-
+        
         // 9. Submit: wait imageAvailable @ Transfer (blit consumes swapchain), signal renderFinished, fence inFlight
         var waitSem = imageAvailableSemaphores[currentFrame];
         var sigSem = renderFinishedSemaphores[currentFrame];
@@ -617,7 +616,7 @@ public unsafe partial class Renderer
             });
         
         
-        graph.AddPass("LightingPass", new List<string>{"GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "Depth"},
+        graph.AddPass("LightingPass", new List<string>{"GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material","Depth"},
             new List<string>{"FinalColor"}, buffer =>
             {
                 //configure single color output for final lighting result
@@ -1276,192 +1275,6 @@ public unsafe struct Frustum
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool Intersects(BoundingBox* box) => Intersects(*box);
-}
-
-[StructLayout(LayoutKind.Sequential)]
-public unsafe class ImageResource : IDisposable
-{
-    private readonly Vk     _vk;
-    private readonly Device _device;
-    private bool            _disposed;
-    public bool IsAllocated { get; set; }
-
-    public string _name { get; }
-    public Format _format;
-    Extent2D _extent;
-    ImageUsageFlags _usage;
-    public ImageLayout _initialLayout;
-    public ImageLayout _finalLayout;
-    
-    
-    public VkImage Image;
-    public DeviceMemory ImageMemory;
-    public ImageView ImageView;
-    
-
-    public ImageResource(
-        Vk vk, Device device,
-        string name, Format format, Extent2D extent,
-        ImageUsageFlags usage,
-        ImageLayout initialLayout = ImageLayout.Undefined,
-        ImageLayout finalLayout   = ImageLayout.ShaderReadOnlyOptimal)
-    {
-        _vk = vk;
-        _device = device;
-        _name = name;
-        _format = format;
-        _extent = extent;
-        _usage = usage;
-        _initialLayout = initialLayout;
-        _finalLayout = finalLayout;
-    }
-
-    /// <summary>
-    /// Adopts already-allocated image handles. Used for resources whose creation
-    /// flow doesn't fit the graph's <see cref="Allocate"/> path (e.g. textures
-    /// uploaded from disk via a staging buffer). Dispose semantics match the
-    /// allocate path — handles are destroyed on Dispose().
-    /// </summary>
-    public ImageResource(
-        Vk vk, Device device,
-        string name, Format format, Extent2D extent,
-        ImageUsageFlags usage,
-        VkImage image, DeviceMemory memory, ImageView view)
-    {
-        _vk = vk;
-        _device = device;
-        _name = name;
-        _format = format;
-        _extent = extent;
-        _usage = usage;
-        _initialLayout = ImageLayout.ShaderReadOnlyOptimal;
-        _finalLayout   = ImageLayout.ShaderReadOnlyOptimal;
-        Image = image;
-        ImageMemory = memory;
-        ImageView = view;
-        IsAllocated = true;
-    }
-    public void Allocate(PhysicalDevice physicalDevice)
-    {
-        //configure image creation info based on resource properties
-        ImageCreateInfo imageInfo = new()
-        {
-            SType = StructureType.ImageCreateInfo,
-            ImageType = ImageType.Type2D,
-            Format = _format,
-            Extent = new Extent3D(_extent.Width, _extent.Height, 1),
-            MipLevels = 1,
-            ArrayLayers = 1,
-            Samples = SampleCountFlags.Count1Bit,
-            Tiling = ImageTiling.Optimal,
-            Usage = _usage,
-            SharingMode = SharingMode.Exclusive,
-            InitialLayout = _initialLayout
-        };
-        if (_vk.CreateImage(_device, ref imageInfo, null, out Image) != Result.Success)
-        {
-            throw new Exception("Failed to create image for resource " + _name);
-        }
-        
-        //alloc backing memory
-        _vk.GetImageMemoryRequirements(_device, Image, out var memReqs);
-
-        var allocInfo = new MemoryAllocateInfo()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = memReqs.Size,
-            MemoryTypeIndex = Renderer.FindMemoryType(_vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.DeviceLocalBit)
-        };
-
-        if (_vk.AllocateMemory(_device, ref allocInfo, null, out ImageMemory) != Result.Success)
-        {
-            throw new Exception("Failed to allocate memory for image " + _name);
-        };
-        if (_vk.BindImageMemory(_device, Image, ImageMemory, 0) != Result.Success)
-        {
-            throw new Exception("Failed to bind image memory for resource " + _name);
-        }
-        
-        // ── Create ImageView ──────────────────────────────────
-        bool isDepth = _format is Format.D32Sfloat
-            or Format.D24UnormS8Uint
-            or Format.D16Unorm;
-        
-        //Create image view
-        var viewInfo = new ImageViewCreateInfo()
-        {
-            SType = StructureType.ImageViewCreateInfo,
-            Image = Image,
-            ViewType = ImageViewType.Type2D,
-            Format = _format,
-            SubresourceRange = new ImageSubresourceRange()
-            {
-                AspectMask = isDepth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit,
-                BaseMipLevel = 0,
-                LevelCount = 1,
-                BaseArrayLayer = 0,
-                LayerCount = 1
-            }
-        };
-
-        if (_vk.CreateImageView(_device, ref viewInfo, null, out ImageView) != Result.Success)
-        {
-            throw new Exception("Failed to create image view for resource " + _name);
-        };
-        IsAllocated = true;
-
-    }
-
-    
-
-    public void Dispose()
-    {
-        if (_disposed) return;
- 
-        // Destroy in reverse-creation order — mirrors C++ RAII destruction
-        if (ImageView.Handle   != 0) _vk.DestroyImageView(_device, ImageView,   null);
-        if (Image.Handle  != 0)      _vk.DestroyImage    (_device, Image,  null);
-        if (ImageMemory.Handle != 0) _vk.FreeMemory      (_device, ImageMemory, null);
- 
-        _disposed = true;
-    }
-
-}
-
-/// <summary>
-/// Composes an <see cref="ImageResource"/> + <see cref="Sampler"/> as a single
-/// shader-readable texture object. Use for sampled textures (loaded from disk,
-/// dummy fallbacks, baked LUTs); <see cref="ImageResource"/> alone is reserved
-/// for render-graph attachments.
-/// </summary>
-public unsafe class Texture : IDisposable
-{
-    private readonly Vk _vk;
-    private readonly Device _device;
-    private bool _disposed;
-
-    public ImageResource Resource { get; }
-    public Sampler Sampler { get; }
-
-    public VkImage Image     => Resource.Image;
-    public ImageView View    => Resource.ImageView;
-
-    public Texture(Vk vk, Device device, ImageResource resource, Sampler sampler)
-    {
-        _vk = vk;
-        _device = device;
-        Resource = resource;
-        Sampler = sampler;
-    }
-
-    public void Dispose()
-    {
-        if (_disposed) return;
-        if (Sampler.Handle != 0) _vk.DestroySampler(_device, Sampler, null);
-        Resource?.Dispose();
-        _disposed = true;
-    }
 }
 
 public unsafe struct Pass

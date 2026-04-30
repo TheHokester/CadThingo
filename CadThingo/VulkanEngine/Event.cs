@@ -40,17 +40,18 @@ class KeyPressEvent : Event
 {
     private int KeyCode;
     private bool repeat;
-
-    public KeyPressEvent(int keycode)
+    private IKeyboard kb;
+    public KeyPressEvent(IKeyboard kb, int keycode)
     {
         KeyCode = keycode;
+        this.kb = kb;
     }
 
-    public int GetKeyCode() => KeyCode;
-
+    public int GetKeyCode => KeyCode;
+    public IKeyboard GetKeyboard => kb;
     public override Event Clone()
     {
-        return new KeyPressEvent(KeyCode);
+        return new KeyPressEvent(kb, KeyCode);
     }
     protected override EventCategory GetCategoryFlags() => EventCategory.Input | EventCategory.Keyboard;
 }
@@ -58,52 +59,69 @@ class KeyPressEvent : Event
 class KeyReleaseEvent : Event
 {
     private int KeyCode;
-    
-    public KeyReleaseEvent(int keycode)
+    private IKeyboard kb;
+    public KeyReleaseEvent(IKeyboard kb, int keycode)
     {
         KeyCode = keycode;
+        this.kb = kb;
     }
-
+    
+    public int GetKeyCode => KeyCode;
+    public IKeyboard GetKeyboard => kb;
     public override Event Clone()
     {
-        return new KeyReleaseEvent(KeyCode);
+        return new KeyReleaseEvent(kb, KeyCode);
     }
     protected override EventCategory GetCategoryFlags() => EventCategory.Input | EventCategory.Keyboard;
 }
 
 class MouseMoveEvent : Event
 {
+    private float absX;
+    private float absY;
     private float dX;
     private float dY;
-    
-    public MouseMoveEvent(float dx, float dy)
+    private IMouse mouse;
+
+    public MouseMoveEvent(IMouse mouse, float absX, float absY, float dx, float dy)
     {
+        this.mouse = mouse;
+        this.absX = absX;
+        this.absY = absY;
         dX = dx;
         dY = dy;
     }
-    
+
+    public float GetAbsX() => absX;
+    public float GetAbsY() => absY;
     public float GetX() => dX;
     public float GetY() => dY;
-    
+    public IMouse GetMouse => mouse;
+
     public override Event Clone()
     {
-        return new MouseMoveEvent(dX, dY);
+        return new MouseMoveEvent(mouse, absX, absY, dX, dY);
     }
     protected override EventCategory GetCategoryFlags() => EventCategory.Input | EventCategory.Mouse;
 }
 
 class MouseKeyDownEvent : Event
 {
-    MouseButton KeyCode; 
-    
-    public MouseKeyDownEvent(MouseButton keycode)
+    private MouseButton KeyCode;
+    private IMouse mouse;
+
+    public MouseKeyDownEvent(IMouse mouse, MouseButton keycode)
     {
+        this.mouse = mouse;
         KeyCode = keycode;
     }
-    
+
+    public MouseButton GetButton => KeyCode;
+    public IMouse GetMouse => mouse;
+
     public override Event Clone()
     {
-        return new MouseKeyDownEvent(KeyCode);
+        return new MouseKeyDownEvent(mouse, KeyCode);
     }
     protected override EventCategory GetCategoryFlags() => EventCategory.Input | EventCategory.MouseButton;
 }
@@ -111,29 +129,46 @@ class MouseKeyDownEvent : Event
 class MouseKeyReleaseEvent : Event
 {
     private MouseButton KeyCode;
-    
-    public MouseKeyReleaseEvent(MouseButton keycode)
+    private IMouse mouse;
+
+    public MouseKeyReleaseEvent(IMouse mouse, MouseButton keycode)
     {
+        this.mouse = mouse;
         KeyCode = keycode;
     }
+
+    public MouseButton GetButton => KeyCode;
+    public IMouse GetMouse => mouse;
+
     public override Event Clone()
     {
-        return new MouseKeyReleaseEvent(KeyCode);
+        return new MouseKeyReleaseEvent(mouse, KeyCode);
     }
     protected override EventCategory GetCategoryFlags() => EventCategory.Input | EventCategory.MouseButton;
 }
 
 class MouseScrollEvent : Event
 {
+    private float _x;
     private float _y;
+    private IMouse mouse;
 
-    public MouseScrollEvent(float y) => _y = y;
+    public MouseScrollEvent(IMouse mouse, float x, float y)
+    {
+        this.mouse = mouse;
+        _x = x;
+        _y = y;
+    }
+
+    public float GetX() => _x;
+    public float GetY() => _y;
+    public IMouse GetMouse => mouse;
 
     public override Event Clone()
     {
-        return new MouseScrollEvent(_y);
+        return new MouseScrollEvent(mouse, _x, _y);
     }
-    
+
     protected override EventCategory GetCategoryFlags() => EventCategory.Input | EventCategory.Mouse;
 }
 
