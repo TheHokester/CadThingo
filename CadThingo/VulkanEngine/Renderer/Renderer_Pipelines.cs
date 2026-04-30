@@ -563,6 +563,14 @@ public unsafe partial class Renderer
                 StageFlags = ShaderStageFlags.FragmentBit,
                 PImmutableSamplers = null
             },
+            new() // TLAS for ray-traced shadows. Bound once at startup; no per-frame update.
+            {
+                Binding = 1,
+                DescriptorType = DescriptorType.AccelerationStructureKhr,
+                DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
+                PImmutableSamplers = null,
+            },
         };
 
         // ── Set 1: G-Buffer inputs ────────────────────────────────────────────
@@ -619,7 +627,14 @@ public unsafe partial class Renderer
                 var updateFlags = DescriptorBindingFlags.UpdateAfterBindBit |
                                   DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
 
-                for (int i = 0; i < set0Bindings.Length; i++) set0Flags[i] = updateFlags;
+                for (int i = 0; i < set0Bindings.Length; i++)
+                {
+                    // AccelerationStructureKhr bindings can't carry UpdateAfterBindBit
+                    // unless descriptorBindingAccelerationStructureUpdateAfterBind is
+                    // enabled (a separate feature we don't request). Leave default (0).
+                    if (set0Bindings[i].DescriptorType == DescriptorType.AccelerationStructureKhr) continue;
+                    set0Flags[i] = updateFlags;
+                }
                 set0FlagsInfo.BindingCount = (uint)set0Bindings.Length;
                 set0FlagsInfo.PBindingFlags = set0Flags;
 

@@ -90,6 +90,7 @@ GBufferOutput PSMain(VSOutput input){
     //pack into GBuffer - NO lighting NO pbr math
     output.Position = float4(input.WorldPos, 1.0);
     output.Normal = float4(N, 0.0);
+    
     output.Albedo = float4(baseColor.rgb, metallic);
     output.Material = float4(roughness, ao, 0.0, 0.0);
     

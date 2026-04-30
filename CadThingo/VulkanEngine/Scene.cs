@@ -31,17 +31,7 @@ public unsafe struct Material
     public float alphaMaskCutoff;
 
 
-    public void Bind()
-    {
-    }
-
-    public void SetUniform(string name, Matrix4x4* value)
-    {
-    }
-
-    public void SetUniform(string name, float value)
-    {
-    }
+    
 }
 
 public class Scene
