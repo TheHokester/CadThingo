@@ -1,16 +1,21 @@
 static const float PI = 3.14159265359;
 
-struct PushConstants {
+struct PbrMaterial {
     float4 baseColorFactor;             // Base color tint/multiplier
     float metallicFactor;               // Metallic property multiplier
     float roughnessFactor;              // Surface roughness multiplier
-    int baseColorTextureSet;            // Texture binding index for base color (-1 = none)
-    int physicalDescriptorTextureSet;   // Texture binding for metallic/roughness
-    int normalTextureSet;               // Texture binding for normal maps
-    int occlusionTextureSet;            // Texture binding for ambient occlusion
-    int emissiveTextureSet;             // Texture binding for emissive maps
-    float alphaMask;                    // Alpha masking enable flag
-    float alphaMaskCutoff;              // Alpha cutoff threshold
+    float alphaCutoff;              // Alpha cutoff threshold
+    uint flags;                    // bit 0 = alphaMask, bit 1 = doubleSided, ...
+    int baseColorTex;            // Texture binding index for base color (-1 = none)
+    int physicalDescriptorTex;   // Texture binding for metallic/roughness
+    int normalTex;               // Texture binding for normal maps
+    int occlusionTex;            // Texture binding for ambient occlusion
+    int emissiveTex;             // Texture binding for emissive maps
+};
+struct InstanceData {
+    float4x4 model;
+    uint materialIndex;
+    uint _pad0, _pad1, _pad2;
 };
 
 //normal distribution function (D) - GGX/trowbridge-reitz

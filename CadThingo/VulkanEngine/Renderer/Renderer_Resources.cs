@@ -75,6 +75,11 @@ public unsafe partial class Renderer
         gBufferMaterial = new ImageResource(vk, device, "GBuffer_Material", Format.R8G8B8A8Unorm,
             new Extent2D(width, height), gBufferUsage,
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        // Emissive G-buffer: linear RGB, no HDR range. Geometry pass writes emissiveSampler.rgb;
+        // lighting pass adds it to the final color before tone-mapping.
+        gBufferEmissive = new ImageResource(vk, device, "GBuffer_Emissive", Format.R8G8B8A8Unorm,
+            new Extent2D(width, height), gBufferUsage,
+            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
     }
 
     public CommandBuffer BeginSingleTimeCommands()
@@ -326,32 +331,28 @@ public unsafe partial class Renderer
 
     private void CreateDescriptorPool()
     {
-        // Sizing: 4 UBO (2 geometry + 2 lighting), 14 CIS (10 geometry + 4 G-buffer),
-        // plus 2 AS slots (one per per-frame lighting set, binding 1). Using 20/20/4 for headroom.
+        // Sizing budget per frame-in-flight where relevant:
+        //   - UniformBuffer:   GeometryFrameUBO + LightingUBO  →  2 × MAX_FRAMES + headroom
+        //   - StorageBuffer:   PbrMaterial[]   + InstanceData[] →  2 × MAX_FRAMES + headroom
+        //   - SampledImage:    bindless texture array          →  MAX_BINDLESS_TEXTURES × MAX_FRAMES
+        //   - Sampler:         bindless samplers (default 0)   →  8 × MAX_FRAMES
+        //   - CombinedImageSampler: g-buffer samplers (shared) →  5 + headroom
+        //   - AccelerationStructure: TLAS                       →  MAX_FRAMES + headroom
         var poolSizes = new DescriptorPoolSize[]
         {
-            new DescriptorPoolSize()
-            {
-                Type = DescriptorType.UniformBuffer,
-                DescriptorCount = (uint)20,
-            },
-            new DescriptorPoolSize()
-            {
-                Type = DescriptorType.CombinedImageSampler,
-                DescriptorCount = (uint)20,
-            },
-            new DescriptorPoolSize()
-            {
-                Type = DescriptorType.AccelerationStructureKhr,
-                DescriptorCount = (uint)4,
-            }
+            new() { Type = DescriptorType.UniformBuffer,            DescriptorCount = 16 },
+            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 16 },
+            new() { Type = DescriptorType.SampledImage,             DescriptorCount = MAX_BINDLESS_TEXTURES * MAX_CONCURRENT_FRAMES },
+            new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
+            new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 16 },
+            new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 4 },
         };
         fixed (DescriptorPoolSize* poolSizesPtr = poolSizes)
         {
             DescriptorPoolCreateInfo poolInfo = new()
             {
                 SType = StructureType.DescriptorPoolCreateInfo,
-                MaxSets = (uint)20,
+                MaxSets = 32,
                 PoolSizeCount = (uint)poolSizes.Length,
                 PPoolSizes = poolSizesPtr,
                 Flags = DescriptorPoolCreateFlags.UpdateAfterBindBit | DescriptorPoolCreateFlags.FreeDescriptorSetBit,
@@ -364,10 +365,10 @@ public unsafe partial class Renderer
     }
     private void CreateDescriptorSets()
     {
-        // Per-frame geometry descriptor sets from geometryDescriptorSetLayout.
-        // Binding 0 = GeometryUBO (written here). Bindings 1-5 = PBR textures (written in 3e).
+        // Per-frame "frame" descriptor sets (set 0): only binding 0 = FrameUBO (view+proj).
+        // Material samplers live on set 1 and are allocated from materialDescriptorPool.
         var layouts = stackalloc DescriptorSetLayout[(int)MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++) layouts[i] = geometryDescriptorSetLayout;
+        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++) layouts[i] = geometryFrameDescriptorSetLayout;
 
         DescriptorSetAllocateInfo allocateInfo = new()
         {
@@ -380,7 +381,7 @@ public unsafe partial class Renderer
         fixed (DescriptorSet* pSets = geometryDescriptorSets)
         {
             if (vk!.AllocateDescriptorSets(device, &allocateInfo, pSets) != Result.Success)
-                throw new Exception("Failed to allocate geometry descriptor sets");
+                throw new Exception("Failed to allocate geometry frame descriptor sets");
         }
 
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
@@ -403,35 +404,181 @@ public unsafe partial class Renderer
             };
             vk!.UpdateDescriptorSets(device, 1, &descriptorWrite, 0, null);
         }
+    }
 
-        // Bindings 1-5 are PBR samplers (baseColor, physical, normal, occlusion, emissive).
-        // The shader samples 1, 2, 4, 5 unconditionally, so every slot needs a valid descriptor.
-        // For now, point all five at the loaded baseColor texture as scaffolding — proper
-        // per-slot material wiring lands when entities carry their own material textures.
-        DescriptorImageInfo baseColorImgInfo = new()
-        {
-            ImageView = baseColor!.View,
-            Sampler   = baseColor.Sampler,
-            ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
-        };
-        var textureWrites = stackalloc WriteDescriptorSet[5];
+    // Geometry pipeline set 1 size budget. Layout binding counts must match.
+    internal const uint MAX_MATERIALS         = 256;
+    internal const uint MAX_INSTANCES         = 4096;
+    internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 5;
+
+    // Per-frame storage buffers feeding the geometry pipeline's bindless set.
+    // CPU writes them at the start of each frame; the descriptor set is fixed-bound to one pair.
+    private UboBuffer[] MaterialStorageBuffers = new UboBuffer[2];
+    private UboBuffer[] InstanceStorageBuffers = new UboBuffer[2];
+
+    // Shared linear-repeat sampler at samplers[0] in the bindless set.
+    private Sampler defaultBindlessSampler;
+
+    // Per-frame bindless descriptor sets, each pointing at its own (material, instance) buffer pair
+    // and the shared bindless texture/sampler arrays.
+    private DescriptorSet[] bindlessDescriptorSets = new DescriptorSet[2];
+
+    private void CreateMaterialAndInstanceBuffers()
+    {
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
         {
-            for (uint b = 1; b <= 5; b++)
-            {
-                textureWrites[b - 1] = new WriteDescriptorSet
-                {
-                    SType = StructureType.WriteDescriptorSet,
-                    DstSet = geometryDescriptorSets[i],
-                    DstBinding = b,
-                    DstArrayElement = 0,
-                    DescriptorType = DescriptorType.CombinedImageSampler,
-                    DescriptorCount = 1,
-                    PImageInfo = &baseColorImgInfo,
-                };
-            }
-            vk!.UpdateDescriptorSets(device, 5, textureWrites, 0, null);
+            CreateMappedStorageBuffer((ulong)(MAX_MATERIALS * (uint)sizeof(PbrMaterial)),     ref MaterialStorageBuffers[i]);
+            CreateMappedStorageBuffer((ulong)(MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)), ref InstanceStorageBuffers[i]);
         }
+    }
+
+    private void CreateMappedStorageBuffer(ulong sizeBytes, ref UboBuffer ubo)
+    {
+        BufferCreateInfo bufferInfo = new()
+        {
+            SType = StructureType.BufferCreateInfo,
+            Size = sizeBytes,
+            Usage = BufferUsageFlags.StorageBufferBit,
+            SharingMode = SharingMode.Exclusive,
+        };
+        vk!.CreateBuffer(device, &bufferInfo, null, out ubo.buffer);
+
+        vk!.GetBufferMemoryRequirements(device, ubo.buffer, out var memReqs);
+        MemoryAllocateInfo allocInfo = new()
+        {
+            SType = StructureType.MemoryAllocateInfo,
+            AllocationSize = memReqs.Size,
+            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit),
+        };
+        vk!.AllocateMemory(device, &allocInfo, null, out ubo.memory);
+        vk!.BindBufferMemory(device, ubo.buffer, ubo.memory, 0);
+        vk!.MapMemory(device, ubo.memory, 0, sizeBytes, MemoryMapFlags.None, ref ubo.mapped);
+    }
+
+    private void CreateDefaultBindlessSampler()
+    {
+        SamplerCreateInfo samplerInfo = new()
+        {
+            SType = StructureType.SamplerCreateInfo,
+            MagFilter = Filter.Linear,
+            MinFilter = Filter.Linear,
+            AddressModeU = SamplerAddressMode.Repeat,
+            AddressModeV = SamplerAddressMode.Repeat,
+            AddressModeW = SamplerAddressMode.Repeat,
+            MipmapMode = SamplerMipmapMode.Linear,
+            AnisotropyEnable = true,
+            MaxAnisotropy = 16,
+            BorderColor = BorderColor.FloatOpaqueBlack,
+            UnnormalizedCoordinates = false,
+            CompareEnable = false,
+            CompareOp = CompareOp.Always,
+            MinLod = 0.0f,
+            MaxLod = 0.0f,
+        };
+        if (vk!.CreateSampler(device, &samplerInfo, null, out defaultBindlessSampler) != Result.Success)
+            throw new Exception("Failed to create default bindless sampler");
+    }
+
+    // Allocates one bindless descriptor set per frame in flight from the main pool. Writes the
+    // per-frame StorageBuffer<PbrMaterial> + StorageBuffer<InstanceData> bindings, plus the shared
+    // sampler at samplers[0]. Texture array (binding 2) is populated lazily by RegisterBindless.
+    private void CreateBindlessDescriptorSets()
+    {
+        var layouts = stackalloc DescriptorSetLayout[(int)MAX_CONCURRENT_FRAMES];
+        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++) layouts[i] = geometryMaterialDescriptorSetLayout;
+
+        DescriptorSetAllocateInfo alloc = new()
+        {
+            SType = StructureType.DescriptorSetAllocateInfo,
+            DescriptorPool = descriptorPool,
+            DescriptorSetCount = MAX_CONCURRENT_FRAMES,
+            PSetLayouts = layouts,
+        };
+        fixed (DescriptorSet* pSets = bindlessDescriptorSets)
+        {
+            if (vk!.AllocateDescriptorSets(device, &alloc, pSets) != Result.Success)
+                throw new Exception("Failed to allocate bindless descriptor sets");
+        }
+
+        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            DescriptorBufferInfo matInfo = new()
+            {
+                Buffer = MaterialStorageBuffers[i].buffer, Offset = 0,
+                Range = (ulong)(MAX_MATERIALS * (uint)sizeof(PbrMaterial)),
+            };
+            DescriptorBufferInfo instInfo = new()
+            {
+                Buffer = InstanceStorageBuffers[i].buffer, Offset = 0,
+                Range = (ulong)(MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)),
+            };
+            DescriptorImageInfo samplerInfo = new()
+            {
+                Sampler = defaultBindlessSampler,
+            };
+
+            var writes = stackalloc WriteDescriptorSet[3];
+            writes[0] = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = bindlessDescriptorSets[i],
+                DstBinding = 0,
+                DescriptorType = DescriptorType.StorageBuffer,
+                DescriptorCount = 1,
+                PBufferInfo = &matInfo,
+            };
+            writes[1] = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = bindlessDescriptorSets[i],
+                DstBinding = 1,
+                DescriptorType = DescriptorType.StorageBuffer,
+                DescriptorCount = 1,
+                PBufferInfo = &instInfo,
+            };
+            writes[2] = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = bindlessDescriptorSets[i],
+                DstBinding = 3,
+                DstArrayElement = 0,
+                DescriptorType = DescriptorType.Sampler,
+                DescriptorCount = 1,
+                PImageInfo = &samplerInfo,
+            };
+            vk!.UpdateDescriptorSets(device, 3, writes, 0, null);
+        }
+    }
+
+    // Writes a Texture's image view into binding 2 (the bindless texture array) at <paramref name="index"/>
+    // for every frame's bindless set. Safe to call any time thanks to UpdateAfterBind on the binding.
+    public void WriteBindlessTexture(int index, Texture texture)
+    {
+        if (index < 0 || index >= MAX_BINDLESS_TEXTURES)
+            throw new ArgumentOutOfRangeException(nameof(index), $"bindless texture index {index} out of [0, {MAX_BINDLESS_TEXTURES}).");
+
+        DescriptorImageInfo imgInfo = new()
+        {
+            ImageView = texture.View,
+            ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
+        };
+
+        var writes = stackalloc WriteDescriptorSet[(int)MAX_CONCURRENT_FRAMES];
+        for (var f = 0; f < MAX_CONCURRENT_FRAMES; f++)
+        {
+            writes[f] = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = bindlessDescriptorSets[f],
+                DstBinding = 2,
+                DstArrayElement = (uint)index,
+                DescriptorType = DescriptorType.SampledImage,
+                DescriptorCount = 1,
+                PImageInfo = &imgInfo,
+            };
+        }
+        vk!.UpdateDescriptorSets(device, MAX_CONCURRENT_FRAMES, writes, 0, null);
     }
 
     private void CreateLightingDescriptorSets()
@@ -494,15 +641,16 @@ public unsafe partial class Renderer
     // the g-buffer images at the new extent).
     private void UpdateGBufferDescriptorSet()
     {
-        var imageInfos = stackalloc DescriptorImageInfo[4]
+        var imageInfos = stackalloc DescriptorImageInfo[5]
         {
             new() { ImageView = gBufferPosition.ImageView, Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
             new() { ImageView = gBufferNormal.ImageView,   Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
             new() { ImageView = gBufferAlbedo.ImageView,   Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
             new() { ImageView = gBufferMaterial.ImageView, Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = gBufferEmissive.ImageView, Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
         };
-        var writes = stackalloc WriteDescriptorSet[4];
-        for (uint i = 0; i < 4; i++)
+        var writes = stackalloc WriteDescriptorSet[5];
+        for (uint i = 0; i < 5; i++)
         {
             writes[i] = new WriteDescriptorSet
             {
@@ -515,7 +663,7 @@ public unsafe partial class Renderer
                 PImageInfo = &imageInfos[i],
             };
         }
-        vk!.UpdateDescriptorSets(device, 4, writes, 0, null);
+        vk!.UpdateDescriptorSets(device, 5, writes, 0, null);
     }
 
     /// <summary>
@@ -556,17 +704,11 @@ public unsafe partial class Renderer
         }
     }
 
-    private void UpdateGeometryUBO(uint frameIndex, Entity* entity, Camera camera)
+    // Writes the per-frame view+proj into GeometryUniformBuffers[frameIndex].
+    // Called once per frame in DrawFrame; per-draw model matrix is pushed via PbrPushConstants.
+    private void UpdateGeometryFrameUBO(uint frameIndex, Camera camera)
     {
-        var transform = entity->GetComponent<TransformComponent>();
-        if (transform == null)
-        {
-            Console.Error.WriteLine("Entity has no transform component");
-            return;
-        }
-
         GeometryUBO ubo = new();
-        ubo.model = *transform.GetModelMatrix();
         if (camera != null)
         {
             ubo.proj = camera.GetProjectionMatrix((float)swapChainExtent.Width / swapChainExtent.Height, 0.1f, 100.0f);
@@ -592,18 +734,18 @@ public unsafe partial class Renderer
         LightingUBO ubo = new();
         // Single neutral white key light above & slightly in front — readable textures,
         // minimal color bias. Extra slots zeroed so they contribute nothing.
-        ubo.lightPosition0 = new Vector4((float)(3 * Math.Cos(angle)), 5.0f, (float)(3.0f * Math.Sin(angle)), 1.0f);
-        ubo.lightColor0    = new Vector4(85.0f, 50.0f, 50.0f, 1.0f);
+        ubo.lightPosition0 = new Vector4((float)(3 * Math.Cos(angle)), 5f, (float)(3f * Math.Sin(angle)), 1.0f);
+        ubo.lightColor0    = new Vector4(135f, 135f, 100f, 2.0f);
         ubo.lightPosition1 = default;
         ubo.lightColor1    = default;
         ubo.lightPosition2 = default;
         ubo.lightColor2    = default;
         ubo.lightPosition3 = default;
         ubo.lightColor3    = default;
-
+        
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
         ubo.exposure = 4.5f;
-        ubo.gamma = 2.0f;
+        ubo.gamma = 2.2f;
         ubo.prefilteredCubeMipLevels = 1.0f;
         ubo.scaleIBLAmbient = 1.0f;
 
@@ -611,27 +753,6 @@ public unsafe partial class Renderer
         new Span<LightingUBO>(data, 1).Fill(ubo);
     }
 
-    private void PushMaterialProperties(CommandBuffer cmd, Material material)
-    {
-        PbrPushConstants pushConstants = new()
-        {
-            BaseColorFactor = material.baseColorFactor,
-            MetallicFactor = material.metallicFactor,
-            RoughnessFactor = material.roughnessFactor,
-            BaseColorTextureSet = material.baseColorTextureSet,
-            PhysicalDescriptorTextureSet = material.physicalDescriptorTextureSet,
-            NormalTextureSet = material.normalTextureSet,
-            OcclusionTextureSet = material.occlusionTextureSet,
-            EmissiveTextureSet = material.emissiveTextureSet,
-            AlphaMask = material.alphaMask,
-            AlphaMaskCutoff = material.alphaMaskCutoff
-        };
-        
-        //push constants to shader with cmdbuffer
-        vk!.CmdPushConstants(cmd, pbrPipelineLayout, ShaderStageFlags.FragmentBit, 0, (uint)sizeof(PbrPushConstants), &pushConstants);
-        
-    }
-    
     private Extent2D ChooseSwapExtent(SurfaceCapabilitiesKHR capabilities)
     {
         if (capabilities.CurrentExtent.Width != uint.MaxValue)
@@ -674,10 +795,10 @@ public unsafe partial class Renderer
     }
 }
 
-// Matches Geometry.slang's GBufferUBO (binding 0 of geometryDescriptorSetLayout).
+// Matches Geometry.slang's FrameUBO (binding 0 of geometryFrameDescriptorSetLayout, set 0).
+// Per-frame view/proj only; the per-draw model matrix moved to PbrPushConstants.
 struct GeometryUBO
 {
-    public Matrix4x4 model;
     public Matrix4x4 view;
     public Matrix4x4 proj;
 }
@@ -701,35 +822,53 @@ struct LightingUBO
     public float scaleIBLAmbient;
 }
 
+// Per-instance row in the geometry pipeline's instance SSBO. Shader sees this as
+// PbrUtils.slang::InstanceData (std430 layout, stride 80B). Padding keeps the C#
+// struct aligned to the shader struct so a Span<InstanceDataGPU> blits cleanly.
+[StructLayout(LayoutKind.Sequential)]
+public struct InstanceDataGPU
+{
+    public Matrix4x4 model;
+    public uint materialIndex;
+    public uint _pad0, _pad1, _pad2;
+}
+
+
 unsafe struct UboBuffer : IDisposable
 {
     public Device device;//for m alloc cleanup
-    
+
     public Buffer buffer;
     public DeviceMemory memory;
     public void* mapped;
-    
+
     public void Dispose()
     {
         Vk.GetApi().FreeMemory(device, memory, null);
         Vk.GetApi().DestroyBuffer(device, buffer, null);
-        
+
         GC.SuppressFinalize(this);
     }
 }
 
-struct PbrPushConstants
+// Mirrors PbrUtils.slang::PbrMaterial under std430. Total payload 52B; padded to 64B
+// so an SSBO array stride matches the shader's expected 16B alignment.
+[StructLayout(LayoutKind.Sequential)]
+public struct PbrMaterial
 {
     public Vector4 BaseColorFactor;
     public float MetallicFactor;
     public float RoughnessFactor;
-    public int BaseColorTextureSet;
-    public int PhysicalDescriptorTextureSet;
-    public int NormalTextureSet;
-    public int OcclusionTextureSet;
-    public int EmissiveTextureSet;
-    public float AlphaMask;
-    public float AlphaMaskCutoff;
+    public float AlphaCutoff;
+    public uint Flags;//bit 0 alphaMask, bit 1 doubleSided, ...
+    public int BaseColorTex;
+    public int PhysicalDescriptorTex;
+    public int NormalTex;
+    public int OcclusionTex;
+    public int EmissiveTex;
+    public int _pad0;
+    public int _pad1;
+    public int _pad2;
 }
 
 public unsafe class ImageResource : IDisposable

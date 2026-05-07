@@ -23,6 +23,15 @@ public class Engine
     //singleton resource manager
     public static ResourceManager ResourceManager = new();
 
+    // Frame timing, queryable from anywhere. DeltaTime is seconds since the previous
+    // frame; TotalTime is seconds since the first frame. Driven by a monotonic
+    // Stopwatch so it's independent of any caller-supplied delta and unaffected by
+    // wall-clock changes. Updated once per frame at the top of MainLoop.
+    private static readonly System.Diagnostics.Stopwatch _frameTimer = System.Diagnostics.Stopwatch.StartNew();
+    private static double _lastTotalTime;
+    public static float DeltaTime { get; private set; }
+    public static float TotalTime { get; private set; }
+
     // Mouse-delta state. GLFW/Silk.NET MouseMove gives absolute position per event,
     // so we convert to deltas here. _firstMouse prevents a huge jump on the first
     // event (where _lastMousePos is still default).
@@ -115,6 +124,13 @@ public class Engine
         // Update/Render events until the window closes. Hook once then Run once.
         window!.Update += delta =>
         {
+            // Tick global frame timer first so any system reading Engine.DeltaTime
+            // / Engine.TotalTime this frame sees fresh values.
+            double now = _frameTimer.Elapsed.TotalSeconds;
+            DeltaTime = (float)(now - _lastTotalTime);
+            _lastTotalTime = now;
+            TotalTime = (float)now;
+
             // Camera maintains its own held-key state from KeyPress/KeyRelease events;
             // Tick(delta) just applies movement using that state for framerate independence.
             renderer.Camera.Tick((float)delta);
