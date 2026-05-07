@@ -267,80 +267,111 @@ public unsafe partial class Renderer
                 throw new Exception("Failed to create graphics pipeline");
             }
         }
+        
+        vk!.DestroyShaderModule(device, shaderModule, null);
     }
 
-    private void CreateGeometryDescriptorSetLayout()
+    // Set 0 of the geometry pipeline. One binding (the per-frame FrameUBO with view+proj),
+    // bound once at the start of the geometry pass and reused for every draw.
+    private void CreateGeometryFrameDescriptorSetLayout()
     {
-        // Binding 0: GBufferUBO — used by the vertex shader (model/view/proj transforms)
-        // Binding 1-5: PBR material textures — used by the fragment shader only
+        var binding = new DescriptorSetLayoutBinding
+        {
+            Binding = 0,
+            DescriptorType = DescriptorType.UniformBuffer,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.VertexBit,
+            PImmutableSamplers = null,
+        };
+
+        DescriptorSetLayoutBindingFlagsCreateInfo flagsCreateInfo = new()
+            { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
+        var flag = DescriptorBindingFlags.UpdateAfterBindBit |
+                   DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
+
+        if (descriptorIndexEnabled)
+        {
+            flagsCreateInfo.BindingCount = 1;
+            flagsCreateInfo.PBindingFlags = &flag;
+        }
+
+        DescriptorSetLayoutCreateInfo layoutInfo = new()
+        {
+            SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 1,
+            PBindings = &binding,
+        };
+        if (descriptorIndexEnabled)
+        {
+            layoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
+            layoutInfo.PNext = &flagsCreateInfo;
+        }
+
+        if (vk!.CreateDescriptorSetLayout(device, &layoutInfo, null, out geometryFrameDescriptorSetLayout) !=
+            Result.Success)
+            throw new Exception("Failed to create geometry frame descriptor set layout");
+    }
+
+    // Set 1 of the geometry pipeline. Five PBR textures (baseColor, metallicRoughness, normal,
+    // occlusion, emissive). One set per material; bound per-draw.
+    const int materialSetCount = 5;
+    
+    private void CreateGeometryMaterialDescriptorSetLayout()
+    {
         var bindings = new DescriptorSetLayoutBinding[]
         {
             new()
             {
                 Binding = 0,
-                DescriptorType = DescriptorType.UniformBuffer,
+                DescriptorType = DescriptorType.StorageBuffer,
                 DescriptorCount = 1,
-                // GBufferUBO is read in VSMain for the MVP transform chain
-                StageFlags = ShaderStageFlags.VertexBit,
-                PImmutableSamplers = null
+                StageFlags = ShaderStageFlags.FragmentBit,
             },
             new()
             {
                 Binding = 1,
-                DescriptorType = DescriptorType.CombinedImageSampler,
+                DescriptorType = DescriptorType.StorageBuffer,
                 DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit,
-                PImmutableSamplers = null
+                StageFlags = ShaderStageFlags.VertexBit|ShaderStageFlags.FragmentBit,
             },
             new()
             {
                 Binding = 2,
-                DescriptorType = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
+                DescriptorType = DescriptorType.SampledImage,
+                DescriptorCount = MAX_MATERIALS * 5,
                 StageFlags = ShaderStageFlags.FragmentBit,
-                PImmutableSamplers = null
-            },
+            }, 
             new()
             {
                 Binding = 3,
-                DescriptorType = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
+                DescriptorType = DescriptorType.Sampler,
+                DescriptorCount = 8,
                 StageFlags = ShaderStageFlags.FragmentBit,
-                PImmutableSamplers = null
-            },
-            new()
-            {
-                Binding = 4,
-                DescriptorType = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit,
-                PImmutableSamplers = null
-            },
-            new()
-            {
-                Binding = 5,
-                DescriptorType = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit,
-                PImmutableSamplers = null
-            },
+            }
         };
+        
+            
 
         DescriptorSetLayoutBindingFlagsCreateInfo flagsCreateInfo = new()
-        {
-            SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo
-        };
-        // One flag entry per binding
+            { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
         var flags = stackalloc DescriptorBindingFlags[bindings.Length];
 
         fixed (DescriptorSetLayoutBinding* pBindings = bindings)
         {
             if (descriptorIndexEnabled)
             {
-                var updateFlags = DescriptorBindingFlags.UpdateAfterBindBit |
-                                  DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-                for (int i = 0; i < bindings.Length; i++)
-                    flags[i] = updateFlags;
+                // Only the bindless texture array (binding 2) needs UpdateAfterBind +
+                // PartiallyBound — RegisterBindless writes new texture slots while the set
+                // is live. The two storage buffers (bindings 0,1) and sampler (3) are
+                // written once at setup, so they don't need UpdateAfterBind (which would
+                // require descriptorBindingStorageBufferUpdateAfterBind / SamplerUpdateAfterBind
+                // features that we don't request).
+                flags[0] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
+                flags[1] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
+                flags[2] = DescriptorBindingFlags.UpdateAfterBindBit |
+                           DescriptorBindingFlags.UpdateUnusedWhilePendingBit |
+                           DescriptorBindingFlags.PartiallyBoundBit;
+                flags[3] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
 
                 flagsCreateInfo.BindingCount = (uint)bindings.Length;
                 flagsCreateInfo.PBindingFlags = flags;
@@ -358,9 +389,9 @@ public unsafe partial class Renderer
                 layoutInfo.PNext = &flagsCreateInfo;
             }
 
-            if (vk!.CreateDescriptorSetLayout(device, &layoutInfo, null, out geometryDescriptorSetLayout) !=
+            if (vk!.CreateDescriptorSetLayout(device, &layoutInfo, null, out geometryMaterialDescriptorSetLayout) !=
                 Result.Success)
-                throw new Exception("Failed to create geometry descriptor set layout");
+                throw new Exception("Failed to create geometry material descriptor set layout");
         }
     }
 
@@ -463,9 +494,10 @@ public unsafe partial class Renderer
             DepthBoundsTestEnable = false,
             StencilTestEnable = false,
         };
-        //config color blending
-        var blendAttachments = stackalloc PipelineColorBlendAttachmentState[4];
-        for (int i = 0; i < 4; i++)
+        //config color blending — one entry per geometry attachment (5 total: position,
+        //normal, albedo, material, emissive). Blending disabled (G-buffer = direct write).
+        var blendAttachments = stackalloc PipelineColorBlendAttachmentState[5];
+        for (int i = 0; i < 5; i++)
         {
             blendAttachments[i] = new()
             {
@@ -478,31 +510,26 @@ public unsafe partial class Renderer
         PipelineColorBlendStateCreateInfo colorBlendInfo = new()
         {
             SType = StructureType.PipelineColorBlendStateCreateInfo,
-            AttachmentCount = 4,
+            AttachmentCount = 5,
             PAttachments = blendAttachments,
         };
-        //configure pushconstants
-        //TODO: create the push constant struct
-        PushConstantRange pushConstantRange = new()
+        // Pipeline layout — set 0 is per-frame (FrameUBO), set 1 is bindless
+        // (StructuredBuffer<PbrMaterial>, StructuredBuffer<InstanceData>, Texture2D[], SamplerState[]).
+        // Per-draw model matrix + material index live in the instance SSBO; no push constants.
+        var setLayouts = stackalloc DescriptorSetLayout[]
         {
-            StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
-            Offset = 0,
-            Size = 128
+            geometryFrameDescriptorSetLayout,
+            geometryMaterialDescriptorSetLayout,
         };
-        //Create the pipeline layout - defunes resource organization
-        fixed (DescriptorSetLayout* pDSLayout = &geometryDescriptorSetLayout)
+        PipelineLayoutCreateInfo layoutInfo = new()
         {
-            PipelineLayoutCreateInfo layoutInfo = new()
-            {
-                SType = StructureType.PipelineLayoutCreateInfo,
-                SetLayoutCount = 1,
-                PSetLayouts = pDSLayout,
-                PushConstantRangeCount = 1,
-                PPushConstantRanges = &pushConstantRange
-            };
-            //create pipeline layout
-            vk!.CreatePipelineLayout(device, &layoutInfo, null, out geometryPipelineLayout);
-        }
+            SType = StructureType.PipelineLayoutCreateInfo,
+            SetLayoutCount = 2,
+            PSetLayouts = setLayouts,
+            PushConstantRangeCount = 0,
+            PPushConstantRanges = null
+        };
+        vk!.CreatePipelineLayout(device, &layoutInfo, null, out geometryPipelineLayout);
 
         //assemble complete pipeline
         GraphicsPipelineCreateInfo pipelineInfo = new()
@@ -530,12 +557,13 @@ public unsafe partial class Renderer
             Format.R32G32B32A32Sfloat, // Normal
             Format.R8G8B8A8Unorm, // Albedo
             Format.R8G8B8A8Unorm, // Material
+            Format.R8G8B8A8Unorm, // Emissive
         };
 
         geometryPipelineRenderingCreateInfo = new()
         {
             SType = StructureType.PipelineRenderingCreateInfo,
-            ColorAttachmentCount = 4,
+            ColorAttachmentCount = 5,
             PColorAttachmentFormats = colorFormats,
             DepthAttachmentFormat = FindDepthFormat(),
         };
@@ -545,6 +573,8 @@ public unsafe partial class Renderer
         }
 
         vk!.CreateGraphicsPipelines(device, default, 1, &pipelineInfo, null, out geometryPipeline);
+        
+        vk!.DestroyShaderModule(device, shader, null);
     }
 
 
@@ -574,7 +604,7 @@ public unsafe partial class Renderer
         };
 
         // ── Set 1: G-Buffer inputs ────────────────────────────────────────────
-        // Four samplers written by the geometry pass, read here for lighting.
+        // Five samplers written by the geometry pass, read here for lighting.
         var set1Bindings = new DescriptorSetLayoutBinding[]
         {
             new() // gbufferPositionSampler
@@ -604,6 +634,14 @@ public unsafe partial class Renderer
             new() // gbufferMaterialSampler  (r = roughness, g = ao)
             {
                 Binding = 3,
+                DescriptorType = DescriptorType.CombinedImageSampler,
+                DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
+                PImmutableSamplers = null
+            },
+            new() // gbufferEmissiveSampler  (rgb = emissive radiance)
+            {
+                Binding = 4,
                 DescriptorType = DescriptorType.CombinedImageSampler,
                 DescriptorCount = 1,
                 StageFlags = ShaderStageFlags.FragmentBit,
@@ -687,7 +725,7 @@ public unsafe partial class Renderer
 
         //create shader module
         ShaderModule shader = CreateShaderModule(shaderCode);
-
+        
         //config vertex stage 
         PipelineShaderStageCreateInfo vertShaderInfo = new()
         {
@@ -786,28 +824,20 @@ public unsafe partial class Renderer
             AttachmentCount = 1,
             PAttachments = &colorBlendAttachment
         };
-        //configure pushconstants
-        //TODO: create the push constant struct
-        PushConstantRange pushConstantRange = new()
-        {
-            StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
-            Offset = 0,
-            Size = 128
-        };
         var pbrLayouts = stackalloc DescriptorSetLayout[]
         {
             PBRDescriptorSetLayout,
             PBRGBufferDescriptorSetLayout
         };
-        //Create the pipeline layout - defunes resource organization
-
+        // PBR lighting pass uses no push constants — set 0 is per-frame light/cam UBO + TLAS,
+        // set 1 is g-buffer samplers, no per-draw data.
         PipelineLayoutCreateInfo layoutInfo = new()
         {
             SType = StructureType.PipelineLayoutCreateInfo,
             SetLayoutCount = 2,
             PSetLayouts = pbrLayouts,
-            PushConstantRangeCount = 1,
-            PPushConstantRanges = &pushConstantRange
+            PushConstantRangeCount = 0,
+            PPushConstantRanges = null
         };
         //create pipeline layout
         vk!.CreatePipelineLayout(device, &layoutInfo, null, out pbrPipelineLayout);
@@ -847,5 +877,7 @@ public unsafe partial class Renderer
 
         //Create the final graphics pipeline
         vk!.CreateGraphicsPipelines(device, default, 1, &pipelineInfo, null, out pbrLightingPipeline);
+        
+        vk!.DestroyShaderModule(device, shader, null);
     }
 }

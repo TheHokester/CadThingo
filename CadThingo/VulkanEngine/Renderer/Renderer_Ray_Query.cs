@@ -448,7 +448,7 @@ public unsafe partial class Renderer
             if (blasCache.ContainsKey((nint)meshComp.mesh)) continue;
             BuildBlas(meshComp.mesh);
         }
-
+        
         RebuildTlas();
     }
 

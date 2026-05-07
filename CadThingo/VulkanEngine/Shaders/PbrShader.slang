@@ -20,13 +20,13 @@ struct LightingUBO {
 // Resource bindings - Connect CPU resources to GPU shader registers
 [[vk::binding(0, 0)]] ConstantBuffer<LightingUBO> ubo;
 [[vk::binding(1, 0)]] RaytracingAccelerationStructure tlas;   // scene TLAS for ray-traced shadows
-[[vk::push_constant]] PushConstants material;
 
 // GBuffer inputs — Set 1 in your descriptor layout
 [[vk::binding(0, 1)]] Sampler2D gBufferPositionSampler;
 [[vk::binding(1, 1)]] Sampler2D gBufferNormalSampler;
 [[vk::binding(2, 1)]] Sampler2D gBufferAlbedoSampler;
 [[vk::binding(3, 1)]] Sampler2D gBufferMaterialSampler;
+[[vk::binding(4, 1)]] Sampler2D gBufferEmissiveSampler;
 
 // Self-shadow bias — pushes the shadow ray origin off the surface along N so
 // floating-point error in the gbuffer position doesn't make the surface
@@ -160,8 +160,12 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     // Add simple ambient lighting (should be replaced with IBL in production)
     float3 ambient = float3(0.03, 0.03, 0.03) * baseColor.rgb * ao;
 
+    // Emissive radiance written by the geometry pass — added pre-tone-map so
+    // exposure/gamma apply uniformly with the rest of the lighting.
+    float3 emissive = gBufferEmissiveSampler.Sample(input.UV).rgb;
+
     // Combine all lighting contributions
-    float3 color = ambient + Lo;
+    float3 color = ambient + Lo + emissive;
 
     // === HDR TONE MAPPING AND GAMMA CORRECTION ===
     // Apply Reinhard tone mapping to compress HDR values to [0,1] range

@@ -1,4 +1,6 @@
-﻿using CadThingo.Graphics.Rendering;
+﻿using System.Numerics;
+using CadThingo.Graphics.Rendering;
+using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.ImGui;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
@@ -161,17 +163,14 @@ public unsafe partial class Renderer
     private ImageResource gBufferNormal;
     private ImageResource gBufferAlbedo;
     private ImageResource gBufferMaterial;
+    private ImageResource gBufferEmissive;
     
     private Sampler gBufferSampler;
 
-    // BaseColor texture for the test entity (viking_room). Single-texture setup until
-    // per-entity material bindings land. Bindings 2-5 of the geometry descriptor set
-    // also point at this texture as a stand-in (the shader samples them unconditionally;
-    // proper per-slot material wiring is a follow-up).
-    private Texture? baseColor;
     //store for lifetime management
     DescriptorSetLayout descriptorSetLayout;
-    DescriptorSetLayout geometryDescriptorSetLayout;
+    DescriptorSetLayout geometryFrameDescriptorSetLayout;    // Geometry pipeline set 0 — FrameUBO (view+proj)
+    DescriptorSetLayout geometryMaterialDescriptorSetLayout; // Geometry pipeline set 1 — bindless materials/instances/textures/samplers
     DescriptorSetLayout PBRDescriptorSetLayout; //Set 0 - Lighting UBO
     DescriptorSetLayout PBRGBufferDescriptorSetLayout;//Set 1 - G buffer descriptors
     DescriptorPool descriptorPool;
@@ -204,7 +203,8 @@ public unsafe partial class Renderer
         CreateImageViews();
         SetupDynamicRendering();
         CreateDescriptorSetLayout();
-        CreateGeometryDescriptorSetLayout();
+        CreateGeometryFrameDescriptorSetLayout();
+        CreateGeometryMaterialDescriptorSetLayout();
         CreatePBRDescriptorSetLayout();
         CreateGraphicsPipeline();
         CreateGeometryPipeline();
@@ -226,15 +226,17 @@ public unsafe partial class Renderer
         
         
         CreateGBufferSampler();
-        // Load the base color texture for the test entity. Must precede CreateDescriptorSets
-        // so the geometry set's sampler bindings point at the real texture from the start.
-        baseColor = Texture.CreateTextureFromPath(this,
-            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Textures\viking_room.png",
-            Format.R8G8B8A8Srgb);
-        //Create descriptor pool
+        //Create descriptor pool (sized for bindless: storage buffers, sampled images, samplers).
         CreateDescriptorPool();
         CreateDescriptorSets();
         CreateLightingDescriptorSets();
+
+        // Bindless geometry-set 1 setup: per-frame material+instance SSBOs, shared default sampler,
+        // and the per-frame descriptor sets they all live in. Texture array (binding 2) is filled
+        // lazily by ResourceManager.RegisterBindless as glTF assets load.
+        CreateDefaultBindlessSampler();
+        CreateMaterialAndInstanceBuffers();
+        CreateBindlessDescriptorSets();
 
         //Create command buffers
         CreateCommandBuffers();
@@ -258,21 +260,21 @@ public unsafe partial class Renderer
         // Wire ResourceManager → upload viking_room mesh → create entity with transform + mesh.
         Engine.ResourceManager.Initialize(this);
 
-        Engine.ResourceManager.Load<MeshResource>(
-            "viking_room",
-            id => new ObjMeshResource(id, Engine.ResourceManager,
-                @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\viking_room.obj"));
 
-        Mesh* meshPtr = Engine.ResourceManager.GetMesh("viking_room");
+        // glTF demo: DamagedHelmet to the side of viking_room so both render together.
+        Entity* helmetRoot = GltfLoader.Load(
+            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\DamagedHelmet.glb",
+            "DamagedHelmet", Engine.ResourceManager, this, scene);
+        var helmetTransform = helmetRoot->GetComponent<TransformComponent>();
+        helmetTransform?.SetPosition(new Vector3(0f, 1f, 0f));
+        
 
-        testEntity = Entity.Create("VikingRoom");
-        var transform = new TransformComponent();
-        // viking_room.obj is Z-up; rotate -90° around X to stand it upright under a Y-up camera.
-        transform.SetRotation(System.Numerics.Quaternion.CreateFromAxisAngle(
-            System.Numerics.Vector3.UnitX, -MathF.PI / 2f));
-        testEntity->AddComponent(transform);
-        testEntity->AddComponent(new MeshComponent(meshPtr, -1));
-        scene.AddEntity(testEntity);
+        // Entity* blue_agent = GltfLoader.Load(
+        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\props\sas_blue.glb",
+        //     "BlueAgent", Engine.ResourceManager, this, scene);
+        // blue_agent->GetComponent<TransformComponent>()?.SetPosition(new Vector3(3f, 0f, 0f));
+        // blue_agent->GetComponent<TransformComponent>()?.SetScale(new Vector3(25f));
+        // blue_agent->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(0, 0, MathF.PI / 2));
     }
 
     public void Update(double d)
@@ -316,7 +318,11 @@ public unsafe partial class Renderer
 
         // ── Mesh pool (global VB/IB) ────────────────────────────
         Engine.ResourceManager.Dispose();
-
+        
+        //── ImGUI dispose ────────────────────────────────────────
+        imGuiUtils?.Dispose();
+        
+        
         // ── Render graph + size-dependent attachments ───────────
         // RenderGraph.Dispose disposes resources it owns; ImageResource.Dispose
         // is idempotent so the explicit calls below are safe redundant cleanup.
@@ -326,14 +332,15 @@ public unsafe partial class Renderer
         gBufferNormal?.Dispose();
         gBufferAlbedo?.Dispose();
         gBufferMaterial?.Dispose();
+        gBufferEmissive?.Dispose();
 
         // ── G-buffer sampler ────────────────────────────────────
         if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
 
-        // ── Standalone textures (image + memory + view + sampler) ─
-        baseColor?.Dispose();
+        // ── Bindless default sampler ────────────────────────────
+        if (defaultBindlessSampler.Handle != 0) vk.DestroySampler(device, defaultBindlessSampler, null);
 
-        // ── Per-frame uniform buffers (FreeMemory implicitly unmaps) ─
+        // ── Per-frame uniform + storage buffers (FreeMemory implicitly unmaps) ─
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
         {
             if (GeometryUniformBuffers[i].buffer.Handle != 0)
@@ -344,6 +351,14 @@ public unsafe partial class Renderer
                 vk.DestroyBuffer(device, LightingUniformBuffers[i].buffer, null);
             if (LightingUniformBuffers[i].memory.Handle != 0)
                 vk.FreeMemory(device, LightingUniformBuffers[i].memory, null);
+            if (MaterialStorageBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, MaterialStorageBuffers[i].buffer, null);
+            if (MaterialStorageBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, MaterialStorageBuffers[i].memory, null);
+            if (InstanceStorageBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, InstanceStorageBuffers[i].buffer, null);
+            if (InstanceStorageBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, InstanceStorageBuffers[i].memory, null);
         }
 
         // ── Pipelines + layouts ─────────────────────────────────
@@ -357,10 +372,10 @@ public unsafe partial class Renderer
 
         // ── Descriptor pool (frees sets) + layouts ──────────────
         if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
-
         if (PBRGBufferDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, PBRGBufferDescriptorSetLayout, null);
         if (PBRDescriptorSetLayout.Handle        != 0) vk.DestroyDescriptorSetLayout(device, PBRDescriptorSetLayout,        null);
-        if (geometryDescriptorSetLayout.Handle   != 0) vk.DestroyDescriptorSetLayout(device, geometryDescriptorSetLayout,   null);
+        if (geometryFrameDescriptorSetLayout.Handle   != 0) vk.DestroyDescriptorSetLayout(device, geometryFrameDescriptorSetLayout,   null);
+        if(geometryMaterialDescriptorSetLayout.Handle !=0) vk!.DestroyDescriptorSetLayout(device, geometryMaterialDescriptorSetLayout, null);
         if (descriptorSetLayout.Handle           != 0) vk.DestroyDescriptorSetLayout(device, descriptorSetLayout,           null);
 
         // ── Command pool (frees buffers) ────────────────────────
@@ -791,6 +806,11 @@ public unsafe partial class Renderer
             indexingFeaturesEnable.ShaderSampledImageArrayNonUniformIndexing = true;
             descriptorIndexingEnabled = true;
         }
+
+        // Bindless geometry pipeline declares Texture2D textures[] (unbounded SPIR-V
+        // RuntimeDescriptorArray capability) — required.
+        if (descriptorIndexingFeaturesSupported.RuntimeDescriptorArray)
+            indexingFeaturesEnable.RuntimeDescriptorArray = true;
 
         if (descriptorIndexingEnabled)
         {

@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using CadThingo.GraphicsPipeline;
 using CadThingo.VulkanEngine;
+using CadThingo.VulkanEngine.Renderer;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 
@@ -28,7 +29,7 @@ public unsafe class ResourceHandle<T> where T : Resource
     }
     
 
-    private T? Get<T>() where T : Resource
+    public T? Get() 
     {
         if (_manager == null) return default;
         return *_manager.GetResource<T>(_ID);
@@ -110,12 +111,19 @@ public unsafe class ResourceManager
     private const int MAX_VERTICES = 1 << 20;   // 1M vertices
     private const int MAX_INDICES  = 1 << 22;   // 4M indices
 
+    // Bindless texture table — every Texture registered here gets a stable int index that
+    // PbrMaterial entries reference. The renderer's bindless descriptor set sees this slot
+    // through the StructuredBuffer<Texture2D> array binding. Indices never shift mid-run;
+    // freed slots go onto _bindlessFree for reuse.
+    private readonly List<Texture> _bindlessTable = new();
+    private readonly Stack<int>    _bindlessFree  = new();
+
     public Buffer GlobalVertexBuffer => globalVertexBuffer;
     public Buffer GlobalIndexBuffer  => globalIndexBuffer;
 
     public DeviceMemory GlobalVertexBufferMemory => globalVertexBufferMemory;
     public DeviceMemory GlobalIndexBufferMemory  => globalIndexBufferMemory;
-
+    
     // Total vertices uploaded so far. Used as a conservative MaxVertex for AS builds —
     // safe because every mesh's index range is rebased into [0, VertexHighWater).
     public int VertexHighWater => vertexWriteOffset;
@@ -176,6 +184,32 @@ public unsafe class ResourceManager
             _renderer.DestroyBuffer(globalVertexBuffer, globalVertexBufferMemory);
             _renderer.DestroyBuffer(globalIndexBuffer,  globalIndexBufferMemory);
         }
+    }
+
+    /// <summary>
+    /// Adds a Texture to the global bindless table and writes its image view into the renderer's
+    /// bindless descriptor set at the returned index. The PbrMaterial fields baseColorTex/normalTex/...
+    /// store these indices and the geometry shader samples textures[index].
+    /// </summary>
+    public int RegisterBindless(Texture tex)
+    {
+        if (_renderer == null)
+            throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called");
+
+        int index;
+        if (_bindlessFree.Count > 0)
+        {
+            index = _bindlessFree.Pop();
+            _bindlessTable[index] = tex;
+        }
+        else
+        {
+            index = _bindlessTable.Count;
+            _bindlessTable.Add(tex);
+        }
+
+        _renderer.WriteBindlessTexture(index, tex);
+        return index;
     }
     
     
@@ -287,17 +321,17 @@ public unsafe class ResourceManager
 /// </summary>
 public unsafe class TextureResource(string id) : Resource(id)
 {
-    //Core Vulkan GPU resources for the texture
-    VkImage image;
-    DeviceMemory imageMemory;
-    ImageView imageView;
-    Sampler sampler;
-    
-    //texture metadata
-    uint width = 0;
-    uint height = 0;
-    uint channels =0;
+    //Core Vulkan GPU resources container for the texture
+    private Texture _texture;
 
+    public Texture Texture => _texture;
+    public TextureResource(string id, Texture texture) : this(id)
+    {
+        this._texture = texture;
+    }
+    //texture metadata
+    private uint width;
+    private uint height;
     ~TextureResource()
     {
         Unload();
@@ -305,71 +339,15 @@ public unsafe class TextureResource(string id) : Resource(id)
 
     public override bool Load()
     {
-        //construct file path
-        string filePath = "textures/" + GetId() + ".ktx";
-        //load image data from disk with file
-        var data = LoadImageData(filePath, width, height, channels);
-        //Transform raw pixel data into Vulkan GPU resources
-        CreateVulkanImage(data, width, height, channels);
-        //Clean up temporary cpu memory
-        FreeImageData(data);
-        
-        return base.Load(); //mark resource loaded
+        return base.Load();
     }
 
     public override void Unload()
     {
-        if (IsLoaded())
-        {
-            //destroy Vulkan GPU resources
-            //temporary implementation
-            Vk? vk = Vk.GetApi();
-            //obtain device handle for resource destruction
-            Device device = GetDevice();
-            
-            vk.DestroySampler(device, sampler, null);
-            vk.DestroyImageView(device, imageView, null);
-            vk.DestroyImage(device, image, null);
-            vk.FreeMemory(device, imageMemory, null);
-        }
+        _texture.Dispose();
         base.Unload();
     }
     
-    public VkImage GetImage() => image;
-    public ImageView GetImageView() => imageView;
-    public Sampler GetSampler => sampler;
-    
-    
-    private char* LoadImageData(string path, uint width, uint height, uint channels)
-    {
-        //temporary implementation
-        //load image data from disk
-        //return pointer to raw pixel data
-        return null;
-    }
-
-    private void FreeImageData(char* data)
-    {
-        //temporary implementation
-        //free memory allocated for raw pixel data
-    }
-    private void CreateVulkanImage(char* data, uint width, uint height, uint channels)
-    {
-        //temporary implementation
-        //transform raw pixel data into Vulkan GPU resources involving complex vulkan operations
-        // - Format selection based on channels
-        // - malloc with appropriate usage flags
-        // - create image with optimal tiling and memory properties
-        //- Data upload via staging buffer
-        // - create image view
-        // - create sampler for appropriate filtering and wrap modes
-    }
-
-    private Device GetDevice()
-    {
-        
-        return default;
-    }
 }
 
 
@@ -583,72 +561,51 @@ public unsafe class ObjMeshResource : MeshResource
 
 public unsafe class MaterialResource(string id) : Resource(id)
 {
-    Material material;
+    private ResourceManager manager;
+    public PbrMaterial Material { get; }
+    public ResourceHandle<TextureResource> baseTex { get; }
+    public ResourceHandle<TextureResource> metallicRoughnessTex { get; }
+    public ResourceHandle<TextureResource> normalTex { get; }
+    public ResourceHandle<TextureResource> occlusionTex { get; }
+    public ResourceHandle<TextureResource> emissiveTex { get; }
+
+    public MaterialResource(string id, ResourceManager rm, PbrMaterial mat) : this(id)
+    {
+        this.manager = rm;
+        Material = mat;
+        baseTex = new ResourceHandle<TextureResource>(manager, id + "_baseTex");
+        metallicRoughnessTex = new ResourceHandle<TextureResource>(manager, id + "_metallicRoughnessTex");
+        normalTex = new ResourceHandle<TextureResource>(manager, id + "_normalTex");
+        occlusionTex = new ResourceHandle<TextureResource>(manager, id + "_occlusionTex");
+        emissiveTex = new ResourceHandle<TextureResource>(manager, id + "_emissiveTex");
+    }
+    public override bool Load()
+    {
+        return base.Load();
+    }
+
+    public Texture[] GetMaterialTextures()
+    {
+        return [
+            baseTex.Get()!.Texture,
+            metallicRoughnessTex.Get()!.Texture,
+            normalTex.Get()!.Texture,
+            occlusionTex.Get()!.Texture,
+            emissiveTex.Get()!.Texture
+        ];
+    }
+
     ~MaterialResource()
     {
         Unload();
     }
-    
-}
-
-public unsafe class ShaderResource(string id) : Resource(id)
-{
-    ShaderModule shaderModule;
-    ShaderStageFlags stage;
-    ~ShaderResource()
-    {
-        Unload();
-    }
-
-    public override bool Load()
-    {
-        //determine file ext based on shader
-        string ext;
-        switch (stage)
-        {
-            case ShaderStageFlags.VertexBit: ext = ".vert"; break;
-            case ShaderStageFlags.FragmentBit: ext = ".frag"; break;
-            case ShaderStageFlags.ComputeBit: ext = ".comp"; break;
-            default: return false;
-        }
-        
-        //load shader from file
-        string filePath = "shaders/" + GetId() + ext + ".spv";
-        
-        //read shader code
-        var shaderCode = File.ReadAllBytes(filePath);
-        
-        //create shader module
-        CreateShaderModule(shaderCode);
-        
-        return base.Load();
-    }
 
     public override void Unload()
     {
-        if (IsLoaded())
-        {
-            Vk? vk = Vk.GetApi();
-            //Get device from somewhere
-            Device device = GetDevice();
-            vk!.DestroyShaderModule(device, shaderModule, null);
-            
-        }
-    }
-    //getters for vulkan resources
-    public ShaderModule GetShaderModule() => shaderModule;
-    public ShaderStageFlags GetStage() => stage;
-    private Device GetDevice()
-    {
-        return default;
-    }
-
-    private void CreateShaderModule(byte[] shaderCode)
-    {
-        //implementation to create vulkan shader module
-        //...
+        base.Unload();
     }
 }
+
 
 public class AsyncResourceManager : IDisposable
 {

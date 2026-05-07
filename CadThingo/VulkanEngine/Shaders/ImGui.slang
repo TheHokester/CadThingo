@@ -5,13 +5,13 @@
 struct VSInput {
     float2 position : POSITION;
     float2 uv : TEXCOORD0;
-    float color : COLOR0;
+    float4 color : COLOR0;
 }
 
 struct VSOutput {
     float4 screenPos : SV_POSITION;
     float2 uv : TEXCOORD0;
-    float color : COLOR0;
+    float4 color : COLOR0;
 }
 
 

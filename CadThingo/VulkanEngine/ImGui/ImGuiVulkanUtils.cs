@@ -61,6 +61,13 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
     // Dynamic state tracking for performance optimization
     bool needsUpdateBuffers = false; // Flag indicating buffer resize requirements
 
+    // Tracks which ImGuiKeys we've already reported as down. Silk.NET's GLFW backend
+    // fires KeyDown on every OS-level key-repeat, but ImGui has its own internal
+    // repeat handling for IsKeyPressed(repeat=true). Forwarding repeats compounds
+    // the two and produces "ludicrous speed" deletes/backspaces in InputText. We
+    // only forward true transitions and let ImGui drive repeat internally.
+    readonly HashSet<ImGuiKey> _keysDown = new();
+
     // Modern Vulkan rendering configuration
     PipelineRenderingCreateInfo renderingInfo; //dynamic rendering setup info\
     // Pipeline color format — mirrors renderer.swapChainImageFormat at construction so the
@@ -102,7 +109,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         vk!.DestroyDescriptorSetLayout(device, descriptorSetLayout, null);
         vk!.DestroyDescriptorPool(device, descriptorPool, null);
         
-        
+        GC.SuppressFinalize(this);
     }
 
     /// <summary>
@@ -142,6 +149,18 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         // EventCategory.Input matches all of those (Keyboard | Mouse | MouseButton
         // are all flagged with Input).
         Engine.EventBus.AddListener(this, EventCategory.Input);
+
+        // Hook Silk.NET's KeyChar directly. The OS/GLFW text-input pipeline produces
+        // proper Unicode codepoints here (handles shift, layouts, IME, etc.) — that
+        // is the only correct source for AddInputCharacter. Doing it from KeyDown
+        // by casting an ImGuiKey enum value gives garbage codepoints (rendered as ?).
+        if (Engine.keyboard != null)
+        {
+            Engine.keyboard.KeyChar += (_, c) =>
+            {
+                ImGuiNET.ImGui.GetIO().AddInputCharacter(c);
+            };
+        }
     }
 
     /// <summary>
@@ -219,6 +238,13 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
     /// <returns></returns>
     public bool newFrame()
     {
+        // Without a real DeltaTime, ImGui's clock advances at a fixed 1/60 per
+        // NewFrame. At very high framerates that makes its internal timers (key
+        // repeat, hover delays, animations) fire many times faster than wall-clock
+        // — e.g. "ludicrous speed" backspace/delete. Clamp guards against the
+        // first frame and any pause-induced spikes that would jump ImGui state.
+        ImGuiIOPtr io = ImGuiNET.ImGui.GetIO();
+        io.DeltaTime = Math.Clamp(Engine.DeltaTime, 1.0f / 10000.0f, 1.0f / 15.0f);
 
         ImGuiNET.ImGui.NewFrame();
         ImGuiNET.ImGui.ShowDemoWindow();
@@ -307,11 +333,26 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         {
             case KeyPressEvent kp:
                 if (ImGuiHelpers.TryMapGlfwKey(kp.GetKeyCode, out var imKeyDown))
-                    io.AddKeyEvent(imKeyDown, true);
+                {
+                    // Suppress OS key-repeats: only forward true transitions. ImGui
+                    // runs its own repeat logic for IsKeyPressed(repeat=true).
+                    if (_keysDown.Add(imKeyDown))
+                    {
+                        io.AddKeyEvent(imKeyDown, true);
+                        UpdateImGuiModifiers(io);
+                    }
+                    // Text input is delivered via Silk's KeyChar event (see init()).
+                }
                 break;
             case KeyReleaseEvent kr:
                 if (ImGuiHelpers.TryMapGlfwKey(kr.GetKeyCode, out var imKeyUp))
-                    io.AddKeyEvent(imKeyUp, false);
+                {
+                    if (_keysDown.Remove(imKeyUp))
+                    {
+                        io.AddKeyEvent(imKeyUp, false);
+                        UpdateImGuiModifiers(io);
+                    }
+                }
                 break;
             case MouseMoveEvent mm:
                 io.AddMousePosEvent(mm.GetAbsX(), mm.GetAbsY());
@@ -326,6 +367,20 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
                 io.AddMouseWheelEvent(ms.GetX(), ms.GetY());
                 break;
         }
+    }
+
+    // Mirror modifier state to ImGui's dedicated mod keys. ImGui needs these set
+    // for shortcuts like Ctrl+A / Shift+Arrow / Alt+click inside InputText.
+    void UpdateImGuiModifiers(ImGuiIOPtr io)
+    {
+        io.AddKeyEvent(ImGuiKey.ModCtrl,
+            _keysDown.Contains(ImGuiKey.LeftCtrl)  || _keysDown.Contains(ImGuiKey.RightCtrl));
+        io.AddKeyEvent(ImGuiKey.ModShift,
+            _keysDown.Contains(ImGuiKey.LeftShift) || _keysDown.Contains(ImGuiKey.RightShift));
+        io.AddKeyEvent(ImGuiKey.ModAlt,
+            _keysDown.Contains(ImGuiKey.LeftAlt)   || _keysDown.Contains(ImGuiKey.RightAlt));
+        io.AddKeyEvent(ImGuiKey.ModSuper,
+            _keysDown.Contains(ImGuiKey.LeftSuper) || _keysDown.Contains(ImGuiKey.RightSuper));
     }
     
     /// <summary>

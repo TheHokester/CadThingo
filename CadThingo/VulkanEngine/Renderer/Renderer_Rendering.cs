@@ -1,6 +1,7 @@
 ﻿using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.GLTF;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 
@@ -283,6 +284,7 @@ public unsafe partial class Renderer
         gBufferNormal.Dispose();
         gBufferAlbedo.Dispose();
         gBufferMaterial.Dispose();
+        gBufferEmissive.Dispose();
 
         CleanupSwapChain();
 
@@ -325,6 +327,8 @@ public unsafe partial class Renderer
 
         // 5. Update per-frame UBOs
         // UpdateGeometryUBO is per-entity — wired in Phase 5/6 once entities exist.
+        
+        UpdateGeometryFrameUBO(currentFrame, camera);
         UpdateLightingUBO(currentFrame, camera);
 
         // 6. Record all render-graph passes (geometry → lighting), record-only.
@@ -469,6 +473,8 @@ public unsafe partial class Renderer
         
         
         graph.AddResource(gBufferMaterial);
+        // Emissive — sampled by the lighting pass and added to the final color before tone-mapping.
+        graph.AddResource(gBufferEmissive);
         //configure depth buffer for accurate depth information
         //standard 32bit depth format preserves accurate depth information
         graph.AddResource(depthImageResource);
@@ -483,11 +489,11 @@ public unsafe partial class Renderer
         //configure geometry pass for G-buffer population
         //this pass renders all geometry and stores intermediate data for lighting calculations
         graph.AddPass("GeometryPass", default,
-            new List<string> { "GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "Depth" }, buffer =>
+            new List<string> { "GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "GBuffer_Emissive", "Depth" }, buffer =>
             {
                 //Configure multiple render target attachments for GBuffer output
                 //each attachment corresponds to a seperate geometric property
-                RenderingAttachmentInfoKHR* colorAttachments = stackalloc RenderingAttachmentInfoKHR[4];
+                RenderingAttachmentInfoKHR* colorAttachments = stackalloc RenderingAttachmentInfoKHR[5];
                 colorAttachments[0] = new()
                 {
                     SType = StructureType.RenderingAttachmentInfoKhr,
@@ -520,6 +526,14 @@ public unsafe partial class Renderer
                     LoadOp = AttachmentLoadOp.Clear,
                     StoreOp = AttachmentStoreOp.Store
                 };
+                colorAttachments[4] = new()
+                {
+                    SType = StructureType.RenderingAttachmentInfoKhr,
+                    ImageView = graph.GetResource("GBuffer_Emissive").ImageView,
+                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
+                    LoadOp = AttachmentLoadOp.Clear,
+                    StoreOp = AttachmentStoreOp.Store
+                };
                 //Configure depth attachment for occlusion culling
                 RenderingAttachmentInfoKHR depthAttachment = new()
                 {
@@ -536,7 +550,7 @@ public unsafe partial class Renderer
                     SType = StructureType.RenderingInfoKhr,
                     RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
                     LayerCount = 1,
-                    ColorAttachmentCount = 4,
+                    ColorAttachmentCount = 5,
                     PColorAttachments = (RenderingAttachmentInfo*)colorAttachments,
                     PDepthAttachment = (RenderingAttachmentInfo*)&depthAttachment
                 };
@@ -557,10 +571,14 @@ public unsafe partial class Renderer
                 vk!.CmdSetViewport(buffer, 0, 1, &vp);
                 vk!.CmdSetScissor(buffer, 0, 1, &scissor);
 
-                // Bind per-frame geometry descriptor set (UBO + dummy samplers)
-                var dset = geometryDescriptorSets[currentFrame];
+                // Set 0 (FrameUBO) + Set 1 (bindless: materials/instances/textures/samplers)
+                // bound once. The whole geometry pass issues zero per-draw rebinds and zero
+                // push constants — model + materialIndex live in the per-instance SSBO.
+                var frameSet = geometryDescriptorSets[currentFrame];
+                var bindlessSet = bindlessDescriptorSets[currentFrame];
+                var geomSets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
                 vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    geometryPipelineLayout, 0, 1, &dset, 0, null);
+                    geometryPipelineLayout, 0, 2, geomSets, 0, null);
 
                 // Bind global VB/IB once — every mesh is packed into these
                 var vb = Engine.ResourceManager.GlobalVertexBuffer;
@@ -569,54 +587,65 @@ public unsafe partial class Renderer
                 vk!.CmdBindVertexBuffers(buffer, 0, 1, &vb, &vbOffset);
                 vk!.CmdBindIndexBuffer(buffer, ib, 0, IndexType.Uint32);
 
-                // Default PBR push constants. Binding 1 is wired to a real base color
-                // texture at descriptor-set creation time, so BaseColorTextureSet = 0.
-                // Remaining texture slots fall back to dummy whites and stay disabled.
-                PbrPushConstants pcDefaults = new()
+                // ── Upload per-frame material SSBO ──────────────────────────────
+                // Copy every scene material followed by a fallback at slot [matCount] used by
+                // entities without a glTF material (legacy/proc geometry).
+                int matCount = scene.MaterialCount;
+                if (matCount + 1 > (int)MAX_MATERIALS)
+                    throw new InvalidOperationException($"Scene material count ({matCount}) exceeds MAX_MATERIALS ({MAX_MATERIALS}).");
+
+                PbrMaterial* matPtr = (PbrMaterial*)MaterialStorageBuffers[currentFrame].mapped;
+                for (int mi = 0; mi < matCount; mi++) matPtr[mi] = scene.Materials[mi];
+
+                int fallbackMatIdx = matCount;
+                matPtr[fallbackMatIdx] = new PbrMaterial
                 {
-                    BaseColorFactor = new Vector4(1, 1, 1, 1),
-                    MetallicFactor = 0.3f,
-                    RoughnessFactor = 0.7f,
-                    BaseColorTextureSet = 0,
-                    PhysicalDescriptorTextureSet = -1,
-                    NormalTextureSet = -1,
-                    OcclusionTextureSet = -1,
-                    EmissiveTextureSet = -1,
-                    AlphaMask = 0f,
-                    AlphaMaskCutoff = 0f,
+                    BaseColorFactor       = new Vector4(1, 1, 1, 1),
+                    MetallicFactor        = 0.3f,
+                    RoughnessFactor       = 0.7f,
+                    AlphaCutoff           = 0f,
+                    Flags                 = 0,
+                    BaseColorTex          = GltfDefaults.BaseColorIndex,
+                    PhysicalDescriptorTex = GltfDefaults.MetallicRoughnessIndex,
+                    NormalTex             = GltfDefaults.NormalIndex,
+                    OcclusionTex          = GltfDefaults.OcclusionIndex,
+                    EmissiveTex           = GltfDefaults.EmissiveIndex,
                 };
 
-                // Iterate entities with MeshComponent. Model matrix is pushed via the mapped UBO
-                // (single-entity correct; multi-entity = last-write-wins until push-constant model lands).
+                // ── Walk entities, fill instance SSBO, draw inline ──────────────
+                InstanceDataGPU* instPtr = (InstanceDataGPU*)InstanceStorageBuffers[currentFrame].mapped;
+                int instanceCount = 0;
                 for (int i = 0; i < scene.EntityCount; i++)
                 {
                     Entity* e = scene.GetEntity(i);
                     if (e == null) continue;
                     var meshComp = e->GetComponent<MeshComponent>();
-                    if (meshComp == null) continue;
-                    if (currentFrame == 0)
+                    if (meshComp == null || meshComp.mesh == null) continue;
+                    var transform = e->GetComponent<TransformComponent>();
+                    if (transform == null) continue;
+                    if (instanceCount >= (int)MAX_INSTANCES)
+                        throw new InvalidOperationException($"Scene instance count exceeds MAX_INSTANCES ({MAX_INSTANCES}).");
+
+                    int matIdx = meshComp.materialIndex >= 0 ? meshComp.materialIndex : fallbackMatIdx;
+
+                    instPtr[instanceCount] = new InstanceDataGPU
                     {
-                        
-                    }
-                    var meshPtr = meshComp.mesh;
-                    if (meshPtr == null) continue;
-
-                    UpdateGeometryUBO(currentFrame, e, camera);
-
-                    PbrPushConstants pc = pcDefaults;
-                    vk!.CmdPushConstants(buffer, geometryPipelineLayout,
-                        ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
-                        0, (uint)sizeof(PbrPushConstants), &pc);
+                        model = *transform.GetWorldMatrix(),
+                        materialIndex = (uint)matIdx,
+                    };
 
                     Mesh m = *meshComp.mesh;
-                    vk!.CmdDrawIndexed(buffer, (uint)m.count, 1, (uint)m.offset, 0, 0);
+                    // firstInstance feeds gl_InstanceID/SV_InstanceID in the vertex shader so
+                    // the VS can index into the InstanceData SSBO without push constants.
+                    vk!.CmdDrawIndexed(buffer, (uint)m.count, 1, (uint)m.offset, 0, (uint)instanceCount);
+                    instanceCount++;
                 }
 
                 vk!.CmdEndRendering(buffer);
             });
         
         
-        graph.AddPass("LightingPass", new List<string>{"GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material","Depth"},
+        graph.AddPass("LightingPass", new List<string>{"GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "GBuffer_Emissive", "Depth"},
             new List<string>{"FinalColor"}, buffer =>
             {
                 //configure single color output for final lighting result
@@ -656,7 +685,8 @@ public unsafe partial class Renderer
                 vk!.CmdSetViewport(buffer, 0, 1, &vp);
                 vk!.CmdSetScissor(buffer, 0, 1, &scissor);
 
-                // Set 0 = per-frame LightingUBO, Set 1 = shared G-buffer samplers
+                // Set 0 = per-frame LightingUBO + TLAS, Set 1 = shared G-buffer samplers.
+                // No push constants — lighting pass reads everything from descriptor bindings.
                 var sets = stackalloc DescriptorSet[2]
                 {
                     lightingDescriptorSets[currentFrame],
@@ -664,25 +694,6 @@ public unsafe partial class Renderer
                 };
                 vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
                     pbrPipelineLayout, 0, 2, sets, 0, null);
-
-                // Shader declares PushConstants but PSMain doesn't read it in the lighting pass;
-                // push defaults so the range is initialized.
-                PbrPushConstants pc = new()
-                {
-                    BaseColorFactor = new Vector4(1, 1, 1, 1),
-                    MetallicFactor = 0.3f,
-                    RoughnessFactor = 0.7f,
-                    BaseColorTextureSet = -1,
-                    PhysicalDescriptorTextureSet = -1,
-                    NormalTextureSet = -1,
-                    OcclusionTextureSet = -1,
-                    EmissiveTextureSet = -1,
-                    AlphaMask = 0f,
-                    AlphaMaskCutoff = 0f,
-                };
-                vk!.CmdPushConstants(buffer, pbrPipelineLayout,
-                    ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
-                    0, (uint)sizeof(PbrPushConstants), &pc);
 
                 // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
                 vk!.CmdDraw(buffer, 3, 1, 0, 0);
