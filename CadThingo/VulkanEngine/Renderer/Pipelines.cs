@@ -272,130 +272,6 @@ public unsafe partial class Renderer
         vk!.DestroyShaderModule(device, shaderModule, null);
     }
 
-    // Set 0 of the geometry pipeline. One binding (the per-frame FrameUBO with view+proj),
-    // bound once at the start of the geometry pass and reused for every draw.
-    private void CreateGeometryFrameDescriptorSetLayout()
-    {
-        var binding = new DescriptorSetLayoutBinding
-        {
-            Binding = 0,
-            DescriptorType = DescriptorType.UniformBuffer,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.VertexBit,
-            PImmutableSamplers = null,
-        };
-
-        DescriptorSetLayoutBindingFlagsCreateInfo flagsCreateInfo = new()
-            { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
-        var flag = DescriptorBindingFlags.UpdateAfterBindBit |
-                   DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-
-        if (descriptorIndexEnabled)
-        {
-            flagsCreateInfo.BindingCount = 1;
-            flagsCreateInfo.PBindingFlags = &flag;
-        }
-
-        DescriptorSetLayoutCreateInfo layoutInfo = new()
-        {
-            SType = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 1,
-            PBindings = &binding,
-        };
-        if (descriptorIndexEnabled)
-        {
-            layoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
-            layoutInfo.PNext = &flagsCreateInfo;
-        }
-
-        if (vk!.CreateDescriptorSetLayout(device, &layoutInfo, null, out geometryFrameDescriptorSetLayout) !=
-            Result.Success)
-            throw new Exception("Failed to create geometry frame descriptor set layout");
-    }
-
-    // Set 1 of the geometry pipeline. Five PBR textures (baseColor, metallicRoughness, normal,
-    // occlusion, emissive). One set per material; bound per-draw.
-    const int materialSetCount = 5;
-    
-    private void CreateGeometryMaterialDescriptorSetLayout()
-    {
-        var bindings = new DescriptorSetLayoutBinding[]
-        {
-            new()
-            {
-                Binding = 0,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit,
-            },
-            new()
-            {
-                Binding = 1,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.VertexBit|ShaderStageFlags.FragmentBit,
-            },
-            new()
-            {
-                Binding = 2,
-                DescriptorType = DescriptorType.SampledImage,
-                DescriptorCount = MAX_MATERIALS * 5,
-                StageFlags = ShaderStageFlags.FragmentBit,
-            }, 
-            new()
-            {
-                Binding = 3,
-                DescriptorType = DescriptorType.Sampler,
-                DescriptorCount = 8,
-                StageFlags = ShaderStageFlags.FragmentBit,
-            }
-        };
-        
-            
-
-        DescriptorSetLayoutBindingFlagsCreateInfo flagsCreateInfo = new()
-            { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
-        var flags = stackalloc DescriptorBindingFlags[bindings.Length];
-
-        fixed (DescriptorSetLayoutBinding* pBindings = bindings)
-        {
-            if (descriptorIndexEnabled)
-            {
-                // Only the bindless texture array (binding 2) needs UpdateAfterBind +
-                // PartiallyBound — RegisterBindless writes new texture slots while the set
-                // is live. The two storage buffers (bindings 0,1) and sampler (3) are
-                // written once at setup, so they don't need UpdateAfterBind (which would
-                // require descriptorBindingStorageBufferUpdateAfterBind / SamplerUpdateAfterBind
-                // features that we don't request).
-                flags[0] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-                flags[1] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-                flags[2] = DescriptorBindingFlags.UpdateAfterBindBit |
-                           DescriptorBindingFlags.UpdateUnusedWhilePendingBit |
-                           DescriptorBindingFlags.PartiallyBoundBit;
-                flags[3] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-
-                flagsCreateInfo.BindingCount = (uint)bindings.Length;
-                flagsCreateInfo.PBindingFlags = flags;
-            }
-
-            DescriptorSetLayoutCreateInfo layoutInfo = new()
-            {
-                SType = StructureType.DescriptorSetLayoutCreateInfo,
-                BindingCount = (uint)bindings.Length,
-                PBindings = pBindings,
-            };
-            if (descriptorIndexEnabled)
-            {
-                layoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
-                layoutInfo.PNext = &flagsCreateInfo;
-            }
-
-            if (vk!.CreateDescriptorSetLayout(device, &layoutInfo, null, out geometryMaterialDescriptorSetLayout) !=
-                Result.Success)
-                throw new Exception("Failed to create geometry material descriptor set layout");
-        }
-    }
-
     private void CreateGeometryPipeline()
     {
         byte[] shaderCode =
@@ -520,7 +396,6 @@ public unsafe partial class Renderer
         var setLayouts = stackalloc DescriptorSetLayout[]
         {
             geometryFrameDescriptorSetLayout,
-            geometryMaterialDescriptorSetLayout,
         };
         PipelineLayoutCreateInfo layoutInfo = new()
         {
@@ -530,7 +405,7 @@ public unsafe partial class Renderer
             PushConstantRangeCount = 0,
             PPushConstantRanges = null
         };
-        vk!.CreatePipelineLayout(device, &layoutInfo, null, out geometryPipelineLayout);
+        // vk!.CreatePipelineLayout(device, &layoutInfo, null, out geometryPipelineLayout);
 
         //assemble complete pipeline
         GraphicsPipelineCreateInfo pipelineInfo = new()
@@ -546,7 +421,7 @@ public unsafe partial class Renderer
             PDepthStencilState = &depthStencil,
             PColorBlendState = &colorBlendInfo,
             PDynamicState = &dynamicStateInfo,
-            Layout = geometryPipelineLayout,
+            // Layout = geometryPipelineLayout,
             RenderPass = default,
             Subpass = 0,
             BasePipelineHandle = default,
@@ -573,7 +448,7 @@ public unsafe partial class Renderer
             pipelineInfo.PNext = pRenderingInfo;
         }
 
-        vk!.CreateGraphicsPipelines(device, default, 1, &pipelineInfo, null, out geometryPipeline);
+        // vk!.CreateGraphicsPipelines(device, default, 1, &pipelineInfo, null, out geometryPipeline);
         
         vk!.DestroyShaderModule(device, shader, null);
     }
@@ -949,15 +824,18 @@ public abstract unsafe class PipelineBase : IDisposable
     // Subclasses populate these in CreateDescriptorSetLayouts(). The default
     // CreatePipelineLayout() reads them to build the VkPipelineLayout.
     protected DescriptorSetLayout[] DescriptorSetLayouts = Array.Empty<DescriptorSetLayout>();
+
     /// <summary>
     /// Descriptor sets for the pipeline <br/>
     /// DescriptorSets[layoutNum][frame]
     /// </summary>
-    protected DescriptorSet[][] DescriptorSets = Array.Empty<DescriptorSet[]>();
+    protected DescriptorSet[][] DescriptorSets;
     protected PushConstantRange[]   PushConstantRanges   = Array.Empty<PushConstantRange>();
 
     public Pipeline                  Handle    => PipelineHandle;
     public PipelineLayout            Layout    => PipelineLayoutHandle;
+    
+    public DescriptorSet GetDescriptorSet(int layoutNum, uint frame) => DescriptorSets[layoutNum][frame];
     public abstract PipelineBindPoint BindPoint { get; }
 
     protected PipelineBase(Renderer renderer)
@@ -1031,7 +909,7 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
     protected abstract Format[] ColorAttachmentFormats  { get; }
 
     // ── Optional hooks (defaults match the common case) ─────────────────────
-    protected virtual Format DepthAttachmentFormat => Format.Undefined;
+    protected virtual Format DepthAttachmentFormat { get; init; } = Format.Undefined;
 
     protected virtual (ShaderStageFlags Stage, string EntryPoint)[] ShaderStages => new[]
     {
@@ -1276,7 +1154,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     
     public GeometryPipeline(Renderer renderer) : base(renderer)
     {
-        
+        DepthAttachmentFormat = renderer.FindDepthFormat();
     }  
 
     protected override void CreateDescriptorSetLayouts()
@@ -1310,7 +1188,8 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts = layouts
         };
-        DescriptorSets = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES][];
+        DescriptorSets = new DescriptorSet[1][];
+        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
         fixed (DescriptorSet* pDS = DescriptorSets[0])
         {
             if (Vk.AllocateDescriptorSets(Device, &allocateInfo, pDS) != Result.Success)
@@ -1402,7 +1281,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     
     // Writes the per-frame view+proj into GeometryUniformBuffers[frameIndex].
     // Called once per frame in DrawFrame; per-draw model matrix is pushed via PbrPushConstants.
-    private void UpdateUbo(uint frameIndex, Camera camera)
+    public void UpdateUbo(uint frameIndex, Camera camera)
     {
         GeometryUBO ubo = new();
         if (camera != null)

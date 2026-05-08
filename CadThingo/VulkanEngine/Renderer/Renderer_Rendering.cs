@@ -328,7 +328,7 @@ public unsafe partial class Renderer
         // 5. Update per-frame UBOs
         // UpdateGeometryUBO is per-entity — wired in Phase 5/6 once entities exist.
         
-        UpdateGeometryFrameUBO(currentFrame, camera);
+        geometryPipeline.UpdateUbo(currentFrame, camera);
         var (lightCount, tileCountX, tileCountY) = UpdateLightingBuffers(currentFrame, camera, scene);
 
         // 5b. GPU cull pass — runs before the geometry pass and produces the
@@ -568,7 +568,7 @@ public unsafe partial class Renderer
                 vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
 
                 // Pipeline + dynamic state
-                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, geometryPipeline);
+                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, geometryPipeline.Handle);
 
                 Viewport vp = new()
                 {
@@ -583,11 +583,11 @@ public unsafe partial class Renderer
                 // Set 0 (FrameUBO) + Set 1 (bindless: materials/instances/textures/samplers)
                 // bound once. The whole geometry pass issues zero per-draw rebinds and zero
                 // push constants — model + materialIndex live in the per-instance SSBO.
-                var frameSet = geometryDescriptorSets[currentFrame];
+                var frameSet = geometryPipeline.GetDescriptorSet(0, currentFrame);
                 var bindlessSet = Engine.ResourceManager.GetBindlessSet(currentFrame);
                 var geomSets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
                 vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    geometryPipelineLayout, 0, 2, geomSets, 0, null);
+                    geometryPipeline.Layout, 0, 2, geomSets, 0, null);
 
                 // Bind global VB/IB once — every mesh is packed into these
                 var vb = Engine.ResourceManager.GlobalVertexBuffer;

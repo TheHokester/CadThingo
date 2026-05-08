@@ -94,8 +94,7 @@ public unsafe partial class Renderer
     //pipelines 
     PipelineLayout pipelineLayout;
     Pipeline graphicsPipeline;
-    PipelineLayout geometryPipelineLayout;
-    Pipeline geometryPipeline;
+    GeometryPipeline geometryPipeline;
     PipelineLayout pbrPipelineLayout;
     Pipeline pbrLightingPipeline;
     Pipeline pbrBlendGraphicsPipeline;
@@ -143,7 +142,6 @@ public unsafe partial class Renderer
     Camera camera;
     public Camera Camera => camera;
     //Uniform buffers — split per pass (Geometry pass writes model/view/proj; Lighting pass writes lights + camPos + tone-mapping params)
-    private UboBuffer[] GeometryUniformBuffers = new UboBuffer[2];
     private UboBuffer[] LightingUniformBuffers = new UboBuffer[2];
     // Per-frame StructuredBuffer<PbrLight> — populated each frame in UpdateLightingBuffers
     // by walking scene.EnumerateLights(). Bound at PBR set 0, binding 1.
@@ -178,11 +176,9 @@ public unsafe partial class Renderer
     //store for lifetime management
     DescriptorSetLayout descriptorSetLayout;
     DescriptorSetLayout geometryFrameDescriptorSetLayout;    // Geometry pipeline set 0 — FrameUBO (view+proj)
-    DescriptorSetLayout geometryMaterialDescriptorSetLayout; // Geometry pipeline set 1 — bindless materials/instances/textures/samplers
     DescriptorSetLayout PBRDescriptorSetLayout; //Set 0 - Lighting UBO
     DescriptorSetLayout PBRGBufferDescriptorSetLayout;//Set 1 - G buffer descriptors
     internal DescriptorPool descriptorPool;
-    private DescriptorSet[] geometryDescriptorSets;
     private DescriptorSet[] lightingDescriptorSets;   // per-frame, binds LightingUBO (set 0)
     private DescriptorSet gBufferDescriptorSet;       // shared, binds G-buffer samplers (set 1)
      
@@ -211,11 +207,15 @@ public unsafe partial class Renderer
         CreateImageViews();
         SetupDynamicRendering();
         CreateDescriptorSetLayout();
-        CreateGeometryFrameDescriptorSetLayout();
-        CreateGeometryMaterialDescriptorSetLayout();
         CreatePBRDescriptorSetLayout();
         CreateGraphicsPipeline();
-        CreateGeometryPipeline();
+        
+        CreateDescriptorPool();
+        Engine.ResourceManager.Initialize(this);
+        
+        geometryPipeline = new GeometryPipeline(this);
+        geometryPipeline.Initialize();
+        
         CreatePBRPipeline();
         CreateCullDescriptorSetLayout();
         CreateCullPipeline();
@@ -239,9 +239,6 @@ public unsafe partial class Renderer
         
         CreateGBufferSampler();
         //Create descriptor pool (sized for bindless: storage buffers, sampled images, samplers).
-        CreateDescriptorPool();
-        Engine.ResourceManager.Initialize(this);
-        CreateDescriptorSets();
 
         // Bindless geometry-set 1 setup: per-frame material+instance SSBOs, shared default sampler,
         // and the per-frame descriptor sets they all live in. Texture array (binding 2) is filled
@@ -416,10 +413,6 @@ public unsafe partial class Renderer
         // ── Per-frame uniform + storage buffers (FreeMemory implicitly unmaps) ─
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
         {
-            if (GeometryUniformBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, GeometryUniformBuffers[i].buffer, null);
-            if (GeometryUniformBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, GeometryUniformBuffers[i].memory, null);
             if (LightingUniformBuffers[i].buffer.Handle != 0)
                 vk.DestroyBuffer(device, LightingUniformBuffers[i].buffer, null);
             if (LightingUniformBuffers[i].memory.Handle != 0)
@@ -451,16 +444,16 @@ public unsafe partial class Renderer
         }
 
         // ── Pipelines + layouts ─────────────────────────────────
+        geometryPipeline.Dispose();
+        
         if (lightCullPipeline.Handle   != 0) vk.DestroyPipeline(device, lightCullPipeline,   null);
         if (cullPipeline.Handle        != 0) vk.DestroyPipeline(device, cullPipeline,        null);
         if (pbrLightingPipeline.Handle != 0) vk.DestroyPipeline(device, pbrLightingPipeline, null);
-        if (geometryPipeline.Handle    != 0) vk.DestroyPipeline(device, geometryPipeline,    null);
         if (graphicsPipeline.Handle    != 0) vk.DestroyPipeline(device, graphicsPipeline,    null);
 
         if (lightCullPipelineLayout.Handle != 0) vk.DestroyPipelineLayout(device, lightCullPipelineLayout, null);
         if (cullPipelineLayout.Handle     != 0) vk.DestroyPipelineLayout(device, cullPipelineLayout,     null);
         if (pbrPipelineLayout.Handle      != 0) vk.DestroyPipelineLayout(device, pbrPipelineLayout,      null);
-        if (geometryPipelineLayout.Handle != 0) vk.DestroyPipelineLayout(device, geometryPipelineLayout, null);
         if (pipelineLayout.Handle         != 0) vk.DestroyPipelineLayout(device, pipelineLayout,         null);
 
         // ── Descriptor pool (frees sets) + layouts ──────────────
@@ -470,7 +463,6 @@ public unsafe partial class Renderer
         if (PBRGBufferDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, PBRGBufferDescriptorSetLayout, null);
         if (PBRDescriptorSetLayout.Handle        != 0) vk.DestroyDescriptorSetLayout(device, PBRDescriptorSetLayout,        null);
         if (geometryFrameDescriptorSetLayout.Handle   != 0) vk.DestroyDescriptorSetLayout(device, geometryFrameDescriptorSetLayout,   null);
-        if(geometryMaterialDescriptorSetLayout.Handle !=0) vk!.DestroyDescriptorSetLayout(device, geometryMaterialDescriptorSetLayout, null);
         if (descriptorSetLayout.Handle           != 0) vk.DestroyDescriptorSetLayout(device, descriptorSetLayout,           null);
 
         // ── Command pool (frees buffers) ────────────────────────

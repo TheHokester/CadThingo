@@ -222,7 +222,6 @@ public unsafe partial class Renderer
     {
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
         {
-            CreateMappedUniformBuffer(sizeof(GeometryUBO), ref GeometryUniformBuffers[i]);
             CreateMappedUniformBuffer(sizeof(LightingFrameUBO), ref LightingUniformBuffers[i]);
             CreateMappedStorageBuffer((ulong)(MAX_LIGHTS * (uint)sizeof(PbrLightGpu)), ref LightStorageBuffers[i]);
         }
@@ -367,48 +366,7 @@ public unsafe partial class Renderer
             }
         }
     }
-    private void CreateDescriptorSets()
-    {
-        // Per-frame "frame" descriptor sets (set 0): only binding 0 = FrameUBO (view+proj).
-        // Material samplers live on set 1 and are allocated from materialDescriptorPool.
-        var layouts = stackalloc DescriptorSetLayout[(int)MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++) layouts[i] = geometryFrameDescriptorSetLayout;
-
-        DescriptorSetAllocateInfo allocateInfo = new()
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = descriptorPool,
-            DescriptorSetCount = MAX_CONCURRENT_FRAMES,
-            PSetLayouts = layouts
-        };
-        geometryDescriptorSets = new DescriptorSet[MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* pSets = geometryDescriptorSets)
-        {
-            if (vk!.AllocateDescriptorSets(device, &allocateInfo, pSets) != Result.Success)
-                throw new Exception("Failed to allocate geometry frame descriptor sets");
-        }
-
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo bufferInfo = new()
-            {
-                Buffer = GeometryUniformBuffers[i].buffer,
-                Offset = 0,
-                Range = (ulong)sizeof(GeometryUBO),
-            };
-            WriteDescriptorSet descriptorWrite = new()
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = geometryDescriptorSets[i],
-                DstBinding = 0,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.UniformBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &bufferInfo
-            };
-            vk!.UpdateDescriptorSets(device, 1, &descriptorWrite, 0, null);
-        }
-    }
+   
 
     // Geometry pipeline set 1 size budget. Layout binding counts must match.
     internal const uint MAX_MATERIALS         = 256;
@@ -734,26 +692,7 @@ public unsafe partial class Renderer
 
     // Writes the per-frame view+proj into GeometryUniformBuffers[frameIndex].
     // Called once per frame in DrawFrame; per-draw model matrix is pushed via PbrPushConstants.
-    private void UpdateGeometryFrameUBO(uint frameIndex, Camera camera)
-    {
-        GeometryUBO ubo = new();
-        if (camera != null)
-        {
-            ubo.proj = camera.GetProjectionMatrix((float)swapChainExtent.Width / swapChainExtent.Height, 0.1f, 100.0f);
-            ubo.view = camera.GetViewMatrix();
-            ubo.proj.M22 *= -1; // Vulkan clip space has Y down
-        }
-        else
-        {
-            ubo.view = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), new Vector3(0, 0, 0), new Vector3(0, 0, 1));
-            ubo.proj = Matrix4x4.CreatePerspectiveFieldOfView((float)(45 * Math.PI / 180),
-                (float)swapChainExtent.Width / swapChainExtent.Height, 0.1f, 100.0f);
-            ubo.proj.M22 *= -1; // flip Y for Vulkan clip space
-        }
-
-        void* data = GeometryUniformBuffers[frameIndex].mapped;
-        new Span<GeometryUBO>(data, 1).Fill(ubo);
-    }
+    
 
     // Reusable scratch list filled by Scene.EnumerateLights. Lives on the renderer
     // so we don't allocate a fresh List<LightComponent> every frame.
