@@ -7,12 +7,17 @@ namespace CadThingo.VulkanEngine;
 
 /// <summary>
 /// Mesh allocated in unmanaged memory so MeshComponent can hold a raw Mesh*.
+/// <para><c>sphereLocal</c> is the bounding sphere in mesh-local space:
+/// xyz = center, w = radius. Computed in <see cref="ResourceManager.UploadMesh"/>
+/// from vertex positions so the GPU cull pass can frustum-test each renderable
+/// without re-walking vertex data.</para>
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct Mesh
 {
     public int offset;
     public int count;
+    public Vector4 sphereLocal;
 }
 
 public class Scene
@@ -54,6 +59,27 @@ public class Scene
     }
 
     public unsafe Entity* GetEntity(int index) => (Entity*)_entityList[index];
+
+    /// <summary>
+    /// Appends every enabled <see cref="LightComponent"/> attached to an active entity
+    /// to <paramref name="output"/>. Used by <c>UpdateLightingBuffers</c> to pack the
+    /// per-frame StructuredBuffer&lt;PbrLight&gt;.
+    ///
+    /// Returns a list (not an iterator) because the body dereferences raw Entity*
+    /// pointers — C# disallows the <c>unsafe</c> modifier on yield-return iterators.
+    /// </summary>
+    public unsafe void EnumerateLights(List<LightComponent> output)
+    {
+        output.Clear();
+        foreach (var ptr in _entityList)
+        {
+            var e = (Entity*)ptr;
+            if (e == null || !e->IsActive) continue;
+            var light = e->GetComponent<LightComponent>();
+            if (light == null || !light.Enabled) continue;
+            output.Add(light);
+        }
+    }
 
     /// <summary>
     /// Registers a bindless material on the scene. Returns the int index stored on

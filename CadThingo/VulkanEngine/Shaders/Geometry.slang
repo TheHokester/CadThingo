@@ -39,10 +39,17 @@ struct GBufferOutput {
 [[vk::binding(2,1)]] Texture2D                      textures[];
 [[vk::binding(3,1)]] SamplerState                   samplers[];
 
+                // SV_InstanceID is the *relative* instance id within a draw call (HLSL
+                // semantic). Slang lowers it to gl_InstanceIndex - gl_BaseInstance, which
+                // is always 0 here (instanceCount=1). We need the *absolute* index to look
+                // up instances[firstInstance], so re-add SV_StartInstanceLocation (=
+                // gl_BaseInstance, the firstInstance the indirect cmd was issued with).
 [[shader("vertex")]]
-VSOutput VSMain(VSInput input, uint instanceIndex : SV_InstanceID)
+VSOutput VSMain(VSInput input,
+                uint instanceIndex : SV_InstanceID,
+                uint baseInstance  : SV_StartInstanceLocation)
 {
-    InstanceData inst = instances[instanceIndex];
+    InstanceData inst = instances[instanceIndex + baseInstance];
 
     float4 worldPos = mul(inst.model, float4(input.Position, 1.0));
 
@@ -56,24 +63,50 @@ VSOutput VSMain(VSInput input, uint instanceIndex : SV_InstanceID)
     return output;
 }
 
+// DEBUG: visualize MaterialIndex directly. If every prim shows ONE color, the
+// VS→FS materialIndex pipeline is broken (likely firstInstance). If different
+// prims show different colors, materialIndex is correctly delivered and the bug
+// is downstream in materials[]/textures[]. Set to 0 to disable.
+#define DEBUG_MATERIAL_INDEX 0
+
 [[shader("fragment")]]
 GBufferOutput PSMain(VSOutput input)
 {
+#if DEBUG_MATERIAL_INDEX
+    GBufferOutput dbg;
+    uint mi = input.MaterialIndex;
+    float r = ((mi >> 0) & 1u) ? 1.0 : 0.0;
+    float g = ((mi >> 1) & 1u) ? 1.0 : 0.0;
+    float b = ((mi >> 2) & 1u) ? 1.0 : 0.0;
+    float scale = 0.3 + 0.7 * (((mi >> 3) & 1u) ? 1.0 : 0.0);
+    dbg.Position = float4(input.WorldPos, 1.0);
+    dbg.Normal   = float4(normalize(input.Normal), 0.0);
+    dbg.Albedo   = float4(r * scale, g * scale, b * scale, 0.0);
+    dbg.Material = float4(0.5, 1.0, 0.0, 0.0);
+    dbg.Emissive = float4(r * scale, g * scale, b * scale, 1.0); // emissive too so unlit areas still show
+    return dbg;
+#endif
+
     PbrMaterial mat = materials[input.MaterialIndex];
 
     // Sampler 0 is the shared linear-repeat default. All bindless textures use it for now.
     SamplerState s = samplers[0];
 
-    float4 baseColor       = textures[mat.baseColorTex].Sample(s, input.UV) * mat.baseColorFactor;
-    float2 metallicRoughness = textures[mat.physicalDescriptorTex].Sample(s, input.UV).bg;
+    // NonUniformResourceIndex is required for descriptor-array indices that may vary
+    // across a wave (different primitives in the same wave can carry different material
+    // indices). Without it, Vulkan leaves the result undefined and most drivers sample
+    // the first lane's texture for the whole wave — i.e. neighbouring prims/models
+    // appear to share textures.
+    float4 baseColor       = textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV) * mat.baseColorFactor;
+    float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).bg;
     float metallic         = metallicRoughness.x * mat.metallicFactor;
     float roughness        = metallicRoughness.y * mat.roughnessFactor;
-    float ao               = textures[mat.occlusionTex].Sample(s, input.UV).r;
-    float3 emissive        = textures[mat.emissiveTex].Sample(s, input.UV).rgb;
+    float ao               = textures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;
+    float3 emissive        = textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb;
 
     float3 N = normalize(input.Normal);
     {
-        float3 tangentNormal = textures[mat.normalTex].Sample(s, input.UV).xyz * 2.0 - 1.0;
+        float3 tangentNormal = textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).xyz * 2.0 - 1.0;
         float3 T = normalize(input.Tangent.xyz);
         float3 B = normalize(cross(N, T)) * input.Tangent.w;
         float3x3 TBN = float3x3(T, B, N);

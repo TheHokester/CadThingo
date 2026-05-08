@@ -1,25 +1,39 @@
-﻿// Output from vertex shader / Input to fragment shader - Interpolated data
+// Output from vertex shader / Input to fragment shader - Interpolated data
 struct LightingVSOutput {
     float4 Position : SV_POSITION; // Required clip space position for rasterization
     float2 UV : TEXCOORD0;         // Texture coordinates (interpolated)
 };
 
-// Uniform buffer - Global data shared across all vertices/fragments
-struct LightingUBO {
-    float4 lightPositions[4];           // Light positions in world space
-    float4 lightColors[4];              // Light intensities and colors
+// Per-frame shading constants. The light array lives in a separate
+// StructuredBuffer<PbrLight> at binding 1; tileCounts + screenSize key the
+// per-tile light list (Phase 4).
+struct LightingFrameUBO {
     float4 camPos;                      // Camera position for view-dependent effects
     float exposure;                     // HDR exposure control
     float gamma;                        // Gamma correction value (typically 2.2)
     float prefilteredCubeMipLevels;     // IBL prefiltered environment map mip levels
     float scaleIBLAmbient;              // IBL ambient contribution scale
+    uint  lightCount;                   // Number of valid entries in lights[]
+    uint  tileCountX;                   // Phase 4 — tiles across the screen
+    uint  tileCountY;                   // Phase 4 — tiles down the screen
+    uint  _pad0;
+    float2 screenSize;                  // pixels (matches CPU swapChainExtent)
+    uint  _pad1;
+    uint  _pad2;
 };
 
 #include "PbrUtils.slang"
 
+// Tile cull constants — must match Renderer_Resources.cs.
+static const uint TILE_SIZE_PX        = 16u;
+static const uint MAX_LIGHTS_PER_TILE = 64u;
+
 // Resource bindings - Connect CPU resources to GPU shader registers
-[[vk::binding(0, 0)]] ConstantBuffer<LightingUBO> ubo;
-[[vk::binding(1, 0)]] RaytracingAccelerationStructure tlas;   // scene TLAS for ray-traced shadows
+[[vk::binding(0, 0)]] ConstantBuffer<LightingFrameUBO>      ubo;
+[[vk::binding(1, 0)]] StructuredBuffer<PbrLight>            lights;
+[[vk::binding(2, 0)]] RaytracingAccelerationStructure       tlas;   // scene TLAS for ray-traced shadows
+[[vk::binding(3, 0)]] StructuredBuffer<uint>                tileLightCount;
+[[vk::binding(4, 0)]] StructuredBuffer<uint>                tileLightIndices;
 
 // GBuffer inputs — Set 1 in your descriptor layout
 [[vk::binding(0, 1)]] Sampler2D gBufferPositionSampler;
@@ -54,7 +68,7 @@ bool isOccluded(float3 origin, float3 dir, float tMax)
 [[shader("vertex")]]
 LightingVSOutput VSMain(uint vertexID : SV_VertexID)
 {
-    // hardcoded fullscreen triangle — covers NDC in one draw call, to give the frag shader something to write on 
+    // hardcoded fullscreen triangle — covers NDC in one draw call, to give the frag shader something to write on
        float2 positions[3] = {
            float2(-1.0, -1.0),
            float2( 3.0, -1.0),
@@ -65,7 +79,7 @@ LightingVSOutput VSMain(uint vertexID : SV_VertexID)
            float2(2.0, 0.0),
            float2(0.0, 2.0)
        };
-    
+
        LightingVSOutput output;
        output.Position = float4(positions[vertexID], 0.0, 1.0);
        output.UV       = uvs[vertexID];
@@ -75,11 +89,11 @@ LightingVSOutput VSMain(uint vertexID : SV_VertexID)
 // Fragment shader entry point - Executes once per pixel
 [[shader("fragment")]]
 float4 PSMain(LightingVSOutput input) : SV_TARGET
-{ 
+{
     //unpack GBUFFER
     float3 WorldPos = gBufferPositionSampler.Sample(input.UV).xyz;
     float3 N = normalize(gBufferNormalSampler.Sample(input.UV)).xyz;
-    
+
     float4 albedoMet = gBufferAlbedoSampler.Sample(input.UV);
     float3 baseColor = albedoMet.rgb;
     float metallic = albedoMet.w;
@@ -89,7 +103,7 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     // === LIGHTING SETUP ===
     // Calculate view direction (fragment to camera)
     float3 V = normalize(ubo.camPos.xyz - WorldPos);
-    
+
     // Calculate reflection vector for environment mapping
     float3 R = reflect(-V, N);
 
@@ -103,32 +117,78 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     float3 Lo = float3(0.0, 0.0, 0.0);
 
     // === DIRECT LIGHTING LOOP ===
-    // Calculate contribution from each light source. Each light's BRDF result is
-    // gated on a shadow-ray visibility test — occluded lights contribute nothing.
-    for (int i = 0; i < 4; i++) {
-        float3 lightPos = ubo.lightPositions[i].xyz;
-        float3 lightColor = ubo.lightColors[i].rgb;
+    // Map the pixel to its 16×16 tile and walk only the lights the cull pass
+    // assigned to this tile. Pixels off the tile grid (shouldn't normally happen)
+    // fall back to zero lights — Lo stays 0 for them.
+    uint tileX    = (uint)input.Position.x / TILE_SIZE_PX;
+    uint tileY    = (uint)input.Position.y / TILE_SIZE_PX;
+    uint tileIdx  = tileY * ubo.tileCountX + tileX;
+    uint perTile  = (tileX < ubo.tileCountX && tileY < ubo.tileCountY)
+                  ? tileLightCount[tileIdx] : 0u;
 
-        // Skip zero-intensity slots (we hand-wired only light 0 right now).
-        if (dot(lightColor, lightColor) <= 0.0) continue;
+    for (uint t = 0u; t < perTile; t++) {
+        uint     lightIdx = tileLightIndices[tileIdx * MAX_LIGHTS_PER_TILE + t];
+        PbrLight lt       = lights[lightIdx];
 
-        // Calculate light direction and attenuation
-        float3 L = normalize(lightPos - WorldPos);      // Light direction
-        float distance = length(lightPos - WorldPos);   // Distance for falloff
-        float attenuation = 1.0 / (distance * distance);     // Inverse square falloff
-        float3 radiance = lightColor * attenuation;           // Attenuated light color
+        uint  type      = (uint)lt.directionType.w;
+        float3 lColor   = lt.colorIntensity.rgb;
+        float  intensity = lt.colorIntensity.a;
+        if (intensity <= 0.0) continue;
+
+        // ── Per-type direction + attenuation ──
+        float3 L;
+        float  distance;
+        float  attenuation;
+        float  spotMask = 1.0;
+
+        if (type == LIGHT_TYPE_DIRECTIONAL) {
+            // Directional: light direction is the field; distance is "infinite"
+            // for shadow ray purposes — use a large finite tMax instead of FLT_MAX
+            // so traversal still terminates cleanly when nothing is hit.
+            L            = normalize(-lt.directionType.xyz);
+            distance     = 1e6;
+            attenuation  = 1.0;
+        } else {
+            // Point / spot: standard inverse-square falloff.
+            float3 toLight = lt.positionRange.xyz - WorldPos;
+            distance       = length(toLight);
+            L              = toLight / max(distance, 1e-4);
+            attenuation    = 1.0 / max(distance * distance, 1e-4);
+
+            // Smooth radius cutoff so contribution drops to 0 at light.range.
+            float range = lt.positionRange.w;
+            if (range > 0.0) {
+                float t   = saturate(1.0 - pow(distance / range, 4.0));
+                attenuation *= t * t;
+            }
+
+            if (type == LIGHT_TYPE_SPOT) {
+                // Spot cone: smoothstep between innerCos and outerCos along -direction.
+                float3 spotDir = normalize(lt.directionType.xyz);
+                float  cosA    = dot(-L, spotDir);
+                float  inner   = lt.spotCones.x;
+                float  outer   = lt.spotCones.y;
+                spotMask       = smoothstep(outer, inner, cosA);
+                if (spotMask <= 0.0) continue;
+            }
+        }
+
+        float3 radiance = lColor * intensity * attenuation * spotMask;
 
         // Shadow ray: WorldPos -> light, with self-shadow bias along N.
-        // Stop the ray a hair short of the light so we don't hit the light itself
-        // (zero-area in this scene, but cheap insurance).
-        float3 shadowOrigin = WorldPos + N * SHADOW_RAY_EPS;
-        if (isOccluded(shadowOrigin, L, distance - SHADOW_RAY_EPS)) continue;
+        // Stop the ray a hair short of the light so we don't hit the light itself.
+        // Skip the ray query for lights with shadow casting disabled.
+        bool castShadows = lt.spotCones.z > 0.5;
+        if (castShadows) {
+            float3 shadowOrigin = WorldPos + N * SHADOW_RAY_EPS;
+            float  tMax         = max(distance - SHADOW_RAY_EPS, 0.0);
+            if (isOccluded(shadowOrigin, L, tMax)) continue;
+        }
 
         // Calculate half vector (between view and light directions)
         float3 H = normalize(V + L);
 
         // === BRDF EVALUATION ===
-        // Calculate all necessary dot products for BRDF terms
         float NdotL = max(dot(N, L), 0.0);  // Lambertian falloff
         float NdotV = max(dot(N, V), 0.0);  // View angle
         float NdotH = max(dot(N, H), 0.0);  // Half vector for specular
@@ -139,20 +199,17 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
         float G = GeometrySmith(NdotV, NdotL, roughness); // Geometry function
         float3 F = FresnelSchlick(HdotV, F0);           // Fresnel reflectance
 
-        // Calculate specular BRDF
+        // Specular BRDF
         float3 numerator = D * G * F;
         float denominator = 4.0 * NdotV * NdotL + 0.0001; // Prevent division by zero
         float3 specular = numerator / denominator;
 
         // === ENERGY CONSERVATION ===
-        // Fresnel term represents specular reflection ratio
         float3 kS = F;                          // Specular contribution
-        float3 kD = float3(1.0, 1.0, 1.0) - kS; // Diffuse contribution (energy conservation)
+        float3 kD = float3(1.0, 1.0, 1.0) - kS; // Diffuse contribution
         kD *= 1.0 - metallic;                   // Metals have no diffuse reflection
 
         // === RADIANCE ACCUMULATION ===
-        // Combine diffuse (Lambertian) and specular (Cook-Torrance) terms
-        // Multiply by incident radiance and cosine foreshortening
         Lo += (kD * baseColor.rgb / PI + specular) * radiance * NdotL;
     }
 
@@ -176,4 +233,3 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
 
     return float4(color, 1.0);
 }
-

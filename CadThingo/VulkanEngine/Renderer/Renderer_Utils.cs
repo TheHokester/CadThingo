@@ -27,7 +27,7 @@ public unsafe partial class Renderer
         throw new Exception("No suitable memory type found.");
     }
 
-    private Format FindDepthFormat()
+    internal Format FindDepthFormat()
     {
         Format depthFormat =
             FindSupportedFormat(new[] { Format.D32Sfloat, Format.D32SfloatS8Uint, Format.D24UnormS8Uint },
@@ -189,7 +189,7 @@ public unsafe partial class Renderer
         return false;
     }
 
-    private ShaderModule CreateShaderModule(byte[] shaderCode)
+    internal ShaderModule CreateShaderModule(byte[] shaderCode)
     {
         //Create shader module
         ShaderModuleCreateInfo createInfo = new()

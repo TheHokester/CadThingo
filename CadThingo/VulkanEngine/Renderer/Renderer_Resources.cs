@@ -223,11 +223,12 @@ public unsafe partial class Renderer
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
         {
             CreateMappedUniformBuffer(sizeof(GeometryUBO), ref GeometryUniformBuffers[i]);
-            CreateMappedUniformBuffer(sizeof(LightingUBO), ref LightingUniformBuffers[i]);
+            CreateMappedUniformBuffer(sizeof(LightingFrameUBO), ref LightingUniformBuffers[i]);
+            CreateMappedStorageBuffer((ulong)(MAX_LIGHTS * (uint)sizeof(PbrLightGpu)), ref LightStorageBuffers[i]);
         }
     }
 
-    private void CreateMappedUniformBuffer(int sizeBytes, ref UboBuffer ubo)
+    internal void CreateMappedUniformBuffer(int sizeBytes, ref UboBuffer ubo)
     {
         BufferCreateInfo bufferInfo = new()
         {
@@ -341,7 +342,10 @@ public unsafe partial class Renderer
         var poolSizes = new DescriptorPoolSize[]
         {
             new() { Type = DescriptorType.UniformBuffer,            DescriptorCount = 16 },
-            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 16 },
+            // Storage buffer budget: bindless mat+instance (2 × MAX_FRAMES), light SSBO
+            // (MAX_FRAMES), plus cull pass (renderables + cmds + instancesOut + count =
+            // 4 × MAX_FRAMES). Round up generously.
+            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 32 },
             new() { Type = DescriptorType.SampledImage,             DescriptorCount = MAX_BINDLESS_TEXTURES * MAX_CONCURRENT_FRAMES },
             new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
             new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 16 },
@@ -352,7 +356,7 @@ public unsafe partial class Renderer
             DescriptorPoolCreateInfo poolInfo = new()
             {
                 SType = StructureType.DescriptorPoolCreateInfo,
-                MaxSets = 32,
+                MaxSets = 48,
                 PoolSizeCount = (uint)poolSizes.Length,
                 PPoolSizes = poolSizesPtr,
                 Flags = DescriptorPoolCreateFlags.UpdateAfterBindBit | DescriptorPoolCreateFlags.FreeDescriptorSetBit,
@@ -411,34 +415,93 @@ public unsafe partial class Renderer
     internal const uint MAX_INSTANCES         = 4096;
     internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 5;
 
-    // Per-frame storage buffers feeding the geometry pipeline's bindless set.
-    // CPU writes them at the start of each frame; the descriptor set is fixed-bound to one pair.
-    private UboBuffer[] MaterialStorageBuffers = new UboBuffer[2];
-    private UboBuffer[] InstanceStorageBuffers = new UboBuffer[2];
+    // Lighting pipeline set 0 binding 1 — per-frame StructuredBuffer<PbrLight>.
+    // Cap chosen to keep the SSBO at 64KB (1024 × 64B); raise if needed.
+    internal const uint MAX_LIGHTS = 1024;
 
-    // Shared linear-repeat sampler at samplers[0] in the bindless set.
-    private Sampler defaultBindlessSampler;
+    // Tiled light culling — Phase 4. Tile size matches the compute group
+    // (16×16 threads collaborating on one tile). MAX_LIGHTS_PER_TILE bounds the
+    // worst-case per-tile slot count; lights past this are dropped (the cull
+    // shader saturates the count).
+    internal const uint TILE_SIZE           = 16;
+    internal const uint MAX_LIGHTS_PER_TILE = 64;
+    // Hard cap on tile count — covers up to 3840×2160(4K) (240*135 tiles). The actual
+    // per-frame tileCountX/Y depends on swapChainExtent and is uploaded via the
+    // frame UBO each frame.
+    internal const uint MAX_TILE_COUNT      = 240 * 135;
 
-    // Per-frame bindless descriptor sets, each pointing at its own (material, instance) buffer pair
-    // and the shared bindless texture/sampler arrays.
-    private DescriptorSet[] bindlessDescriptorSets = new DescriptorSet[2];
+    // Cull-pass per-frame buffers. RenderableInput is the CPU input list (one row
+    // per scene entity); IndirectCmd holds the post-cull VkDrawIndexedIndirectCommand
+    // array; IndirectCount holds a single uint that the cull shader InterlockedAdds
+    // into to claim slots and the rasterizer reads via vkCmdDrawIndexedIndirectCount.
+    private UboBuffer[] RenderableInputBuffers = new UboBuffer[2];
+    private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[2];
+    private UboBuffer[] IndirectCountBuffers   = new UboBuffer[2];
 
-    private void CreateMaterialAndInstanceBuffers()
+    // Tiled light-cull per-frame buffers — Phase 4. TileLightCount[tileIdx] is the
+    // number of lights that overlap each tile; TileLightIndices[tileIdx*MAX +
+    // slot] is the flat index into the lights SSBO. The lighting pass reads both,
+    // keyed by tileIdx = (gl_FragCoord / TILE_SIZE).
+    private UboBuffer[] TileLightCountBuffers   = new UboBuffer[2];
+    private UboBuffer[] TileLightIndicesBuffers = new UboBuffer[2];
+
+
+    
+
+    // Allocates the four per-frame buffers driving the GPU cull pass + indirect draw.
+    // Sizes track MAX_INSTANCES so we never overflow the visibility-pass output even
+    // if every scene entity is visible.
+    private void CreateCullBuffers()
     {
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
         {
-            CreateMappedStorageBuffer((ulong)(MAX_MATERIALS * (uint)sizeof(PbrMaterial)),     ref MaterialStorageBuffers[i]);
-            CreateMappedStorageBuffer((ulong)(MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)), ref InstanceStorageBuffers[i]);
+            CreateMappedStorageBuffer(
+                (ulong)(MAX_INSTANCES * (uint)sizeof(RenderableInputGpu)),
+                ref RenderableInputBuffers[i]);
+
+            // Indirect command buffer also needs IndirectBuffer usage so vkCmdDraw...Indirect
+            // can read it without validation errors.
+            CreateMappedStorageBuffer(
+                (ulong)(MAX_INSTANCES * (uint)sizeof(DrawIndexedIndirectCommandGpu)),
+                ref IndirectCmdBuffers[i],
+                BufferUsageFlags.IndirectBufferBit);
+
+            // Count buffer is one uint. Needs IndirectBuffer for the count read and
+            // TransferDst so vkCmdFillBuffer can reset it to 0 every frame.
+            CreateMappedStorageBuffer(
+                sizeof(uint),
+                ref IndirectCountBuffers[i],
+                BufferUsageFlags.IndirectBufferBit | BufferUsageFlags.TransferDstBit);
         }
     }
 
-    private void CreateMappedStorageBuffer(ulong sizeBytes, ref UboBuffer ubo)
+    // Tile-cull buffers — sized for the worst-case tile count (MAX_TILE_COUNT).
+    // Per frame: TileLightCount = MAX × 4B, TileLightIndices = MAX × MAX_LIGHTS_PER_TILE × 4B.
+    // For MAX_TILE_COUNT = 32400 and MAX_LIGHTS_PER_TILE = 64 → 130KB + 8.3MB per frame.
+    private void CreateTileLightCullBuffers()
+    {
+        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            CreateMappedStorageBuffer(
+                (ulong)(MAX_TILE_COUNT * sizeof(uint)),
+                ref TileLightCountBuffers[i]);
+            CreateMappedStorageBuffer(
+                (ulong)(MAX_TILE_COUNT * MAX_LIGHTS_PER_TILE * sizeof(uint)),
+                ref TileLightIndicesBuffers[i]);
+        }
+    }
+
+    // Allocates a host-visible, coherent, persistently-mapped SSBO. Optional extra
+    // usage bits let callers turn the same buffer into an indirect-cmd / indirect-
+    // count source on top of plain storage usage.
+    internal void CreateMappedStorageBuffer(ulong sizeBytes, ref UboBuffer ubo,
+        BufferUsageFlags extraUsage = 0)
     {
         BufferCreateInfo bufferInfo = new()
         {
             SType = StructureType.BufferCreateInfo,
             Size = sizeBytes,
-            Usage = BufferUsageFlags.StorageBufferBit,
+            Usage = BufferUsageFlags.StorageBufferBit | extraUsage,
             SharingMode = SharingMode.Exclusive,
         };
         vk!.CreateBuffer(device, &bufferInfo, null, out ubo.buffer);
@@ -456,104 +519,20 @@ public unsafe partial class Renderer
         vk!.MapMemory(device, ubo.memory, 0, sizeBytes, MemoryMapFlags.None, ref ubo.mapped);
     }
 
-    private void CreateDefaultBindlessSampler()
-    {
-        SamplerCreateInfo samplerInfo = new()
-        {
-            SType = StructureType.SamplerCreateInfo,
-            MagFilter = Filter.Linear,
-            MinFilter = Filter.Linear,
-            AddressModeU = SamplerAddressMode.Repeat,
-            AddressModeV = SamplerAddressMode.Repeat,
-            AddressModeW = SamplerAddressMode.Repeat,
-            MipmapMode = SamplerMipmapMode.Linear,
-            AnisotropyEnable = true,
-            MaxAnisotropy = 16,
-            BorderColor = BorderColor.FloatOpaqueBlack,
-            UnnormalizedCoordinates = false,
-            CompareEnable = false,
-            CompareOp = CompareOp.Always,
-            MinLod = 0.0f,
-            MaxLod = 0.0f,
-        };
-        if (vk!.CreateSampler(device, &samplerInfo, null, out defaultBindlessSampler) != Result.Success)
-            throw new Exception("Failed to create default bindless sampler");
-    }
+   
 
-    // Allocates one bindless descriptor set per frame in flight from the main pool. Writes the
-    // per-frame StorageBuffer<PbrMaterial> + StorageBuffer<InstanceData> bindings, plus the shared
-    // sampler at samplers[0]. Texture array (binding 2) is populated lazily by RegisterBindless.
-    private void CreateBindlessDescriptorSets()
-    {
-        var layouts = stackalloc DescriptorSetLayout[(int)MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++) layouts[i] = geometryMaterialDescriptorSetLayout;
+    
 
-        DescriptorSetAllocateInfo alloc = new()
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = descriptorPool,
-            DescriptorSetCount = MAX_CONCURRENT_FRAMES,
-            PSetLayouts = layouts,
-        };
-        fixed (DescriptorSet* pSets = bindlessDescriptorSets)
-        {
-            if (vk!.AllocateDescriptorSets(device, &alloc, pSets) != Result.Success)
-                throw new Exception("Failed to allocate bindless descriptor sets");
-        }
-
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo matInfo = new()
-            {
-                Buffer = MaterialStorageBuffers[i].buffer, Offset = 0,
-                Range = (ulong)(MAX_MATERIALS * (uint)sizeof(PbrMaterial)),
-            };
-            DescriptorBufferInfo instInfo = new()
-            {
-                Buffer = InstanceStorageBuffers[i].buffer, Offset = 0,
-                Range = (ulong)(MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)),
-            };
-            DescriptorImageInfo samplerInfo = new()
-            {
-                Sampler = defaultBindlessSampler,
-            };
-
-            var writes = stackalloc WriteDescriptorSet[3];
-            writes[0] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = bindlessDescriptorSets[i],
-                DstBinding = 0,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &matInfo,
-            };
-            writes[1] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = bindlessDescriptorSets[i],
-                DstBinding = 1,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &instInfo,
-            };
-            writes[2] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = bindlessDescriptorSets[i],
-                DstBinding = 3,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.Sampler,
-                DescriptorCount = 1,
-                PImageInfo = &samplerInfo,
-            };
-            vk!.UpdateDescriptorSets(device, 3, writes, 0, null);
-        }
-    }
-
-    // Writes a Texture's image view into binding 2 (the bindless texture array) at <paramref name="index"/>
-    // for every frame's bindless set. Safe to call any time thanks to UpdateAfterBind on the binding.
-    public void WriteBindlessTexture(int index, Texture texture)
+    /// <summary>
+    /// Writes a bindless texture to the given descriptor set at the given binding.
+    /// All descriptor sets must use the same layout.
+    /// </summary>
+    /// <param name="index"></param>
+    /// <param name="texture"></param>
+    /// <param name="sets"></param>
+    /// <param name="binding"></param>
+    /// <exception cref="ArgumentOutOfRangeException"></exception>
+    public void WriteBindlessTexture(int index, Texture texture, DescriptorSet[] sets, uint binding)
     {
         if (index < 0 || index >= MAX_BINDLESS_TEXTURES)
             throw new ArgumentOutOfRangeException(nameof(index), $"bindless texture index {index} out of [0, {MAX_BINDLESS_TEXTURES}).");
@@ -564,21 +543,21 @@ public unsafe partial class Renderer
             ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
         };
 
-        var writes = stackalloc WriteDescriptorSet[(int)MAX_CONCURRENT_FRAMES];
-        for (var f = 0; f < MAX_CONCURRENT_FRAMES; f++)
+        var writes = stackalloc WriteDescriptorSet[sets.Length];
+        for (var f = 0; f < sets.Length; f++)
         {
             writes[f] = new WriteDescriptorSet
             {
                 SType = StructureType.WriteDescriptorSet,
-                DstSet = bindlessDescriptorSets[f],
-                DstBinding = 2,
+                DstSet = sets[f],
+                DstBinding = binding,
                 DstArrayElement = (uint)index,
                 DescriptorType = DescriptorType.SampledImage,
                 DescriptorCount = 1,
                 PImageInfo = &imgInfo,
             };
         }
-        vk!.UpdateDescriptorSets(device, MAX_CONCURRENT_FRAMES, writes, 0, null);
+        vk!.UpdateDescriptorSets(device, (uint)sets.Length, writes, 0, null);
     }
 
     private void CreateLightingDescriptorSets()
@@ -602,13 +581,32 @@ public unsafe partial class Renderer
         }
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
         {
-            DescriptorBufferInfo bufInfo = new()
+            DescriptorBufferInfo frameInfo = new()
             {
                 Buffer = LightingUniformBuffers[i].buffer,
                 Offset = 0,
-                Range = (ulong)sizeof(LightingUBO),
+                Range = (ulong)sizeof(LightingFrameUBO),
             };
-            WriteDescriptorSet write = new()
+            DescriptorBufferInfo lightsInfo = new()
+            {
+                Buffer = LightStorageBuffers[i].buffer,
+                Offset = 0,
+                Range = (ulong)(MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
+            };
+            DescriptorBufferInfo tileCountInfo = new()
+            {
+                Buffer = TileLightCountBuffers[i].buffer,
+                Offset = 0,
+                Range = (ulong)(MAX_TILE_COUNT * sizeof(uint)),
+            };
+            DescriptorBufferInfo tileIdxInfo = new()
+            {
+                Buffer = TileLightIndicesBuffers[i].buffer,
+                Offset = 0,
+                Range = (ulong)(MAX_TILE_COUNT * MAX_LIGHTS_PER_TILE * sizeof(uint)),
+            };
+            var writes = stackalloc WriteDescriptorSet[4];
+            writes[0] = new WriteDescriptorSet
             {
                 SType = StructureType.WriteDescriptorSet,
                 DstSet = lightingDescriptorSets[i],
@@ -616,9 +614,39 @@ public unsafe partial class Renderer
                 DstArrayElement = 0,
                 DescriptorType = DescriptorType.UniformBuffer,
                 DescriptorCount = 1,
-                PBufferInfo = &bufInfo,
+                PBufferInfo = &frameInfo,
             };
-            vk!.UpdateDescriptorSets(device, 1, &write, 0, null);
+            writes[1] = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = lightingDescriptorSets[i],
+                DstBinding = 1,
+                DstArrayElement = 0,
+                DescriptorType = DescriptorType.StorageBuffer,
+                DescriptorCount = 1,
+                PBufferInfo = &lightsInfo,
+            };
+            writes[2] = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = lightingDescriptorSets[i],
+                DstBinding = 3,
+                DstArrayElement = 0,
+                DescriptorType = DescriptorType.StorageBuffer,
+                DescriptorCount = 1,
+                PBufferInfo = &tileCountInfo,
+            };
+            writes[3] = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = lightingDescriptorSets[i],
+                DstBinding = 4,
+                DstArrayElement = 0,
+                DescriptorType = DescriptorType.StorageBuffer,
+                DescriptorCount = 1,
+                PBufferInfo = &tileIdxInfo,
+            };
+            vk!.UpdateDescriptorSets(device, 4, writes, 0, null);
         }
 
         // Set 1: shared G-buffer samplers (same ImageViews every frame)
@@ -695,7 +723,7 @@ public unsafe partial class Renderer
                 SType = StructureType.WriteDescriptorSet,
                 PNext = &asWrite,
                 DstSet = lightingDescriptorSets[i],
-                DstBinding = 1,
+                DstBinding = 2,
                 DstArrayElement = 0,
                 DescriptorType = DescriptorType.AccelerationStructureKhr,
                 DescriptorCount = 1,
@@ -727,30 +755,75 @@ public unsafe partial class Renderer
         new Span<GeometryUBO>(data, 1).Fill(ubo);
     }
 
-    float angle = 0.0f;
-    private void UpdateLightingUBO(uint frameIndex, Camera camera)
+    // Reusable scratch list filled by Scene.EnumerateLights. Lives on the renderer
+    // so we don't allocate a fresh List<LightComponent> every frame.
+    private readonly List<LightComponent> _lightScratch = new();
+
+    // Returns (lightCount, tileCountX, tileCountY) so DrawFrame can pass them
+    // directly to RecordLightCullPass without recomputing.
+    private (uint lightCount, uint tileCountX, uint tileCountY) UpdateLightingBuffers(
+        uint frameIndex, Camera camera, Scene scene)
     {
-        angle += 0.0003f;
-        LightingUBO ubo = new();
-        // Single neutral white key light above & slightly in front — readable textures,
-        // minimal color bias. Extra slots zeroed so they contribute nothing.
-        ubo.lightPosition0 = new Vector4((float)(3 * Math.Cos(angle)), 5f, (float)(3f * Math.Sin(angle)), 1.0f);
-        ubo.lightColor0    = new Vector4(135f, 135f, 100f, 2.0f);
-        ubo.lightPosition1 = default;
-        ubo.lightColor1    = default;
-        ubo.lightPosition2 = default;
-        ubo.lightColor2    = default;
-        ubo.lightPosition3 = default;
-        ubo.lightColor3    = default;
-        
+        scene.EnumerateLights(_lightScratch);
+
+        // ── Pack lights ────────────────────────────────────────
+        PbrLightGpu* lightPtr = (PbrLightGpu*)LightStorageBuffers[frameIndex].mapped;
+        uint count = 0;
+        foreach (var light in _lightScratch)
+        {
+            if (count >= MAX_LIGHTS) break;
+
+            // World-space position from the owner transform if present.
+            Vector3 worldPos = Vector3.Zero;
+            if (light.Owner != null)
+            {
+                var t = light.Owner->GetComponent<TransformComponent>();
+                if (t != null)
+                {
+                    var w = *t.GetWorldMatrix();
+                    worldPos = new Vector3(w.M41, w.M42, w.M43);
+                }
+            }
+
+            // Normalize direction — guard against zero-vector default.
+            Vector3 dir = light.Direction.LengthSquared() > 1e-8f
+                ? Vector3.Normalize(light.Direction)
+                : new Vector3(0, -1, 0);
+
+            // Range: -1 sentinel marks directional lights so the shader can branch
+            // on attenuation without inspecting Type for the most common test.
+            float range = light.Type == LightType.Directional ? -1f : light.Range;
+
+            lightPtr[count] = new PbrLightGpu
+            {
+                positionRange  = new Vector4(worldPos, range),
+                colorIntensity = new Vector4(light.Color, light.Intensity),
+                directionType  = new Vector4(dir, (float)(uint)light.Type),
+                spotCones      = new Vector4(light.InnerConeCos, light.OuterConeCos,
+                                             light.CastShadows ? 1f : 0f, 0f),
+            };
+            count++;
+        }
+
+        // ── Frame UBO ──────────────────────────────────────────
+        uint tileX = (swapChainExtent.Width  + TILE_SIZE - 1) / TILE_SIZE;
+        uint tileY = (swapChainExtent.Height + TILE_SIZE - 1) / TILE_SIZE;
+
+        LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
         ubo.exposure = 4.5f;
         ubo.gamma = 2.2f;
         ubo.prefilteredCubeMipLevels = 1.0f;
         ubo.scaleIBLAmbient = 1.0f;
+        ubo.lightCount = count;
+        ubo.tileCountX = tileX;
+        ubo.tileCountY = tileY;
+        ubo.screenSize = new Vector2(swapChainExtent.Width, swapChainExtent.Height);
 
         void* data = LightingUniformBuffers[frameIndex].mapped;
-        new Span<LightingUBO>(data, 1).Fill(ubo);
+        new Span<LightingFrameUBO>(data, 1).Fill(ubo);
+
+        return (count, tileX, tileY);
     }
 
     private Extent2D ChooseSwapExtent(SurfaceCapabilitiesKHR capabilities)
@@ -803,23 +876,35 @@ struct GeometryUBO
     public Matrix4x4 proj;
 }
 
-// Matches PbrShader.slang's LightingUBO (binding 0 of PBRDescriptorSetLayout).
-// Inline fields instead of managed arrays so the struct is blittable.
-struct LightingUBO
+// Matches PbrShader.slang's LightingFrameUBO (binding 0 of PBRDescriptorSetLayout).
+// Phase 4 added tileCountX/Y + screenSize so the fragment shader can map
+// gl_FragCoord -> tile index and read the per-tile light list.
+[StructLayout(LayoutKind.Sequential)]
+struct LightingFrameUBO
 {
-    public Vector4 lightPosition0;
-    public Vector4 lightPosition1;
-    public Vector4 lightPosition2;
-    public Vector4 lightPosition3;
-    public Vector4 lightColor0;
-    public Vector4 lightColor1;
-    public Vector4 lightColor2;
-    public Vector4 lightColor3;
     public Vector4 camPos;
     public float exposure;
     public float gamma;
     public float prefilteredCubeMipLevels;
     public float scaleIBLAmbient;
+    public uint lightCount;
+    public uint tileCountX;
+    public uint tileCountY;
+    public uint _pad0;
+    public Vector2 screenSize;          // pixels
+    public uint _pad1;
+    public uint _pad2;
+}
+
+// Mirrors PbrUtils.slang::PbrLight under std430 (16B alignment, no padding needed —
+// the struct is exactly 4 × float4 = 64B).
+[StructLayout(LayoutKind.Sequential)]
+public struct PbrLightGpu
+{
+    public Vector4 positionRange;   // xyz = world pos, w = range (point/spot; ignored for directional)
+    public Vector4 colorIntensity;  // rgb = linear color, a = intensity
+    public Vector4 directionType;   // xyz = direction (dir/spot, world-space), w = LightType as float
+    public Vector4 spotCones;       // x = innerCos, y = outerCos, z = castShadows (0/1), w = pad
 }
 
 // Per-instance row in the geometry pipeline's instance SSBO. Shader sees this as
@@ -831,6 +916,33 @@ public struct InstanceDataGPU
     public Matrix4x4 model;
     public uint materialIndex;
     public uint _pad0, _pad1, _pad2;
+}
+
+// Cull-pass input record. CPU writes one per scene entity into RenderableInputBuffers
+// each frame; the compute shader reads it and emits an indirect draw + InstanceData
+// when the bounding sphere passes the frustum test. Std430 alignment, total 96B.
+[StructLayout(LayoutKind.Sequential)]
+public struct RenderableInputGpu
+{
+    public Matrix4x4 model;        // 64B
+    public Vector4 sphereLocal;    // 16B  (xyz center, w radius — local space)
+    public uint indexCount;        //  4B  ┐
+    public uint firstIndex;        //  4B  │  pulled straight from Mesh
+    public uint materialIndex;     //  4B  │
+    public uint _pad;              //  4B  ┘  std430 16B alignment
+}
+
+// Mirrors VkDrawIndexedIndirectCommand exactly. Compute writes this struct into the
+// indirect-cmd buffer per surviving renderable; vkCmdDrawIndexedIndirectCount
+// consumes them.
+[StructLayout(LayoutKind.Sequential)]
+public struct DrawIndexedIndirectCommandGpu
+{
+    public uint indexCount;
+    public uint instanceCount;
+    public uint firstIndex;
+    public int  vertexOffset;
+    public uint firstInstance;
 }
 
 

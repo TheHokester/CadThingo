@@ -329,7 +329,16 @@ public unsafe partial class Renderer
         // UpdateGeometryUBO is per-entity — wired in Phase 5/6 once entities exist.
         
         UpdateGeometryFrameUBO(currentFrame, camera);
-        UpdateLightingUBO(currentFrame, camera);
+        var (lightCount, tileCountX, tileCountY) = UpdateLightingBuffers(currentFrame, camera, scene);
+
+        // 5b. GPU cull pass — runs before the geometry pass and produces the
+        // indirect command + post-cull instance buffers the geometry pass consumes.
+        renderableCountThisFrame = RecordCullPass(cmd, currentFrame, camera);
+
+        // 5c. Tiled light-cull — bins lights into per-tile slot lists for the
+        // lighting fragment shader. Buffer barrier inside makes the writes
+        // visible to the fragment stage of the lighting pass.
+        RecordLightCullPass(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
 
         // 6. Record all render-graph passes (geometry → lighting), record-only.
         scene.renderGraph.Execute(cmd);
@@ -575,7 +584,7 @@ public unsafe partial class Renderer
                 // bound once. The whole geometry pass issues zero per-draw rebinds and zero
                 // push constants — model + materialIndex live in the per-instance SSBO.
                 var frameSet = geometryDescriptorSets[currentFrame];
-                var bindlessSet = bindlessDescriptorSets[currentFrame];
+                var bindlessSet = Engine.ResourceManager.GetBindlessSet(currentFrame);
                 var geomSets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
                 vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
                     geometryPipelineLayout, 0, 2, geomSets, 0, null);
@@ -594,7 +603,7 @@ public unsafe partial class Renderer
                 if (matCount + 1 > (int)MAX_MATERIALS)
                     throw new InvalidOperationException($"Scene material count ({matCount}) exceeds MAX_MATERIALS ({MAX_MATERIALS}).");
 
-                PbrMaterial* matPtr = (PbrMaterial*)MaterialStorageBuffers[currentFrame].mapped;
+                PbrMaterial* matPtr = (PbrMaterial*)Engine.ResourceManager.GetMaterialMapped(currentFrame);
                 for (int mi = 0; mi < matCount; mi++) matPtr[mi] = scene.Materials[mi];
 
                 int fallbackMatIdx = matCount;
@@ -612,33 +621,20 @@ public unsafe partial class Renderer
                     EmissiveTex           = GltfDefaults.EmissiveIndex,
                 };
 
-                // ── Walk entities, fill instance SSBO, draw inline ──────────────
-                InstanceDataGPU* instPtr = (InstanceDataGPU*)InstanceStorageBuffers[currentFrame].mapped;
-                int instanceCount = 0;
-                for (int i = 0; i < scene.EntityCount; i++)
+                // ── GPU-driven indirect draw ────────────────────────────────────
+                // The cull compute pass (RecordCullPass) already populated:
+                //   - InstanceStorageBuffers : per-visible-renderable model + materialIndex,
+                //                              read by the VS via SV_InstanceID.
+                //   - IndirectCmdBuffers     : VkDrawIndexedIndirectCommand[] visible mesh draws.
+                //   - IndirectCountBuffers   : single uint of how many entries are valid.
+                // A single vkCmdDrawIndexedIndirectCount consumes them all.
+                if (renderableCountThisFrame > 0)
                 {
-                    Entity* e = scene.GetEntity(i);
-                    if (e == null) continue;
-                    var meshComp = e->GetComponent<MeshComponent>();
-                    if (meshComp == null || meshComp.mesh == null) continue;
-                    var transform = e->GetComponent<TransformComponent>();
-                    if (transform == null) continue;
-                    if (instanceCount >= (int)MAX_INSTANCES)
-                        throw new InvalidOperationException($"Scene instance count exceeds MAX_INSTANCES ({MAX_INSTANCES}).");
-
-                    int matIdx = meshComp.materialIndex >= 0 ? meshComp.materialIndex : fallbackMatIdx;
-
-                    instPtr[instanceCount] = new InstanceDataGPU
-                    {
-                        model = *transform.GetWorldMatrix(),
-                        materialIndex = (uint)matIdx,
-                    };
-
-                    Mesh m = *meshComp.mesh;
-                    // firstInstance feeds gl_InstanceID/SV_InstanceID in the vertex shader so
-                    // the VS can index into the InstanceData SSBO without push constants.
-                    vk!.CmdDrawIndexed(buffer, (uint)m.count, 1, (uint)m.offset, 0, (uint)instanceCount);
-                    instanceCount++;
+                    vk!.CmdDrawIndexedIndirectCount(buffer,
+                        IndirectCmdBuffers[currentFrame].buffer, 0,
+                        IndirectCountBuffers[currentFrame].buffer, 0,
+                        renderableCountThisFrame,
+                        (uint)sizeof(DrawIndexedIndirectCommandGpu));
                 }
 
                 vk!.CmdEndRendering(buffer);
@@ -912,7 +908,7 @@ public unsafe class RenderGraph : IDisposable
                             LayerCount = 1
                         }
                     };
-
+                    
                     _vk.CmdPipelineBarrier(cmd,
                         PipelineStageFlags.AllCommandsBit,
                         PipelineStageFlags.FragmentShaderBit,

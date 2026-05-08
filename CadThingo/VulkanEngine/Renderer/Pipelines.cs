@@ -1,4 +1,5 @@
-﻿using CadThingo.GraphicsPipeline;
+﻿using System.Numerics;
+using CadThingo.GraphicsPipeline;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -580,9 +581,10 @@ public unsafe partial class Renderer
 
     private void CreatePBRDescriptorSetLayout()
     {
-        // ── Set 0: LightingUBO ────────────────────────────────────────────────
+        // ── Set 0: LightingFrameUBO + Light SSBO + TLAS + Tile cull buffers ───
         // Only the fragment shader reads lights, camPos, exposure, gamma etc.
         // The vertex shader is a procedural fullscreen triangle (SV_VertexID only).
+        // Phase 4 added bindings 3,4 for the tiled light cull output.
         var set0Bindings = new DescriptorSetLayoutBinding[]
         {
             new()
@@ -593,10 +595,34 @@ public unsafe partial class Renderer
                 StageFlags = ShaderStageFlags.FragmentBit,
                 PImmutableSamplers = null
             },
-            new() // TLAS for ray-traced shadows. Bound once at startup; no per-frame update.
+            new() // StructuredBuffer<PbrLight> — per-frame, rewritten in UpdateLightingBuffers.
             {
                 Binding = 1,
+                DescriptorType = DescriptorType.StorageBuffer,
+                DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
+                PImmutableSamplers = null,
+            },
+            new() // TLAS for ray-traced shadows. Bound once at startup; no per-frame update.
+            {
+                Binding = 2,
                 DescriptorType = DescriptorType.AccelerationStructureKhr,
+                DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
+                PImmutableSamplers = null,
+            },
+            new() // tileLightCount[tileIdx] — produced by LightCulling.slang.
+            {
+                Binding = 3,
+                DescriptorType = DescriptorType.StorageBuffer,
+                DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
+                PImmutableSamplers = null,
+            },
+            new() // tileLightIndices[tileIdx*MAX + slot] — produced by LightCulling.slang.
+            {
+                Binding = 4,
+                DescriptorType = DescriptorType.StorageBuffer,
                 DescriptorCount = 1,
                 StageFlags = ShaderStageFlags.FragmentBit,
                 PImmutableSamplers = null,
@@ -667,10 +693,14 @@ public unsafe partial class Renderer
 
                 for (int i = 0; i < set0Bindings.Length; i++)
                 {
-                    // AccelerationStructureKhr bindings can't carry UpdateAfterBindBit
-                    // unless descriptorBindingAccelerationStructureUpdateAfterBind is
-                    // enabled (a separate feature we don't request). Leave default (0).
+                    // AccelerationStructureKhr and StorageBuffer bindings can't carry
+                    // UpdateAfterBindBit unless their respective UpdateAfterBind features
+                    // (descriptorBindingAccelerationStructureUpdateAfterBind /
+                    // descriptorBindingStorageBufferUpdateAfterBind) are enabled — we
+                    // don't request either. The light SSBO is per-frame mapped memory,
+                    // so per-frame vkUpdateDescriptorSets isn't needed anyway.
                     if (set0Bindings[i].DescriptorType == DescriptorType.AccelerationStructureKhr) continue;
+                    if (set0Bindings[i].DescriptorType == DescriptorType.StorageBuffer) continue;
                     set0Flags[i] = updateFlags;
                 }
                 set0FlagsInfo.BindingCount = (uint)set0Bindings.Length;
@@ -879,5 +909,517 @@ public unsafe partial class Renderer
         vk!.CreateGraphicsPipelines(device, default, 1, &pipelineInfo, null, out pbrLightingPipeline);
         
         vk!.DestroyShaderModule(device, shader, null);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Pipeline wrapper layout
+// ────────────────────────────────────────────────────────────────────────────
+//  Three layers:
+//    1. PipelineBase      — owns the handle, layout, cache, descriptor set
+//                           layouts, push-constant ranges, and the lifecycle.
+//    2. GraphicsPipeline  — assembles GraphicsPipelineCreateInfo from a set of
+//                           protected virtual hooks (vertex input, raster,
+//                           blend, depth, dynamic rendering formats, …) so
+//                           concrete pipelines override only what differs.
+//    3. ComputePipeline   — single-shader-stage compute equivalent.
+//
+//  Concrete pipelines (Geometry, PbrLighting, DrawCull, LightCull, …)
+//  inherit from layer 2/3 and own their own SSBOs/UBOs, push-constant
+//  structs, descriptor sets, and Record(...) entry points.
+// ────────────────────────────────────────────────────────────────────────────
+
+public abstract unsafe class PipelineBase : IDisposable
+{
+    // Single reference back to the renderer — pipelines call into things like
+    // Renderer.CreateMappedStorageBuffer / CreateShaderModule / FindDepthFormat
+    // directly. The fields and methods on Renderer that pipelines need are
+    // 'internal' for same-assembly access.
+    protected readonly Renderer Renderer;
+
+    // Convenience accessors so subclass bodies stay short — these just forward
+    // to the renderer's vk / device.
+    protected Vk     Vk     => Renderer.vk!;
+    protected Device Device => Renderer.device;
+
+    protected Pipeline       PipelineHandle;
+    protected PipelineLayout PipelineLayoutHandle;
+    protected PipelineCache  PipelineCacheHandle;
+
+    // Subclasses populate these in CreateDescriptorSetLayouts(). The default
+    // CreatePipelineLayout() reads them to build the VkPipelineLayout.
+    protected DescriptorSetLayout[] DescriptorSetLayouts = Array.Empty<DescriptorSetLayout>();
+    /// <summary>
+    /// Descriptor sets for the pipeline <br/>
+    /// DescriptorSets[layoutNum][frame]
+    /// </summary>
+    protected DescriptorSet[][] DescriptorSets = Array.Empty<DescriptorSet[]>();
+    protected PushConstantRange[]   PushConstantRanges   = Array.Empty<PushConstantRange>();
+
+    public Pipeline                  Handle    => PipelineHandle;
+    public PipelineLayout            Layout    => PipelineLayoutHandle;
+    public abstract PipelineBindPoint BindPoint { get; }
+
+    protected PipelineBase(Renderer renderer)
+    {
+        Renderer = renderer;
+    }
+
+    // Called once by the owner (Renderer) after construction. Each step is a
+    // virtual hook so concrete pipelines slot in their own logic without
+    // re-implementing the whole flow.
+    public void Initialize()
+    {
+        CreateDescriptorSetLayouts();
+        CreatePipelineLayout();
+        CreatePipeline();
+        CreateResources();
+        CreateDescriptorSets();
+        WriteDescriptors();
+    }
+
+    // Required: populate descriptorSetLayouts and (optionally) pushConstantRanges.
+    protected abstract void CreateDescriptorSetLayouts();
+
+    // Required: build the VkPipeline itself. GraphicsPipeline / ComputePipeline
+    // seal this and drive it from their hooks; only override directly if a
+    // pipeline doesn't fit either category.
+    protected abstract void CreatePipeline();
+
+    protected virtual void CreatePipelineLayout()
+    {
+        fixed (DescriptorSetLayout* pLayouts = DescriptorSetLayouts)
+        fixed (PushConstantRange*   pRanges  = PushConstantRanges)
+        {
+            PipelineLayoutCreateInfo info = new()
+            {
+                SType                  = StructureType.PipelineLayoutCreateInfo,
+                SetLayoutCount         = (uint)DescriptorSetLayouts.Length,
+                PSetLayouts            = pLayouts,
+                PushConstantRangeCount = (uint)PushConstantRanges.Length,
+                PPushConstantRanges    = pRanges,
+            };
+            if (Vk.CreatePipelineLayout(Device, &info, null, out PipelineLayoutHandle) != Result.Success)
+                throw new Exception($"Failed to create pipeline layout for {GetType().Name}");
+        }
+    }
+
+    // Concrete pipelines override these to allocate their owned SSBOs/UBOs,
+    // allocate descriptor sets from the pool, and write the initial bindings.
+    protected virtual void CreateResources()          { }
+    protected virtual void CreateDescriptorSets()     { }
+    protected virtual void WriteDescriptors()  { }
+
+    public virtual void Dispose()
+    {
+        if (PipelineHandle.Handle       != 0) Vk.DestroyPipeline(Device, PipelineHandle, null);
+        if (PipelineLayoutHandle.Handle != 0) Vk.DestroyPipelineLayout(Device, PipelineLayoutHandle, null);
+        foreach (var dsl in DescriptorSetLayouts)
+            if (dsl.Handle != 0) Vk.DestroyDescriptorSetLayout(Device, dsl, null);
+        if (PipelineCacheHandle.Handle  != 0) Vk.DestroyPipelineCache(Device, PipelineCacheHandle, null);
+    }
+}
+
+public abstract unsafe class GraphicsPipeline : PipelineBase
+{
+    public override PipelineBindPoint BindPoint => PipelineBindPoint.Graphics;
+
+    protected GraphicsPipeline(Renderer renderer) : base(renderer) { }
+
+    // ── Required overrides ──────────────────────────────────────────────────
+    protected abstract string   ShaderPath              { get; }
+    protected abstract Format[] ColorAttachmentFormats  { get; }
+
+    // ── Optional hooks (defaults match the common case) ─────────────────────
+    protected virtual Format DepthAttachmentFormat => Format.Undefined;
+
+    protected virtual (ShaderStageFlags Stage, string EntryPoint)[] ShaderStages => new[]
+    {
+        (ShaderStageFlags.VertexBit,   "VSMain"),
+        (ShaderStageFlags.FragmentBit, "PSMain"),
+    };
+
+    protected virtual VertexInputBindingDescription[]   GetVertexInputBindings()   => Array.Empty<VertexInputBindingDescription>();
+    protected virtual VertexInputAttributeDescription[] GetVertexInputAttributes() => Array.Empty<VertexInputAttributeDescription>();
+
+    protected virtual PipelineInputAssemblyStateCreateInfo BuildInputAssembly() => new()
+    {
+        SType                  = StructureType.PipelineInputAssemblyStateCreateInfo,
+        Topology               = PrimitiveTopology.TriangleList,
+        PrimitiveRestartEnable = false,
+    };
+
+    protected virtual PipelineViewportStateCreateInfo BuildViewportState() => new()
+    {
+        SType         = StructureType.PipelineViewportStateCreateInfo,
+        ViewportCount = 1,
+        ScissorCount  = 1,
+    };
+
+    protected virtual PipelineRasterizationStateCreateInfo BuildRasterizer() => new()
+    {
+        SType                   = StructureType.PipelineRasterizationStateCreateInfo,
+        DepthClampEnable        = false,
+        RasterizerDiscardEnable = false,
+        PolygonMode             = PolygonMode.Fill,
+        LineWidth               = 1.0f,
+        CullMode                = CullModeFlags.BackBit,
+        FrontFace               = FrontFace.CounterClockwise,
+        DepthBiasEnable         = false,
+    };
+
+    protected virtual PipelineMultisampleStateCreateInfo BuildMultisample() => new()
+    {
+        SType                = StructureType.PipelineMultisampleStateCreateInfo,
+        SampleShadingEnable  = false,
+        RasterizationSamples = SampleCountFlags.Count1Bit,
+    };
+
+    protected virtual PipelineDepthStencilStateCreateInfo BuildDepthStencil() => new()
+    {
+        SType                 = StructureType.PipelineDepthStencilStateCreateInfo,
+        DepthTestEnable       = true,
+        DepthWriteEnable      = true,
+        DepthCompareOp        = CompareOp.Less,
+        DepthBoundsTestEnable = false,
+        StencilTestEnable     = false,
+        MinDepthBounds        = 0.0f,
+        MaxDepthBounds        = 1.0f,
+    };
+
+    // One no-blend attachment per color target by default. Override for
+    // additive / alpha / G-buffer-with-mixed-formats cases.
+    protected virtual PipelineColorBlendAttachmentState[] BuildColorBlendAttachments()
+    {
+        var att = new PipelineColorBlendAttachmentState[ColorAttachmentFormats.Length];
+        for (int i = 0; i < att.Length; i++)
+        {
+            att[i] = new()
+            {
+                BlendEnable    = false,
+                ColorWriteMask = ColorComponentFlags.RBit | ColorComponentFlags.GBit |
+                                 ColorComponentFlags.BBit | ColorComponentFlags.ABit,
+            };
+        }
+        return att;
+    }
+
+    protected virtual DynamicState[] DynamicStates => new[] { DynamicState.Viewport, DynamicState.Scissor };
+
+    // Drives the pipeline build from the hooks above. Sealed because concrete
+    // pipelines should configure via overrides rather than re-implementing
+    // the whole assembly — that's the main thing keeping the sprawl out.
+    protected sealed override void CreatePipeline()
+    {
+        byte[] code   = File.ReadAllBytes(ShaderPath);
+        var    module = Renderer.CreateShaderModule(code);
+
+        var stageDefs = ShaderStages;
+        var stages    = stackalloc PipelineShaderStageCreateInfo[stageDefs.Length];
+        var entryPtrs = stackalloc nint[stageDefs.Length];
+        for (int i = 0; i < stageDefs.Length; i++)
+        {
+            entryPtrs[i] = SilkMarshal.StringToPtr(stageDefs[i].EntryPoint);
+            stages[i] = new()
+            {
+                SType  = StructureType.PipelineShaderStageCreateInfo,
+                Stage  = stageDefs[i].Stage,
+                Module = module,
+                PName  = (byte*)entryPtrs[i],
+            };
+        }
+
+        var vertexInputBindings   = GetVertexInputBindings();
+        var vertexInputAttributes = GetVertexInputAttributes();
+        var inputAssembly         = BuildInputAssembly();
+        var viewportState         = BuildViewportState();
+        var rasterizer            = BuildRasterizer();
+        var multisample           = BuildMultisample();
+        var depthStencil          = BuildDepthStencil();
+        var blendAttachments      = BuildColorBlendAttachments();
+        var dynamicStates         = DynamicStates;
+        var colorFormats          = ColorAttachmentFormats;
+
+        fixed (VertexInputBindingDescription*     pBindings  = vertexInputBindings)
+        fixed (VertexInputAttributeDescription*   pAttribs   = vertexInputAttributes)
+        fixed (PipelineColorBlendAttachmentState* pBlend     = blendAttachments)
+        fixed (DynamicState*                      pDyn       = dynamicStates)
+        fixed (Format*                            pColorFmts = colorFormats)
+        {
+            var vertexInput = new PipelineVertexInputStateCreateInfo
+            {
+                SType                           = StructureType.PipelineVertexInputStateCreateInfo,
+                VertexBindingDescriptionCount   = (uint)vertexInputBindings.Length,
+                PVertexBindingDescriptions      = pBindings,
+                VertexAttributeDescriptionCount = (uint)vertexInputAttributes.Length,
+                PVertexAttributeDescriptions    = pAttribs,
+            };
+
+            var colorBlend = new PipelineColorBlendStateCreateInfo
+            {
+                SType           = StructureType.PipelineColorBlendStateCreateInfo,
+                LogicOpEnable   = false,
+                LogicOp         = LogicOp.Copy,
+                AttachmentCount = (uint)blendAttachments.Length,
+                PAttachments    = pBlend,
+            };
+
+            var dynamic = new PipelineDynamicStateCreateInfo
+            {
+                SType             = StructureType.PipelineDynamicStateCreateInfo,
+                DynamicStateCount = (uint)dynamicStates.Length,
+                PDynamicStates    = pDyn,
+            };
+
+            var renderingInfo = new PipelineRenderingCreateInfo
+            {
+                SType                   = StructureType.PipelineRenderingCreateInfo,
+                ColorAttachmentCount    = (uint)colorFormats.Length,
+                PColorAttachmentFormats = pColorFmts,
+                DepthAttachmentFormat   = DepthAttachmentFormat,
+                StencilAttachmentFormat = Format.Undefined,
+            };
+
+            var info = new GraphicsPipelineCreateInfo
+            {
+                SType               = StructureType.GraphicsPipelineCreateInfo,
+                PNext               = &renderingInfo,
+                StageCount          = (uint)stageDefs.Length,
+                PStages             = stages,
+                PVertexInputState   = &vertexInput,
+                PInputAssemblyState = &inputAssembly,
+                PViewportState      = &viewportState,
+                PRasterizationState = &rasterizer,
+                PMultisampleState   = &multisample,
+                PDepthStencilState  = &depthStencil,
+                PColorBlendState    = &colorBlend,
+                PDynamicState       = &dynamic,
+                Layout              = PipelineLayoutHandle,
+                RenderPass          = default,
+                Subpass             = 0,
+                BasePipelineHandle  = default,
+                BasePipelineIndex   = -1,
+            };
+
+            if (Vk.CreateGraphicsPipelines(Device, PipelineCacheHandle, 1, &info, null, out PipelineHandle) != Result.Success)
+                throw new Exception($"Failed to create graphics pipeline for {GetType().Name}");
+        }
+
+        for (int i = 0; i < stageDefs.Length; i++) SilkMarshal.Free(entryPtrs[i]);
+        Vk.DestroyShaderModule(Device, module, null);
+    }
+}
+
+public abstract unsafe class ComputePipeline : PipelineBase
+{
+    public override PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
+
+    protected ComputePipeline(Renderer renderer) : base(renderer) { }
+
+    protected abstract string ShaderPath { get; }
+
+    // slangc emits the SPIR-V OpEntryPoint as "main" regardless of the source
+    // function name. Override only if the .spv was produced by a toolchain
+    // that preserves a different entry-point symbol.
+    protected virtual string EntryPoint => "main";
+
+    protected sealed override void CreatePipeline()
+    {
+        byte[] code   = File.ReadAllBytes(ShaderPath);
+        var    module = Renderer.CreateShaderModule(code);
+        var    entry  = SilkMarshal.StringToPtr(EntryPoint);
+
+        var stage = new PipelineShaderStageCreateInfo
+        {
+            SType  = StructureType.PipelineShaderStageCreateInfo,
+            Stage  = ShaderStageFlags.ComputeBit,
+            Module = module,
+            PName  = (byte*)entry,
+        };
+
+        var info = new ComputePipelineCreateInfo
+        {
+            SType  = StructureType.ComputePipelineCreateInfo,
+            Stage  = stage,
+            Layout = PipelineLayoutHandle,
+        };
+
+        if (Vk.CreateComputePipelines(Device, PipelineCacheHandle, 1, &info, null, out PipelineHandle) != Result.Success)
+            throw new Exception($"Failed to create compute pipeline for {GetType().Name}");
+
+        SilkMarshal.Free(entry);
+        Vk.DestroyShaderModule(Device, module, null);
+    }
+}
+
+public sealed unsafe class GeometryPipeline : GraphicsPipeline
+{
+    struct GeometryUBO
+    {
+        public Matrix4x4 view;
+        public Matrix4x4 proj;
+    }
+    //Per frame uniform buffers for geometry pipeline
+    private UboBuffer[] GeometryUniformBuffers = new UboBuffer[2];
+    
+    protected override string ShaderPath { get; } =
+        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\Geometry.spv";
+    protected override Format[] ColorAttachmentFormats { get; } =
+    [
+        Format.R32G32B32A32Sfloat, // Position
+        Format.R32G32B32A32Sfloat, // Normal
+        Format.R8G8B8A8Unorm, // Albedo
+        Format.R8G8B8A8Unorm, // Material
+        Format.R8G8B8A8Unorm // Emissive
+    ];
+    
+    
+    public GeometryPipeline(Renderer renderer) : base(renderer)
+    {
+        
+    }  
+
+    protected override void CreateDescriptorSetLayouts()
+    {
+        CreateFrameDescriptorSetLayout(out var frameDSL);
+        DescriptorSetLayouts = new[] { frameDSL,  Engine.ResourceManager.GetBindlessLayout()};
+    }
+
+    protected override void CreateResources()
+    {
+        base.CreateResources();
+        
+        
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            Renderer.CreateMappedUniformBuffer(sizeof(GeometryUBO), ref GeometryUniformBuffers[i]);
+        }
+    }
+
+    protected override void CreateDescriptorSets()
+    {
+        // Per-frame "frame" descriptor sets (set 0): only binding 0 = FrameUBO (view+proj).
+        // Material samplers live on set 1 and are allocated from materialDescriptorPool.
+        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
+
+        DescriptorSetAllocateInfo allocateInfo = new()
+        {
+            SType = StructureType.DescriptorSetAllocateInfo,
+            DescriptorPool = Renderer.descriptorPool,
+            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
+            PSetLayouts = layouts
+        };
+        DescriptorSets = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES][];
+        fixed (DescriptorSet* pDS = DescriptorSets[0])
+        {
+            if (Vk.AllocateDescriptorSets(Device, &allocateInfo, pDS) != Result.Success)
+            {
+                throw new Exception("Failed to allocate descriptor sets using layout 0 for geometry pipeline");
+            }
+        }
+    }
+
+    protected override void WriteDescriptors()
+    {
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            DescriptorBufferInfo bufferInfo = new()
+            {
+                Buffer = GeometryUniformBuffers[i].buffer,
+                Offset = 0,
+                Range = (ulong)sizeof(GeometryUBO),
+            };
+            WriteDescriptorSet descriptorWrite = new()
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = DescriptorSets[0][i],
+                DstBinding = 0,
+                DstArrayElement = 0,
+                DescriptorType = DescriptorType.UniformBuffer,
+                DescriptorCount = 1,
+                PBufferInfo = &bufferInfo
+            };
+            Vk!.UpdateDescriptorSets(Device, 1, &descriptorWrite, 0, null);
+        }
+    }
+
+    protected override VertexInputBindingDescription[] GetVertexInputBindings()
+    {
+        return [Vertex.GetBindingDescription()];
+    }
+
+    protected override VertexInputAttributeDescription[] GetVertexInputAttributes()
+    {
+        return Vertex.GetAttributeDescriptions();
+    }
+    
+    
+    // Set 0 of the geometry pipeline. One binding (the per-frame FrameUBO with view+proj),
+    // bound once at the start of the geometry pass and reused for every draw.
+    private void CreateFrameDescriptorSetLayout(out DescriptorSetLayout layout)
+    {
+        var binding = new DescriptorSetLayoutBinding
+        {
+            Binding = 0,
+            DescriptorType = DescriptorType.UniformBuffer,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.VertexBit,
+            PImmutableSamplers = null,
+        };
+
+        DescriptorSetLayoutBindingFlagsCreateInfo flagsCreateInfo = new()
+            { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
+        var flag = DescriptorBindingFlags.UpdateAfterBindBit |
+                   DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
+
+        if (Renderer.descriptorIndexEnabled)
+        {
+            flagsCreateInfo.BindingCount = 1;
+            flagsCreateInfo.PBindingFlags = &flag;
+        }
+
+        DescriptorSetLayoutCreateInfo layoutInfo = new()
+        {
+            SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 1,
+            PBindings = &binding,
+        };
+        if (Renderer.descriptorIndexEnabled)
+        {
+            layoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
+            layoutInfo.PNext = &flagsCreateInfo;
+        }
+
+        if (Vk!.CreateDescriptorSetLayout(Device, &layoutInfo, null, out layout) !=
+            Result.Success)
+            throw new Exception("Failed to create geometry frame descriptor set layout");
+    }
+
+    // Set 1 of the geometry pipeline. Five PBR textures (baseColor, metallicRoughness, normal,
+    // occlusion, emissive). One set per material; bound per-draw.
+    const int materialSetCount = 5;
+    
+    // Writes the per-frame view+proj into GeometryUniformBuffers[frameIndex].
+    // Called once per frame in DrawFrame; per-draw model matrix is pushed via PbrPushConstants.
+    private void UpdateUbo(uint frameIndex, Camera camera)
+    {
+        GeometryUBO ubo = new();
+        if (camera != null)
+        {
+            ubo.proj = camera.GetProjectionMatrix((float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+            ubo.view = camera.GetViewMatrix();
+            ubo.proj.M22 *= -1; // Vulkan clip space has Y down
+        }
+        else
+        {
+            ubo.view = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), new Vector3(0, 0, 0), new Vector3(0, 0, 1));
+            ubo.proj = Matrix4x4.CreatePerspectiveFieldOfView((float)(45 * Math.PI / 180),
+                (float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+            ubo.proj.M22 *= -1; // flip Y for Vulkan clip space
+        }
+
+        void* data = GeometryUniformBuffers[frameIndex].mapped;
+        new Span<GeometryUBO>(data, 1).Fill(ubo);
     }
 }

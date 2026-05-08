@@ -22,7 +22,7 @@ public unsafe partial class Renderer
     /// <summary>
     /// Renderer fields
     /// </summary>
-    Vk? vk = Globals.vk;
+    internal Vk? vk = Globals.vk;
     public bool initialized = false;
     
     private bool enableValidationLayers = true;
@@ -57,7 +57,7 @@ public unsafe partial class Renderer
     private Queue presentQueue;
     private Queue computeQueue;
     private Queue transferQueue;
-    private bool descriptorIndexEnabled = false;
+    internal bool descriptorIndexEnabled = false;
     private bool robustness2Enabled = false;
     private bool accelerationStructureEnabled = false;
     private bool rayQueryEnabled = false;
@@ -71,13 +71,13 @@ public unsafe partial class Renderer
 
     
     //swapchain fields
-    private const uint MAX_CONCURRENT_FRAMES = 2;
+    internal const uint MAX_CONCURRENT_FRAMES = 2;
     
     private KhrSwapchain swapChainKhr;
     private SwapchainKHR swapChain;
     private Image[] swapChainImages;
     internal Format swapChainImageFormat;
-    private Extent2D swapChainExtent;
+    internal Extent2D swapChainExtent;
     internal ImageView[] swapChainImageViews;
     private ImageLayout[] swapChainImageLayouts;
 
@@ -145,7 +145,15 @@ public unsafe partial class Renderer
     //Uniform buffers — split per pass (Geometry pass writes model/view/proj; Lighting pass writes lights + camPos + tone-mapping params)
     private UboBuffer[] GeometryUniformBuffers = new UboBuffer[2];
     private UboBuffer[] LightingUniformBuffers = new UboBuffer[2];
+    // Per-frame StructuredBuffer<PbrLight> — populated each frame in UpdateLightingBuffers
+    // by walking scene.EnumerateLights(). Bound at PBR set 0, binding 1.
+    private UboBuffer[] LightStorageBuffers = new UboBuffer[2];
     
+    // Total renderables packed into the cull-input buffer this frame. Drives the
+    // maxDrawCount arg of vkCmdDrawIndexedIndirectCount; reset every frame in
+    // RecordCullPass before the geometry pass runs.
+    uint renderableCountThisFrame;
+
     //Sync objects
     Semaphore[] imageAvailableSemaphores;
     Semaphore[] renderFinishedSemaphores;
@@ -173,7 +181,7 @@ public unsafe partial class Renderer
     DescriptorSetLayout geometryMaterialDescriptorSetLayout; // Geometry pipeline set 1 — bindless materials/instances/textures/samplers
     DescriptorSetLayout PBRDescriptorSetLayout; //Set 0 - Lighting UBO
     DescriptorSetLayout PBRGBufferDescriptorSetLayout;//Set 1 - G buffer descriptors
-    DescriptorPool descriptorPool;
+    internal DescriptorPool descriptorPool;
     private DescriptorSet[] geometryDescriptorSets;
     private DescriptorSet[] lightingDescriptorSets;   // per-frame, binds LightingUBO (set 0)
     private DescriptorSet gBufferDescriptorSet;       // shared, binds G-buffer samplers (set 1)
@@ -209,6 +217,10 @@ public unsafe partial class Renderer
         CreateGraphicsPipeline();
         CreateGeometryPipeline();
         CreatePBRPipeline();
+        CreateCullDescriptorSetLayout();
+        CreateCullPipeline();
+        CreateLightCullDescriptorSetLayout();
+        CreateLightCullPipeline();
         //create command pool
         CreateCommandPool();
         
@@ -228,15 +240,21 @@ public unsafe partial class Renderer
         CreateGBufferSampler();
         //Create descriptor pool (sized for bindless: storage buffers, sampled images, samplers).
         CreateDescriptorPool();
+        Engine.ResourceManager.Initialize(this);
         CreateDescriptorSets();
-        CreateLightingDescriptorSets();
 
         // Bindless geometry-set 1 setup: per-frame material+instance SSBOs, shared default sampler,
         // and the per-frame descriptor sets they all live in. Texture array (binding 2) is filled
         // lazily by ResourceManager.RegisterBindless as glTF assets load.
-        CreateDefaultBindlessSampler();
-        CreateMaterialAndInstanceBuffers();
-        CreateBindlessDescriptorSets();
+        CreateCullBuffers();
+        // Tile-cull buffers must exist BEFORE CreateLightingDescriptorSets — its writes
+        // reference TileLightCountBuffers/TileLightIndicesBuffers (PBR set 0 bindings 3,4).
+        CreateTileLightCullBuffers();
+        CreateLightingDescriptorSets();
+        // Cull descriptor sets reference the per-frame cull buffers, so they must
+        // be created after CreateCullBuffers (and after CreateDescriptorPool).
+        CreateCullDescriptorSets();
+        CreateLightCullDescriptorSets();
 
         //Create command buffers
         CreateCommandBuffers();
@@ -258,28 +276,85 @@ public unsafe partial class Renderer
     private void CreateTestEntity()
     {
         // Wire ResourceManager → upload viking_room mesh → create entity with transform + mesh.
-        Engine.ResourceManager.Initialize(this);
+        
 
 
         // glTF demo: DamagedHelmet to the side of viking_room so both render together.
+        Entity* blue_agent = GltfLoader.Load(
+            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\props\sas_blue.glb",
+            "BlueAgent", Engine.ResourceManager, this, scene);
+        blue_agent->GetComponent<TransformComponent>()?.SetScale(new Vector3(25f));
+        blue_agent->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(0, 0, MathF.PI / 2));
+        blue_agent->GetComponent<TransformComponent>()?.SetPosition(new Vector3(6f, 0f, 0f));
+        
+        
         Entity* helmetRoot = GltfLoader.Load(
             @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\DamagedHelmet.glb",
             "DamagedHelmet", Engine.ResourceManager, this, scene);
         var helmetTransform = helmetRoot->GetComponent<TransformComponent>();
         helmetTransform?.SetPosition(new Vector3(0f, 1f, 0f));
+
+        // Phase 2 smoke test — three LightComponents (directional / point / spot)
+        // confirming the per-frame StructuredBuffer<PbrLight> path lights the helmet.
         
 
-        // Entity* blue_agent = GltfLoader.Load(
-        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\props\sas_blue.glb",
-        //     "BlueAgent", Engine.ResourceManager, this, scene);
-        // blue_agent->GetComponent<TransformComponent>()?.SetPosition(new Vector3(3f, 0f, 0f));
-        // blue_agent->GetComponent<TransformComponent>()?.SetScale(new Vector3(25f));
-        // blue_agent->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(0, 0, MathF.PI / 2));
+        
+        
+        SpawnTestLights();
+    }
+
+    private void SpawnTestLights()
+    {
+        // Directional key light — sun-like, pointing slightly down and forward.
+        // Position irrelevant for directional; we keep an identity transform.
+        Entity* dirLight = Entity.Create("KeyLight");
+        dirLight->AddComponent(new TransformComponent());
+        dirLight->AddComponent(new LightComponent
+        {
+            Type        = LightType.Directional,
+            Color       = new Vector3(1.0f, 0.97f, 0.92f),
+            Intensity   = 3.0f,
+            Direction   = new Vector3(-0.4f, -1.0f, -0.3f),
+            CastShadows = true,
+        });
+        dirLight->Initialize();
+        scene.AddEntity(dirLight);
+
+        // Point fill light — warm, sits to the right of and above the helmet.
+        Entity* pointLight = Entity.Create("PointFill");
+        pointLight->AddComponent(new TransformComponent());
+        pointLight->GetComponent<TransformComponent>()?.SetPosition(new Vector3(2.5f, 2.0f, 1.5f));
+        pointLight->AddComponent(new LightComponent
+        {
+            Type      = LightType.Point,
+            Color     = new Vector3(1.0f, 0.7f, 0.4f),
+            Intensity = 12.0f,
+            Range     = 8.0f,
+        });
+        pointLight->Initialize();
+        scene.AddEntity(pointLight);
+
+        // Spot rim light — tight cone aimed at the helmet from below-left.
+        Entity* spotLight = Entity.Create("SpotRim");
+        spotLight->AddComponent(new TransformComponent());
+        spotLight->GetComponent<TransformComponent>()?.SetPosition(new Vector3(-2.5f, 0.5f, 1.0f));
+        spotLight->AddComponent(new LightComponent
+        {
+            Type         = LightType.Spot,
+            Color        = new Vector3(0.6f, 0.8f, 1.0f),
+            Intensity    = 25.0f,
+            Range        = 10.0f,
+            Direction    = new Vector3(1.0f, 0.2f, -0.4f),
+            InnerConeCos = MathF.Cos(MathF.PI / 8f),  // ~22.5°
+            OuterConeCos = MathF.Cos(MathF.PI / 5f),  // ~36°
+        });
+        spotLight->Initialize();
+        scene.AddEntity(spotLight);
     }
 
     public void Update(double d)
     {
-        
+
         DrawFrame();
     }
 
@@ -337,8 +412,6 @@ public unsafe partial class Renderer
         // ── G-buffer sampler ────────────────────────────────────
         if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
 
-        // ── Bindless default sampler ────────────────────────────
-        if (defaultBindlessSampler.Handle != 0) vk.DestroySampler(device, defaultBindlessSampler, null);
 
         // ── Per-frame uniform + storage buffers (FreeMemory implicitly unmaps) ─
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
@@ -351,27 +424,49 @@ public unsafe partial class Renderer
                 vk.DestroyBuffer(device, LightingUniformBuffers[i].buffer, null);
             if (LightingUniformBuffers[i].memory.Handle != 0)
                 vk.FreeMemory(device, LightingUniformBuffers[i].memory, null);
-            if (MaterialStorageBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, MaterialStorageBuffers[i].buffer, null);
-            if (MaterialStorageBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, MaterialStorageBuffers[i].memory, null);
-            if (InstanceStorageBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, InstanceStorageBuffers[i].buffer, null);
-            if (InstanceStorageBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, InstanceStorageBuffers[i].memory, null);
+            if (LightStorageBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, LightStorageBuffers[i].buffer, null);
+            if (LightStorageBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, LightStorageBuffers[i].memory, null);
+            if (RenderableInputBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, RenderableInputBuffers[i].buffer, null);
+            if (RenderableInputBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, RenderableInputBuffers[i].memory, null);
+            if (IndirectCmdBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, IndirectCmdBuffers[i].buffer, null);
+            if (IndirectCmdBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, IndirectCmdBuffers[i].memory, null);
+            if (IndirectCountBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, IndirectCountBuffers[i].buffer, null);
+            if (IndirectCountBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, IndirectCountBuffers[i].memory, null);
+            if (TileLightCountBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, TileLightCountBuffers[i].buffer, null);
+            if (TileLightCountBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, TileLightCountBuffers[i].memory, null);
+            if (TileLightIndicesBuffers[i].buffer.Handle != 0)
+                vk.DestroyBuffer(device, TileLightIndicesBuffers[i].buffer, null);
+            if (TileLightIndicesBuffers[i].memory.Handle != 0)
+                vk.FreeMemory(device, TileLightIndicesBuffers[i].memory, null);
         }
 
         // ── Pipelines + layouts ─────────────────────────────────
+        if (lightCullPipeline.Handle   != 0) vk.DestroyPipeline(device, lightCullPipeline,   null);
+        if (cullPipeline.Handle        != 0) vk.DestroyPipeline(device, cullPipeline,        null);
         if (pbrLightingPipeline.Handle != 0) vk.DestroyPipeline(device, pbrLightingPipeline, null);
         if (geometryPipeline.Handle    != 0) vk.DestroyPipeline(device, geometryPipeline,    null);
         if (graphicsPipeline.Handle    != 0) vk.DestroyPipeline(device, graphicsPipeline,    null);
 
+        if (lightCullPipelineLayout.Handle != 0) vk.DestroyPipelineLayout(device, lightCullPipelineLayout, null);
+        if (cullPipelineLayout.Handle     != 0) vk.DestroyPipelineLayout(device, cullPipelineLayout,     null);
         if (pbrPipelineLayout.Handle      != 0) vk.DestroyPipelineLayout(device, pbrPipelineLayout,      null);
         if (geometryPipelineLayout.Handle != 0) vk.DestroyPipelineLayout(device, geometryPipelineLayout, null);
         if (pipelineLayout.Handle         != 0) vk.DestroyPipelineLayout(device, pipelineLayout,         null);
 
         // ── Descriptor pool (frees sets) + layouts ──────────────
         if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
+        if (lightCullDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, lightCullDescriptorSetLayout, null);
+        if (cullDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, cullDescriptorSetLayout, null);
         if (PBRGBufferDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, PBRGBufferDescriptorSetLayout, null);
         if (PBRDescriptorSetLayout.Handle        != 0) vk.DestroyDescriptorSetLayout(device, PBRDescriptorSetLayout,        null);
         if (geometryFrameDescriptorSetLayout.Handle   != 0) vk.DestroyDescriptorSetLayout(device, geometryFrameDescriptorSetLayout,   null);
@@ -675,162 +770,129 @@ public unsafe partial class Renderer
             queueCreateInfos.Add(queueCreateInfo);
         }
         
-        //Query supported features then enable them
+        //Query supported features. We use the 1.2 / 1.3 omnibus structs in place of
+        //the individual Timeline / MemoryModel / BufferAddress / 8BitStorage /
+        //DescriptorIndexing feature structs because Vulkan forbids mixing them with
+        //the 1.2 features struct in the same pNext chain (VUID-VkDeviceCreateInfo-
+        //pNext-02830) and the omnibus already exposes every individual field we need.
         var coreSupported = new PhysicalDeviceFeatures2
         {
             SType = StructureType.PhysicalDeviceFeatures2
-        };
-        var timelineSupported = new PhysicalDeviceTimelineSemaphoreFeatures
-        {
-            SType = StructureType.PhysicalDeviceTimelineSemaphoreFeatures
-        };
-        var memoryModelSupported = new PhysicalDeviceVulkanMemoryModelFeatures
-        {
-            SType = StructureType.PhysicalDeviceVulkanMemoryModelFeatures
-        };
-        var bufferAddressSupported = new PhysicalDeviceBufferDeviceAddressFeatures
-        {
-            SType = StructureType.PhysicalDeviceBufferDeviceAddressFeatures
-        };
-        var storage8BitSupported = new PhysicalDevice8BitStorageFeatures
-        {
-            SType = StructureType.PhysicalDevice8BitStorageFeatures
         };
         var vulkan11Supported = new PhysicalDeviceVulkan11Features
         {
             SType = StructureType.PhysicalDeviceVulkan11Features
         };
+        var vulkan12Supported = new PhysicalDeviceVulkan12Features
+        {
+            SType = StructureType.PhysicalDeviceVulkan12Features
+        };
         var vulkan13Supported = new PhysicalDeviceVulkan13Features
         {
             SType = StructureType.PhysicalDeviceVulkan13Features
         };
-        
-        coreSupported.PNext = &timelineSupported;
-        timelineSupported.PNext = &memoryModelSupported;
-        memoryModelSupported.PNext = &bufferAddressSupported;
-        bufferAddressSupported.PNext = &storage8BitSupported;
-        storage8BitSupported.PNext = &vulkan11Supported;
-        vulkan11Supported.PNext = &vulkan13Supported;
-        vulkan13Supported.PNext = null;
+        var robust2Supported = new PhysicalDeviceRobustness2FeaturesEXT
+        {
+            SType = StructureType.PhysicalDeviceRobustness2FeaturesExt
+        };
+        var accelerationStructureFeaturesSupported = new PhysicalDeviceAccelerationStructureFeaturesKHR
+        {
+            SType = StructureType.PhysicalDeviceAccelerationStructureFeaturesKhr
+        };
+        var rayQueryFeaturesSupported = new PhysicalDeviceRayQueryFeaturesKHR
+        {
+            SType = StructureType.PhysicalDeviceRayQueryFeaturesKhr
+        };
+
+        coreSupported.PNext             = &vulkan11Supported;
+        vulkan11Supported.PNext         = &vulkan12Supported;
+        vulkan12Supported.PNext         = &vulkan13Supported;
+        vulkan13Supported.PNext         = &robust2Supported;
+        robust2Supported.PNext          = &accelerationStructureFeaturesSupported;
+        accelerationStructureFeaturesSupported.PNext = &rayQueryFeaturesSupported;
+        rayQueryFeaturesSupported.PNext = null;
 
         vk!.GetPhysicalDeviceFeatures2(physicalDevice, &coreSupported);
 
         bool supported = (
             coreSupported.Features.SamplerAnisotropy &&
-            timelineSupported.TimelineSemaphore &&
-            memoryModelSupported.VulkanMemoryModel &&
-            bufferAddressSupported.BufferDeviceAddress &&
+            coreSupported.Features.MultiDrawIndirect &&
+            coreSupported.Features.DrawIndirectFirstInstance &&
             vulkan11Supported.ShaderDrawParameters &&
+            vulkan12Supported.TimelineSemaphore &&
+            vulkan12Supported.VulkanMemoryModel &&
+            vulkan12Supported.BufferDeviceAddress &&
+            vulkan12Supported.DrawIndirectCount &&
             vulkan13Supported.DynamicRendering &&
             vulkan13Supported.Synchronization2);
         if(!supported) throw new Exception("Device does not support required features");
-        
-        
+
+
         //enable required features (verified to be supported)
         vk!.GetPhysicalDeviceFeatures2(physicalDevice, out var features);
         features.SType = StructureType.PhysicalDeviceFeatures2;
         features.Features.SamplerAnisotropy = true;
         features.Features.DepthBiasClamp = coreSupported.Features.DepthBiasClamp ? true : false;
-        
-        //Timeline semaphore features (required for synch2)
-        PhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = new(){SType = StructureType.PhysicalDeviceTimelineSemaphoreFeatures};
-        timelineFeatures.TimelineSemaphore = true;
-        //Vulkan memory model
-        PhysicalDeviceVulkanMemoryModelFeatures memoryModelFeatures = new(){SType = StructureType.PhysicalDeviceVulkanMemoryModelFeatures};
-        memoryModelFeatures.VulkanMemoryModel = true;
-        memoryModelFeatures.VulkanMemoryModelDeviceScope = memoryModelSupported.VulkanMemoryModelDeviceScope;
-        //Buffer device address features (required for some buffer operations)
-        PhysicalDeviceBufferDeviceAddressFeatures bufferAddressFeatures = new(){SType = StructureType.PhysicalDeviceBufferDeviceAddressFeatures};
-        bufferAddressFeatures.BufferDeviceAddress = true;
-        //8 bit storage features (required for some shader storage operations)
-        PhysicalDevice8BitStorageFeatures storage8BitFeatures = new(){SType = StructureType.PhysicalDevice8BitStorageFeatures};
-        storage8BitFeatures.StorageBuffer8BitAccess = storage8BitSupported.StorageBuffer8BitAccess;
-        //vulkan 1.3 features
+        // Required by the GPU-driven cull pass: indirect draws emit one
+        // VkDrawIndexedIndirectCommand per visible mesh, all consumed by a single
+        // vkCmdDrawIndexedIndirectCount.
+        features.Features.MultiDrawIndirect = true;
+        // The cull shader writes a non-zero firstInstance into each indirect command
+        // so the geometry VS can resolve SV_InstanceID -> instances[slot]. Without
+        // this feature the spec requires firstInstance=0 and drivers silently clamp
+        // it, making every primitive read instances[0].
+        features.Features.DrawIndirectFirstInstance = true;
+        //rayQuery shader uses indexing into a large sampled-image array.
+        if (coreSupported.Features.ShaderSampledImageArrayDynamicIndexing)
+            features.Features.ShaderSampledImageArrayDynamicIndexing = true;
+
+        //vulkan 1.1
+        PhysicalDeviceVulkan11Features vulkan11Features = new(){SType = StructureType.PhysicalDeviceVulkan11Features};
+        vulkan11Features.ShaderDrawParameters = true;
+
+        //vulkan 1.2 — rolls in Timeline, MemoryModel, BufferDeviceAddress, 8-bit storage,
+        //DescriptorIndexing, and DrawIndirectCount (used by vkCmdDrawIndexedIndirectCount).
+        PhysicalDeviceVulkan12Features vulkan12Features = new(){SType = StructureType.PhysicalDeviceVulkan12Features};
+        vulkan12Features.TimelineSemaphore                = true;
+        vulkan12Features.VulkanMemoryModel                = true;
+        vulkan12Features.VulkanMemoryModelDeviceScope     = vulkan12Supported.VulkanMemoryModelDeviceScope;
+        vulkan12Features.BufferDeviceAddress              = true;
+        vulkan12Features.StorageBuffer8BitAccess          = vulkan12Supported.StorageBuffer8BitAccess;
+        vulkan12Features.DrawIndirectCount                = true;
+
+        //Descriptor-indexing fields live on the 1.2 features struct. The DescriptorIndexing
+        //master toggle is required when VK_EXT_descriptor_indexing is in the enabled
+        //extension list (VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-02833).
+        var descriptorIndexingEnabled = false;
+        if (vulkan12Supported.ShaderSampledImageArrayNonUniformIndexing)
+        {
+            vulkan12Features.ShaderSampledImageArrayNonUniformIndexing = true;
+            descriptorIndexingEnabled = true;
+        }
+        if (vulkan12Supported.RuntimeDescriptorArray)
+            vulkan12Features.RuntimeDescriptorArray = true;
+        if (descriptorIndexingEnabled)
+        {
+            if (vulkan12Supported.DescriptorBindingPartiallyBound)
+                vulkan12Features.DescriptorBindingPartiallyBound = true;
+            if (vulkan12Supported.DescriptorBindingUpdateUnusedWhilePending)
+                vulkan12Features.DescriptorBindingUpdateUnusedWhilePending = true;
+        }
+        if (vulkan12Supported.DescriptorBindingSampledImageUpdateAfterBind)
+            vulkan12Features.DescriptorBindingSampledImageUpdateAfterBind = true;
+        if (vulkan12Supported.DescriptorBindingUniformBufferUpdateAfterBind)
+            vulkan12Features.DescriptorBindingUniformBufferUpdateAfterBind = true;
+        if (vulkan12Supported.DescriptorBindingUpdateUnusedWhilePending)
+            vulkan12Features.DescriptorBindingUpdateUnusedWhilePending = true;
+        // The descriptor-indexing master toggle gates the whole feature family and
+        // is required when the legacy VK_EXT_descriptor_indexing extension is enabled.
+        if (descriptorIndexingEnabled)
+            vulkan12Features.DescriptorIndexing = true;
+
+        //vulkan 1.3
         PhysicalDeviceVulkan13Features vulkan13Features = new(){SType = StructureType.PhysicalDeviceVulkan13Features};
         vulkan13Features.DynamicRendering = true;
         vulkan13Features.Synchronization2 = true;
-        //vulkan 1.1 features
-        PhysicalDeviceVulkan11Features vulkan11Features = new(){SType = StructureType.PhysicalDeviceVulkan11Features};
-        vulkan11Features.ShaderDrawParameters = true;
-        
-        
-        
-        //----------------------------------------------------------------
-        //------------------query extended features support---------------
-        //----------------------------------------------------------------
-        PhysicalDeviceFeatures2 extendedFeaturesSupported = new()
-        {
-            SType = StructureType.PhysicalDeviceFeatures2,
-        };
-        //descriptor indexing features
-        PhysicalDeviceDescriptorIndexingFeatures descriptorIndexingFeaturesSupported = new()
-        {
-            SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
-        };
-        //robust2 supported
-        PhysicalDeviceRobustness2FeaturesEXT robust2Supported = new()
-        {
-            SType = StructureType.PhysicalDeviceRobustness2FeaturesExt
-        };
-        //AccelerationStructure features
-        PhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeaturesSupported = new()
-        {
-            SType = StructureType.PhysicalDeviceAccelerationStructureFeaturesKhr
-        };
-        //RayQuery features
-        PhysicalDeviceRayQueryFeaturesKHR rayQueryFeaturesSupported = new()
-        {
-            SType = StructureType.PhysicalDeviceRayQueryFeaturesKhr
-        };
-        extendedFeaturesSupported.PNext = &descriptorIndexingFeaturesSupported;
-        descriptorIndexingFeaturesSupported.PNext = &robust2Supported;
-        robust2Supported.PNext = &accelerationStructureFeaturesSupported;
-        accelerationStructureFeaturesSupported.PNext = &rayQueryFeaturesSupported;
-        rayQueryFeaturesSupported.PNext = null;
-        
-        vk!.GetPhysicalDeviceFeatures2(physicalDevice, &extendedFeaturesSupported);
-        
-        //rayQuery shader uses indexing into a large sampled-image array.
-        //some drivers require this core feature to be explicitly enabled
-        if (extendedFeaturesSupported.Features.ShaderSampledImageArrayDynamicIndexing)
-        {
-            features.Features.ShaderSampledImageArrayDynamicIndexing = true;
-        }
-        //Prepare descriptor indexing features to enable if supported
-        PhysicalDeviceDescriptorIndexingFeatures indexingFeaturesEnable = new(){SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures};
-        var descriptorIndexingEnabled = false;
-        //enable non uniform indexing
-        //some drivers require this core feature to be explicitly enabled for rayQuery
-        if (descriptorIndexingFeaturesSupported.ShaderSampledImageArrayNonUniformIndexing)
-        {
-            indexingFeaturesEnable.ShaderSampledImageArrayNonUniformIndexing = true;
-            descriptorIndexingEnabled = true;
-        }
-
-        // Bindless geometry pipeline declares Texture2D textures[] (unbounded SPIR-V
-        // RuntimeDescriptorArray capability) — required.
-        if (descriptorIndexingFeaturesSupported.RuntimeDescriptorArray)
-            indexingFeaturesEnable.RuntimeDescriptorArray = true;
-
-        if (descriptorIndexingEnabled)
-        {
-            if (descriptorIndexingFeaturesSupported.DescriptorBindingPartiallyBound)
-            {
-                indexingFeaturesEnable.DescriptorBindingPartiallyBound = true;
-            }
-
-            if (descriptorIndexingFeaturesSupported.DescriptorBindingUpdateUnusedWhilePending)
-            {
-                indexingFeaturesEnable.DescriptorBindingUpdateUnusedWhilePending = true;
-            }
-        }
-        //optionally enable updateAfterBind flags when supported, not necessarily required for rayQuery tex's
-        if (descriptorIndexingFeaturesSupported.DescriptorBindingSampledImageUpdateAfterBind)
-            indexingFeaturesEnable.DescriptorBindingSampledImageUpdateAfterBind = true;
-        if (descriptorIndexingFeaturesSupported.DescriptorBindingUniformBufferUpdateAfterBind)
-            indexingFeaturesEnable.DescriptorBindingUniformBufferUpdateAfterBind = true;
-        if (descriptorIndexingFeaturesSupported.DescriptorBindingUpdateUnusedWhilePending)
-            indexingFeaturesEnable.DescriptorBindingUpdateUnusedWhilePending = true;
         
         //helper to verify that an extension is enabled
         bool hasExtension(string name)
@@ -867,20 +929,11 @@ public unsafe partial class Renderer
             rayQueryEnable.RayQuery = true;
         }
         
-        //chain all features together
-        features.PNext = &timelineFeatures;
-        timelineFeatures.PNext = &memoryModelFeatures;
-        memoryModelFeatures.PNext = &bufferAddressFeatures;
-        bufferAddressFeatures.PNext = &storage8BitFeatures;
-        storage8BitFeatures.PNext = &vulkan11Features;
-        vulkan11Features.PNext = &vulkan13Features;
-        //build explicitly for enabled features
+        //chain all features together: 1.1 -> 1.2 -> 1.3 -> optional ext structs
+        features.PNext = &vulkan11Features;
+        vulkan11Features.PNext = &vulkan12Features;
+        vulkan12Features.PNext = &vulkan13Features;
         void** tailNext = (void**)&vulkan13Features.PNext;
-        if (descriptorIndexingEnabled)
-        {
-            *tailNext = &indexingFeaturesEnable;
-            tailNext = (void**)&indexingFeaturesEnable.PNext;
-        }
 
         if (hasRobust2)
         {
@@ -899,33 +952,30 @@ public unsafe partial class Renderer
             *tailNext = &rayQueryEnable;
             tailNext = (void**)&rayQueryEnable.PNext;
         }
-        
+
         //record which features ended up enabled
-        descriptorIndexEnabled = descriptorIndexingEnabled && (indexingFeaturesEnable.DescriptorBindingPartiallyBound && indexingFeaturesEnable.DescriptorBindingUpdateUnusedWhilePending);
+        descriptorIndexEnabled = descriptorIndexingEnabled && (vulkan12Features.DescriptorBindingPartiallyBound && vulkan12Features.DescriptorBindingUpdateUnusedWhilePending);
         robustness2Enabled = hasRobust2 && (robust2Enable.RobustBufferAccess2 || robust2Enable.RobustImageAccess2 || robust2Enable.NullDescriptor);
         accelerationStructureEnabled = hasAccelerationStructure && accelerationstructureEnable.AccelerationStructure;
         rayQueryEnabled = hasRayQuery && rayQueryEnable.RayQuery;
 
         Console.WriteLine($"----> RayShadowsSupported: {RayShadowsSupported} " +
                           $"(rayQuery={rayQueryEnabled}, accelStruct={accelerationStructureEnabled})");
-        
+
         bool printFeatures = false;
         if (printFeatures)
         {
             Console.WriteLine("----> Device Features:");
             Console.WriteLine("----> Sampler Anisotropy: " + features.Features.SamplerAnisotropy);
             Console.WriteLine("----> Depth Bias Clamp: " + features.Features.DepthBiasClamp);
-            Console.WriteLine("----> Timeline Semaphore: " + timelineFeatures.TimelineSemaphore);
-            Console.WriteLine("----> Vulkan Memory Model: " + memoryModelFeatures.VulkanMemoryModel);
-            Console.WriteLine("----> Buffer Device Address: " + bufferAddressFeatures.BufferDeviceAddress);
-            Console.WriteLine("----> 8 bit Storage: " + storage8BitFeatures.StorageBuffer8BitAccess);
+            Console.WriteLine("----> MultiDrawIndirect: " + features.Features.MultiDrawIndirect);
             Console.WriteLine("----> Vulkan 1.1 Features: " + vulkan11Features.ShaderDrawParameters);
+            Console.WriteLine("----> Vulkan 1.2 Features: timeline=" + vulkan12Features.TimelineSemaphore +
+                              " memoryModel=" + vulkan12Features.VulkanMemoryModel +
+                              " bufferDeviceAddress=" + vulkan12Features.BufferDeviceAddress +
+                              " drawIndirectCount=" + vulkan12Features.DrawIndirectCount +
+                              " descriptorIndexing=" + vulkan12Features.DescriptorIndexing);
             Console.WriteLine("----> Vulkan 1.3 Features: " + vulkan13Features.DynamicRendering + " " + vulkan13Features.Synchronization2);
-            Console.WriteLine("----> Descriptor Indexing Features: " + indexingFeaturesEnable.ShaderSampledImageArrayNonUniformIndexing + "\n "
-                              + indexingFeaturesEnable.DescriptorBindingPartiallyBound + "\n "
-                              + indexingFeaturesEnable.DescriptorBindingUpdateUnusedWhilePending + "\n "
-                              + indexingFeaturesEnable.DescriptorBindingSampledImageUpdateAfterBind + "\n "
-                              + indexingFeaturesEnable.DescriptorBindingUniformBufferUpdateAfterBind);
             Console.WriteLine("----> Robustness 2 Features: " + robust2Enable.RobustBufferAccess2 + "\n " + robust2Enable.RobustImageAccess2 + "\n "
                               + robust2Enable.NullDescriptor);
             Console.WriteLine("----> Acceleration Structure Features: " + accelerationstructureEnable.AccelerationStructure);

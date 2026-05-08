@@ -18,6 +18,23 @@ struct InstanceData {
     uint _pad0, _pad1, _pad2;
 };
 
+// Per-light record packed by Renderer_Resources.UpdateLightingBuffers.
+// Conventions:
+//   positionRange.w  =  range (point/spot)     — directional uses -1 sentinel
+//   directionType.w  =  LightType encoded as float (0=Dir, 1=Point, 2=Spot)
+//   spotCones.z      =  CastShadows (0/1)
+struct PbrLight {
+    float4 positionRange;
+    float4 colorIntensity;
+    float4 directionType;
+    float4 spotCones;
+};
+
+// Light type tags — must match CadThingo.VulkanEngine.LightType.
+static const uint LIGHT_TYPE_DIRECTIONAL = 0u;
+static const uint LIGHT_TYPE_POINT       = 1u;
+static const uint LIGHT_TYPE_SPOT        = 2u;
+
 //normal distribution function (D) - GGX/trowbridge-reitz
 //describes the statistical distribution of material microfacet normals
 float DistributionGGX(float NdotH, float roughness){
