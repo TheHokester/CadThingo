@@ -62,7 +62,8 @@ public static class GltfMaterialResource
             MetallicFactor        = (float)(mrChannel?.GetFactor("MetallicFactor")  ?? 1.0),
             RoughnessFactor       = (float)(mrChannel?.GetFactor("RoughnessFactor") ?? 1.0),
             AlphaCutoff           = gltfMat.AlphaCutoff,
-            Flags                 = gltfMat.Alpha == SharpGLTF.Schema2.AlphaMode.MASK ? 1u : 0u,
+            Flags                 = (gltfMat.Alpha == SharpGLTF.Schema2.AlphaMode.MASK  ? 1u : 0u)
+                                  | (gltfMat.Alpha == SharpGLTF.Schema2.AlphaMode.BLEND ? 4u : 0u),
             BaseColorTex          = texIdx[0],
             PhysicalDescriptorTex = texIdx[1],
             NormalTex             = texIdx[2],

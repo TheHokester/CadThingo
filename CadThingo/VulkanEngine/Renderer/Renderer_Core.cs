@@ -96,10 +96,17 @@ public unsafe partial class Renderer
     internal DrawCullPipeline     drawCullPipeline;
     internal LightCullPipeline    lightCullPipeline;
     internal PbrDeferredPipeline  PbrDeferredPipeline;   // accessor used by LightCullPipeline (consumer of the lights SSBO)
+    internal TonemapPipeline      tonemapPipeline;       // post-process: HDRColor → FinalColor
+    internal TransparentPipeline  transparentPipeline;   // forward+ BLEND-mode pass between lighting and tonemap
 
     // Specialization-constant gate for soft (PCSS-style) ray-queried shadows.
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
     public bool softShadowsEnabled = true;
+
+    // Tone-map curve selector — threaded into TonemapPipeline.Operator at
+    // construction time as a specialization constant. Toggling requires a
+    // pipeline rebuild.
+    public TonemapOperator tonemapOperator = TonemapOperator.Filmic;
     
     //Command pool and buffers
     CommandPool commandPool;
@@ -146,6 +153,7 @@ public unsafe partial class Renderer
         var message = SilkMarshal.PtrToString((nint)data->PMessage);
         Console.WriteLine($"[VALIDATION LAYER:] {message}");
         return Vk.False;
+        
     }
     
     
@@ -200,6 +208,21 @@ public unsafe partial class Renderer
         // Wire light-cull tile buffers into the PBR lighting set now that both exist.
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
 
+        // Tone-map / post pass — reads HDRColor produced by the lighting pass, writes
+        // the LDR FinalColor that the swapchain blit sources. Initialized after
+        // SetupDeferredRenderer so the HDRColor ImageView exists for the descriptor write.
+        tonemapPipeline = new TonemapPipeline(this) { Operator = tonemapOperator };
+        tonemapPipeline.Initialize();
+        tonemapPipeline.WriteHdrInputDescriptor(
+            scene.renderGraph.GetResource("HDRColor").ImageView, gBufferSampler);
+
+        // Transparent forward+ pass — renders BLEND-mode materials between the lighting
+        // pass and the tonemap pass. Shares the lights SSBO + TLAS + tile cull buffers
+        // with PbrDeferredPipeline; shares the bindless set with GeometryPipeline.
+        transparentPipeline = new TransparentPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
+        transparentPipeline.Initialize();
+        transparentPipeline.WriteSharedLightingDescriptors(PbrDeferredPipeline, lightCullPipeline);
+
         //Create command buffers
         CreateCommandBuffers();
         //Create sync objects
@@ -210,8 +233,13 @@ public unsafe partial class Renderer
         // Build BLAS / TLAS for ray-traced shadows. Gated on RayShadowsSupported
         // inside InitRayQuery — safe to call even when ray queries aren't available.
         InitRayQuery();
-        // Bind the TLAS into the lighting descriptor set (one write per frame).
-        if (tlas.Handle != 0) PbrDeferredPipeline.WriteTlasDescriptor(tlas);
+        // Bind the TLAS into the lighting descriptor sets — both the deferred lighting
+        // pass and the forward+ transparent pass walk it for ray-traced shadows.
+        if (tlas.Handle != 0)
+        {
+            PbrDeferredPipeline.WriteTlasDescriptor(tlas);
+            transparentPipeline.WriteTlasDescriptor(tlas);
+        }
 
         initialized = true;
     }
@@ -229,14 +257,14 @@ public unsafe partial class Renderer
         // blue_agent->GetComponent<TransformComponent>()?.SetScale(new Vector3(25f));
         // blue_agent->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(0, 0, MathF.PI / 2));
         // blue_agent->GetComponent<TransformComponent>()?.SetPosition(new Vector3(6f, 0f, 0f));
-        
+        //
         
         // Entity* helmetRoot = GltfLoader.Load(
         //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\DamagedHelmet.glb",
         //     "DamagedHelmet", Engine.ResourceManager, this, scene);
         // var helmetTransform = helmetRoot->GetComponent<TransformComponent>();
         // helmetTransform?.SetPosition(new Vector3(0f, 1f, 0f));
-
+        //
         // Phase 2 smoke test — three LightComponents (directional / point / spot)
         // confirming the per-frame StructuredBuffer<PbrLight> path lights the helmet.
         
@@ -246,6 +274,16 @@ public unsafe partial class Renderer
             "Sponza", Engine.ResourceManager, this, scene);
         var sponzaTransform = sponza->GetComponent<TransformComponent>();
         sponzaTransform?.SetPosition(new Vector3(0f, 0f, 0f));
+        //
+        
+        //Chess scene 
+        // Entity* chessScene = GltfLoader.Load(@"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\ABeautifulGame.glb",
+        //     "ChessScene", Engine.ResourceManager, this, scene);
+        
+        //930 turbo
+        // Entity* turbo930 = GltfLoader.Load(
+        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Props\free_1975_porsche_911_930_turbo.glb", 
+        //     "Turbo930", Engine.ResourceManager, this, scene);
         
         
         SpawnTestLights();
@@ -260,13 +298,14 @@ public unsafe partial class Renderer
         dirLight->AddComponent(new LightComponent
         {
             Type        = LightType.Directional,
-            Color       = new Vector3(1.0f, 1f, 0.92f),
-            Intensity   = 10.0f,
-            Direction   = new Vector3(0f, -1.0f, 0f),
+            Color       = new Vector3(255f/255, 223f/255, 155f/255),
+            Intensity   = 2.0f,
+            Direction   = new Vector3(-0.3f, -1f, 0f),
+            Radius      = 0.01f,
             CastShadows = true,
         });
         dirLight->Initialize();
-        // scene.AddEntity(dirLight);
+        scene.AddEntity(dirLight);
 
         // Point fill light — warm, sits to the right of and above the helmet.
         Entity* pointLight = Entity.Create("PointFill");
@@ -282,7 +321,7 @@ public unsafe partial class Renderer
             Radius = 0.03f,
         });
         pointLight->Initialize();
-        scene.AddEntity(pointLight);
+        // scene.AddEntity(pointLight);
 
         // Spot rim light — tight cone aimed at the helmet from below-left.
         Entity* spotLight = Entity.Create("SpotRim");
@@ -299,7 +338,7 @@ public unsafe partial class Renderer
             OuterConeCos = MathF.Cos(MathF.PI / 5f),  // ~36°
         });
         spotLight->Initialize();
-        // scene.AddEntity(spotLight);
+        scene.AddEntity(spotLight);
     }
 
     public void Update(double d)
@@ -328,7 +367,7 @@ public unsafe partial class Renderer
             if (inFlightFences[i].Handle != 0)
                 vk.DestroyFence(device, inFlightFences[i], null);
         }
-
+        
         // ── ECS-owned native memory ─────────────────────────────
         if (testEntity != null)
         {
@@ -363,6 +402,8 @@ public unsafe partial class Renderer
         if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
 
         // ── Pipelines (each pipeline disposes its own buffers, sets, layouts) ─
+        transparentPipeline?.Dispose();
+        tonemapPipeline    ?.Dispose();
         PbrDeferredPipeline?.Dispose();
         lightCullPipeline  ?.Dispose();
         drawCullPipeline   ?.Dispose();

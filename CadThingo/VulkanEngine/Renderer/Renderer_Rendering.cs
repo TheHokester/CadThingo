@@ -2,6 +2,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
+using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 
@@ -298,6 +299,11 @@ public unsafe partial class Renderer
 
         // G-buffer ImageViews are fresh — re-bind them on the lighting pass set.
         PbrDeferredPipeline.WriteGBufferDescriptors();
+
+        // HDRColor ImageView is also fresh after the graph rebuild — re-bind it on
+        // the tonemap pass's sampler binding.
+        tonemapPipeline.WriteHdrInputDescriptor(
+            scene.renderGraph.GetResource("HDRColor").ImageView, gBufferSampler);
     }
 
     public void DrawFrame()
@@ -328,6 +334,7 @@ public unsafe partial class Renderer
         // 5. Update per-frame UBOs
         geometryPipeline.UpdateUbo(currentFrame, camera);
         var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
+        transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
 
         // 5b. GPU cull pass — runs before the geometry pass and produces the
         // indirect command + post-cull instance buffers the geometry pass consumes.
@@ -486,12 +493,20 @@ public unsafe partial class Renderer
         //standard 32bit depth format preserves accurate depth information
         graph.AddResource(depthImageResource);
         
+        // HDR linear scene target — produced by the lighting pass (and later the
+        // forward+ transparent pass). Consumed by the tone-map pass which writes
+        // the LDR FinalColor. SampledBit lets the tonemap pass bind it as a texture.
+        graph.AddResource("HDRColor", Format.R16G16B16A16Sfloat, new Extent2D(width, height),
+            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.SampledBit,
+            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+
         //configure finalcolor buffer for the completed lighting results
         //standard color format with transfer capability for presentation or post processing
         graph.AddResource("FinalColor", Format.R8G8B8A8Unorm, new Extent2D(width, height),
             ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit,
             ImageLayout.Undefined, ImageLayout.TransferSrcOptimal);
         
+        //set names of FInal and hdr color for debug
         
         //configure geometry pass for G-buffer population
         //this pass renders all geometry and stores intermediate data for lighting calculations
@@ -642,13 +657,13 @@ public unsafe partial class Renderer
         
         
         graph.AddPass("LightingPass", new List<string>{"GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "GBuffer_Emissive", "Depth"},
-            new List<string>{"FinalColor"}, buffer =>
+            new List<string>{"HDRColor"}, buffer =>
             {
                 //configure single color output for final lighting result
                 RenderingAttachmentInfoKHR colorAttachment = new()
                 {
                     SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("FinalColor").ImageView,
+                    ImageView = graph.GetResource("HDRColor").ImageView,
                     ImageLayout = ImageLayout.ColorAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
                     StoreOp = AttachmentStoreOp.Store,
@@ -697,7 +712,129 @@ public unsafe partial class Renderer
 
                 vk!.CmdEndRendering(buffer);
             });
-        
+
+        // Forward+ transparent pass — blends BLEND-mode materials into HDRColor on
+        // top of the deferred lighting result, depth-tested LE against the geometry
+        // pass's Depth (no depth write). Declares HDRColor + Depth as writes so the
+        // graph's writer→writer edges serialize this after LightingPass + GeometryPass
+        // and the current-layout tracker preserves HDR contents for blending.
+        // Body is a stub for stage 3 — pipeline + attachments bind but no draws.
+        graph.AddPass("TransparentPass", new List<string>(),
+            new List<string>{"HDRColor", "Depth"}, buffer =>
+            {
+                RenderingAttachmentInfoKHR colorAttachment = new()
+                {
+                    SType       = StructureType.RenderingAttachmentInfoKhr,
+                    ImageView   = graph.GetResource("HDRColor").ImageView,
+                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
+                    LoadOp      = AttachmentLoadOp.Load,                  // preserve lighting pass output
+                    StoreOp     = AttachmentStoreOp.Store,
+                };
+                RenderingAttachmentInfoKHR depthAttachment = new()
+                {
+                    SType       = StructureType.RenderingAttachmentInfoKhr,
+                    ImageView   = graph.GetResource("Depth").ImageView,
+                    ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
+                    LoadOp      = AttachmentLoadOp.Load,                  // preserve geometry pass depth
+                    StoreOp     = AttachmentStoreOp.Store,
+                };
+                RenderingInfoKHR renderingInfo = new()
+                {
+                    SType                = StructureType.RenderingInfoKhr,
+                    RenderArea           = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
+                    LayerCount           = 1,
+                    ColorAttachmentCount = 1,
+                    PColorAttachments    = (RenderingAttachmentInfo*)&colorAttachment,
+                    PDepthAttachment     = (RenderingAttachmentInfo*)&depthAttachment,
+                };
+
+                vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
+                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, transparentPipeline.Handle);
+
+                Viewport vp = new()
+                {
+                    X = 0, Y = 0,
+                    Width = width, Height = height,
+                    MinDepth = 0.0f, MaxDepth = 1.0f,
+                };
+                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
+                vk!.CmdSetViewport(buffer, 0, 1, &vp);
+                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
+
+                // Set 0: own frame UBO + shared lights/TLAS/tile buffers.
+                // Set 1: bindless materials/instances/textures/samplers (shared with GeometryPipeline).
+                var frameSet    = transparentPipeline.GetDescriptorSet(0, currentFrame);
+                var bindlessSet = Engine.ResourceManager.GetBindlessSet(currentFrame);
+                var sets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
+                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
+                    transparentPipeline.Layout, 0, 2, sets, 0, null);
+
+                // Bind global VB/IB once — every BLEND entity references offsets into these.
+                var vb = Engine.ResourceManager.GlobalVertexBuffer;
+                var ib = Engine.ResourceManager.GlobalIndexBuffer;
+                ulong vbOffset = 0;
+                vk!.CmdBindVertexBuffers(buffer, 0, 1, &vb, &vbOffset);
+                vk!.CmdBindIndexBuffer(buffer, ib, 0, IndexType.Uint32);
+
+                // One push-constant + draw per BLEND entity, in back-to-front order
+                // set by DrawCullPipeline.Record.
+                var draws = drawCullPipeline.LastTransparentDraws;
+                for (int di = 0; di < draws.Count; di++)
+                {
+                    var d = draws[di];
+                    transparentPipeline.PushDrawConstants(buffer, d.Model, d.MaterialIndex);
+                    vk!.CmdDrawIndexed(buffer, d.IndexCount, 1, d.FirstIndex, 0, 0);
+                }
+
+                vk!.CmdEndRendering(buffer);
+            });
+
+        // Post-process: sample HDRColor, apply exposure + Reinhard + inverse gamma,
+        // write LDR into FinalColor. FinalColor's graph-declared finalLayout
+        // (TransferSrcOptimal) is honoured by the post-pass barrier, keeping
+        // the existing blit-to-swapchain path unchanged.
+        graph.AddPass("TonemapPass", new List<string>{"HDRColor"},
+            new List<string>{"FinalColor"}, buffer =>
+            {
+                RenderingAttachmentInfoKHR colorAttachment = new()
+                {
+                    SType = StructureType.RenderingAttachmentInfoKhr,
+                    ImageView = graph.GetResource("FinalColor").ImageView,
+                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
+                    LoadOp = AttachmentLoadOp.DontCare,
+                    StoreOp = AttachmentStoreOp.Store,
+                };
+                RenderingInfoKHR renderingInfo = new()
+                {
+                    SType = StructureType.RenderingInfoKhr,
+                    RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
+                    LayerCount = 1,
+                    ColorAttachmentCount = 1,
+                    PColorAttachments = (RenderingAttachmentInfo*)&colorAttachment
+                };
+
+                vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
+                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, tonemapPipeline.Handle);
+
+                Viewport vp = new()
+                {
+                    X = 0, Y = 0,
+                    Width = width, Height = height,
+                    MinDepth = 0.0f, MaxDepth = 1.0f,
+                };
+                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
+                vk!.CmdSetViewport(buffer, 0, 1, &vp);
+                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
+
+                var set = tonemapPipeline.GetDescriptorSet(0, 0);
+                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
+                    tonemapPipeline.Layout, 0, 1, &set, 0, null);
+                tonemapPipeline.PushConstants(buffer);
+
+                vk!.CmdDraw(buffer, 3, 1, 0, 0);
+                vk!.CmdEndRendering(buffer);
+            });
+
         graph.Compile();
     }
 
@@ -731,6 +868,12 @@ public unsafe class RenderGraph : IDisposable
     private readonly Dictionary<string, ImageResource> _imageResources = new();
     private List<Pass> passes;
     private List<int> executionOrder;
+
+    // Tracks each resource's current Vulkan layout across passes within a frame and
+    // across frames. Source layout for every transition barrier comes from this dict
+    // so blends / post-process passes that consume previous-pass output read the
+    // correct contents rather than racing an Undefined→X discard.
+    private readonly Dictionary<string, ImageLayout> _currentLayout = new();
 
     public RenderGraph(Vk vk, Device device, PhysicalDevice physicalDevice)
     {
@@ -818,15 +961,39 @@ public unsafe class RenderGraph : IDisposable
         var inDegree = new int[n];
         for (int i = 0; i < n; i++) adjacency[i] = new List<int>();
 
-        // Build edges: for each resource, find (writer → reader) pairs
+        // Build edges: for each resource, find (writer → reader) pairs.
+        // Restricted to j > i: a pass only reads from writers declared before it.
+        // Without this restriction, a later-declared writer of the same resource
+        // (e.g. TransparentPass writing Depth that LightingPass also reads) creates
+        // a back-edge into an earlier pass, and combined with writer→writer edges
+        // for other shared resources produces a cycle that strands the topo sort.
         for (var i = 0; i < n; i++)
         {
             foreach (var output in passes[i]._outputs)
             {
-                for (int j = 0; j < n; j++)
+                for (int j = i + 1; j < n; j++)
                 {
-                    if (i == j) continue;
                     if (passes[j]._inputs.Contains(output))
+                    {
+                        adjacency[i].Add(j);
+                        inDegree[j]++;
+                    }
+                }
+            }
+        }
+
+        // Writer → writer edges: when two passes both write the same resource,
+        // serialize them in declaration order (earlier-declared runs first).
+        // Without this the topo sort would put them in arbitrary order and
+        // blend / accumulation chains (LightingPass → TransparentPass into
+        // HDRColor) would break non-deterministically.
+        for (int i = 0; i < n; i++)
+        {
+            foreach (var output in passes[i]._outputs)
+            {
+                for (int j = i + 1; j < n; j++)
+                {
+                    if (passes[j]._outputs.Contains(output) && !adjacency[i].Contains(j))
                     {
                         adjacency[i].Add(j);
                         inDegree[j]++;
@@ -865,6 +1032,14 @@ public unsafe class RenderGraph : IDisposable
         foreach (var resource in _imageResources.Values)
             resource.Allocate(_physicalDevice);
 
+        // Seed the tracker. Resources start in their declared _initialLayout
+        // (typically Undefined for fresh allocations); subsequent transitions
+        // update the tracker so each pass sources from the actual prior layout.
+        foreach (var kv in _imageResources)
+        {
+            _currentLayout[kv.Key] = kv.Value._initialLayout;
+            
+        }
         _compiled = true;
     }
 
@@ -881,7 +1056,7 @@ public unsafe class RenderGraph : IDisposable
         foreach (var passIndex in executionOrder)
         {
             var pass = passes[passIndex];
-
+            
             // ----- Barrier transition inputs -> ShaderReadOnlyOptimal
             foreach (var inputName in pass._inputs)
             {
@@ -893,7 +1068,7 @@ public unsafe class RenderGraph : IDisposable
                     var barrier = new ImageMemoryBarrier()
                     {
                         SType = StructureType.ImageMemoryBarrier,
-                        OldLayout = resource._initialLayout,
+                        OldLayout = _currentLayout[inputName],
                         NewLayout = ImageLayout.ShaderReadOnlyOptimal,
                         SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
@@ -909,7 +1084,7 @@ public unsafe class RenderGraph : IDisposable
                             LayerCount = 1
                         }
                     };
-                    
+
                     _vk.CmdPipelineBarrier(cmd,
                         PipelineStageFlags.AllCommandsBit,
                         PipelineStageFlags.FragmentShaderBit,
@@ -917,6 +1092,8 @@ public unsafe class RenderGraph : IDisposable
                         0, null,
                         0, null,
                         1, ref barrier);
+
+                    _currentLayout[inputName] = ImageLayout.ShaderReadOnlyOptimal;
                 }
             }
 
@@ -928,13 +1105,14 @@ public unsafe class RenderGraph : IDisposable
                     ImageResource resource = _imageResources[outputName];
                     bool isDepth =
                         resource._format is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16UnormS8Uint;
+                    var targetAttachmentLayout = isDepth
+                        ? ImageLayout.DepthStencilAttachmentOptimal
+                        : ImageLayout.ColorAttachmentOptimal;
                     var barrier = new ImageMemoryBarrier()
                     {
                         SType = StructureType.ImageMemoryBarrier,
-                        OldLayout = resource._initialLayout,
-                        NewLayout = isDepth
-                            ? ImageLayout.DepthStencilAttachmentOptimal
-                            : ImageLayout.ColorAttachmentOptimal,
+                        OldLayout = _currentLayout[outputName],
+                        NewLayout = targetAttachmentLayout,
                         SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         Image = resource.Image,
@@ -961,6 +1139,8 @@ public unsafe class RenderGraph : IDisposable
                         0, null,
                         0, null,
                         1, ref barrier);
+
+                    _currentLayout[outputName] = targetAttachmentLayout;
                 }
             }
 
@@ -977,9 +1157,7 @@ public unsafe class RenderGraph : IDisposable
                 var barrier = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
-                    OldLayout = isDepth
-                        ? ImageLayout.DepthStencilAttachmentOptimal
-                        : ImageLayout.ColorAttachmentOptimal,
+                    OldLayout = _currentLayout[outputName],
                     NewLayout = resource._finalLayout,
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
@@ -997,7 +1175,7 @@ public unsafe class RenderGraph : IDisposable
                         LayerCount = 1
                     }
                 };
-
+                
                 _vk.CmdPipelineBarrier(
                     cmd,
                     isDepth
@@ -1006,6 +1184,8 @@ public unsafe class RenderGraph : IDisposable
                     PipelineStageFlags.AllCommandsBit, // before any subsequent work
                     DependencyFlags.ByRegionBit,
                     0, null, 0, null, 1, ref barrier);
+
+                _currentLayout[outputName] = resource._finalLayout;
             }
         }
     }

@@ -5,7 +5,7 @@ struct PbrMaterial {
     float metallicFactor;               // Metallic property multiplier
     float roughnessFactor;              // Surface roughness multiplier
     float alphaCutoff;              // Alpha cutoff threshold
-    uint flags;                    // bit 0 = alphaMask, bit 1 = doubleSided, ...
+    uint flags;                    // bit 0 = alphaMask, bit 1 = doubleSided, bit 2 = alphaBlend, ...
     int baseColorTex;            // Texture binding index for base color (-1 = none)
     int physicalDescriptorTex;   // Texture binding for metallic/roughness
     int normalTex;               // Texture binding for normal maps

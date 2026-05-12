@@ -98,6 +98,13 @@ GBufferOutput PSMain(VSOutput input)
     // the first lane's texture for the whole wave — i.e. neighbouring prims/models
     // appear to share textures.
     float4 baseColor       = textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV) * mat.baseColorFactor;
+
+    // MASK alpha test (bit 0 of flags). BLEND materials (bit 2) route to the dedicated
+    // transparent pass and shouldn't reach the geometry pass after the partition lands —
+    // but their glTF alphaCutoff defaults to 0 so this discard wouldn't fire for them
+    // even if they did.
+    if ((mat.flags & 1u) != 0u && baseColor.a < mat.alphaCutoff) discard;
+
     float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).bg;
     float metallic         = metallicRoughness.x * mat.metallicFactor;
     float roughness        = metallicRoughness.y * mat.roughnessFactor;

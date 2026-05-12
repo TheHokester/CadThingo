@@ -626,6 +626,19 @@ public struct RenderableInputGpu
     public uint _pad;              //  4B  ┘  std430 16B alignment
 }
 
+// CPU-side transparent draw record. Forward+ transparent pass walks a sorted
+// list of these (back-to-front by view-space Z) and issues one push-constant +
+// vkCmdDrawIndexed per entity. Not a GPU SSBO type — the per-draw model + matidx
+// ride in push constants since the count is typically small.
+public struct TransparentDraw
+{
+    public Matrix4x4 Model;
+    public uint      MaterialIndex;
+    public uint      IndexCount;
+    public uint      FirstIndex;     // into Engine.ResourceManager.GlobalIndexBuffer
+    public float     ViewDepth;      // view-space Z of the entity's origin; sort key
+}
+
 // Mirrors VkDrawIndexedIndirectCommand exactly. Compute writes this struct into the
 // indirect-cmd buffer per surviving renderable; vkCmdDrawIndexedIndirectCount
 // consumes them.
@@ -664,7 +677,7 @@ public struct PbrMaterial
     public float MetallicFactor;
     public float RoughnessFactor;
     public float AlphaCutoff;
-    public uint Flags;//bit 0 alphaMask, bit 1 doubleSided, ...
+    public uint Flags;//bit 0 alphaMask, bit 1 doubleSided, bit 2 alphaBlend, ...
     public int BaseColorTex;
     public int PhysicalDescriptorTex;
     public int NormalTex;
@@ -673,6 +686,25 @@ public struct PbrMaterial
     public int _pad0;
     public int _pad1;
     public int _pad2;
+}
+
+public enum AlphaMode : uint
+{
+    Opaque = 0,
+    Mask   = 1,
+    Blend  = 2,
+}
+
+public static class PbrMaterialAlphaExtensions
+{
+    // BLEND takes precedence over MASK if both bits are accidentally set
+    // (shouldn't happen from glTF — they're mutually exclusive there).
+    public static AlphaMode GetAlphaMode(this in PbrMaterial mat)
+    {
+        if ((mat.Flags & 0x4u) != 0u) return AlphaMode.Blend;
+        if ((mat.Flags & 0x1u) != 0u) return AlphaMode.Mask;
+        return AlphaMode.Opaque;
+    }
 }
 
 public unsafe class ImageResource : IDisposable

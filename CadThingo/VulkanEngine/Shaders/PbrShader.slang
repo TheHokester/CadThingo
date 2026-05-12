@@ -9,8 +9,8 @@ struct LightingVSOutput {
 // per-tile light list (Phase 4).
 struct LightingFrameUBO {
     float4 camPos;                      // Camera position for view-dependent effects
-    float exposure;                     // HDR exposure control
-    float gamma;                        // Gamma correction value (typically 2.2)
+    float _padExposure;                 // formerly exposure — tone-map moved to dedicated post pass
+    float _padGamma;                    // formerly gamma — tone-map moved to dedicated post pass
     float prefilteredCubeMipLevels;     // IBL prefiltered environment map mip levels
     float scaleIBLAmbient;              // IBL ambient contribution scale
     uint  lightCount;                   // Number of valid entries in lights[]
@@ -316,7 +316,7 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
 
     // === AMBIENT AND EMISSIVE ===
     // Add simple ambient lighting (should be replaced with IBL in production)
-    float3 ambient = float3(0.03, 0.03, 0.03) * baseColor.rgb * ao;
+    float3 ambient = float3(0.0075) * baseColor.rgb * ao;
 
     // Emissive radiance written by the geometry pass — added pre-tone-map so
     // exposure/gamma apply uniformly with the rest of the lighting.
@@ -325,12 +325,8 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     // Combine all lighting contributions
     float3 color = ambient + Lo + emissive;
 
-    // === HDR TONE MAPPING AND GAMMA CORRECTION ===
-    // Apply Reinhard tone mapping to compress HDR values to [0,1] range
-    color = color / (color + float3(1.0, 1.0, 1.0));
-
-    // Apply gamma correction for sRGB display (inverse gamma)
-    color = pow(color, float3(1.0 / ubo.gamma, 1.0 / ubo.gamma, 1.0 / ubo.gamma));
-
+    // Output linear scene-referred HDR — the dedicated tone-map pass downstream
+    // applies exposure, Reinhard, and inverse gamma before writing the LDR
+    // FinalColor target.
     return float4(color, 1.0);
 }

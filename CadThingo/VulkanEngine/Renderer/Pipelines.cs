@@ -616,6 +616,15 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     /// maxDrawCount on vkCmdDrawIndexedIndirectCount.</summary>
     public uint LastRenderableCount { get; private set; }
 
+    // BLEND-mode entities partitioned out of the cull input during Record.
+    // Sorted back-to-front by view-space depth so the transparent pass renders
+    // far-first.
+    private readonly List<TransparentDraw> _transparentDraws = new();
+
+    /// <summary>BLEND-mode draws captured this frame, sorted back-to-front by view-space Z.
+    /// Consumed by the TransparentPass; empty when no scene material is BLEND-mode.</summary>
+    public IReadOnlyList<TransparentDraw> LastTransparentDraws => _transparentDraws;
+
     public DrawCullPipeline(Renderer renderer) : base(renderer)
     {
         PushConstantRanges = new[]
@@ -763,10 +772,15 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam, Scene scene)
     {
         // ── Pack RenderableInput rows from the scene ─────────────────────
+        // Opaque (OPAQUE + MASK) entities go through the GPU cull → indirect-draw path.
+        // BLEND entities are siphoned into _transparentDraws for the forward+ pass.
         RenderableInputGpu* inputPtr = (RenderableInputGpu*)RenderableInputBuffers[frameIndex].mapped;
         uint count = 0;
         int matCount = scene.MaterialCount;
         int fallbackMatIdx = matCount; // matches the fallback slot written by the geometry pass
+
+        _transparentDraws.Clear();
+        Matrix4x4 viewMat = cam != null ? cam.GetViewMatrix() : Matrix4x4.Identity;
 
         for (int i = 0; i < scene.EntityCount; i++)
         {
@@ -776,15 +790,42 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
             if (meshComp == null || meshComp.mesh == null) continue;
             var transform = e->GetComponent<TransformComponent>();
             if (transform == null) continue;
+
+            int  matIdx = meshComp.materialIndex >= 0 ? meshComp.materialIndex : fallbackMatIdx;
+            Mesh m      = *meshComp.mesh;
+            var  world  = *transform.GetWorldMatrix();
+
+            // Fallback material is implicitly opaque. Real materials carry their
+            // mode in the Flags bitfield.
+            AlphaMode mode = AlphaMode.Opaque;
+            if (matIdx >= 0 && matIdx < matCount)
+                mode = scene.Materials[matIdx].GetAlphaMode();
+
+            if (mode == AlphaMode.Blend)
+            {
+                // System.Numerics row-vector convention: Vector.Transform(v, m) = v * m.
+                // CreateLookAt produces -Z-forward view space, so farther entities
+                // have more-negative Z. Sort ascending for back-to-front order.
+                var worldOrigin = new Vector4(world.M41, world.M42, world.M43, 1f);
+                float viewZ = Vector4.Transform(worldOrigin, viewMat).Z;
+
+                _transparentDraws.Add(new TransparentDraw
+                {
+                    Model         = world,
+                    MaterialIndex = (uint)matIdx,
+                    IndexCount    = (uint)m.count,
+                    FirstIndex    = (uint)m.offset,
+                    ViewDepth     = viewZ,
+                });
+                continue;
+            }
+
             if (count >= Renderer.MAX_INSTANCES)
                 throw new InvalidOperationException($"Renderable count exceeds MAX_INSTANCES ({Renderer.MAX_INSTANCES}).");
 
-            int matIdx = meshComp.materialIndex >= 0 ? meshComp.materialIndex : fallbackMatIdx;
-            Mesh m = *meshComp.mesh;
-
             inputPtr[count] = new RenderableInputGpu
             {
-                model         = *transform.GetWorldMatrix(),
+                model         = world,
                 sphereLocal   = m.sphereLocal,
                 indexCount    = (uint)m.count,
                 firstIndex    = (uint)m.offset,
@@ -792,6 +833,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
             };
             count++;
         }
+
+        // Back-to-front: far (lowest view-space Z) first.
+        _transparentDraws.Sort((a, b) => a.ViewDepth.CompareTo(b.ViewDepth));
 
         LastRenderableCount = count;
         if (count == 0) return 0;
@@ -910,7 +954,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         public Vector2   ScreenSize;
         public uint      TileCountX;
         public uint      TileCountY;
-        public uint      LightCount;
+        public uint      LightCount; 
         public uint      _pad0;
         public uint      _pad1;
         public uint      _pad2;
@@ -1140,8 +1184,8 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     struct LightingFrameUBO
     {
         public Vector4 camPos;
-        public float exposure;
-        public float gamma;
+        public float _padExposure;          // formerly exposure — tone-map moved to TonemapPipeline
+        public float _padGamma;             // formerly gamma — tone-map moved to TonemapPipeline
         public float prefilteredCubeMipLevels;
         public float scaleIBLAmbient;
         public uint lightCount;
@@ -1156,7 +1200,9 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     protected override string ShaderPath { get; } =
         @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PBR.spv";
 
-    protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R8G8B8A8Unorm };
+    // Lighting writes linear HDR scene-referred color; tone-map + gamma run in
+    // the separate TonemapPipeline pass that consumes this attachment.
+    protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 
     // Set 0 — per-frame lighting (UBO, lights SSBO, TLAS, tile cull buffers).
     // Set 1 — shared G-buffer samplers (one allocation reused every frame).
@@ -1645,8 +1691,6 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
         LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
-        ubo.exposure = 4.5f;
-        ubo.gamma = 2.2f;
         ubo.prefilteredCubeMipLevels = 1.0f;
         ubo.scaleIBLAmbient = 1.0f;
         ubo.lightCount = count;
@@ -1658,5 +1702,528 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         new Span<LightingFrameUBO>(data, 1).Fill(ubo);
 
         return (count, tileX, tileY);
+    }
+}
+
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Tone-map / post pass — samples HDRColor, writes FinalColor (LDR)
+// ────────────────────────────────────────────────────────────────────────────
+
+// Matches the TONEMAP_OPERATOR spec constant in Tonemap.slang. Read once at
+// pipeline build; changing the operator requires Dispose + rebuild.
+public enum TonemapOperator : uint
+{
+    Reinhard = 0,
+    Filmic   = 1,
+}
+
+public sealed unsafe class TonemapPipeline : GraphicsPipeline
+{
+    // Push constants — fragment-only, 8 bytes total, well under the 128B
+    // guaranteed minimum. Kept off the per-frame UBO because exposure/gamma
+    // change rarely and don't deserve a descriptor binding of their own.
+    [StructLayout(LayoutKind.Sequential)]
+    struct TonemapPushConstants
+    {
+        public float Exposure;
+        public float Gamma;
+    }
+
+    protected override string ShaderPath { get; } =
+        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\Tonemap.spv";
+
+    protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R8G8B8A8Unorm };
+
+    // Surfaced as plain properties so the renderer (or imgui later) can adjust.
+    // Defaults preserve the visual output of the pre-refactor inline tone-map.
+    public float Exposure { get; set; } = 4.5f;
+    public float Gamma    { get; set; } = 2.0f;
+
+    /// <summary>Selects the tone-map curve via <c>constant_id 0</c> in
+    /// Tonemap.slang. Read once at pipeline build; toggling requires
+    /// Dispose + rebuild.</summary>
+    public TonemapOperator Operator { get; init; } = TonemapOperator.Filmic;
+
+    public TonemapPipeline(Renderer renderer) : base(renderer)
+    {
+        PushConstantRanges = new[]
+        {
+            new PushConstantRange
+            {
+                StageFlags = ShaderStageFlags.FragmentBit,
+                Offset     = 0,
+                Size       = (uint)sizeof(TonemapPushConstants),
+            }
+        };
+    }
+
+    // Fullscreen triangle — no vertex inputs, no depth, no blend, no culling.
+
+    protected override PipelineDepthStencilStateCreateInfo BuildDepthStencil() => new()
+    {
+        SType                 = StructureType.PipelineDepthStencilStateCreateInfo,
+        DepthTestEnable       = false,
+        DepthWriteEnable      = false,
+        DepthCompareOp        = CompareOp.Always,
+        DepthBoundsTestEnable = false,
+        StencilTestEnable     = false,
+    };
+
+    protected override PipelineRasterizationStateCreateInfo BuildRasterizer() => new()
+    {
+        SType                   = StructureType.PipelineRasterizationStateCreateInfo,
+        DepthClampEnable        = false,
+        RasterizerDiscardEnable = false,
+        PolygonMode             = PolygonMode.Fill,
+        LineWidth               = 1.0f,
+        CullMode                = CullModeFlags.None,
+        FrontFace               = FrontFace.CounterClockwise,
+        DepthBiasEnable         = false,
+    };
+
+    // Wire constant_id 0 (TONEMAP_OPERATOR) on the fragment stage. The slang
+    // declaration is uint, so we pack the enum value into a 4-byte slot.
+    protected override int FillSpecializationData(
+        int stageIdx,
+        SpecializationMapEntry* entries,
+        byte* data,
+        out uint dataSize)
+    {
+        // ShaderStages default: [0]=VS, [1]=FS. Spec constant lives on FS only.
+        if (stageIdx == 1)
+        {
+            entries[0] = new SpecializationMapEntry
+            {
+                ConstantID = 0,
+                Offset     = 0,
+                Size       = sizeof(uint),
+            };
+            *(uint*)data = (uint)Operator;
+            dataSize = sizeof(uint);
+            return 1;
+        }
+        dataSize = 0;
+        return 0;
+    }
+
+    // ── Descriptor layout — set 0, binding 0 = HDR input sampler ───────────
+
+    protected override void CreateDescriptorSetLayouts()
+    {
+        DescriptorSetLayouts = new DescriptorSetLayout[1];
+        OwnedDescriptorSetLayoutIndices = new[] { 0 };
+
+        var binding = new DescriptorSetLayoutBinding
+        {
+            Binding         = 0,
+            DescriptorType  = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags      = ShaderStageFlags.FragmentBit,
+        };
+        var layoutInfo = new DescriptorSetLayoutCreateInfo
+        {
+            SType        = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 1,
+            PBindings    = &binding,
+        };
+        if (Vk.CreateDescriptorSetLayout(Device, &layoutInfo, null, out DescriptorSetLayouts[0]) != Result.Success)
+            throw new Exception("Failed to create tonemap descriptor set layout");
+    }
+
+    // No per-frame mapped buffers — the HDR image is graph-owned, single-buffered,
+    // and tunables ride in push constants.
+    protected override void CreateResources() { }
+
+    protected override void CreateDescriptorSets()
+    {
+        // Single shared set — HDR image is single-buffered like FinalColor.
+        var layout = DescriptorSetLayouts[0];
+        DescriptorSetAllocateInfo allocInfo = new()
+        {
+            SType              = StructureType.DescriptorSetAllocateInfo,
+            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorSetCount = 1,
+            PSetLayouts        = &layout,
+        };
+        DescriptorSets = new DescriptorSet[1][];
+        DescriptorSets[0] = new DescriptorSet[1];
+        fixed (DescriptorSet* pSet = DescriptorSets[0])
+        {
+            if (Vk.AllocateDescriptorSets(Device, &allocInfo, pSet) != Result.Success)
+                throw new Exception("Failed to allocate tonemap descriptor set");
+        }
+    }
+
+    // Descriptor target (HDRColor view) only exists after the render graph compiles,
+    // so the renderer calls WriteHdrInputDescriptor explicitly post-setup and on
+    // every swapchain recreate.
+    protected override void WriteDescriptors() { }
+
+    public void WriteHdrInputDescriptor(ImageView hdrView, Sampler sampler)
+    {
+        DescriptorImageInfo imageInfo = new()
+        {
+            ImageView   = hdrView,
+            Sampler     = sampler,
+            ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
+        };
+        WriteDescriptorSet write = new()
+        {
+            SType           = StructureType.WriteDescriptorSet,
+            DstSet          = DescriptorSets[0][0],
+            DstBinding      = 0,
+            DstArrayElement = 0,
+            DescriptorType  = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            PImageInfo      = &imageInfo,
+        };
+        Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
+    }
+
+    public void PushConstants(CommandBuffer cmd)
+    {
+        var pc = new TonemapPushConstants { Exposure = Exposure, Gamma = Gamma };
+        Vk.CmdPushConstants(cmd, Layout,
+            ShaderStageFlags.FragmentBit,
+            0, (uint)sizeof(TonemapPushConstants), &pc);
+    }
+}
+
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Transparent forward+ pass — renders BLEND-mode materials into HDRColor with
+//  src-alpha / one-minus-src-alpha blending, depth-tested LE against the
+//  geometry pass's depth buffer (no depth write).
+// ────────────────────────────────────────────────────────────────────────────
+
+public sealed unsafe class TransparentPipeline : GraphicsPipeline
+{
+    // Matches Transparent.slang::FrameUBO. View+proj feed the VS; camPos +
+    // tile state feed the FS.
+    [StructLayout(LayoutKind.Sequential)]
+    struct TransparentFrameUBO
+    {
+        public Matrix4x4 view;
+        public Matrix4x4 proj;
+        public Vector4 camPos;
+        public uint    lightCount;
+        public uint    tileCountX;
+        public uint    tileCountY;
+        public uint    _pad0;
+        public Vector2 screenSize;
+        public uint    _pad1;
+        public uint    _pad2;
+    }
+
+    // Matches Transparent.slang::DrawPC. 80B; well under the 128B Vulkan minimum.
+    [StructLayout(LayoutKind.Sequential)]
+    struct TransparentPushConstants
+    {
+        public Matrix4x4 Model;
+        public uint      MaterialIndex;
+        public uint      _pad0;
+        public uint      _pad1;
+        public uint      _pad2;
+    }
+
+    protected override string ShaderPath { get; } =
+        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\Transparent.spv";
+
+    protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
+
+    public bool SoftShadowsEnabled { get; init; } = true;
+
+    private const int SetFrame    = 0;
+    private const int SetBindless = 1;
+
+    private UboBuffer[] FrameUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+
+    public TransparentPipeline(Renderer renderer) : base(renderer)
+    {
+        DepthAttachmentFormat = renderer.FindDepthFormat();
+        PushConstantRanges = new[]
+        {
+            new PushConstantRange
+            {
+                StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
+                Offset     = 0,
+                Size       = (uint)sizeof(TransparentPushConstants),
+            }
+        };
+    }
+
+    public override void Dispose()
+    {
+        foreach (var b in FrameUniformBuffers) b.Dispose();
+        base.Dispose();
+    }
+
+    // Wire constant_id 0 (SOFT_SHADOWS) on the fragment stage — mirrors PbrDeferredPipeline.
+    protected override int FillSpecializationData(
+        int stageIdx,
+        SpecializationMapEntry* entries,
+        byte* data,
+        out uint dataSize)
+    {
+        if (stageIdx == 1)
+        {
+            entries[0] = new SpecializationMapEntry
+            {
+                ConstantID = 0,
+                Offset     = 0,
+                Size       = sizeof(uint),
+            };
+            *(uint*)data = SoftShadowsEnabled ? 1u : 0u;
+            dataSize = sizeof(uint);
+            return 1;
+        }
+        dataSize = 0;
+        return 0;
+    }
+
+    // ── Pipeline state overrides ───────────────────────────────────────────
+
+    protected override PipelineDepthStencilStateCreateInfo BuildDepthStencil() => new()
+    {
+        SType                 = StructureType.PipelineDepthStencilStateCreateInfo,
+        DepthTestEnable       = true,
+        DepthWriteEnable      = false,                       // multiple transparent layers stack
+        DepthCompareOp        = CompareOp.LessOrEqual,
+        DepthBoundsTestEnable = false,
+        StencilTestEnable     = false,
+        MinDepthBounds        = 0.0f,
+        MaxDepthBounds        = 1.0f,
+    };
+
+    protected override PipelineRasterizationStateCreateInfo BuildRasterizer() => new()
+    {
+        SType                   = StructureType.PipelineRasterizationStateCreateInfo,
+        DepthClampEnable        = false,
+        RasterizerDiscardEnable = false,
+        PolygonMode             = PolygonMode.Fill,
+        LineWidth               = 1.0f,
+        CullMode                = CullModeFlags.None,         // most transparents need both sides visible
+        FrontFace               = FrontFace.CounterClockwise,
+        DepthBiasEnable         = false,
+    };
+
+    // Standard src-alpha / one-minus-src-alpha. Dest alpha tracks accumulated
+    // coverage in case anything downstream wants to sample it.
+    protected override PipelineColorBlendAttachmentState[] BuildColorBlendAttachments()
+    {
+        return new[]
+        {
+            new PipelineColorBlendAttachmentState
+            {
+                BlendEnable         = true,
+                SrcColorBlendFactor = BlendFactor.SrcAlpha,
+                DstColorBlendFactor = BlendFactor.OneMinusSrcAlpha,
+                ColorBlendOp        = BlendOp.Add,
+                SrcAlphaBlendFactor = BlendFactor.One,
+                DstAlphaBlendFactor = BlendFactor.OneMinusSrcAlpha,
+                AlphaBlendOp        = BlendOp.Add,
+                ColorWriteMask      = ColorComponentFlags.RBit | ColorComponentFlags.GBit |
+                                      ColorComponentFlags.BBit | ColorComponentFlags.ABit,
+            },
+        };
+    }
+
+    protected override VertexInputBindingDescription[]   GetVertexInputBindings()   => [Vertex.GetBindingDescription()];
+    protected override VertexInputAttributeDescription[] GetVertexInputAttributes() => Vertex.GetAttributeDescriptions();
+
+    // ── Descriptor layouts ─────────────────────────────────────────────────
+
+    protected override void CreateDescriptorSetLayouts()
+    {
+        DescriptorSetLayouts = new DescriptorSetLayout[2];
+        OwnedDescriptorSetLayoutIndices = new[] { 0 };
+
+        // Set 0 — own frame UBO + cross-pipeline lighting handles.
+        var set0Bindings = new DescriptorSetLayoutBinding[]
+        {
+            new() { Binding = 0, DescriptorType = DescriptorType.UniformBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit },
+            new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
+            new() { Binding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
+            new() { Binding = 3, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
+            new() { Binding = 4, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
+        };
+
+        fixed (DescriptorSetLayoutBinding* pSet0 = set0Bindings)
+        {
+            var set0LayoutInfo = new DescriptorSetLayoutCreateInfo
+            {
+                SType        = StructureType.DescriptorSetLayoutCreateInfo,
+                BindingCount = (uint)set0Bindings.Length,
+                PBindings    = pSet0,
+            };
+            if (Vk.CreateDescriptorSetLayout(Device, &set0LayoutInfo, null, out DescriptorSetLayouts[SetFrame]) != Result.Success)
+                throw new Exception("Failed to create transparent set 0 layout");
+        }
+
+        // Set 1 — bindless, borrowed from ResourceManager (matches GeometryPipeline).
+        DescriptorSetLayouts[SetBindless] = Engine.ResourceManager.GetBindlessLayout();
+    }
+
+    protected override void CreateResources()
+    {
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            Renderer.CreateMappedUniformBuffer(sizeof(TransparentFrameUBO), ref FrameUniformBuffers[i]);
+        }
+    }
+
+    protected override void CreateDescriptorSets()
+    {
+        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[SetFrame];
+
+        var allocInfo = new DescriptorSetAllocateInfo
+        {
+            SType              = StructureType.DescriptorSetAllocateInfo,
+            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
+            PSetLayouts        = layouts,
+        };
+        DescriptorSets = new DescriptorSet[1][];
+        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
+        fixed (DescriptorSet* pSets = DescriptorSets[0])
+        {
+            if (Vk.AllocateDescriptorSets(Device, &allocInfo, pSets) != Result.Success)
+                throw new Exception("Failed to allocate transparent descriptor sets");
+        }
+    }
+
+    // Only binding 0 (own UBO) is written here. Bindings 1–4 (lights / TLAS / tile
+    // buffers) point at PbrDeferredPipeline / LightCullPipeline's buffers and are
+    // written by the renderer after those pipelines exist.
+    protected override void WriteDescriptors()
+    {
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            DescriptorBufferInfo frameInfo = new()
+            {
+                Buffer = FrameUniformBuffers[i].buffer,
+                Offset = 0,
+                Range  = (ulong)sizeof(TransparentFrameUBO),
+            };
+            var write = new WriteDescriptorSet
+            {
+                SType           = StructureType.WriteDescriptorSet,
+                DstSet          = DescriptorSets[0][i],
+                DstBinding      = 0,
+                DstArrayElement = 0,
+                DescriptorType  = DescriptorType.UniformBuffer,
+                DescriptorCount = 1,
+                PBufferInfo     = &frameInfo,
+            };
+            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
+        }
+    }
+
+    /// <summary>Bind the per-frame lights SSBO + the tile cull output buffers
+    /// produced by LightCullPipeline. Call once at startup after both producer
+    /// pipelines exist.</summary>
+    public void WriteSharedLightingDescriptors(PbrDeferredPipeline pbr, LightCullPipeline lightCull)
+    {
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            DescriptorBufferInfo lightsInfo = new()
+            {
+                Buffer = pbr.GetLightStorageBuffer((uint)i),
+                Offset = 0,
+                Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
+            };
+            DescriptorBufferInfo tileCountInfo = new()
+            {
+                Buffer = lightCull.GetTileLightCountBuffer((uint)i),
+                Offset = 0,
+                Range  = (ulong)(Renderer.MAX_TILE_COUNT * sizeof(uint)),
+            };
+            DescriptorBufferInfo tileIdxInfo = new()
+            {
+                Buffer = lightCull.GetTileLightIndicesBuffer((uint)i),
+                Offset = 0,
+                Range  = (ulong)(Renderer.MAX_TILE_COUNT * Renderer.MAX_LIGHTS_PER_TILE * sizeof(uint)),
+            };
+
+            var writes = stackalloc WriteDescriptorSet[3];
+            writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i], DstBinding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &lightsInfo };
+            writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i], DstBinding = 3, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &tileCountInfo };
+            writes[2] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i], DstBinding = 4, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &tileIdxInfo };
+            Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
+        }
+    }
+
+    /// <summary>Mirror of PbrDeferredPipeline.WriteTlasDescriptor — call after InitRayQuery
+    /// and on every TLAS recreate.</summary>
+    public void WriteTlasDescriptor(AccelerationStructureKHR tlas)
+    {
+        if (tlas.Handle == 0) return;
+
+        var tlasHandle = tlas;
+        var asWrite = new WriteDescriptorSetAccelerationStructureKHR
+        {
+            SType = StructureType.WriteDescriptorSetAccelerationStructureKhr,
+            AccelerationStructureCount = 1,
+            PAccelerationStructures = &tlasHandle,
+        };
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            var write = new WriteDescriptorSet
+            {
+                SType           = StructureType.WriteDescriptorSet,
+                PNext           = &asWrite,
+                DstSet          = DescriptorSets[0][i],
+                DstBinding      = 2,
+                DescriptorType  = DescriptorType.AccelerationStructureKhr,
+                DescriptorCount = 1,
+            };
+            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
+        }
+    }
+
+    /// <summary>Fill the per-frame FrameUBO from the current camera + tile counts.
+    /// Call once per frame from DrawFrame; tileCount / lightCount come from
+    /// PbrDeferredPipeline.UpdatePerFrame so the two pipelines stay coherent.</summary>
+    public void UpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, uint tileCountX, uint tileCountY)
+    {
+        TransparentFrameUBO ubo = new();
+        if (camera != null)
+        {
+            ubo.proj = camera.GetProjectionMatrix(
+                (float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+            ubo.view = camera.GetViewMatrix();
+            ubo.proj.M22 *= -1;
+            ubo.camPos = new Vector4(camera.GetPosition(), 1.0f);
+        }
+        else
+        {
+            ubo.view   = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), Vector3.Zero, new Vector3(0, 0, 1));
+            ubo.proj   = Matrix4x4.CreatePerspectiveFieldOfView((float)(45 * Math.PI / 180),
+                (float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+            ubo.proj.M22 *= -1;
+            ubo.camPos = new Vector4(2, 2, 2, 1);
+        }
+        ubo.lightCount = lightCount;
+        ubo.tileCountX = tileCountX;
+        ubo.tileCountY = tileCountY;
+        ubo.screenSize = new Vector2(Renderer.swapChainExtent.Width, Renderer.swapChainExtent.Height);
+
+        void* data = FrameUniformBuffers[frameIndex].mapped;
+        new Span<TransparentFrameUBO>(data, 1).Fill(ubo);
+    }
+
+    /// <summary>Push the per-draw model matrix + material index. Called once per transparent draw.</summary>
+    public void PushDrawConstants(CommandBuffer cmd, in Matrix4x4 model, uint materialIndex)
+    {
+        var pc = new TransparentPushConstants
+        {
+            Model         = model,
+            MaterialIndex = materialIndex,
+        };
+        Vk.CmdPushConstants(cmd, Layout,
+            ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
+            0, (uint)sizeof(TransparentPushConstants), &pc);
     }
 }
