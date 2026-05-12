@@ -297,7 +297,7 @@ public unsafe partial class Renderer
         SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);
 
         // G-buffer ImageViews are fresh — re-bind them on the lighting pass set.
-        UpdateGBufferDescriptorSet();
+        PbrDeferredPipeline.WriteGBufferDescriptors();
     }
 
     public void DrawFrame()
@@ -326,19 +326,17 @@ public unsafe partial class Renderer
             throw new Exception("Failed to begin command buffer");
 
         // 5. Update per-frame UBOs
-        // UpdateGeometryUBO is per-entity — wired in Phase 5/6 once entities exist.
-        
         geometryPipeline.UpdateUbo(currentFrame, camera);
-        var (lightCount, tileCountX, tileCountY) = UpdateLightingBuffers(currentFrame, camera, scene);
+        var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
 
         // 5b. GPU cull pass — runs before the geometry pass and produces the
         // indirect command + post-cull instance buffers the geometry pass consumes.
-        renderableCountThisFrame = RecordCullPass(cmd, currentFrame, camera);
+        drawCullPipeline.Record(cmd, currentFrame, camera, scene);
 
         // 5c. Tiled light-cull — bins lights into per-tile slot lists for the
         // lighting fragment shader. Buffer barrier inside makes the writes
         // visible to the fragment stage of the lighting pass.
-        RecordLightCullPass(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
+        lightCullPipeline.Record(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
 
         // 6. Record all render-graph passes (geometry → lighting), record-only.
         scene.renderGraph.Execute(cmd);
@@ -622,18 +620,20 @@ public unsafe partial class Renderer
                 };
 
                 // ── GPU-driven indirect draw ────────────────────────────────────
-                // The cull compute pass (RecordCullPass) already populated:
-                //   - InstanceStorageBuffers : per-visible-renderable model + materialIndex,
-                //                              read by the VS via SV_InstanceID.
-                //   - IndirectCmdBuffers     : VkDrawIndexedIndirectCommand[] visible mesh draws.
-                //   - IndirectCountBuffers   : single uint of how many entries are valid.
+                // The draw-cull compute pass already populated:
+                //   - InstanceStorageBuffers (ResourceManager): per-visible-renderable model
+                //     + materialIndex, read by the VS via SV_InstanceID.
+                //   - IndirectCmdBuffers     (DrawCullPipeline): VkDrawIndexedIndirectCommand[]
+                //                                                visible mesh draws.
+                //   - IndirectCountBuffers   (DrawCullPipeline): single uint of valid entries.
                 // A single vkCmdDrawIndexedIndirectCount consumes them all.
-                if (renderableCountThisFrame > 0)
+                uint renderableCount = drawCullPipeline.LastRenderableCount;
+                if (renderableCount > 0)
                 {
                     vk!.CmdDrawIndexedIndirectCount(buffer,
-                        IndirectCmdBuffers[currentFrame].buffer, 0,
-                        IndirectCountBuffers[currentFrame].buffer, 0,
-                        renderableCountThisFrame,
+                        drawCullPipeline.GetIndirectCmdBuffer  (currentFrame), 0,
+                        drawCullPipeline.GetIndirectCountBuffer(currentFrame), 0,
+                        renderableCount,
                         (uint)sizeof(DrawIndexedIndirectCommandGpu));
                 }
 
@@ -669,7 +669,7 @@ public unsafe partial class Renderer
                 //execute screen space lighting calcs.
                 vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
 
-                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, pbrLightingPipeline);
+                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, PbrDeferredPipeline.Handle);
 
                 Viewport vp = new()
                 {
@@ -681,15 +681,16 @@ public unsafe partial class Renderer
                 vk!.CmdSetViewport(buffer, 0, 1, &vp);
                 vk!.CmdSetScissor(buffer, 0, 1, &scissor);
 
-                // Set 0 = per-frame LightingUBO + TLAS, Set 1 = shared G-buffer samplers.
+                // Set 0 = per-frame LightingUBO + Lights SSBO + TLAS + tile cull buffers.
+                // Set 1 = shared G-buffer samplers (single allocation reused every frame).
                 // No push constants — lighting pass reads everything from descriptor bindings.
                 var sets = stackalloc DescriptorSet[2]
                 {
-                    lightingDescriptorSets[currentFrame],
-                    gBufferDescriptorSet,
+                    PbrDeferredPipeline.GetDescriptorSet(0, currentFrame),
+                    PbrDeferredPipeline.GetDescriptorSet(1, 0),
                 };
                 vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    pbrPipelineLayout, 0, 2, sets, 0, null);
+                    PbrDeferredPipeline.Layout, 0, 2, sets, 0, null);
 
                 // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
                 vk!.CmdDraw(buffer, 3, 1, 0, 0);

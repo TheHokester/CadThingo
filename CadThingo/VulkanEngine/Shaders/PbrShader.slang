@@ -35,6 +35,12 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 [[vk::binding(3, 0)]] StructuredBuffer<uint>                tileLightCount;
 [[vk::binding(4, 0)]] StructuredBuffer<uint>                tileLightIndices;
 
+// Specialization constants — picked up via VkSpecializationInfo at pipeline build.
+// SOFT_SHADOWS off (default) → single-ray binary occlusion (the original path).
+// SOFT_SHADOWS on            → blocker-search + Vogel-disk penumbra taps.
+// Flip CadThingo's Renderer.softShadowsEnabled and rebuild the PBR pipeline.
+[[vk::constant_id(0)]] const bool SOFT_SHADOWS = false;
+
 // GBuffer inputs — Set 1 in your descriptor layout
 [[vk::binding(0, 1)]] Sampler2D gBufferPositionSampler;
 [[vk::binding(1, 1)]] Sampler2D gBufferNormalSampler;
@@ -47,9 +53,19 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 // shadow itself. Tune up if you see acne, down if you see "peter-panning."
 static const float SHADOW_RAY_EPS = 0.002;
 
+// Distance-to-occluder soft shadow tunables.
+//   PENUMBRA_SAMPLES — penumbra-tap rays per shaded pixel (cost scales linearly).
+//   GOLDEN_ANGLE     — Vogel-disk increment; sqrt(i/N) radius + golden-angle theta
+//                      gives a low-discrepancy disk pattern with no precomputed table.
+//   MAX_CONE_HA      — clamps the penumbra cone half-angle so a blocker hugging the
+//                      light doesn't produce a hemispherical spray of samples.
+static const int   PENUMBRA_SAMPLES = 8;
+static const float GOLDEN_ANGLE     = 2.39996323;
+static const float MAX_CONE_HA      = 0.25;
+
 // Returns true iff a ray from `origin` toward `dir` hits any geometry within
 // `tMax`. Uses ACCEPT_FIRST_HIT_AND_END_SEARCH so the traversal exits on the
-// first intersection — perfect for binary visibility.
+// first intersection — perfect for binary visibility (penumbra taps).
 bool isOccluded(float3 origin, float3 dir, float tMax)
 {
     RayDesc ray;
@@ -62,6 +78,81 @@ bool isOccluded(float3 origin, float3 dir, float tMax)
     q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
     q.Proceed();
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
+// Closest-hit blocker search along the center shadow ray. Returns the hit
+// distance (CommittedRayT), or -1 on miss. BLAS geometry is built opaque so
+// Proceed() terminates after one call — the while loop is just for safety.
+float blockerSearch(float3 origin, float3 dir, float tMax)
+{
+    RayDesc ray;
+    ray.Origin    = origin;
+    ray.Direction = dir;
+    ray.TMin      = 0.0;
+    ray.TMax      = tMax;
+
+    RayQuery<RAY_FLAG_NONE> q;
+    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    while (q.Proceed()) {}
+    return (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ? q.CommittedRayT() : -1.0;
+}
+
+// Orthonormal basis around the light direction L. Used to place Vogel-disk
+// samples in the plane perpendicular to L.
+void buildLightBasis(float3 L, out float3 T, out float3 B)
+{
+    float3 up = abs(L.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
+    T = normalize(cross(up, L));
+    B = cross(L, T);
+}
+
+// Per-pixel hash → rotation angle for the Vogel disk. Different pattern per
+// pixel breaks up banding and approximates blue-noise distribution cheaply.
+float pixelJitter(float2 px)
+{
+    return frac(sin(dot(px, float2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+}
+
+// Distance-to-occluder soft shadow. Returns [0..1] visibility.
+//   distanceToLight: full ray length from surface to light center
+//                    (set to 1e6 for directional — used as a sentinel below)
+//   lightRadius:     world-space radius for point/spot; tan(angularRadius) for
+//                    directional (sun ≈ 0.005). 0 falls back to hard shadow.
+//
+// Two-phase: closest-hit blocker search seeds a PCSS-style penumbra estimate,
+// then N Vogel-disk taps inside that cone produce a soft edge. When the blocker
+// hugs the surface the cone collapses to ~0 and you get a crisp contact shadow;
+// when the blocker hugs the light the cone widens, softening the silhouette.
+float softShadow(float3 origin, float3 L, float distanceToLight, float lightRadius, float jitterAngle)
+{
+    float tMax = max(distanceToLight - SHADOW_RAY_EPS, 0.0);
+
+    float tBlocker = blockerSearch(origin, L, tMax);
+    if (tBlocker < 0.0)        return 1.0;   // unobstructed
+    if (lightRadius <= 1e-4)   return 0.0;   // point light → hard shadow
+
+    // Penumbra-width formula (PCSS, expressed as a cone half-angle around L):
+    //   finite light:  α = lightRadius · tBlocker / (dLight · (dLight − tBlocker))
+    //   directional:   α ≈ lightRadius   (lightRadius is already tan(angularRadius))
+    // The 1e5 cutoff matches the 1e6 sentinel CPU-side writes for directional lights.
+    float coneHalfAngle = (distanceToLight > 1e5)
+        ? lightRadius
+        : (lightRadius * tBlocker) / (distanceToLight * max(distanceToLight - tBlocker, 1e-4));
+    coneHalfAngle = min(coneHalfAngle, MAX_CONE_HA);
+
+    float3 T, B;
+    buildLightBasis(L, T, B);
+
+    float unblocked = 0.0;
+    for (int i = 0; i < PENUMBRA_SAMPLES; i++) {
+        float r     = sqrt((i + 0.5) / float(PENUMBRA_SAMPLES));
+        float theta = i * GOLDEN_ANGLE + jitterAngle;
+        float2 disk = float2(cos(theta), sin(theta)) * r * coneHalfAngle;
+
+        float3 dir = normalize(L + T * disk.x + B * disk.y);
+        if (!isOccluded(origin, dir, tMax)) unblocked += 1.0;
+    }
+    return unblocked / float(PENUMBRA_SAMPLES);
 }
 
 
@@ -176,13 +267,23 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
         float3 radiance = lColor * intensity * attenuation * spotMask;
 
         // Shadow ray: WorldPos -> light, with self-shadow bias along N.
-        // Stop the ray a hair short of the light so we don't hit the light itself.
-        // Skip the ray query for lights with shadow casting disabled.
+        // Spec-constant gate picks soft (multi-tap penumbra) vs hard (1-ray binary).
+        // The branch on SOFT_SHADOWS is resolved at pipeline-build time, so the
+        // unused arm is compiled out entirely — no per-pixel cost for the toggle.
         bool castShadows = lt.spotCones.z > 0.5;
         if (castShadows) {
             float3 shadowOrigin = WorldPos + N * SHADOW_RAY_EPS;
             float  tMax         = max(distance - SHADOW_RAY_EPS, 0.0);
-            if (isOccluded(shadowOrigin, L, tMax)) continue;
+
+            if (SOFT_SHADOWS) {
+                float lightRadius = lt.spotCones.w;
+                float jitter      = pixelJitter(input.Position.xy);
+                float visibility  = softShadow(shadowOrigin, L, distance, lightRadius, jitter);
+                if (visibility <= 0.0) continue;
+                radiance *= visibility;
+            } else {
+                if (isOccluded(shadowOrigin, L, tMax)) continue;
+            }
         }
 
         // Calculate half vector (between view and light directions)

@@ -91,46 +91,15 @@ public unsafe partial class Renderer
     RenderingAttachmentInfo depthAttachment;
     
     
-    //pipelines 
-    PipelineLayout pipelineLayout;
-    Pipeline graphicsPipeline;
-    GeometryPipeline geometryPipeline;
-    PipelineLayout pbrPipelineLayout;
-    Pipeline pbrLightingPipeline;
-    Pipeline pbrBlendGraphicsPipeline;
-    //transparent pbr pipeline for premultiplied alpha
-    Pipeline pbrPremulPipeline;
-    //opaque pbr pipeline varient used for mirrored offscreen pass(cull to avoid winding issues)
-    Pipeline pbrPrepassGraphicsPipeline;
-    //reflection pbr pipeline used for mirroring offscreen pass
-    Pipeline pbrReflectionGraphicsPipeline;
-    //specialized pipeline for architectural glass (windows, lamps etc ect...)
-    //shared descriptors and vertex input with pbr pipelines but uses a dedicated 
-    //fragment shader for the glass surface
-    Pipeline glassGraphicsPipeline;
-    PipelineLayout lightingPipelineLayout;
-    Pipeline lightingPipeline;
-    
-    //fullscreen composite pipeline to draw the opaque offscreen color to the swapchain
-    PipelineLayout compositePipelineLayout;
-    Pipeline compositePipeline;
-    DescriptorSetLayout compositeDSL;
-    DescriptorSet compositeDS;
-    
-    //PipelineRenderingCreateInfos for lifetime management
-    PipelineRenderingCreateInfo mainPipelineRenderingCreateInfo;
-    PipelineRenderingCreateInfo geometryPipelineRenderingCreateInfo;
-    PipelineRenderingCreateInfo pbrPipelineRenderingCreateInfo; 
-    PipelineRenderingCreateInfo lightingPipelineRenderingCreateInfo; 
-    PipelineRenderingCreateInfo compositePipelineRenderingCreateInfo;  
-    
-    //Compute pipeline
-    PipelineLayout computePipelineLayout;
-    Pipeline computePipeline;
-    DescriptorSetLayout computeDSL;
-    DescriptorPool computeDescriptorPool;
-    DescriptorSet[] computeDSets;
-    CommandPool computeCommandPool;
+    //pipelines — each owns its own VkPipeline, layouts, descriptor sets, and per-pipeline buffers
+    internal GeometryPipeline     geometryPipeline;
+    internal DrawCullPipeline     drawCullPipeline;
+    internal LightCullPipeline    lightCullPipeline;
+    internal PbrDeferredPipeline  PbrDeferredPipeline;   // accessor used by LightCullPipeline (consumer of the lights SSBO)
+
+    // Specialization-constant gate for soft (PCSS-style) ray-queried shadows.
+    // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
+    public bool softShadowsEnabled = true;
     
     //Command pool and buffers
     CommandPool commandPool;
@@ -141,16 +110,6 @@ public unsafe partial class Renderer
     //Camera
     Camera camera;
     public Camera Camera => camera;
-    //Uniform buffers — split per pass (Geometry pass writes model/view/proj; Lighting pass writes lights + camPos + tone-mapping params)
-    private UboBuffer[] LightingUniformBuffers = new UboBuffer[2];
-    // Per-frame StructuredBuffer<PbrLight> — populated each frame in UpdateLightingBuffers
-    // by walking scene.EnumerateLights(). Bound at PBR set 0, binding 1.
-    private UboBuffer[] LightStorageBuffers = new UboBuffer[2];
-    
-    // Total renderables packed into the cull-input buffer this frame. Drives the
-    // maxDrawCount arg of vkCmdDrawIndexedIndirectCount; reset every frame in
-    // RecordCullPass before the geometry pass runs.
-    uint renderableCountThisFrame;
 
     //Sync objects
     Semaphore[] imageAvailableSemaphores;
@@ -163,24 +122,19 @@ public unsafe partial class Renderer
     //tracks last timeline value that was submitted
     volatile uint lastTimelineValue;
     
-    //Depth buffer + Images
+    //Depth buffer + Images — shared across passes via the render graph and the
+    //PBR pipeline's g-buffer sampler set. Internal so PbrDeferredPipeline.WriteGBufferDescriptors
+    //can rebind ImageViews after swapchain recreate.
     ImageResource depthImageResource;
-    private ImageResource gBufferPosition;
-    private ImageResource gBufferNormal;
-    private ImageResource gBufferAlbedo;
-    private ImageResource gBufferMaterial;
-    private ImageResource gBufferEmissive;
-    
-    private Sampler gBufferSampler;
+    internal ImageResource gBufferPosition;
+    internal ImageResource gBufferNormal;
+    internal ImageResource gBufferAlbedo;
+    internal ImageResource gBufferMaterial;
+    internal ImageResource gBufferEmissive;
 
-    //store for lifetime management
-    DescriptorSetLayout descriptorSetLayout;
-    DescriptorSetLayout geometryFrameDescriptorSetLayout;    // Geometry pipeline set 0 — FrameUBO (view+proj)
-    DescriptorSetLayout PBRDescriptorSetLayout; //Set 0 - Lighting UBO
-    DescriptorSetLayout PBRGBufferDescriptorSetLayout;//Set 1 - G buffer descriptors
+    internal Sampler gBufferSampler;
+
     internal DescriptorPool descriptorPool;
-    private DescriptorSet[] lightingDescriptorSets;   // per-frame, binds LightingUBO (set 0)
-    private DescriptorSet gBufferDescriptorSet;       // shared, binds G-buffer samplers (set 1)
      
     
     private static unsafe uint DebugCallBack(
@@ -206,58 +160,50 @@ public unsafe partial class Renderer
         CreateSwapChain();
         CreateImageViews();
         SetupDynamicRendering();
-        CreateDescriptorSetLayout();
-        CreatePBRDescriptorSetLayout();
-        CreateGraphicsPipeline();
-        
+
         CreateDescriptorPool();
         Engine.ResourceManager.Initialize(this);
-        
+
+        CreateCommandPool();
+        // ImageResource objects only — actual VkImage + ImageView allocation happens
+        // inside graph.Compile() called from SetupDeferredRenderer below.
+        CreateDepthResources();
+        CreateGBufferResources();
+        CreateGBufferSampler();
+
+        // ── Pipelines that don't depend on allocated g-buffer image views ──
+        // Render-graph pass closures (registered in SetupDeferredRenderer) read
+        // `geometryPipeline` / `drawCullPipeline` / `PbrDeferredPipeline` through
+        // `this`, so they must exist (be non-null) by the time the closures *run*
+        // (per frame in DrawFrame), not when they're declared.
         geometryPipeline = new GeometryPipeline(this);
         geometryPipeline.Initialize();
-        
-        CreatePBRPipeline();
-        CreateCullDescriptorSetLayout();
-        CreateCullPipeline();
-        CreateLightCullDescriptorSetLayout();
-        CreateLightCullPipeline();
-        //create command pool
-        CreateCommandPool();
-        
-        //Creates image resources, no gpu alloc yet
-        CreateDepthResources();
-        //same
-        CreateGBufferResources();
-        //Create both geo and lighting uniform buffers
-        CreateUniformBuffers();
-        
+
+        drawCullPipeline = new DrawCullPipeline(this);
+        drawCullPipeline.Initialize();
+
         scene = new Scene(vk, device, physicalDevice);//initialise scene
-        SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);//adds resources to render graph & compiles
+        // graph.Compile() inside SetupDeferredRenderer allocates the g-buffer
+        // images. The PBR pipeline's set 1 binds those views, so PbrDeferredPipeline
+        // must initialize AFTER this call.
+        SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);
         imGuiUtils = new ImGuiVulkanUtils(this, (uint)queueFamilyIndices.graphicsFamily! );
         imGuiUtils?.init(swapChainExtent.Width, swapChainExtent.Height);
-        
-        
-        CreateGBufferSampler();
-        //Create descriptor pool (sized for bindless: storage buffers, sampled images, samplers).
 
-        // Bindless geometry-set 1 setup: per-frame material+instance SSBOs, shared default sampler,
-        // and the per-frame descriptor sets they all live in. Texture array (binding 2) is filled
-        // lazily by ResourceManager.RegisterBindless as glTF assets load.
-        CreateCullBuffers();
-        // Tile-cull buffers must exist BEFORE CreateLightingDescriptorSets — its writes
-        // reference TileLightCountBuffers/TileLightIndicesBuffers (PBR set 0 bindings 3,4).
-        CreateTileLightCullBuffers();
-        CreateLightingDescriptorSets();
-        // Cull descriptor sets reference the per-frame cull buffers, so they must
-        // be created after CreateCullBuffers (and after CreateDescriptorPool).
-        CreateCullDescriptorSets();
-        CreateLightCullDescriptorSets();
+        // ── Lighting + light-cull pipelines (depend on allocated g-buffer / lights SSBO) ──
+        PbrDeferredPipeline = new PbrDeferredPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
+        PbrDeferredPipeline.Initialize();
+
+        lightCullPipeline = new LightCullPipeline(this);
+        lightCullPipeline.Initialize();
+
+        // Wire light-cull tile buffers into the PBR lighting set now that both exist.
+        PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
 
         //Create command buffers
         CreateCommandBuffers();
         //Create sync objects
         CreateSyncObjects();
-        //setup deffered rendering
 
         CreateTestEntity();
 
@@ -265,7 +211,7 @@ public unsafe partial class Renderer
         // inside InitRayQuery — safe to call even when ray queries aren't available.
         InitRayQuery();
         // Bind the TLAS into the lighting descriptor set (one write per frame).
-        UpdateLightingTlasDescriptor();
+        if (tlas.Handle != 0) PbrDeferredPipeline.WriteTlasDescriptor(tlas);
 
         initialized = true;
     }
@@ -277,24 +223,29 @@ public unsafe partial class Renderer
 
 
         // glTF demo: DamagedHelmet to the side of viking_room so both render together.
-        Entity* blue_agent = GltfLoader.Load(
-            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\props\sas_blue.glb",
-            "BlueAgent", Engine.ResourceManager, this, scene);
-        blue_agent->GetComponent<TransformComponent>()?.SetScale(new Vector3(25f));
-        blue_agent->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(0, 0, MathF.PI / 2));
-        blue_agent->GetComponent<TransformComponent>()?.SetPosition(new Vector3(6f, 0f, 0f));
+        // Entity* blue_agent = GltfLoader.Load(
+        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\props\sas_blue.glb",
+        //     "BlueAgent", Engine.ResourceManager, this, scene);
+        // blue_agent->GetComponent<TransformComponent>()?.SetScale(new Vector3(25f));
+        // blue_agent->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(0, 0, MathF.PI / 2));
+        // blue_agent->GetComponent<TransformComponent>()?.SetPosition(new Vector3(6f, 0f, 0f));
         
         
-        Entity* helmetRoot = GltfLoader.Load(
-            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\DamagedHelmet.glb",
-            "DamagedHelmet", Engine.ResourceManager, this, scene);
-        var helmetTransform = helmetRoot->GetComponent<TransformComponent>();
-        helmetTransform?.SetPosition(new Vector3(0f, 1f, 0f));
+        // Entity* helmetRoot = GltfLoader.Load(
+        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\DamagedHelmet.glb",
+        //     "DamagedHelmet", Engine.ResourceManager, this, scene);
+        // var helmetTransform = helmetRoot->GetComponent<TransformComponent>();
+        // helmetTransform?.SetPosition(new Vector3(0f, 1f, 0f));
 
         // Phase 2 smoke test — three LightComponents (directional / point / spot)
         // confirming the per-frame StructuredBuffer<PbrLight> path lights the helmet.
         
-
+        //Sponza scene
+        Entity* sponza = GltfLoader.Load(
+            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\sponza.glb",
+            "Sponza", Engine.ResourceManager, this, scene);
+        var sponzaTransform = sponza->GetComponent<TransformComponent>();
+        sponzaTransform?.SetPosition(new Vector3(0f, 0f, 0f));
         
         
         SpawnTestLights();
@@ -309,24 +260,26 @@ public unsafe partial class Renderer
         dirLight->AddComponent(new LightComponent
         {
             Type        = LightType.Directional,
-            Color       = new Vector3(1.0f, 0.97f, 0.92f),
-            Intensity   = 3.0f,
-            Direction   = new Vector3(-0.4f, -1.0f, -0.3f),
+            Color       = new Vector3(1.0f, 1f, 0.92f),
+            Intensity   = 10.0f,
+            Direction   = new Vector3(0f, -1.0f, 0f),
             CastShadows = true,
         });
         dirLight->Initialize();
-        scene.AddEntity(dirLight);
+        // scene.AddEntity(dirLight);
 
         // Point fill light — warm, sits to the right of and above the helmet.
         Entity* pointLight = Entity.Create("PointFill");
         pointLight->AddComponent(new TransformComponent());
-        pointLight->GetComponent<TransformComponent>()?.SetPosition(new Vector3(2.5f, 2.0f, 1.5f));
+        pointLight->GetComponent<TransformComponent>()?.SetPosition(new Vector3(10f, 20f, 0f));
         pointLight->AddComponent(new LightComponent
         {
             Type      = LightType.Point,
-            Color     = new Vector3(1.0f, 0.7f, 0.4f),
-            Intensity = 12.0f,
-            Range     = 8.0f,
+            Color     = new Vector3(1.0f, 1.0f, 0.4f),
+            Intensity = 5000.0f,
+            Range     = 100.0f,
+            CastShadows = true,
+            Radius = 0.03f,
         });
         pointLight->Initialize();
         scene.AddEntity(pointLight);
@@ -346,7 +299,7 @@ public unsafe partial class Renderer
             OuterConeCos = MathF.Cos(MathF.PI / 5f),  // ~36°
         });
         spotLight->Initialize();
-        scene.AddEntity(spotLight);
+        // scene.AddEntity(spotLight);
     }
 
     public void Update(double d)
@@ -409,61 +362,14 @@ public unsafe partial class Renderer
         // ── G-buffer sampler ────────────────────────────────────
         if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
 
+        // ── Pipelines (each pipeline disposes its own buffers, sets, layouts) ─
+        PbrDeferredPipeline?.Dispose();
+        lightCullPipeline  ?.Dispose();
+        drawCullPipeline   ?.Dispose();
+        geometryPipeline   ?.Dispose();
 
-        // ── Per-frame uniform + storage buffers (FreeMemory implicitly unmaps) ─
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            if (LightingUniformBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, LightingUniformBuffers[i].buffer, null);
-            if (LightingUniformBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, LightingUniformBuffers[i].memory, null);
-            if (LightStorageBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, LightStorageBuffers[i].buffer, null);
-            if (LightStorageBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, LightStorageBuffers[i].memory, null);
-            if (RenderableInputBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, RenderableInputBuffers[i].buffer, null);
-            if (RenderableInputBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, RenderableInputBuffers[i].memory, null);
-            if (IndirectCmdBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, IndirectCmdBuffers[i].buffer, null);
-            if (IndirectCmdBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, IndirectCmdBuffers[i].memory, null);
-            if (IndirectCountBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, IndirectCountBuffers[i].buffer, null);
-            if (IndirectCountBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, IndirectCountBuffers[i].memory, null);
-            if (TileLightCountBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, TileLightCountBuffers[i].buffer, null);
-            if (TileLightCountBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, TileLightCountBuffers[i].memory, null);
-            if (TileLightIndicesBuffers[i].buffer.Handle != 0)
-                vk.DestroyBuffer(device, TileLightIndicesBuffers[i].buffer, null);
-            if (TileLightIndicesBuffers[i].memory.Handle != 0)
-                vk.FreeMemory(device, TileLightIndicesBuffers[i].memory, null);
-        }
-
-        // ── Pipelines + layouts ─────────────────────────────────
-        geometryPipeline.Dispose();
-        
-        if (lightCullPipeline.Handle   != 0) vk.DestroyPipeline(device, lightCullPipeline,   null);
-        if (cullPipeline.Handle        != 0) vk.DestroyPipeline(device, cullPipeline,        null);
-        if (pbrLightingPipeline.Handle != 0) vk.DestroyPipeline(device, pbrLightingPipeline, null);
-        if (graphicsPipeline.Handle    != 0) vk.DestroyPipeline(device, graphicsPipeline,    null);
-
-        if (lightCullPipelineLayout.Handle != 0) vk.DestroyPipelineLayout(device, lightCullPipelineLayout, null);
-        if (cullPipelineLayout.Handle     != 0) vk.DestroyPipelineLayout(device, cullPipelineLayout,     null);
-        if (pbrPipelineLayout.Handle      != 0) vk.DestroyPipelineLayout(device, pbrPipelineLayout,      null);
-        if (pipelineLayout.Handle         != 0) vk.DestroyPipelineLayout(device, pipelineLayout,         null);
-
-        // ── Descriptor pool (frees sets) + layouts ──────────────
+        // ── Descriptor pool (frees the descriptor sets owned by the pipelines) ─
         if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
-        if (lightCullDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, lightCullDescriptorSetLayout, null);
-        if (cullDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, cullDescriptorSetLayout, null);
-        if (PBRGBufferDescriptorSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, PBRGBufferDescriptorSetLayout, null);
-        if (PBRDescriptorSetLayout.Handle        != 0) vk.DestroyDescriptorSetLayout(device, PBRDescriptorSetLayout,        null);
-        if (geometryFrameDescriptorSetLayout.Handle   != 0) vk.DestroyDescriptorSetLayout(device, geometryFrameDescriptorSetLayout,   null);
-        if (descriptorSetLayout.Handle           != 0) vk.DestroyDescriptorSetLayout(device, descriptorSetLayout,           null);
 
         // ── Command pool (frees buffers) ────────────────────────
         if (commandPool.Handle != 0) vk.DestroyCommandPool(device, commandPool, null);

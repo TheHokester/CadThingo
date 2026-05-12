@@ -233,10 +233,15 @@ public unsafe class ResourceManager
         {
             _renderer.DestroyBuffer(globalVertexBuffer, globalVertexBufferMemory);
             _renderer.DestroyBuffer(globalIndexBuffer,  globalIndexBufferMemory);
-            
+
             vk!.DestroySampler(device, defaultBindlessSampler, null);
             _renderer.DestroyBuffer(MaterialStorageBuffers[0].buffer, MaterialStorageBuffers[0].memory);
             _renderer.DestroyBuffer(InstanceStorageBuffers[0].buffer, InstanceStorageBuffers[0].memory);
+
+            // Bindless descriptor set layout is created in CreateBindlessDescriptorSetLayout
+            // and owned here — GeometryPipeline borrows it via GetBindlessLayout.
+            if (MaterialBindlessLayout.Handle != 0)
+                vk!.DestroyDescriptorSetLayout(device, MaterialBindlessLayout, null);
         }
     }
     public DescriptorSetLayout GetBindlessLayout() => MaterialBindlessLayout;
@@ -439,8 +444,8 @@ public unsafe class ResourceManager
             UnnormalizedCoordinates = false,
             CompareEnable = false,
             CompareOp = CompareOp.Always,
-            MinLod = 0.0f,
-            MaxLod = 0.0f,
+            MinLod = 0.0f, 
+            MaxLod = Vk.LodClampNone,
         };
         if (vk!.CreateSampler(device, &samplerInfo, null, out defaultBindlessSampler) != Result.Success)
             throw new Exception("Failed to create default bindless sampler");

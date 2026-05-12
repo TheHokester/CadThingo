@@ -317,7 +317,12 @@ public unsafe partial class Renderer
 
             dst[count++] = new AccelerationStructureInstanceKHR
             {
-                Transform                              = ToTransformMatrixKHR(*transform.GetModelMatrix()),
+                // World matrix, not local — must match the per-instance ModelMatrix
+                // the geometry pass uploads (Renderer_Compute.cs:235 and the gbuffer
+                // shader). With only local here, child entities in the scenegraph
+                // get their BLAS placed at the wrong world position and rays from
+                // the correct world-space gbuffer surface miss them entirely.
+                Transform                              = ToTransformMatrixKHR(*transform.GetWorldMatrix()),
                 InstanceCustomIndex                    = (uint)i,
                 Mask                                   = 0xFF,
                 InstanceShaderBindingTableRecordOffset = 0,

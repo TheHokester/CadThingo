@@ -247,7 +247,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         io.DeltaTime = Math.Clamp(Engine.DeltaTime, 1.0f / 10000.0f, 1.0f / 15.0f);
 
         ImGuiNET.ImGui.NewFrame();
-        ImGuiNET.ImGui.ShowDemoWindow();
+        ImGuiUI.Draw();
         ImGuiNET.ImGui.Render();
 
         var drawData = ImGuiNET.ImGui.GetDrawData();

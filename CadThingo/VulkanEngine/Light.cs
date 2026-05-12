@@ -26,4 +26,9 @@ public unsafe class LightComponent : Component
     public float     OuterConeCos = 0.85f;      // spot: cos of outer cone half-angle
     public bool      CastShadows  = true;
     public bool      Enabled      = true;
+
+    // Penumbra control for ray-queried soft shadows. Interpreted as a world-space
+    // radius for point/spot, and as tan(angularRadius) for directional (sun ≈ 0.005).
+    // 0 = hard shadow (single-ray binary occlusion).
+    public float     Radius       = 0f;
 }

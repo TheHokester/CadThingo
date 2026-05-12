@@ -218,15 +218,6 @@ public unsafe partial class Renderer
         }
             
     }
-    private void CreateUniformBuffers()
-    {
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            CreateMappedUniformBuffer(sizeof(LightingFrameUBO), ref LightingUniformBuffers[i]);
-            CreateMappedStorageBuffer((ulong)(MAX_LIGHTS * (uint)sizeof(PbrLightGpu)), ref LightStorageBuffers[i]);
-        }
-    }
-
     internal void CreateMappedUniformBuffer(int sizeBytes, ref UboBuffer ubo)
     {
         BufferCreateInfo bufferInfo = new()
@@ -328,6 +319,103 @@ public unsafe partial class Renderer
             1, &barrier);
     }
 
+    internal void GenerateMipMaps(CommandBuffer cmds, Image image, Format format, uint width, uint height,uint mipLevels)
+    {
+        ImageMemoryBarrier barrier = new()
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            Image = image,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            SubresourceRange = new()
+            {
+                AspectMask = ImageAspectFlags.ColorBit,
+                LevelCount = 1,
+                LayerCount = 1
+            }
+        };
+        var mipWidth = width;
+        var mipHeight = height;
+        
+        
+        for(uint i =1; i < mipLevels; i++)
+        {
+            barrier.SubresourceRange.BaseMipLevel = i - 1;
+            barrier.OldLayout = ImageLayout.TransferDstOptimal;
+            barrier.NewLayout = ImageLayout.TransferSrcOptimal;
+            barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
+            barrier.DstAccessMask = AccessFlags.TransferReadBit;
+            
+            vk!.CmdPipelineBarrier(cmds, PipelineStageFlags.TransferBit,
+                PipelineStageFlags.TransferBit, 0, 
+                0, null,
+                0, null,
+                1, &barrier);
+
+            ImageBlit blit = new()
+            {
+                SrcOffsets =
+                {
+                    Element0 = new Offset3D(0, 0, 0),
+                    Element1 = new Offset3D((int)mipWidth, (int)mipHeight, 1)
+                },
+                SrcSubresource =
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    MipLevel = i - 1,
+                    BaseArrayLayer = 0,
+                    LayerCount = 1
+                },
+                DstOffsets =
+                {
+                    Element0 = new Offset3D(0, 0, 0),
+                    Element1 = new Offset3D((int)mipWidth > 1 ? (int)mipWidth / 2 : 1,
+                        (int)mipHeight > 1 ? (int)mipHeight / 2 : 1, 1)
+                },
+                DstSubresource =
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    MipLevel = i,
+                    BaseArrayLayer = 0,
+                    LayerCount = 1
+                }
+            };
+            
+            vk!.CmdBlitImage(cmds, 
+                image, ImageLayout.TransferSrcOptimal,
+                image, ImageLayout.TransferDstOptimal,
+                1, &blit,
+                Filter.Linear);
+            
+            barrier.OldLayout = ImageLayout.TransferSrcOptimal;
+            barrier.NewLayout = ImageLayout.ShaderReadOnlyOptimal;
+            barrier.SrcAccessMask = AccessFlags.TransferReadBit;
+            barrier.DstAccessMask = AccessFlags.ShaderReadBit;
+            
+            vk!.CmdPipelineBarrier(cmds, PipelineStageFlags.TransferBit,
+                PipelineStageFlags.FragmentShaderBit, 0,
+                 0, null,
+                 0, null,
+                 1, &barrier);
+            
+            if(mipWidth > 1) mipWidth /= 2;
+            if(mipHeight > 1) mipHeight /= 2;
+        }
+        
+        barrier.SubresourceRange.BaseMipLevel = mipLevels - 1;
+        barrier.OldLayout = ImageLayout.TransferDstOptimal;
+        barrier.NewLayout = ImageLayout.ShaderReadOnlyOptimal;
+        barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
+        barrier.DstAccessMask = AccessFlags.ShaderReadBit;
+        
+        vk!.CmdPipelineBarrier(cmds, PipelineStageFlags.TransferBit,
+            PipelineStageFlags.FragmentShaderBit, 0,
+             0, null,
+             0, null,
+             1, &barrier);
+        
+    }
+    
 
     private void CreateDescriptorPool()
     {
@@ -368,7 +456,10 @@ public unsafe partial class Renderer
     }
    
 
-    // Geometry pipeline set 1 size budget. Layout binding counts must match.
+    // Pipeline-wide size budgets. The actual GPU buffers these size are owned by
+    // the pipelines that need them (DrawCullPipeline, LightCullPipeline,
+    // PbrDeferredPipeline) or by ResourceManager (materials/instances/bindless
+    // textures).
     internal const uint MAX_MATERIALS         = 256;
     internal const uint MAX_INSTANCES         = 4096;
     internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 5;
@@ -377,7 +468,7 @@ public unsafe partial class Renderer
     // Cap chosen to keep the SSBO at 64KB (1024 × 64B); raise if needed.
     internal const uint MAX_LIGHTS = 1024;
 
-    // Tiled light culling — Phase 4. Tile size matches the compute group
+    // Tiled light culling. Tile size matches the compute group
     // (16×16 threads collaborating on one tile). MAX_LIGHTS_PER_TILE bounds the
     // worst-case per-tile slot count; lights past this are dropped (the cull
     // shader saturates the count).
@@ -387,67 +478,6 @@ public unsafe partial class Renderer
     // per-frame tileCountX/Y depends on swapChainExtent and is uploaded via the
     // frame UBO each frame.
     internal const uint MAX_TILE_COUNT      = 240 * 135;
-
-    // Cull-pass per-frame buffers. RenderableInput is the CPU input list (one row
-    // per scene entity); IndirectCmd holds the post-cull VkDrawIndexedIndirectCommand
-    // array; IndirectCount holds a single uint that the cull shader InterlockedAdds
-    // into to claim slots and the rasterizer reads via vkCmdDrawIndexedIndirectCount.
-    private UboBuffer[] RenderableInputBuffers = new UboBuffer[2];
-    private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[2];
-    private UboBuffer[] IndirectCountBuffers   = new UboBuffer[2];
-
-    // Tiled light-cull per-frame buffers — Phase 4. TileLightCount[tileIdx] is the
-    // number of lights that overlap each tile; TileLightIndices[tileIdx*MAX +
-    // slot] is the flat index into the lights SSBO. The lighting pass reads both,
-    // keyed by tileIdx = (gl_FragCoord / TILE_SIZE).
-    private UboBuffer[] TileLightCountBuffers   = new UboBuffer[2];
-    private UboBuffer[] TileLightIndicesBuffers = new UboBuffer[2];
-
-
-    
-
-    // Allocates the four per-frame buffers driving the GPU cull pass + indirect draw.
-    // Sizes track MAX_INSTANCES so we never overflow the visibility-pass output even
-    // if every scene entity is visible.
-    private void CreateCullBuffers()
-    {
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            CreateMappedStorageBuffer(
-                (ulong)(MAX_INSTANCES * (uint)sizeof(RenderableInputGpu)),
-                ref RenderableInputBuffers[i]);
-
-            // Indirect command buffer also needs IndirectBuffer usage so vkCmdDraw...Indirect
-            // can read it without validation errors.
-            CreateMappedStorageBuffer(
-                (ulong)(MAX_INSTANCES * (uint)sizeof(DrawIndexedIndirectCommandGpu)),
-                ref IndirectCmdBuffers[i],
-                BufferUsageFlags.IndirectBufferBit);
-
-            // Count buffer is one uint. Needs IndirectBuffer for the count read and
-            // TransferDst so vkCmdFillBuffer can reset it to 0 every frame.
-            CreateMappedStorageBuffer(
-                sizeof(uint),
-                ref IndirectCountBuffers[i],
-                BufferUsageFlags.IndirectBufferBit | BufferUsageFlags.TransferDstBit);
-        }
-    }
-
-    // Tile-cull buffers — sized for the worst-case tile count (MAX_TILE_COUNT).
-    // Per frame: TileLightCount = MAX × 4B, TileLightIndices = MAX × MAX_LIGHTS_PER_TILE × 4B.
-    // For MAX_TILE_COUNT = 32400 and MAX_LIGHTS_PER_TILE = 64 → 130KB + 8.3MB per frame.
-    private void CreateTileLightCullBuffers()
-    {
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            CreateMappedStorageBuffer(
-                (ulong)(MAX_TILE_COUNT * sizeof(uint)),
-                ref TileLightCountBuffers[i]);
-            CreateMappedStorageBuffer(
-                (ulong)(MAX_TILE_COUNT * MAX_LIGHTS_PER_TILE * sizeof(uint)),
-                ref TileLightIndicesBuffers[i]);
-        }
-    }
 
     // Allocates a host-visible, coherent, persistently-mapped SSBO. Optional extra
     // usage bits let callers turn the same buffer into an indirect-cmd / indirect-
@@ -518,253 +548,6 @@ public unsafe partial class Renderer
         vk!.UpdateDescriptorSets(device, (uint)sets.Length, writes, 0, null);
     }
 
-    private void CreateLightingDescriptorSets()
-    {
-        // Set 0: per-frame LightingUBO
-        var lightingLayouts = stackalloc DescriptorSetLayout[(int)MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++) lightingLayouts[i] = PBRDescriptorSetLayout;
-
-        DescriptorSetAllocateInfo lightingAlloc = new()
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = descriptorPool,
-            DescriptorSetCount = MAX_CONCURRENT_FRAMES,
-            PSetLayouts = lightingLayouts
-        };
-        lightingDescriptorSets = new DescriptorSet[MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* pSets = lightingDescriptorSets)
-        {
-            if (vk!.AllocateDescriptorSets(device, &lightingAlloc, pSets) != Result.Success)
-                throw new Exception("Failed to allocate lighting descriptor sets");
-        }
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo frameInfo = new()
-            {
-                Buffer = LightingUniformBuffers[i].buffer,
-                Offset = 0,
-                Range = (ulong)sizeof(LightingFrameUBO),
-            };
-            DescriptorBufferInfo lightsInfo = new()
-            {
-                Buffer = LightStorageBuffers[i].buffer,
-                Offset = 0,
-                Range = (ulong)(MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
-            };
-            DescriptorBufferInfo tileCountInfo = new()
-            {
-                Buffer = TileLightCountBuffers[i].buffer,
-                Offset = 0,
-                Range = (ulong)(MAX_TILE_COUNT * sizeof(uint)),
-            };
-            DescriptorBufferInfo tileIdxInfo = new()
-            {
-                Buffer = TileLightIndicesBuffers[i].buffer,
-                Offset = 0,
-                Range = (ulong)(MAX_TILE_COUNT * MAX_LIGHTS_PER_TILE * sizeof(uint)),
-            };
-            var writes = stackalloc WriteDescriptorSet[4];
-            writes[0] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = lightingDescriptorSets[i],
-                DstBinding = 0,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.UniformBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &frameInfo,
-            };
-            writes[1] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = lightingDescriptorSets[i],
-                DstBinding = 1,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &lightsInfo,
-            };
-            writes[2] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = lightingDescriptorSets[i],
-                DstBinding = 3,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &tileCountInfo,
-            };
-            writes[3] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = lightingDescriptorSets[i],
-                DstBinding = 4,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &tileIdxInfo,
-            };
-            vk!.UpdateDescriptorSets(device, 4, writes, 0, null);
-        }
-
-        // Set 1: shared G-buffer samplers (same ImageViews every frame)
-        var gBufLayout = PBRGBufferDescriptorSetLayout;
-        DescriptorSetAllocateInfo gBufAlloc = new()
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = descriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts = &gBufLayout,
-        };
-        if (vk!.AllocateDescriptorSets(device, &gBufAlloc, out gBufferDescriptorSet) != Result.Success)
-            throw new Exception("Failed to allocate G-buffer descriptor set");
-
-        UpdateGBufferDescriptorSet();
-    }
-
-    // Writes current G-buffer ImageViews into the lighting-pass g-buffer descriptor set.
-    // Called on initial setup and again after swap chain recreation (which re-allocates
-    // the g-buffer images at the new extent).
-    private void UpdateGBufferDescriptorSet()
-    {
-        var imageInfos = stackalloc DescriptorImageInfo[5]
-        {
-            new() { ImageView = gBufferPosition.ImageView, Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = gBufferNormal.ImageView,   Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = gBufferAlbedo.ImageView,   Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = gBufferMaterial.ImageView, Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = gBufferEmissive.ImageView, Sampler = gBufferSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-        };
-        var writes = stackalloc WriteDescriptorSet[5];
-        for (uint i = 0; i < 5; i++)
-        {
-            writes[i] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = gBufferDescriptorSet,
-                DstBinding = i,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
-                PImageInfo = &imageInfos[i],
-            };
-        }
-        vk!.UpdateDescriptorSets(device, 5, writes, 0, null);
-    }
-
-    /// <summary>
-    /// Writes the current TLAS handle into binding 1 of every per-frame lighting set.
-    /// Called once at startup after InitRayQuery, and again whenever the TLAS handle
-    /// is recreated (full rebuild path in RebuildTlas free+reallocates).
-    ///
-    /// Skips silently when ray queries aren't available — the layout still has the
-    /// binding declared, but the shader path that reads it is gated by a constant.
-    /// </summary>
-    private void UpdateLightingTlasDescriptor()
-    {
-        if (khrAccelStruct == null || tlas.Handle == 0) return;
-
-        var tlasHandle = tlas;
-        var asWrite = new WriteDescriptorSetAccelerationStructureKHR
-        {
-            SType = StructureType.WriteDescriptorSetAccelerationStructureKhr,
-            AccelerationStructureCount = 1,
-            PAccelerationStructures = &tlasHandle,
-        };
-
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            // Acceleration-structure writes carry no buffer/image info — they're
-            // resolved via the chained WriteDescriptorSetAccelerationStructureKHR.
-            var write = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                PNext = &asWrite,
-                DstSet = lightingDescriptorSets[i],
-                DstBinding = 2,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.AccelerationStructureKhr,
-                DescriptorCount = 1,
-            };
-            vk!.UpdateDescriptorSets(device, 1, &write, 0, null);
-        }
-    }
-
-    // Writes the per-frame view+proj into GeometryUniformBuffers[frameIndex].
-    // Called once per frame in DrawFrame; per-draw model matrix is pushed via PbrPushConstants.
-    
-
-    // Reusable scratch list filled by Scene.EnumerateLights. Lives on the renderer
-    // so we don't allocate a fresh List<LightComponent> every frame.
-    private readonly List<LightComponent> _lightScratch = new();
-
-    // Returns (lightCount, tileCountX, tileCountY) so DrawFrame can pass them
-    // directly to RecordLightCullPass without recomputing.
-    private (uint lightCount, uint tileCountX, uint tileCountY) UpdateLightingBuffers(
-        uint frameIndex, Camera camera, Scene scene)
-    {
-        scene.EnumerateLights(_lightScratch);
-
-        // ── Pack lights ────────────────────────────────────────
-        PbrLightGpu* lightPtr = (PbrLightGpu*)LightStorageBuffers[frameIndex].mapped;
-        uint count = 0;
-        foreach (var light in _lightScratch)
-        {
-            if (count >= MAX_LIGHTS) break;
-
-            // World-space position from the owner transform if present.
-            Vector3 worldPos = Vector3.Zero;
-            if (light.Owner != null)
-            {
-                var t = light.Owner->GetComponent<TransformComponent>();
-                if (t != null)
-                {
-                    var w = *t.GetWorldMatrix();
-                    worldPos = new Vector3(w.M41, w.M42, w.M43);
-                }
-            }
-
-            // Normalize direction — guard against zero-vector default.
-            Vector3 dir = light.Direction.LengthSquared() > 1e-8f
-                ? Vector3.Normalize(light.Direction)
-                : new Vector3(0, -1, 0);
-
-            // Range: -1 sentinel marks directional lights so the shader can branch
-            // on attenuation without inspecting Type for the most common test.
-            float range = light.Type == LightType.Directional ? -1f : light.Range;
-
-            lightPtr[count] = new PbrLightGpu
-            {
-                positionRange  = new Vector4(worldPos, range),
-                colorIntensity = new Vector4(light.Color, light.Intensity),
-                directionType  = new Vector4(dir, (float)(uint)light.Type),
-                spotCones      = new Vector4(light.InnerConeCos, light.OuterConeCos,
-                                             light.CastShadows ? 1f : 0f, 0f),
-            };
-            count++;
-        }
-
-        // ── Frame UBO ──────────────────────────────────────────
-        uint tileX = (swapChainExtent.Width  + TILE_SIZE - 1) / TILE_SIZE;
-        uint tileY = (swapChainExtent.Height + TILE_SIZE - 1) / TILE_SIZE;
-
-        LightingFrameUBO ubo = new();
-        ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
-        ubo.exposure = 4.5f;
-        ubo.gamma = 2.2f;
-        ubo.prefilteredCubeMipLevels = 1.0f;
-        ubo.scaleIBLAmbient = 1.0f;
-        ubo.lightCount = count;
-        ubo.tileCountX = tileX;
-        ubo.tileCountY = tileY;
-        ubo.screenSize = new Vector2(swapChainExtent.Width, swapChainExtent.Height);
-
-        void* data = LightingUniformBuffers[frameIndex].mapped;
-        new Span<LightingFrameUBO>(data, 1).Fill(ubo);
-
-        return (count, tileX, tileY);
-    }
-
     private Extent2D ChooseSwapExtent(SurfaceCapabilitiesKHR capabilities)
     {
         if (capabilities.CurrentExtent.Width != uint.MaxValue)
@@ -807,34 +590,6 @@ public unsafe partial class Renderer
     }
 }
 
-// Matches Geometry.slang's FrameUBO (binding 0 of geometryFrameDescriptorSetLayout, set 0).
-// Per-frame view/proj only; the per-draw model matrix moved to PbrPushConstants.
-struct GeometryUBO
-{
-    public Matrix4x4 view;
-    public Matrix4x4 proj;
-}
-
-// Matches PbrShader.slang's LightingFrameUBO (binding 0 of PBRDescriptorSetLayout).
-// Phase 4 added tileCountX/Y + screenSize so the fragment shader can map
-// gl_FragCoord -> tile index and read the per-tile light list.
-[StructLayout(LayoutKind.Sequential)]
-struct LightingFrameUBO
-{
-    public Vector4 camPos;
-    public float exposure;
-    public float gamma;
-    public float prefilteredCubeMipLevels;
-    public float scaleIBLAmbient;
-    public uint lightCount;
-    public uint tileCountX;
-    public uint tileCountY;
-    public uint _pad0;
-    public Vector2 screenSize;          // pixels
-    public uint _pad1;
-    public uint _pad2;
-}
-
 // Mirrors PbrUtils.slang::PbrLight under std430 (16B alignment, no padding needed —
 // the struct is exactly 4 × float4 = 64B).
 [StructLayout(LayoutKind.Sequential)]
@@ -843,7 +598,7 @@ public struct PbrLightGpu
     public Vector4 positionRange;   // xyz = world pos, w = range (point/spot; ignored for directional)
     public Vector4 colorIntensity;  // rgb = linear color, a = intensity
     public Vector4 directionType;   // xyz = direction (dir/spot, world-space), w = LightType as float
-    public Vector4 spotCones;       // x = innerCos, y = outerCos, z = castShadows (0/1), w = pad
+    public Vector4 spotCones;       // x = innerCos, y = outerCos, z = castShadows (0/1), w = lightRadius
 }
 
 // Per-instance row in the geometry pipeline's instance SSBO. Shader sees this as
@@ -897,8 +652,6 @@ unsafe struct UboBuffer : IDisposable
     {
         Vk.GetApi().FreeMemory(device, memory, null);
         Vk.GetApi().DestroyBuffer(device, buffer, null);
-
-        GC.SuppressFinalize(this);
     }
 }
 
@@ -1127,6 +880,7 @@ public unsafe class Texture : IDisposable
         var physicalDevice = renderer.physicalDevice;
 
         ulong imageSize = (ulong)width * (ulong)height * 4UL;
+        uint mipLevels = (uint)Math.Floor(Math.Log2(Math.Max(width, height))) + 1;
 
         // Stage pixels in a host-visible buffer.
         renderer.CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
@@ -1138,7 +892,7 @@ public unsafe class Texture : IDisposable
         System.Buffer.MemoryCopy(pixels, mapped, (long)imageSize, (long)imageSize);
         vk.UnmapMemory(device, stagingMem);
 
-        const ImageUsageFlags usage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit;
+        const ImageUsageFlags usage = ImageUsageFlags.TransferDstBit |ImageUsageFlags.TransferSrcBit | ImageUsageFlags.SampledBit;
         var extent2D = new Extent2D(extent.Width, extent.Height);
 
         // Device-local image.
@@ -1148,7 +902,7 @@ public unsafe class Texture : IDisposable
             ImageType = ImageType.Type2D,
             Format = format,
             Extent = extent,
-            MipLevels = 1,
+            MipLevels = mipLevels,
             ArrayLayers = 1,
             Samples = SampleCountFlags.Count1Bit,
             Tiling = ImageTiling.Optimal,
@@ -1172,7 +926,7 @@ public unsafe class Texture : IDisposable
 
         // Transition → copy → transition (single-time command).
         var cmd = renderer.BeginSingleTimeCommands();
-        renderer.TransitionImageLayout(cmd, image, format, ImageLayout.Undefined, ImageLayout.TransferDstOptimal);
+        renderer.TransitionImageLayout(cmd, image, format, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels: mipLevels);
         BufferImageCopy region = new()
         {
             BufferOffset = 0,
@@ -1189,7 +943,7 @@ public unsafe class Texture : IDisposable
             ImageExtent = extent,
         };
         vk.CmdCopyBufferToImage(cmd, staging, image, ImageLayout.TransferDstOptimal, 1, &region);
-        renderer.TransitionImageLayout(cmd, image, format, ImageLayout.TransferDstOptimal, ImageLayout.ShaderReadOnlyOptimal);
+        renderer.GenerateMipMaps(cmd, image, format, width, height,mipLevels);
         renderer.EndSingleTimeCommands(cmd);
 
         vk.DestroyBuffer(device, staging, null);
@@ -1204,7 +958,7 @@ public unsafe class Texture : IDisposable
             SubresourceRange = new ImageSubresourceRange
             {
                 AspectMask = ImageAspectFlags.ColorBit,
-                BaseMipLevel = 0, LevelCount = 1,
+                BaseMipLevel = 0, LevelCount = mipLevels,
                 BaseArrayLayer = 0, LayerCount = 1,
             },
         };
@@ -1227,7 +981,7 @@ public unsafe class Texture : IDisposable
             CompareOp = CompareOp.Always,
             MipmapMode = SamplerMipmapMode.Linear,
             MinLod = 0.0f,
-            MaxLod = 0.0f,
+            MaxLod = Vk.LodClampNone,
             MipLodBias = 0.0f,
         };
         vk.CreateSampler(device, &samplerInfo, null, out var sampler);
