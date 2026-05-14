@@ -46,7 +46,7 @@ public static unsafe class GltfDefaults
         // Occlusion: 1.0 = no occlusion.
         _occlusion         = MakeOnePixel(renderer, 255, 255, 255, 255, Format.R8G8B8A8Unorm);
         // Emissive: black sRGB so missing emissive contributes nothing additive.
-        _emissive          = MakeOnePixel(renderer,   0,   0,   0, 255, Format.R8G8B8A8Srgb);
+        _emissive          = MakeOnePixel(renderer,   255,   255,   255, 255, Format.R8G8B8A8Srgb);
 
         rm.Load<TextureResource>(BaseColorId,         _ => new TextureResource(BaseColorId,         _baseColor));
         rm.Load<TextureResource>(MetallicRoughnessId, _ => new TextureResource(MetallicRoughnessId, _metallicRoughness));

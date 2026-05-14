@@ -239,6 +239,10 @@ public unsafe partial class Renderer
         {
             PbrDeferredPipeline.WriteTlasDescriptor(tlas);
             transparentPipeline.WriteTlasDescriptor(tlas);
+            // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
+            // path in the PBR lighting shadow rays. Has to happen after
+            // InitRayQuery because the SSBO is allocated inside RebuildTlas.
+            PbrDeferredPipeline.WriteShadowAlphaDescriptors();
         }
 
         initialized = true;
@@ -269,11 +273,11 @@ public unsafe partial class Renderer
         // confirming the per-frame StructuredBuffer<PbrLight> path lights the helmet.
         
         //Sponza scene
-        Entity* sponza = GltfLoader.Load(
-            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\sponza.glb",
-            "Sponza", Engine.ResourceManager, this, scene);
-        var sponzaTransform = sponza->GetComponent<TransformComponent>();
-        sponzaTransform?.SetPosition(new Vector3(0f, 0f, 0f));
+        // Entity* sponza = GltfLoader.Load(
+        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\sponza.glb",
+        //     "Sponza", Engine.ResourceManager, this, scene);
+        // var sponzaTransform = sponza->GetComponent<TransformComponent>();
+        // sponzaTransform?.SetPosition(new Vector3(0f, 0f, 0f));
         //
         
         //Chess scene 
@@ -281,10 +285,14 @@ public unsafe partial class Renderer
         //     "ChessScene", Engine.ResourceManager, this, scene);
         
         //930 turbo
-        // Entity* turbo930 = GltfLoader.Load(
-        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Props\free_1975_porsche_911_930_turbo.glb", 
-        //     "Turbo930", Engine.ResourceManager, this, scene);
+        Entity* turbo930 = GltfLoader.Load(
+            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Props\free_1975_porsche_911_930_turbo.glb", 
+            "Turbo930", Engine.ResourceManager, this, scene);
+        turbo930->GetComponent<TransformComponent>()?.SetPosition(new Vector3(-1f, 0.05f, 7.7f));
+        turbo930->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(4.25f, 0, 0));
         
+        Entity* Bistro = GltfLoader.Load(@"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\Bistro_Godot.glb",
+            "Bistro", Engine.ResourceManager, this, scene);
         
         SpawnTestLights();
     }
@@ -300,7 +308,7 @@ public unsafe partial class Renderer
             Type        = LightType.Directional,
             Color       = new Vector3(255f/255, 223f/255, 155f/255),
             Intensity   = 2.0f,
-            Direction   = new Vector3(-0.3f, -1f, 0f),
+            Direction   = new Vector3(0.45f, -0.9f, 0.25f),
             Radius      = 0.01f,
             CastShadows = true,
         });
@@ -324,21 +332,35 @@ public unsafe partial class Renderer
         // scene.AddEntity(pointLight);
 
         // Spot rim light — tight cone aimed at the helmet from below-left.
-        Entity* spotLight = Entity.Create("SpotRim");
-        spotLight->AddComponent(new TransformComponent());
-        spotLight->GetComponent<TransformComponent>()?.SetPosition(new Vector3(-2.5f, 0.5f, 1.0f));
-        spotLight->AddComponent(new LightComponent
+        Entity* spotLight1 = Entity.Create("SpotRim");
+        spotLight1->AddComponent(new TransformComponent());
+        spotLight1->GetComponent<TransformComponent>()?.SetPosition(new Vector3(0.75f, 0.82f, 2.2f));
+        spotLight1->AddComponent(new LightComponent
         {
-            Type         = LightType.Spot,
-            Color        = new Vector3(0.6f, 0.8f, 1.0f),
+            Type         = LightType.Point,
+            Color        = new Vector3(0.8f, 0.8f, 1.0f),
             Intensity    = 25.0f,
             Range        = 10.0f,
-            Direction    = new Vector3(1.0f, 0.2f, -0.4f),
-            InnerConeCos = MathF.Cos(MathF.PI / 8f),  // ~22.5°
-            OuterConeCos = MathF.Cos(MathF.PI / 5f),  // ~36°
+            Direction    = new Vector3(0f, 0f, 1f),
+            InnerConeCos = MathF.Cos(MathF.PI / 4f),  //  ~90°
+            OuterConeCos = MathF.Cos(MathF.PI / 2f),  // ~120°
         });
-        spotLight->Initialize();
-        scene.AddEntity(spotLight);
+        spotLight1->Initialize();
+        // scene.AddEntity(spotLight1);
+        Entity* spotLight2 = Entity.Create("SpotRim2");
+        spotLight2->AddComponent(new TransformComponent());
+        spotLight2->GetComponent<TransformComponent>()?.SetPosition(new Vector3(-0.75f, 0.82f, 2.2f));
+        spotLight2->AddComponent(new LightComponent
+        {
+            Type = LightType.Point,
+            Color = new Vector3(0.8f, 0.8f, 1.0f),
+            Intensity = 25.0f,
+            Range = 10.0f,
+            CastShadows = true,
+        });
+        spotLight2->Initialize();
+        // scene.AddEntity(spotLight2);
+
     }
 
     public void Update(double d)

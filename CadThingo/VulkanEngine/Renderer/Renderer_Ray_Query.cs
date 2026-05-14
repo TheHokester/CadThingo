@@ -1,7 +1,20 @@
+using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 
 namespace CadThingo.VulkanEngine.Renderer;
+
+// Per-entity record consumed by the PBR lighting shader's shadow-ray alpha-test
+// path. One slot per TLAS instance, keyed by AccelerationStructureInstanceKHR.
+// InstanceCustomIndex. Layout matches PbrShader.slang::ShadowEntityInfo.
+[StructLayout(LayoutKind.Sequential)]
+public struct ShadowEntityInfo
+{
+    public uint IndexOffset;     // uint elements into GlobalIndexBuffer for this mesh's first triangle
+    public uint MaterialIndex;   // index into the materials SSBO
+    public uint Flags;           // copy of PbrMaterial.Flags — bit 0 = MASK, bit 2 = BLEND
+    public uint _pad0;
+}
 
 public unsafe partial class Renderer
 {
@@ -53,6 +66,28 @@ public unsafe partial class Renderer
     private Buffer       asScratchBuffer;
     private DeviceMemory asScratchMem;
     private ulong        asScratchSize;
+
+    // Per-entity shadow-alpha info. One ShadowEntityInfo per TLAS instance,
+    // indexed by InstanceCustomIndex. Host-visible + coherent so RebuildTlas
+    // writes them inline with the instance buffer. Grows alongside the instance
+    // buffer; capacity is tracked separately because zero-entity scenes still
+    // need a valid binding.
+    private Buffer       shadowInfoBuffer;
+    private DeviceMemory shadowInfoMem;
+    private void*        shadowInfoMapped;
+    private uint         shadowInfoCapacity;     // number of slots allocated, not bytes
+
+    /// <summary>Buffer holding ShadowEntityInfo records, indexed by InstanceCustomIndex.
+    /// PbrDeferredPipeline binds this on its shadow-alpha descriptor set. Returns
+    /// a zero handle until InitRayQuery has run.</summary>
+    public Buffer ShadowInfoBuffer => shadowInfoBuffer;
+    public ulong ShadowInfoBufferSize =>
+        (ulong)shadowInfoCapacity * (ulong)sizeof(ShadowEntityInfo);
+
+    /// <summary>Set by RebuildTlas whenever EnsureShadowInfoCapacity reallocates
+    /// the underlying VkBuffer — the renderer reads this after RebuildTlas and
+    /// re-writes the PBR pipeline's shadow-alpha descriptor when true.</summary>
+    private bool shadowInfoBufferResized;
 
     private bool tlasDirty = true;
 
@@ -199,6 +234,54 @@ public unsafe partial class Renderer
         tlasInstanceCapacity = capacity;
     }
 
+    /// <summary>
+    /// Mirror of EnsureInstanceCapacity for the ShadowEntityInfo SSBO. Returns
+    /// true iff the underlying VkBuffer was (re-)allocated — the caller must
+    /// re-write the PBR pipeline's shadow-alpha descriptor set in that case.
+    /// </summary>
+    private bool EnsureShadowInfoCapacity(uint requiredInstances)
+    {
+        if (shadowInfoCapacity >= requiredInstances && shadowInfoBuffer.Handle != 0)
+            return false;
+
+        if (shadowInfoMem.Handle != 0)
+        {
+            vk!.UnmapMemory(device, shadowInfoMem);
+            DestroyBuffer(shadowInfoBuffer, shadowInfoMem);
+            shadowInfoMapped = null;
+        }
+
+        uint capacity = 8;
+        while (capacity < requiredInstances) capacity <<= 1;
+
+        ulong sizeBytes = (ulong)capacity * (ulong)sizeof(ShadowEntityInfo);
+        vk!.CreateBuffer(device, new BufferCreateInfo
+        {
+            SType       = StructureType.BufferCreateInfo,
+            Size        = sizeBytes,
+            Usage       = BufferUsageFlags.StorageBufferBit,
+            SharingMode = SharingMode.Exclusive,
+        }, null, out shadowInfoBuffer);
+
+        vk!.GetBufferMemoryRequirements(device, shadowInfoBuffer, out var memReqs);
+        var allocInfo = new MemoryAllocateInfo
+        {
+            SType           = StructureType.MemoryAllocateInfo,
+            AllocationSize  = memReqs.Size,
+            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit),
+        };
+        if (vk!.AllocateMemory(device, &allocInfo, null, out shadowInfoMem) != Result.Success)
+            throw new Exception("Failed to allocate ShadowEntityInfo memory");
+        vk!.BindBufferMemory(device, shadowInfoBuffer, shadowInfoMem, 0);
+
+        void* mapped = null;
+        vk!.MapMemory(device, shadowInfoMem, 0, sizeBytes, 0, ref mapped);
+        shadowInfoMapped = mapped;
+        shadowInfoCapacity = capacity;
+        return true;
+    }
+
 
     // ──────────────────────────────────────────────────────────
     //  Building blocks
@@ -293,16 +376,29 @@ public unsafe partial class Renderer
     private void RebuildTlas()
     {
         // 1. Make sure the persistently-mapped instance buffer can hold a
-        //    worst-case fill (one record per entity).
+        //    worst-case fill (one record per entity). Mirror that capacity into
+        //    the ShadowEntityInfo SSBO so InstanceCustomIndex stays a direct index.
         EnsureInstanceCapacity((uint)scene.EntityCount);
-        var dst = (AccelerationStructureInstanceKHR*)tlasInstanceMapped;
+        shadowInfoBufferResized = EnsureShadowInfoCapacity((uint)scene.EntityCount);
+        var dst    = (AccelerationStructureInstanceKHR*)tlasInstanceMapped;
+        var sDst   = (ShadowEntityInfo*)shadowInfoMapped;
         uint count = 0;
 
         // 2. Walk entities. Pack one record per (transform + mesh) pair. Entity
         //    only has GetComponent<T> (singular) — multi-mesh entities aren't a
         //    thing yet, so one record per entity is correct.
+        //
+        //    TLAS instances are compacted (`count` grows only for renderables),
+        //    but ShadowEntityInfo MUST be keyed by entity index `i` because the
+        //    shadow ray reads it via CandidateInstanceID() which returns the
+        //    InstanceCustomIndex we set below (= `i`). Writing it by `count`
+        //    instead silently misaligns the lookup whenever a non-renderable
+        //    entity (light-only, transform-only, etc.) sits earlier in the list —
+        //    so we default-init the i-th slot up front and overwrite when valid.
         for (int i = 0; i < scene.EntityCount; i++)
         {
+            sDst[i] = default;
+
             Entity* e = scene.GetEntity(i);
             if (e == null) continue;
             var transform = e->GetComponent<TransformComponent>();
@@ -315,6 +411,26 @@ public unsafe partial class Renderer
             if (!blasCache.TryGetValue((nint)meshComp.mesh, out var blas))
                 blas = BuildBlas(meshComp.mesh);
 
+            // Lookup the entity's material so we can flag non-opaque instances
+            // (MASK + BLEND) as ForceNoOpaque — that's what gives the ray query
+            // a chance to alpha-test in the Proceed loop on the GPU. Materials
+            // are scene-owned so this is a cheap host lookup, no GPU readback.
+            uint matFlags = 0u;
+            int  matIdx   = meshComp.materialIndex;
+            if (matIdx >= 0)
+                matFlags = scene.GetMaterial(matIdx).Flags;
+
+            var instFlags = GeometryInstanceFlagsKHR.TriangleFacingCullDisableBitKhr;
+            if ((matFlags & 5u) != 0u)   // bit 0 = MASK, bit 2 = BLEND
+                instFlags |= GeometryInstanceFlagsKHR.ForceNoOpaqueBitKhr;
+
+            sDst[i] = new ShadowEntityInfo
+            {
+                IndexOffset   = (uint)meshComp.mesh->offset,
+                MaterialIndex = matIdx >= 0 ? (uint)matIdx : 0u,
+                Flags         = matFlags,
+            };
+
             dst[count++] = new AccelerationStructureInstanceKHR
             {
                 // World matrix, not local — must match the per-instance ModelMatrix
@@ -326,7 +442,7 @@ public unsafe partial class Renderer
                 InstanceCustomIndex                    = (uint)i,
                 Mask                                   = 0xFF,
                 InstanceShaderBindingTableRecordOffset = 0,
-                Flags                                  = GeometryInstanceFlagsKHR.TriangleFacingCullDisableBitKhr,
+                Flags                                  = instFlags,
                 AccelerationStructureReference         = blas.DeviceAddress,
             };
         }
@@ -467,6 +583,13 @@ public unsafe partial class Renderer
             vk!.UnmapMemory(device, tlasInstanceMem);
             tlasInstanceMapped = null;
         }
+
+        if (shadowInfoMapped != null)
+        {
+            vk!.UnmapMemory(device, shadowInfoMem);
+            shadowInfoMapped = null;
+        }
+        if (shadowInfoBuffer.Handle != 0) DestroyBuffer(shadowInfoBuffer, shadowInfoMem);
 
         if (tlas.Handle != 0)
         {

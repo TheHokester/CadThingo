@@ -168,7 +168,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
     float  metallic          = metallicRoughness.x * mat.metallicFactor;
     float  roughness         = metallicRoughness.y * mat.roughnessFactor;
     float  ao                = textures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;
-    float3 emissiveTex       = textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb;
+    float3 emissiveTex       = textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb * mat.emissiveFactor;
 
     // Tangent-space normal map (same as geometry pass).
     float3 N = normalize(input.Normal);

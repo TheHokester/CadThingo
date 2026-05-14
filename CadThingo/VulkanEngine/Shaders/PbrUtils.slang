@@ -1,16 +1,17 @@
 static const float PI = 3.14159265359;
 
 struct PbrMaterial {
-    float4 baseColorFactor;             // Base color tint/multiplier
-    float metallicFactor;               // Metallic property multiplier
-    float roughnessFactor;              // Surface roughness multiplier
-    float alphaCutoff;              // Alpha cutoff threshold
+    float4 baseColorFactor;        // Base color tint/multiplier
+    float3 emissiveFactor;         // HDR emissive (glTF factor × KHR_materials_emissive_strength)
+    float alphaCutoff;             // Packs into emissiveFactor's std430 trailing 4B
+    float metallicFactor;          // Metallic property multiplier
+    float roughnessFactor;         // Surface roughness multiplier
     uint flags;                    // bit 0 = alphaMask, bit 1 = doubleSided, bit 2 = alphaBlend, ...
-    int baseColorTex;            // Texture binding index for base color (-1 = none)
-    int physicalDescriptorTex;   // Texture binding for metallic/roughness
-    int normalTex;               // Texture binding for normal maps
-    int occlusionTex;            // Texture binding for ambient occlusion
-    int emissiveTex;             // Texture binding for emissive maps
+    int baseColorTex;              // Texture binding index for base color (-1 = none)
+    int physicalDescriptorTex;     // Texture binding for metallic/roughness
+    int normalTex;                 // Texture binding for normal maps
+    int occlusionTex;              // Texture binding for ambient occlusion
+    int emissiveTex;               // Texture binding for emissive maps
 };
 struct InstanceData {
     float4x4 model;

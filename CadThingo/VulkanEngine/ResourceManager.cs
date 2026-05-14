@@ -108,8 +108,8 @@ public unsafe class ResourceManager
     private DeviceMemory globalIndexBufferMemory;
     private int indexWriteOffset;    // in indices
 
-    private const int MAX_VERTICES = 1 << 20;   // 1M vertices
-    private const int MAX_INDICES  = 1 << 22;   // 4M indices
+    private const int MAX_VERTICES = 1 << 22;   // 4M vertices
+    private const int MAX_INDICES  = 1 << 24;   // 16M indices
 
     // Bindless texture table — every Texture registered here gets a stable int index that
     // PbrMaterial entries reference. The renderer's bindless descriptor set sees this slot
@@ -152,14 +152,18 @@ public unsafe class ResourceManager
         ulong vbSize = (ulong)(MAX_VERTICES * sizeof(Vertex));
         ulong ibSize = (ulong)(MAX_INDICES  * sizeof(uint));
 
+        // StorageBufferBit so the PBR lighting shadow-ray alpha-test path can bind
+        // these as ByteAddressBuffers and pull UVs / indices at hit time.
         renderer.CreateBuffer(vbSize,
             BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
+            BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
             out globalVertexBuffer, out globalVertexBufferMemory);
 
         renderer.CreateBuffer(ibSize,
             BufferUsageFlags.IndexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
+            BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
             out globalIndexBuffer, out globalIndexBufferMemory);

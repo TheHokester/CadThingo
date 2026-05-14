@@ -48,6 +48,75 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 [[vk::binding(3, 1)]] Sampler2D gBufferMaterialSampler;
 [[vk::binding(4, 1)]] Sampler2D gBufferEmissiveSampler;
 
+// ── Set 2: shadow-alpha plumbing ───────────────────────────────────────────
+// ShadowEntityInfo[i] = info for the entity whose TLAS InstanceCustomIndex == i.
+// Filled CPU-side in Renderer_Ray_Query.cs::RebuildTlas. Read in the shadow-ray
+// Proceed loop when the candidate is non-opaque (CPU sets ForceNoOpaqueBit on
+// MASK + BLEND TLAS instances; opaque geometry never enters the Proceed loop).
+struct ShadowEntityInfo {
+    uint indexOffset;     // first uint of this mesh's triangle list inside globalIndices
+    uint materialIndex;   // index into materials[]
+    uint flags;           // bit 0 = MASK, bit 2 = BLEND
+    uint _pad;
+};
+
+[[vk::binding(0, 2)]] StructuredBuffer<ShadowEntityInfo> entityShadowInfo;
+[[vk::binding(1, 2)]] ByteAddressBuffer                  globalIndices;
+[[vk::binding(2, 2)]] ByteAddressBuffer                  globalVertices;
+
+// ── Set 3: bindless materials/instances/textures/samplers ──────────────────
+// Layout shared with the geometry pass (owned by ResourceManager). Only the
+// alpha-test path reads materials + textures + samplers; instances[] is
+// layout parity only.
+[[vk::binding(0, 3)]] StructuredBuffer<PbrMaterial>      materials;
+[[vk::binding(1, 3)]] StructuredBuffer<InstanceData>     instances;     // unused here
+[[vk::binding(2, 3)]] Texture2D                          textures[];
+[[vk::binding(3, 3)]] SamplerState                       samplers[];
+
+// Vertex stride / UV offset — must match the C# Vertex struct in MeshComponent.cs
+//   Position(12) + Normal(12) + TexCoord(8) + Tangent(16) = 48 bytes
+static const uint VERTEX_STRIDE    = 48u;
+static const uint VERTEX_UV_OFFSET = 24u;   // 12 (Position) + 12 (Normal)
+
+float2 fetchVertexUV(uint vertexIndex) {
+    return asfloat(globalVertices.Load2(vertexIndex * VERTEX_STRIDE + VERTEX_UV_OFFSET));
+}
+
+uint fetchTriangleIndex(uint indexOffset, uint primIdx, uint corner) {
+    return globalIndices.Load((indexOffset + primIdx * 3u + corner) * 4u);
+}
+
+// Decides whether a candidate non-opaque hit should occlude the shadow ray.
+//   BLEND  → false (light passes through unattenuated).
+//   MASK   → alpha-tests sampled baseColor.a against material.alphaCutoff.
+//   other  → defensive: returns true so a stray non-opaque-tagged opaque
+//            instance still casts a shadow.
+bool shadowAlphaPasses(uint instCustomIdx, uint primIdx, float2 bary)
+{ 
+    ShadowEntityInfo info = entityShadowInfo[instCustomIdx];
+    if ((info.flags & 4u) != 0u) return false;   // BLEND → no shadow
+    if ((info.flags & 1u) == 0u) return true;    // not MASK → commit (defensive)
+
+    PbrMaterial mat = materials[info.materialIndex];
+    
+    if(mat.alphaCutoff == 0.0f) return true;
+
+    uint i0 = fetchTriangleIndex(info.indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(info.indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(info.indexOffset, primIdx, 2u);
+    float2 uv0 = fetchVertexUV(i0);
+    float2 uv1 = fetchVertexUV(i1);
+    float2 uv2 = fetchVertexUV(i2);
+    float  w0  = 1.0 - bary.x - bary.y;
+    float2 uv  = uv0 * w0 + uv1 * bary.x + uv2 * bary.y;
+
+    float alpha = textures[NonUniformResourceIndex(mat.baseColorTex)]
+                    .SampleLevel(samplers[0], uv, 0).a
+                * mat.baseColorFactor.a;
+
+    return alpha >= mat.alphaCutoff;
+}
+
 // Self-shadow bias — pushes the shadow ray origin off the surface along N so
 // floating-point error in the gbuffer position doesn't make the surface
 // shadow itself. Tune up if you see acne, down if you see "peter-panning."
@@ -64,8 +133,10 @@ static const float GOLDEN_ANGLE     = 2.39996323;
 static const float MAX_CONE_HA      = 0.25;
 
 // Returns true iff a ray from `origin` toward `dir` hits any geometry within
-// `tMax`. Uses ACCEPT_FIRST_HIT_AND_END_SEARCH so the traversal exits on the
-// first intersection — perfect for binary visibility (penumbra taps).
+// `tMax`. Opaque BLAS geometry auto-commits on first hit; non-opaque (MASK +
+// BLEND, tagged ForceNoOpaque CPU-side) routes through shadowAlphaPasses in
+// the Proceed loop. ACCEPT_FIRST_HIT_AND_END_SEARCH still ends traversal on
+// the first *committed* hit — works for both opaque and alpha-passing cases.
 bool isOccluded(float3 origin, float3 dir, float tMax)
 {
     RayDesc ray;
@@ -76,13 +147,26 @@ bool isOccluded(float3 origin, float3 dir, float tMax)
 
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
     q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
-    q.Proceed();
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+        {
+            if (shadowAlphaPasses(
+                    q.CandidateInstanceID(),
+                    q.CandidatePrimitiveIndex(),
+                    q.CandidateTriangleBarycentrics()))
+            {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
+    }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
 // Closest-hit blocker search along the center shadow ray. Returns the hit
-// distance (CommittedRayT), or -1 on miss. BLAS geometry is built opaque so
-// Proceed() terminates after one call — the while loop is just for safety.
+// distance (CommittedRayT), or -1 on miss. Non-opaque candidates go through
+// shadowAlphaPasses; BLEND geometry never commits so it can't seed the
+// penumbra cone (matches "glass casts no shadow" semantics elsewhere).
 float blockerSearch(float3 origin, float3 dir, float tMax)
 {
     RayDesc ray;
@@ -93,7 +177,19 @@ float blockerSearch(float3 origin, float3 dir, float tMax)
 
     RayQuery<RAY_FLAG_NONE> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
-    while (q.Proceed()) {}
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+        {
+            if (shadowAlphaPasses(
+                    q.CandidateInstanceID(),
+                    q.CandidatePrimitiveIndex(),
+                    q.CandidateTriangleBarycentrics()))
+            {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
+    }
     return (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ? q.CommittedRayT() : -1.0;
 }
 

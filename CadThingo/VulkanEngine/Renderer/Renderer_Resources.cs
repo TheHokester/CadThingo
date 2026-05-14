@@ -75,9 +75,9 @@ public unsafe partial class Renderer
         gBufferMaterial = new ImageResource(vk, device, "GBuffer_Material", Format.R8G8B8A8Unorm,
             new Extent2D(width, height), gBufferUsage,
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        // Emissive G-buffer: linear RGB, no HDR range. Geometry pass writes emissiveSampler.rgb;
+        // Emissive G-buffer: HDR range. Geometry pass writes emissiveSampler.rgb;
         // lighting pass adds it to the final color before tone-mapping.
-        gBufferEmissive = new ImageResource(vk, device, "GBuffer_Emissive", Format.R8G8B8A8Unorm,
+        gBufferEmissive = new ImageResource(vk, device, "GBuffer_Emissive", Format.R16G16B16A16Sfloat,
             new Extent2D(width, height), gBufferUsage,
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
     }
@@ -430,9 +430,10 @@ public unsafe partial class Renderer
         {
             new() { Type = DescriptorType.UniformBuffer,            DescriptorCount = 16 },
             // Storage buffer budget: bindless mat+instance (2 × MAX_FRAMES), light SSBO
-            // (MAX_FRAMES), plus cull pass (renderables + cmds + instancesOut + count =
-            // 4 × MAX_FRAMES). Round up generously.
-            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 32 },
+            // (MAX_FRAMES), cull pass (renderables + cmds + instancesOut + count =
+            // 4 × MAX_FRAMES), PBR shadow-alpha set (ShadowEntityInfo + global vb + ib).
+            // Round up generously.
+            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 48 },
             new() { Type = DescriptorType.SampledImage,             DescriptorCount = MAX_BINDLESS_TEXTURES * MAX_CONCURRENT_FRAMES },
             new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
             new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 16 },
@@ -668,24 +669,23 @@ unsafe struct UboBuffer : IDisposable
     }
 }
 
-// Mirrors PbrUtils.slang::PbrMaterial under std430. Total payload 52B; padded to 64B
-// so an SSBO array stride matches the shader's expected 16B alignment.
+// Mirrors PbrUtils.slang::PbrMaterial under std430. Layout chosen so the struct is
+// exactly 64B with zero padding on either side: vec4 first, then vec3 (16B-aligned)
+// with the trailing AlphaCutoff packed into the vec3's std430 slack, then scalars/ints.
 [StructLayout(LayoutKind.Sequential)]
 public struct PbrMaterial
 {
     public Vector4 BaseColorFactor;
+    public Vector3 EmissiveFactor;
+    public float AlphaCutoff;
     public float MetallicFactor;
     public float RoughnessFactor;
-    public float AlphaCutoff;
     public uint Flags;//bit 0 alphaMask, bit 1 doubleSided, bit 2 alphaBlend, ...
     public int BaseColorTex;
     public int PhysicalDescriptorTex;
     public int NormalTex;
     public int OcclusionTex;
     public int EmissiveTex;
-    public int _pad0;
-    public int _pad1;
-    public int _pad2;
 }
 
 public enum AlphaMode : uint

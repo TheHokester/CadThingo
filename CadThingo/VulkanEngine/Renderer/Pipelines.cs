@@ -419,7 +419,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         Format.R32G32B32A32Sfloat, // Normal
         Format.R8G8B8A8Unorm, // Albedo
         Format.R8G8B8A8Unorm, // Material
-        Format.R8G8B8A8Unorm // Emissive
+        Format.R16G16B16A16Sfloat // Emissive
     ];
 
 
@@ -1206,9 +1206,17 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
     // Set 0 — per-frame lighting (UBO, lights SSBO, TLAS, tile cull buffers).
     // Set 1 — shared G-buffer samplers (one allocation reused every frame).
-    // The bindless-style "set index" matches what the PBR shader expects.
-    private const int SetLighting = 0;
-    private const int SetGBuffer  = 1;
+    // Set 2 — shadow-alpha plumbing (ShadowEntityInfo + global vb/ib as
+    //         ByteAddressBuffers; one shared allocation, rewritten when the
+    //         shadow info VkBuffer is reallocated).
+    // Set 3 — bindless materials/instances/textures/samplers — borrowed from
+    //         ResourceManager so the shadow-alpha path can sample baseColor
+    //         alpha at hit time without duplicating the bindless allocation.
+    // The set indices match what PbrShader.slang expects.
+    private const int SetLighting     = 0;
+    private const int SetGBuffer      = 1;
+    private const int SetShadowAlpha  = 2;
+    private const int SetBindless     = 3;
 
     // Per-frame data owned by this pipeline. UpdatePerFrame fills both each frame.
     private UboBuffer[] LightingUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
@@ -1289,8 +1297,10 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        DescriptorSetLayouts = new DescriptorSetLayout[2];
-        OwnedDescriptorSetLayoutIndices = new[] { 0, 1 };
+        // Layouts 0/1/2 are owned by this pipeline. Layout 3 (bindless) is
+        // borrowed from ResourceManager and must NOT be destroyed in Dispose.
+        DescriptorSetLayouts = new DescriptorSetLayout[4];
+        OwnedDescriptorSetLayoutIndices = new[] { 0, 1, 2 };
 
         // ── Set 0: LightingFrameUBO + Light SSBO + TLAS + Tile cull buffers ───
         // Only the fragment shader reads lights, camPos, exposure, gamma etc.
@@ -1350,6 +1360,17 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
             new() { Binding = 4, DescriptorType = DescriptorType.CombinedImageSampler, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit, PImmutableSamplers = null },
         };
 
+        // ── Set 2: shadow-alpha plumbing ──────────────────────────────────────
+        // ShadowEntityInfo (per-entity index/material lookup), globalIndices,
+        // globalVertices. All three are read in the fragment stage by the
+        // ray-query Proceed loop only when the candidate is non-opaque.
+        var set2Bindings = new DescriptorSetLayoutBinding[]
+        {
+            new() { Binding = 0, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit, PImmutableSamplers = null },
+            new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit, PImmutableSamplers = null },
+            new() { Binding = 2, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit, PImmutableSamplers = null },
+        };
+
         DescriptorSetLayoutBindingFlagsCreateInfo set0FlagsInfo = new()
             { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
         DescriptorSetLayoutBindingFlagsCreateInfo set1FlagsInfo = new()
@@ -1360,6 +1381,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
         fixed (DescriptorSetLayoutBinding* pSet0 = set0Bindings)
         fixed (DescriptorSetLayoutBinding* pSet1 = set1Bindings)
+        fixed (DescriptorSetLayoutBinding* pSet2 = set2Bindings)
         {
             if (Renderer.descriptorIndexEnabled)
             {
@@ -1413,7 +1435,24 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
             }
             if (Vk.CreateDescriptorSetLayout(Device, &set1LayoutInfo, null, out DescriptorSetLayouts[SetGBuffer]) != Result.Success)
                 throw new Exception("Failed to create PBR set 1 (GBuffer) descriptor set layout");
+
+            // Set 2: shadow-alpha plumbing. Pure StorageBuffers — no
+            // UpdateAfterBind chain (the underlying VkBuffer reallocates rarely
+            // and the renderer pauses the device before rewriting). Standard
+            // pool flags are fine.
+            DescriptorSetLayoutCreateInfo set2LayoutInfo = new()
+            {
+                SType        = StructureType.DescriptorSetLayoutCreateInfo,
+                BindingCount = (uint)set2Bindings.Length,
+                PBindings    = pSet2,
+            };
+            if (Vk.CreateDescriptorSetLayout(Device, &set2LayoutInfo, null, out DescriptorSetLayouts[SetShadowAlpha]) != Result.Success)
+                throw new Exception("Failed to create PBR set 2 (ShadowAlpha) descriptor set layout");
         }
+
+        // Set 3: borrow ResourceManager's bindless layout — owned there, freed
+        // there. The pipeline layout still needs it slotted in.
+        DescriptorSetLayouts[SetBindless] = Engine.ResourceManager.GetBindlessLayout();
     }
 
     // ── Resources ──────────────────────────────────────────────────────────
@@ -1445,7 +1484,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
             PSetLayouts        = lightingLayouts,
         };
 
-        DescriptorSets = new DescriptorSet[2][];
+        DescriptorSets = new DescriptorSet[4][];
         DescriptorSets[SetLighting] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
         fixed (DescriptorSet* pSets = DescriptorSets[SetLighting])
         {
@@ -1468,6 +1507,28 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
             if (Vk.AllocateDescriptorSets(Device, &gBufAlloc, pSet) != Result.Success)
                 throw new Exception("Failed to allocate PBR g-buffer descriptor set");
         }
+
+        // Set 2 — shared shadow-alpha set. The bound buffers are renderer-wide
+        // singletons (one ShadowEntityInfo SSBO, one global vb, one global ib),
+        // so frame-in-flight duplication isn't needed.
+        var shadowLayout = DescriptorSetLayouts[SetShadowAlpha];
+        DescriptorSetAllocateInfo shadowAlloc = new()
+        {
+            SType              = StructureType.DescriptorSetAllocateInfo,
+            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorSetCount = 1,
+            PSetLayouts        = &shadowLayout,
+        };
+        DescriptorSets[SetShadowAlpha] = new DescriptorSet[1];
+        fixed (DescriptorSet* pSet = DescriptorSets[SetShadowAlpha])
+        {
+            if (Vk.AllocateDescriptorSets(Device, &shadowAlloc, pSet) != Result.Success)
+                throw new Exception("Failed to allocate PBR shadow-alpha descriptor set");
+        }
+
+        // Set 3 — bindless set is owned by ResourceManager. We don't allocate
+        // here; callers bind ResourceManager.GetBindlessSet(frame) at draw time.
+        DescriptorSets[SetBindless] = null;
     }
 
     // ── Descriptor writes ──────────────────────────────────────────────────
@@ -1603,6 +1664,69 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
             };
             Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
         }
+    }
+
+    /// <summary>Binds set 2: ShadowEntityInfo SSBO + global vertex/index
+    /// buffers (as raw storage buffers for ByteAddressBuffer access in the
+    /// shader). Call once after InitRayQuery has built the SSBO, and again any
+    /// time the ShadowEntityInfo VkBuffer is reallocated by RebuildTlas.</summary>
+    public void WriteShadowAlphaDescriptors()
+    {
+        var rm = Engine.ResourceManager;
+        var shadowBuf = Renderer.ShadowInfoBuffer;
+        if (shadowBuf.Handle == 0) return;
+
+        DescriptorBufferInfo shadowInfo = new()
+        {
+            Buffer = shadowBuf,
+            Offset = 0,
+            Range  = Renderer.ShadowInfoBufferSize,
+        };
+        DescriptorBufferInfo indexInfo = new()
+        {
+            Buffer = rm.GlobalIndexBuffer,
+            Offset = 0,
+            Range  = Vk.WholeSize,
+        };
+        DescriptorBufferInfo vertexInfo = new()
+        {
+            Buffer = rm.GlobalVertexBuffer,
+            Offset = 0,
+            Range  = Vk.WholeSize,
+        };
+
+        var writes = stackalloc WriteDescriptorSet[3];
+        writes[0] = new WriteDescriptorSet
+        {
+            SType           = StructureType.WriteDescriptorSet,
+            DstSet          = DescriptorSets[SetShadowAlpha][0],
+            DstBinding      = 0,
+            DstArrayElement = 0,
+            DescriptorType  = DescriptorType.StorageBuffer,
+            DescriptorCount = 1,
+            PBufferInfo     = &shadowInfo,
+        };
+        writes[1] = new WriteDescriptorSet
+        {
+            SType           = StructureType.WriteDescriptorSet,
+            DstSet          = DescriptorSets[SetShadowAlpha][0],
+            DstBinding      = 1,
+            DstArrayElement = 0,
+            DescriptorType  = DescriptorType.StorageBuffer,
+            DescriptorCount = 1,
+            PBufferInfo     = &indexInfo,
+        };
+        writes[2] = new WriteDescriptorSet
+        {
+            SType           = StructureType.WriteDescriptorSet,
+            DstSet          = DescriptorSets[SetShadowAlpha][0],
+            DstBinding      = 2,
+            DstArrayElement = 0,
+            DescriptorType  = DescriptorType.StorageBuffer,
+            DescriptorCount = 1,
+            PBufferInfo     = &vertexInfo,
+        };
+        Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
     }
 
     /// <summary>Re-writes the 5 g-buffer sampler bindings on set 1. Run after

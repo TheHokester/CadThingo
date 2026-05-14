@@ -109,7 +109,7 @@ GBufferOutput PSMain(VSOutput input)
     float metallic         = metallicRoughness.x * mat.metallicFactor;
     float roughness        = metallicRoughness.y * mat.roughnessFactor;
     float ao               = textures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;
-    float3 emissive        = textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb;
+    float3 emissive        = textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb * mat.emissiveFactor;
 
     float3 N = normalize(input.Normal);
     {

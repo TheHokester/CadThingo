@@ -623,9 +623,10 @@ public unsafe partial class Renderer
                 matPtr[fallbackMatIdx] = new PbrMaterial
                 {
                     BaseColorFactor       = new Vector4(1, 1, 1, 1),
+                    EmissiveFactor        = Vector3.Zero,
+                    AlphaCutoff           = 0f,
                     MetallicFactor        = 0.3f,
                     RoughnessFactor       = 0.7f,
-                    AlphaCutoff           = 0f,
                     Flags                 = 0,
                     BaseColorTex          = GltfDefaults.BaseColorIndex,
                     PhysicalDescriptorTex = GltfDefaults.MetallicRoughnessIndex,
@@ -699,13 +700,18 @@ public unsafe partial class Renderer
                 // Set 0 = per-frame LightingUBO + Lights SSBO + TLAS + tile cull buffers.
                 // Set 1 = shared G-buffer samplers (single allocation reused every frame).
                 // No push constants — lighting pass reads everything from descriptor bindings.
-                var sets = stackalloc DescriptorSet[2]
+                // Set 2 = shadow-alpha (ShadowEntityInfo + global vb/ib).
+                // Set 3 = bindless materials/textures/samplers, owned by ResourceManager.
+                // The shadow-ray Proceed loop in PbrShader.slang reads both at hit time.
+                var sets = stackalloc DescriptorSet[4]
                 {
                     PbrDeferredPipeline.GetDescriptorSet(0, currentFrame),
                     PbrDeferredPipeline.GetDescriptorSet(1, 0),
+                    PbrDeferredPipeline.GetDescriptorSet(2, 0),
+                    Engine.ResourceManager.GetBindlessSet(currentFrame),
                 };
                 vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    PbrDeferredPipeline.Layout, 0, 2, sets, 0, null);
+                    PbrDeferredPipeline.Layout, 0, 4, sets, 0, null);
 
                 // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
                 vk!.CmdDraw(buffer, 3, 1, 0, 0);

@@ -1,6 +1,7 @@
 using System.Numerics;
 using SharpGLTF.Memory;
 using SharpGLTF.Schema2;
+using SharpGLTF.Validation;
 
 namespace CadThingo.VulkanEngine.GLTF;
 
@@ -27,7 +28,7 @@ public static unsafe class GltfLoader
 
         // 2. Parse the .glb/.gltf file. SharpGLTF reads embedded image bytes for .glb
         //    and resolves relative URIs for .gltf — both work through this single API.
-        var model = ModelRoot.Load(path);
+        var model = ModelRoot.Load(path, new ReadSettings{Validation = ValidationMode.TryFix});
 
         // 3. Materials pass — build PbrMaterial structs (with bindless texture indices) and
         //    register on the scene. Map SharpGLTF Material → engine Scene material index.

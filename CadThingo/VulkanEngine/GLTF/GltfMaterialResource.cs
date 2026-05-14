@@ -55,13 +55,15 @@ public static class GltfMaterialResource
 
         var baseColorChannel = gltfMat.FindChannel("BaseColor");
         var mrChannel        = gltfMat.FindChannel("MetallicRoughness");
-
+        var emChannel = gltfMat.FindChannel("Emissive");
+        
         return new PbrMaterial
         {
             BaseColorFactor       = baseColorChannel?.Color ?? new Vector4(1, 1, 1, 1),
+            EmissiveFactor        = emChannel?.Color.AsVector3() ?? Vector3.Zero,
+            AlphaCutoff           = gltfMat.AlphaCutoff,
             MetallicFactor        = (float)(mrChannel?.GetFactor("MetallicFactor")  ?? 1.0),
             RoughnessFactor       = (float)(mrChannel?.GetFactor("RoughnessFactor") ?? 1.0),
-            AlphaCutoff           = gltfMat.AlphaCutoff,
             Flags                 = (gltfMat.Alpha == SharpGLTF.Schema2.AlphaMode.MASK  ? 1u : 0u)
                                   | (gltfMat.Alpha == SharpGLTF.Schema2.AlphaMode.BLEND ? 4u : 0u),
             BaseColorTex          = texIdx[0],
