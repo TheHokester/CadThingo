@@ -248,6 +248,9 @@ public unsafe partial class Renderer
         transparentPipeline = new TransparentPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
         transparentPipeline.Initialize();
         transparentPipeline.WriteSharedLightingDescriptors(PbrDeferredPipeline, lightCullPipeline);
+        // IBL bindings live on Renderer-owned VkImages that exist before any
+        // pipeline initializes; write them straight after Initialize.
+        transparentPipeline.WriteIblDescriptors();
 
         //Create command buffers
         CreateCommandBuffers();

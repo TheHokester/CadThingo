@@ -1878,7 +1878,10 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
         LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
-        ubo.prefilteredCubeMipLevels = 1.0f;
+        // Used by PbrShader.slang to scale roughness into the prefiltered mip chain.
+        // Renderer.prefilteredCubeMipLevels is set in CreateIblResources and never
+        // changes — IBL bakes overwrite content, not metadata.
+        ubo.prefilteredCubeMipLevels = Renderer.prefilteredCubeMipLevels;
         ubo.scaleIBLAmbient = 1.0f;
         ubo.lightCount = count;
         ubo.tileCountX = tileX;
@@ -2099,8 +2102,11 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         public uint    tileCountY;
         public uint    _pad0;
         public Vector2 screenSize;
-        public uint    _pad1;
-        public uint    _pad2;
+        // Repurposed from former trailing 8B pad — matches LightingFrameUBO IBL
+        // params byte-for-byte so the same Renderer.prefilteredCubeMipLevels +
+        // scaleIBLAmbient story applies on the transparent pass.
+        public float   prefilteredCubeMipLevels;
+        public float   scaleIBLAmbient;
     }
 
     // Matches Transparent.slang::DrawPC. 80B; well under the 128B Vulkan minimum.
@@ -2226,7 +2232,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         DescriptorSetLayouts = new DescriptorSetLayout[2];
         OwnedDescriptorSetLayoutIndices = new[] { 0 };
 
-        // Set 0 — own frame UBO + cross-pipeline lighting handles.
+        // Set 0 — own frame UBO + cross-pipeline lighting handles + IBL samplers.
         var set0Bindings = new DescriptorSetLayoutBinding[]
         {
             new() { Binding = 0, DescriptorType = DescriptorType.UniformBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit },
@@ -2234,6 +2240,12 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
             new() { Binding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
             new() { Binding = 3, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
             new() { Binding = 4, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
+            // IBL — mirrors PbrDeferredPipeline slots 5/6/7. Mirror is intentional:
+            // PBR + Transparent each own a distinct set 0 layout, both pointing at
+            // the same renderer-wide IBL VkImages.
+            new() { Binding = 5, DescriptorType = DescriptorType.CombinedImageSampler,     DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
+            new() { Binding = 6, DescriptorType = DescriptorType.CombinedImageSampler,     DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
+            new() { Binding = 7, DescriptorType = DescriptorType.CombinedImageSampler,     DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
         };
 
         fixed (DescriptorSetLayoutBinding* pSet0 = set0Bindings)
@@ -2342,6 +2354,39 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         }
     }
 
+    /// <summary>Mirror of PbrDeferredPipeline.WriteIblDescriptors — same renderer-
+    /// wide images, separate descriptor sets. Called once at startup after the
+    /// IBL resources exist; doesn't need re-running on rebake because the VkImage
+    /// handles persist.</summary>
+    public void WriteIblDescriptors()
+    {
+        var imageInfos = stackalloc DescriptorImageInfo[3]
+        {
+            new() { ImageView = Renderer.irradianceCubeView,  Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.prefilteredCubeView, Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.brdfLutView,         Sampler = Renderer.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+        };
+
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            var writes = stackalloc WriteDescriptorSet[3];
+            for (uint b = 0; b < 3; b++)
+            {
+                writes[b] = new WriteDescriptorSet
+                {
+                    SType           = StructureType.WriteDescriptorSet,
+                    DstSet          = DescriptorSets[0][i],
+                    DstBinding      = 5 + b,
+                    DstArrayElement = 0,
+                    DescriptorType  = DescriptorType.CombinedImageSampler,
+                    DescriptorCount = 1,
+                    PImageInfo      = &imageInfos[b],
+                };
+            }
+            Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
+        }
+    }
+
     /// <summary>Mirror of PbrDeferredPipeline.WriteTlasDescriptor — call after InitRayQuery
     /// and on every TLAS recreate.</summary>
     public void WriteTlasDescriptor(AccelerationStructureKHR tlas)
@@ -2396,6 +2441,8 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         ubo.tileCountX = tileCountX;
         ubo.tileCountY = tileCountY;
         ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
+        ubo.prefilteredCubeMipLevels = Renderer.prefilteredCubeMipLevels;
+        ubo.scaleIBLAmbient          = 1.0f;
 
         void* data = FrameUniformBuffers[frameIndex].mapped;
         new Span<TransparentFrameUBO>(data, 1).Fill(ubo);

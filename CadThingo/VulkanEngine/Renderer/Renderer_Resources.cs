@@ -460,10 +460,10 @@ public unsafe partial class Renderer
             new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 48 },
             new() { Type = DescriptorType.SampledImage,             DescriptorCount = MAX_BINDLESS_TEXTURES * MAX_CONCURRENT_FRAMES },
             new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
-            // 5 g-buffer samplers (set 1) + 3 IBL samplers × MAX_FRAMES on set 0 +
-            // ImGui viewport + headroom. Cheap to oversize; 24 keeps the budget
-            // future-proof for skybox sampler bindings in a later phase.
-            new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 24 },
+            // 5 g-buffer samplers (set 1) + 3 IBL samplers × MAX_FRAMES on set 0
+            // for both PBR + Transparent pipelines + ImGui viewport + headroom.
+            // Cheap to oversize.
+            new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 32 },
             new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 4 },
             // IBL bake passes need StorageImage descriptors — one per dispatch.
             // Worst case is the prefilter chain (1 set × prefilteredCubeMipLevels

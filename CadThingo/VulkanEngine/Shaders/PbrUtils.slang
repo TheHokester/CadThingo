@@ -66,3 +66,12 @@ float3 FresnelSchlick(float cosTheta, float3 F0){
 return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
+// Roughness-aware Schlick Fresnel for IBL split-sum eval. The standard
+// FresnelSchlick saturates F0 at grazing angles for smooth surfaces; this
+// variant pulls the limit down on rough surfaces so the kS term doesn't
+// overestimate the specular grab when integrating against an environment.
+// Source: Karis 2013 / Lazarov 2013.
+float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness){
+    return F0 + (max(float3(1.0 - roughness, 1.0 - roughness, 1.0 - roughness), F0) - F0) * pow(1.0 - cosTheta, 5.0);
+}
+

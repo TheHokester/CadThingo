@@ -34,6 +34,13 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 [[vk::binding(2, 0)]] RaytracingAccelerationStructure       tlas;   // scene TLAS for ray-traced shadows
 [[vk::binding(3, 0)]] StructuredBuffer<uint>                tileLightCount;
 [[vk::binding(4, 0)]] StructuredBuffer<uint>                tileLightIndices;
+// IBL split-sum: irradianceCube + prefilteredCube give diffuse and per-roughness
+// specular environment contribution; brdfLut is the view-independent F0 fit.
+// Cubes are baked from .hdr; black-cleared until LoadEnvironmentHdr runs, which
+// gives a zero IBL contribution until then.
+[[vk::binding(5, 0)]] SamplerCube                           irradianceCube;
+[[vk::binding(6, 0)]] SamplerCube                           prefilteredCube;
+[[vk::binding(7, 0)]] Sampler2D                             brdfLut;
 
 // Specialization constants — picked up via VkSpecializationInfo at pipeline build.
 // SOFT_SHADOWS off (default) → single-ray binary occlusion (the original path).
@@ -410,9 +417,28 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
         Lo += (kD * baseColor.rgb / PI + specular) * radiance * NdotL;
     }
 
-    // === AMBIENT AND EMISSIVE ===
-    // Add simple ambient lighting (should be replaced with IBL in production)
-    float3 ambient = float3(0.0075) * baseColor.rgb * ao;
+    // === IBL — SPLIT-SUM AMBIENT ===
+    // Diffuse term: irradiance map (Lambert-convolved env) modulated by baseColor.
+    // Specular term: prefiltered env (GGX importance-sampled per mip-roughness)
+    // multiplied by the split-sum BRDF LUT — that LUT pre-integrates the F0-
+    // independent part of the BRDF so the runtime cost is one cube sample + one
+    // 2D sample per pixel regardless of integration count.
+    // When no environment has been loaded the cubes are black and this whole
+    // contribution evaluates to 0 — the scene falls back to direct lighting only.
+    float  NdotV_ibl  = max(dot(N, V), 0.0);
+    float3 F_ibl      = FresnelSchlickRoughness(NdotV_ibl, F0, roughness);
+    float3 kS_ibl     = F_ibl;
+    float3 kD_ibl     = (float3(1.0) - kS_ibl) * (1.0 - metallic);
+
+    float3 irradianceVal = irradianceCube.Sample(N).rgb;
+    float3 diffuseIBL    = irradianceVal * baseColor.rgb;
+
+    float  maxMip          = max(ubo.prefilteredCubeMipLevels - 1.0, 0.0);
+    float3 prefilteredVal  = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
+    float2 envBRDF         = brdfLut.SampleLevel(float2(NdotV_ibl, roughness), 0).xy;
+    float3 specularIBL     = prefilteredVal * (F_ibl * envBRDF.x + envBRDF.y);
+
+    float3 ambient = (kD_ibl * diffuseIBL + specularIBL) * ao * ubo.scaleIBLAmbient;
 
     // Emissive radiance written by the geometry pass — added pre-tone-map so
     // exposure/gamma apply uniformly with the rest of the lighting.

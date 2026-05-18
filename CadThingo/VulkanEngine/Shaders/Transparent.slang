@@ -15,8 +15,10 @@ struct FrameUBO {
     uint   tileCountY;
     uint   _pad0;
     float2 screenSize;
-    uint   _pad1;
-    uint   _pad2;
+    // IBL params — repurposed from former trailing pad slots (same bytes as
+    // PbrShader.slang::LightingFrameUBO so the CPU update path stays symmetric).
+    float  prefilteredCubeMipLevels;
+    float  scaleIBLAmbient;
 };
 
 struct DrawPC {
@@ -37,6 +39,11 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 [[vk::binding(2, 0)]] RaytracingAccelerationStructure       tlas;
 [[vk::binding(3, 0)]] StructuredBuffer<uint>                tileLightCount;
 [[vk::binding(4, 0)]] StructuredBuffer<uint>                tileLightIndices;
+// IBL split-sum — same handles as PbrShader.slang. Pipelines own separate
+// descriptor sets but the underlying VkImage / Sampler resources are shared.
+[[vk::binding(5, 0)]] SamplerCube                           irradianceCube;
+[[vk::binding(6, 0)]] SamplerCube                           prefilteredCube;
+[[vk::binding(7, 0)]] Sampler2D                             brdfLut;
 
 // Set 1 — bindless materials/instances/textures/samplers (shared layout with GeometryPipeline).
 [[vk::binding(0, 1)]] StructuredBuffer<PbrMaterial>         materials;
@@ -273,7 +280,24 @@ float4 PSMain(VSOutput input) : SV_TARGET
         Lo += (kD * baseColor.rgb / baseColor.a * PI + specular) * radiance * NdotL;
     }
 
-    float3 ambient = float3(0.03, 0.03, 0.03) * baseColor.rgb * ao;
+    // Split-sum IBL — mirrors the deferred PbrShader.slang ambient block.
+    // Zero contribution until an environment is baked; the prior 0.03 floor
+    // is intentionally gone because transparents need physically-correct
+    // reflection of the env once it lands.
+    float  NdotV_ibl  = max(dot(N, V), 0.0);
+    float3 F_ibl      = FresnelSchlickRoughness(NdotV_ibl, F0, roughness);
+    float3 kS_ibl     = F_ibl;
+    float3 kD_ibl     = (float3(1.0) - kS_ibl) * (1.0 - metallic);
+
+    float3 irradianceVal = irradianceCube.Sample(N).rgb;
+    float3 diffuseIBL    = irradianceVal * baseColor.rgb;
+
+    float  maxMip          = max(frame.prefilteredCubeMipLevels - 1.0, 0.0);
+    float3 prefilteredVal  = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
+    float2 envBRDF         = brdfLut.SampleLevel(float2(NdotV_ibl, roughness), 0).xy;
+    float3 specularIBL     = prefilteredVal * (F_ibl * envBRDF.x + envBRDF.y);
+
+    float3 ambient = (kD_ibl * diffuseIBL + specularIBL) * ao * frame.scaleIBLAmbient;
     float3 color   = ambient + Lo + emissiveTex;
 
     // Fresnel-modulated alpha: at grazing angles the surface becomes more reflective,
