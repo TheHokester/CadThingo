@@ -55,4 +55,13 @@ public static unsafe class EditorState
     /// the parent's indent level, so meaningful descendants don't disappear.
     /// </summary>
     public static bool HideEmptyEntities = false;
+
+    // ── Renderer settings ────────────────────────────────────────
+    /// <summary>
+    /// Toggles the skybox draw between the lighting and transparent passes.
+    /// When off, sky pixels show the lighting pass's black clear instead of
+    /// the env cube. Phase 5 surfaces this as a checkbox in the Renderer
+    /// Settings panel.
+    /// </summary>
+    public static bool SkyboxEnabled = true;
 }

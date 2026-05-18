@@ -10,3 +10,4 @@ D:\VulkanSDK\Bin\slangc.exe EquirectToCube.slang -target spirv -o ../../Assets/S
 D:\VulkanSDK\Bin\slangc.exe IrradianceConvolve.slang -target spirv -o ../../Assets/Shaders/IrradianceConvolve.spv
 D:\VulkanSDK\Bin\slangc.exe PrefilterEnv.slang -target spirv -o ../../Assets/Shaders/PrefilterEnv.spv
 D:\VulkanSDK\Bin\slangc.exe BrdfLutGen.slang -target spirv -o ../../Assets/Shaders/BrdfLutGen.spv
+D:\VulkanSDK\Bin\slangc.exe Skybox.slang -target spirv -o ../../Assets/Shaders/Skybox.spv

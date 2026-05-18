@@ -382,6 +382,9 @@ public unsafe partial class Renderer
         geometryPipeline.UpdateUbo(currentFrame, camera);
         var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
         transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
+        // Skybox always updates — pass body is conditional on EditorState.SkyboxEnabled
+        // so we can flip the toggle without re-recording the graph.
+        skyboxPipeline.UpdatePerFrame(currentFrame, camera, 1.0f);
 
         // 5b. GPU cull pass — runs before the geometry pass and produces the
         // indirect command + post-cull instance buffers the geometry pass consumes.
@@ -730,8 +733,10 @@ public unsafe partial class Renderer
                     ImageLayout = ImageLayout.ColorAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
                     StoreOp = AttachmentStoreOp.Store,
-                    ClearValue = new ClearValue() { Color = new ClearColorValue(0.2f, 0.3f, 0.8f, 1.0f) }
-
+                    // Black behind the scene — sky pixels in the PBR pass take the
+                    // early-out path now, so this is what shows when the skybox
+                    // toggle is off. Phase 5 can expose a background color picker.
+                    ClearValue = new ClearValue() { Color = new ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f) }
                 };
                 //Configure lighting pass rendeirng without depth testing 
                 //unnecessary since we're processing each pixel exactly once
@@ -778,6 +783,64 @@ public unsafe partial class Renderer
                 // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
                 vk!.CmdDraw(buffer, 3, 1, 0, 0);
 
+                vk!.CmdEndRendering(buffer);
+            });
+
+        // Skybox pass — runs between lighting and transparent. Depth-tested
+        // EQUAL @ 1.0, no depth write; writes only to pixels where the geometry
+        // pass left the cleared far-plane depth (i.e. true sky). PBR shader
+        // emits black for those same pixels via the WorldPos.w sky-gate, so
+        // here LOAD_OP_LOAD preserves the lit framebuffer and the skybox just
+        // overwrites the black sky.
+        graph.AddPass("SkyboxPass", new List<string>(),
+            new List<string>{"HDRColor", "Depth"}, buffer =>
+            {
+                if (!CadThingo.VulkanEngine.ImGui.EditorState.SkyboxEnabled) return;
+
+                RenderingAttachmentInfoKHR colorAttachment = new()
+                {
+                    SType       = StructureType.RenderingAttachmentInfoKhr,
+                    ImageView   = graph.GetResource("HDRColor").ImageView,
+                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
+                    LoadOp      = AttachmentLoadOp.Load,
+                    StoreOp     = AttachmentStoreOp.Store,
+                };
+                RenderingAttachmentInfoKHR depthAttachment = new()
+                {
+                    SType       = StructureType.RenderingAttachmentInfoKhr,
+                    ImageView   = graph.GetResource("Depth").ImageView,
+                    ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
+                    LoadOp      = AttachmentLoadOp.Load,
+                    StoreOp     = AttachmentStoreOp.Store,
+                };
+                RenderingInfoKHR renderingInfo = new()
+                {
+                    SType                = StructureType.RenderingInfoKhr,
+                    RenderArea           = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
+                    LayerCount           = 1,
+                    ColorAttachmentCount = 1,
+                    PColorAttachments    = (RenderingAttachmentInfo*)&colorAttachment,
+                    PDepthAttachment     = (RenderingAttachmentInfo*)&depthAttachment,
+                };
+
+                vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
+                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, skyboxPipeline.Handle);
+
+                Viewport vp = new()
+                {
+                    X = 0, Y = 0,
+                    Width = width, Height = height,
+                    MinDepth = 0.0f, MaxDepth = 1.0f,
+                };
+                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
+                vk!.CmdSetViewport(buffer, 0, 1, &vp);
+                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
+
+                var set = skyboxPipeline.GetDescriptorSet(0, currentFrame);
+                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
+                    skyboxPipeline.Layout, 0, 1, &set, 0, null);
+
+                vk!.CmdDraw(buffer, 3, 1, 0, 0);
                 vk!.CmdEndRendering(buffer);
             });
 

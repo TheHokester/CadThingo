@@ -107,6 +107,7 @@ public unsafe partial class Renderer
     internal PbrDeferredPipeline  PbrDeferredPipeline;   // accessor used by LightCullPipeline (consumer of the lights SSBO)
     internal TonemapPipeline      tonemapPipeline;       // post-process: HDRColor → FinalColor
     internal TransparentPipeline  transparentPipeline;   // forward+ BLEND-mode pass between lighting and tonemap
+    internal SkyboxPipeline       skyboxPipeline;        // background env-cube draw, between lighting and transparent
 
     // Specialization-constant gate for soft (PCSS-style) ray-queried shadows.
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
@@ -252,6 +253,11 @@ public unsafe partial class Renderer
         // pipeline initializes; write them straight after Initialize.
         transparentPipeline.WriteIblDescriptors();
 
+        // Skybox renders the envCube into HDRColor between lighting and transparent.
+        // EditorState.SkyboxEnabled gates the draw without re-recording the graph.
+        skyboxPipeline = new SkyboxPipeline(this);
+        skyboxPipeline.Initialize();
+
         //Create command buffers
         CreateCommandBuffers();
         //Create sync objects
@@ -280,7 +286,7 @@ public unsafe partial class Renderer
     private void CreateTestEntity()
     {
         // Wire ResourceManager → upload viking_room mesh → create entity with transform + mesh.
-        
+
 
 
         // glTF demo: DamagedHelmet to the side of viking_room so both render together.
@@ -456,6 +462,7 @@ public unsafe partial class Renderer
         CleanupIblResources();
 
         // ── Pipelines (each pipeline disposes its own buffers, sets, layouts) ─
+        skyboxPipeline     ?.Dispose();
         transparentPipeline?.Dispose();
         tonemapPipeline    ?.Dispose();
         PbrDeferredPipeline?.Dispose();

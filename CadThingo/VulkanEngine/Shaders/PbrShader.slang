@@ -285,7 +285,12 @@ LightingVSOutput VSMain(uint vertexID : SV_VertexID)
 float4 PSMain(LightingVSOutput input) : SV_TARGET
 {
     //unpack GBUFFER
-    float3 WorldPos = gBufferPositionSampler.Sample(input.UV).xyz;
+    // gBufferPosition.w == 1.0 wherever Geometry.slang ran; == 0.0 on the
+    // cleared sky pixels. Bail early so we don't sample irradiance with an
+    // undefined-normalized normal (and so the skybox pass can paint here).
+    float4 WorldPosW = gBufferPositionSampler.Sample(input.UV);
+    if (WorldPosW.w < 0.5) return float4(0, 0, 0, 1);
+    float3 WorldPos = WorldPosW.xyz;
     float3 N = normalize(gBufferNormalSampler.Sample(input.UV)).xyz;
 
     float4 albedoMet = gBufferAlbedoSampler.Sample(input.UV);
