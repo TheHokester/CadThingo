@@ -465,6 +465,11 @@ public unsafe partial class Renderer
             // future-proof for skybox sampler bindings in a later phase.
             new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 24 },
             new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 4 },
+            // IBL bake passes need StorageImage descriptors — one per dispatch.
+            // Worst case is the prefilter chain (1 set × prefilteredCubeMipLevels
+            // mips) + equirect→cube + irradiance + BRDF LUT ≈ 11 sets. Oversize
+            // generously since these allocate/free transiently.
+            new() { Type = DescriptorType.StorageImage,             DescriptorCount = 24 },
         };
         fixed (DescriptorPoolSize* poolSizesPtr = poolSizes)
         {

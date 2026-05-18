@@ -192,9 +192,13 @@ public unsafe partial class Renderer
         CreateGBufferSampler();
 
         // IBL images allocated up-front, cleared to black. The PBR lighting set
-        // binds them unconditionally; Phase 2 compute passes fill the content
-        // when an HDR is loaded.
+        // binds them unconditionally; the compute bake passes fill the content
+        // when an HDR is loaded via LoadEnvironmentHdr.
         CreateIblResources();
+        CreateIblBakePipelines();
+        // BRDF LUT is view-independent — bake once at init and reuse for every
+        // environment that gets loaded later.
+        BakeBrdfLut();
 
         // ── Pipelines that don't depend on allocated g-buffer image views ──
         // Render-graph pass closures (registered in SetupDeferredRenderer) read

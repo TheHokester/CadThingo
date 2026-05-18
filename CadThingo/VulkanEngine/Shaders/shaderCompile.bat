@@ -6,3 +6,7 @@ D:\VulkanSDK\Bin\slangc.exe CullDraws.slang -target spirv -o ../../Assets/Shader
 D:\VulkanSDK\Bin\slangc.exe LightCulling.slang -target spirv -o ../../Assets/Shaders/LightCulling.spv
 D:\VulkanSDK\Bin\slangc.exe Tonemap.slang -target spirv -o ../../Assets/Shaders/Tonemap.spv
 D:\VulkanSDK\Bin\slangc.exe Transparent.slang -target spirv -capability spvRayQueryKHR -o ../../Assets/Shaders/Transparent.spv
+D:\VulkanSDK\Bin\slangc.exe EquirectToCube.slang -target spirv -o ../../Assets/Shaders/EquirectToCube.spv
+D:\VulkanSDK\Bin\slangc.exe IrradianceConvolve.slang -target spirv -o ../../Assets/Shaders/IrradianceConvolve.spv
+D:\VulkanSDK\Bin\slangc.exe PrefilterEnv.slang -target spirv -o ../../Assets/Shaders/PrefilterEnv.spv
+D:\VulkanSDK\Bin\slangc.exe BrdfLutGen.slang -target spirv -o ../../Assets/Shaders/BrdfLutGen.spv

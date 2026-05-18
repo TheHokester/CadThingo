@@ -1,3 +1,5 @@
+using System;
+using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer;
@@ -318,8 +320,502 @@ public unsafe partial class Renderer
         vk!.CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
     }
 
+    // ── Bake pipelines ─────────────────────────────────────────────────────
+    // Created once at engine init; live for the lifetime of the renderer. The
+    // BRDF LUT bake runs immediately after construction (the result is view-
+    // independent — same LUT for every environment). The other three pipelines
+    // sit idle until LoadEnvironmentHdr is invoked.
+
+    internal IblBakePipeline equirectToCubePipeline    = null!;
+    internal IblBakePipeline irradianceConvolvePipeline = null!;
+    internal IblBakePipeline prefilterEnvPipeline      = null!;
+    internal IblBakePipeline brdfLutGenPipeline        = null!;
+
+    // Push-constant structs. Slang's `cbuffer` push block reads these exactly —
+    // member order/types must match the shader's PC struct.
+    [StructLayout(LayoutKind.Sequential)]
+    struct PcFaceSize { public uint faceSize; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PcPrefilter
+    {
+        public float roughness;
+        public uint  mipFaceSize;
+        public uint  envCubeSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PcLutSize { public uint lutSize; }
+
+    internal void CreateIblBakePipelines()
+    {
+        const string shaderDir = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\";
+
+        equirectToCubePipeline = new IblBakePipeline(this,
+            shaderDir + "EquirectToCube.spv",     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
+        irradianceConvolvePipeline = new IblBakePipeline(this,
+            shaderDir + "IrradianceConvolve.spv", hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
+        prefilterEnvPipeline = new IblBakePipeline(this,
+            shaderDir + "PrefilterEnv.spv",       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
+        brdfLutGenPipeline = new IblBakePipeline(this,
+            shaderDir + "BrdfLutGen.spv",         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
+
+        equirectToCubePipeline    .Initialize();
+        irradianceConvolvePipeline.Initialize();
+        prefilterEnvPipeline      .Initialize();
+        brdfLutGenPipeline        .Initialize();
+    }
+
+    void DisposeIblBakePipelines()
+    {
+        brdfLutGenPipeline?.Dispose();
+        prefilterEnvPipeline?.Dispose();
+        irradianceConvolvePipeline?.Dispose();
+        equirectToCubePipeline?.Dispose();
+    }
+
+    // ── Storage-image views ────────────────────────────────────────────────
+    // The cube ImageViews from Phase 1 are sample-only (ViewType.Cube). Storage
+    // writes need a 2D-array view at a specific mip level. Created on demand
+    // during a bake, destroyed immediately after.
+
+    ImageView CreateCubeStorageView(VkImage image, Format format, uint mipLevel)
+    {
+        ImageViewCreateInfo info = new()
+        {
+            SType    = StructureType.ImageViewCreateInfo,
+            Image    = image,
+            ViewType = ImageViewType.Type2DArray,
+            Format   = format,
+            SubresourceRange = new ImageSubresourceRange
+            {
+                AspectMask     = ImageAspectFlags.ColorBit,
+                BaseMipLevel   = mipLevel,
+                LevelCount     = 1,
+                BaseArrayLayer = 0,
+                LayerCount     = 6,
+            },
+        };
+        if (vk!.CreateImageView(device, &info, null, out var view) != Result.Success)
+            throw new Exception("Failed to create IBL cube storage view");
+        return view;
+    }
+
+    ImageView CreateLut2DStorageView(VkImage image, Format format)
+    {
+        ImageViewCreateInfo info = new()
+        {
+            SType    = StructureType.ImageViewCreateInfo,
+            Image    = image,
+            ViewType = ImageViewType.Type2D,
+            Format   = format,
+            SubresourceRange = new ImageSubresourceRange
+            {
+                AspectMask     = ImageAspectFlags.ColorBit,
+                BaseMipLevel   = 0,
+                LevelCount     = 1,
+                BaseArrayLayer = 0,
+                LayerCount     = 1,
+            },
+        };
+        if (vk!.CreateImageView(device, &info, null, out var view) != Result.Success)
+            throw new Exception("Failed to create IBL LUT storage view");
+        return view;
+    }
+
+    // ── Layout transitions ─────────────────────────────────────────────────
+    // Phase 2 dispatches mix sampling (ShaderRead) and storage writes (General)
+    // on the same image, sometimes per-mip. This helper takes an explicit
+    // subresource range and chooses access/stage masks from old→new layout.
+
+    void IblTransition(CommandBuffer cmd, VkImage image,
+        ImageLayout oldLayout, ImageLayout newLayout, in ImageSubresourceRange range)
+    {
+        var (srcAccess, srcStage) = LayoutToSrc(oldLayout);
+        var (dstAccess, dstStage) = LayoutToDst(newLayout);
+
+        ImageMemoryBarrier barrier = new()
+        {
+            SType               = StructureType.ImageMemoryBarrier,
+            OldLayout           = oldLayout,
+            NewLayout           = newLayout,
+            SrcAccessMask       = srcAccess,
+            DstAccessMask       = dstAccess,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image               = image,
+            SubresourceRange    = range,
+        };
+        vk!.CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
+    }
+
+    static (AccessFlags access, PipelineStageFlags stage) LayoutToSrc(ImageLayout l) => l switch
+    {
+        ImageLayout.Undefined             => (0,                                 PipelineStageFlags.TopOfPipeBit),
+        ImageLayout.General               => (AccessFlags.ShaderWriteBit,        PipelineStageFlags.ComputeShaderBit),
+        ImageLayout.TransferDstOptimal    => (AccessFlags.TransferWriteBit,      PipelineStageFlags.TransferBit),
+        ImageLayout.TransferSrcOptimal    => (AccessFlags.TransferReadBit,       PipelineStageFlags.TransferBit),
+        ImageLayout.ShaderReadOnlyOptimal => (AccessFlags.ShaderReadBit,         PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.ComputeShaderBit),
+        _ => throw new Exception($"IblTransition: unsupported src layout {l}")
+    };
+
+    static (AccessFlags access, PipelineStageFlags stage) LayoutToDst(ImageLayout l) => l switch
+    {
+        ImageLayout.General               => (AccessFlags.ShaderWriteBit | AccessFlags.ShaderReadBit, PipelineStageFlags.ComputeShaderBit),
+        ImageLayout.TransferDstOptimal    => (AccessFlags.TransferWriteBit,                          PipelineStageFlags.TransferBit),
+        ImageLayout.TransferSrcOptimal    => (AccessFlags.TransferReadBit,                           PipelineStageFlags.TransferBit),
+        ImageLayout.ShaderReadOnlyOptimal => (AccessFlags.ShaderReadBit,                             PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.ComputeShaderBit),
+        _ => throw new Exception($"IblTransition: unsupported dst layout {l}")
+    };
+
+    static ImageSubresourceRange CubeRange(uint baseMip, uint levelCount) => new()
+    {
+        AspectMask     = ImageAspectFlags.ColorBit,
+        BaseMipLevel   = baseMip,
+        LevelCount     = levelCount,
+        BaseArrayLayer = 0,
+        LayerCount     = 6,
+    };
+
+    static ImageSubresourceRange Lut2DRange() => new()
+    {
+        AspectMask     = ImageAspectFlags.ColorBit,
+        BaseMipLevel   = 0,
+        LevelCount     = 1,
+        BaseArrayLayer = 0,
+        LayerCount     = 1,
+    };
+
+    // ── BRDF LUT bake ──────────────────────────────────────────────────────
+    // Runs once at engine init. The split-sum integral is view-independent so
+    // we never need to re-bake it. ~262k integration runs, milliseconds on any
+    // modern GPU.
+
+    public void BakeBrdfLut()
+    {
+        var cmd = BeginSingleTimeCommands();
+        IblTransition(cmd, brdfLutImage,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General, Lut2DRange());
+
+        var view = CreateLut2DStorageView(brdfLutImage, Format.R16G16Sfloat);
+        var set  = brdfLutGenPipeline.AllocateDescriptorSet();
+        brdfLutGenPipeline.WriteDescriptors(set, view, default, default);
+
+        vk!.CmdBindPipeline(cmd, PipelineBindPoint.Compute, brdfLutGenPipeline.Handle);
+        vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, brdfLutGenPipeline.Layout,
+            0, 1, &set, 0, null);
+
+        var pc = new PcLutSize { lutSize = BrdfLutSize };
+        vk!.CmdPushConstants(cmd, brdfLutGenPipeline.Layout,
+            ShaderStageFlags.ComputeBit, 0, (uint)sizeof(PcLutSize), &pc);
+
+        uint groups = (BrdfLutSize + 15) / 16;
+        vk!.CmdDispatch(cmd, groups, groups, 1);
+
+        IblTransition(cmd, brdfLutImage,
+            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal, Lut2DRange());
+
+        EndSingleTimeCommands(cmd);
+
+        vk!.DestroyImageView(device, view, null);
+        brdfLutGenPipeline.FreeDescriptorSet(set);
+    }
+
+    // ── Full HDR → IBL chain ───────────────────────────────────────────────
+    // Drives equirect upload → cube unwrap → mip generation → irradiance →
+    // prefiltered specular. Safe to call multiple times (rebake on environment
+    // swap); device is waited on so prior IBL reads can't observe a torn state.
+
+    public void LoadEnvironmentHdr(string path)
+    {
+        var img = HdrLoader.Load(path);
+        vk!.DeviceWaitIdle(device);
+
+        // ── 1. Upload equirect as a 2D RGBA16F sampled image ─────────────
+        UploadEquirectHalf(img, out var eqImage, out var eqMemory, out var eqView, out var eqSampler);
+
+        // ── 2. EquirectToCube: write envCube mip 0 layers 0..5 ───────────
+        var cubeMip0View = CreateCubeStorageView(envCubeImage, Format.R16G16B16A16Sfloat, mipLevel: 0);
+        var eqCubeSet    = equirectToCubePipeline.AllocateDescriptorSet();
+        equirectToCubePipeline.WriteDescriptors(eqCubeSet, cubeMip0View, eqView, eqSampler);
+
+        var cmd = BeginSingleTimeCommands();
+
+        // envCube: ShaderRead → General (all mips/layers). Mip 0 receives storage
+        // writes; mips 1..N get TransferDst during the blit chain so it's simpler
+        // to push the whole image through one transition now.
+        IblTransition(cmd, envCubeImage,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General, CubeRange(0, envCubeMipLevels));
+
+        vk!.CmdBindPipeline(cmd, PipelineBindPoint.Compute, equirectToCubePipeline.Handle);
+        vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, equirectToCubePipeline.Layout,
+            0, 1, &eqCubeSet, 0, null);
+        var pcFace = new PcFaceSize { faceSize = EnvCubeFaceSize };
+        vk!.CmdPushConstants(cmd, equirectToCubePipeline.Layout,
+            ShaderStageFlags.ComputeBit, 0, (uint)sizeof(PcFaceSize), &pcFace);
+        uint cubeGroups = (EnvCubeFaceSize + 15) / 16;
+        vk!.CmdDispatch(cmd, cubeGroups, cubeGroups, 6);
+
+        // ── 3. envCube mip chain via vkCmdBlitImage ──────────────────────
+        // mip 0 was just written via storage → needs General→TransferSrc.
+        // mips 1..N were freshly transitioned to General (TopOfPipe) → need
+        // General→TransferDst before the first blit lands on them.
+        IblTransition(cmd, envCubeImage, ImageLayout.General, ImageLayout.TransferSrcOptimal,
+            CubeRange(0, 1));
+        if (envCubeMipLevels > 1)
+            IblTransition(cmd, envCubeImage, ImageLayout.General, ImageLayout.TransferDstOptimal,
+                CubeRange(1, envCubeMipLevels - 1));
+
+        // BlitCubeMipChain leaves every mip in ShaderReadOnlyOptimal — irradiance
+        // + prefilter dispatches below sample envCube directly.
+        BlitCubeMipChain(cmd, envCubeImage, EnvCubeFaceSize, envCubeMipLevels);
+
+        // ── 4. Irradiance convolution ────────────────────────────────────
+        var irrView = CreateCubeStorageView(irradianceCubeImage, Format.R16G16B16A16Sfloat, mipLevel: 0);
+        var irrSet  = irradianceConvolvePipeline.AllocateDescriptorSet();
+        irradianceConvolvePipeline.WriteDescriptors(irrSet, irrView, envCubeView, iblCubeSampler);
+
+        IblTransition(cmd, irradianceCubeImage, ImageLayout.ShaderReadOnlyOptimal,
+            ImageLayout.General, CubeRange(0, 1));
+
+        vk!.CmdBindPipeline(cmd, PipelineBindPoint.Compute, irradianceConvolvePipeline.Handle);
+        vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, irradianceConvolvePipeline.Layout,
+            0, 1, &irrSet, 0, null);
+        var pcIrr = new PcFaceSize { faceSize = IrradianceCubeFaceSize };
+        vk!.CmdPushConstants(cmd, irradianceConvolvePipeline.Layout,
+            ShaderStageFlags.ComputeBit, 0, (uint)sizeof(PcFaceSize), &pcIrr);
+        uint irrGroups = (IrradianceCubeFaceSize + 15) / 16;
+        vk!.CmdDispatch(cmd, irrGroups, irrGroups, 6);
+
+        IblTransition(cmd, irradianceCubeImage, ImageLayout.General,
+            ImageLayout.ShaderReadOnlyOptimal, CubeRange(0, 1));
+
+        // ── 5. Prefilter — per-mip dispatches with per-mip storage views ──
+        var prefilterMipViews = new ImageView[prefilteredCubeMipLevels];
+        var prefilterSets     = new DescriptorSet[prefilteredCubeMipLevels];
+
+        IblTransition(cmd, prefilteredCubeImage, ImageLayout.ShaderReadOnlyOptimal,
+            ImageLayout.General, CubeRange(0, prefilteredCubeMipLevels));
+
+        vk!.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilterEnvPipeline.Handle);
+        for (uint m = 0; m < prefilteredCubeMipLevels; m++)
+        {
+            uint mipSize = System.Math.Max(1u, PrefilteredCubeFaceSize >> (int)m);
+            float roughness = prefilteredCubeMipLevels == 1
+                ? 0f
+                : (float)m / (float)(prefilteredCubeMipLevels - 1);
+
+            prefilterMipViews[m] = CreateCubeStorageView(prefilteredCubeImage, Format.R16G16B16A16Sfloat, mipLevel: m);
+            prefilterSets[m]     = prefilterEnvPipeline.AllocateDescriptorSet();
+            prefilterEnvPipeline.WriteDescriptors(prefilterSets[m], prefilterMipViews[m], envCubeView, iblCubeSampler);
+
+            var set = prefilterSets[m];
+            vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, prefilterEnvPipeline.Layout,
+                0, 1, &set, 0, null);
+            var pcPre = new PcPrefilter
+            {
+                roughness   = roughness,
+                mipFaceSize = mipSize,
+                envCubeSize = EnvCubeFaceSize,
+            };
+            vk!.CmdPushConstants(cmd, prefilterEnvPipeline.Layout,
+                ShaderStageFlags.ComputeBit, 0, (uint)sizeof(PcPrefilter), &pcPre);
+            uint mipGroups = (mipSize + 15) / 16;
+            vk!.CmdDispatch(cmd, mipGroups, mipGroups, 6);
+        }
+
+        IblTransition(cmd, prefilteredCubeImage, ImageLayout.General,
+            ImageLayout.ShaderReadOnlyOptimal, CubeRange(0, prefilteredCubeMipLevels));
+
+        EndSingleTimeCommands(cmd);
+
+        // ── 6. Cleanup transient bake resources ──────────────────────────
+        vk!.DestroyImageView(device, cubeMip0View, null);
+        vk!.DestroyImageView(device, irrView, null);
+        for (int m = 0; m < prefilterMipViews.Length; m++)
+            vk!.DestroyImageView(device, prefilterMipViews[m], null);
+
+        equirectToCubePipeline.FreeDescriptorSet(eqCubeSet);
+        irradianceConvolvePipeline.FreeDescriptorSet(irrSet);
+        for (int m = 0; m < prefilterSets.Length; m++)
+            prefilterEnvPipeline.FreeDescriptorSet(prefilterSets[m]);
+
+        vk!.DestroySampler(device, eqSampler, null);
+        vk!.DestroyImageView(device, eqView, null);
+        vk!.DestroyImage(device, eqImage, null);
+        vk!.FreeMemory(device, eqMemory, null);
+    }
+
+    /// <summary>
+    /// Uploads an HDR equirect (float32 RGBA) into a device-local RGBA16F 2D
+    /// image with a linear-clamp sampler. The half conversion saves half the
+    /// VRAM with no visible loss for IBL bake — we re-integrate over the cube
+    /// anyway, so banding from 11-bit mantissa truncation can't survive.
+    /// </summary>
+    void UploadEquirectHalf(HdrLoader.HdrImage img,
+        out VkImage image, out DeviceMemory memory, out ImageView view, out Sampler sampler)
+    {
+        int texelCount = img.Width * img.Height;
+        ulong byteSize = (ulong)texelCount * 4UL * 2UL; // 4 channels × 2 bytes (Half)
+
+        // CPU-side float32 → float16 conversion. System.Half is a value type; the
+        // unsafe block writes straight into the mapped staging buffer.
+        CreateBuffer(byteSize, BufferUsageFlags.TransferSrcBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out var staging, out var stagingMem);
+
+        void* mapped = null;
+        vk!.MapMemory(device, stagingMem, 0, byteSize, 0, ref mapped);
+        var halfSpan = new Span<Half>(mapped, texelCount * 4);
+        for (int i = 0; i < texelCount * 4; i++) halfSpan[i] = (Half)img.Pixels[i];
+        vk!.UnmapMemory(device, stagingMem);
+
+        ImageCreateInfo info = new()
+        {
+            SType         = StructureType.ImageCreateInfo,
+            ImageType     = ImageType.Type2D,
+            Format        = Format.R16G16B16A16Sfloat,
+            Extent        = new Extent3D((uint)img.Width, (uint)img.Height, 1),
+            MipLevels     = 1,
+            ArrayLayers   = 1,
+            Samples       = SampleCountFlags.Count1Bit,
+            Tiling        = ImageTiling.Optimal,
+            Usage         = ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
+            SharingMode   = SharingMode.Exclusive,
+            InitialLayout = ImageLayout.Undefined,
+        };
+        if (vk!.CreateImage(device, &info, null, out image) != Result.Success)
+            throw new Exception("Failed to create equirect upload image");
+
+        vk!.GetImageMemoryRequirements(device, image, out var memReqs);
+        MemoryAllocateInfo alloc = new()
+        {
+            SType           = StructureType.MemoryAllocateInfo,
+            AllocationSize  = memReqs.Size,
+            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
+                MemoryPropertyFlags.DeviceLocalBit),
+        };
+        if (vk!.AllocateMemory(device, &alloc, null, out memory) != Result.Success)
+            throw new Exception("Failed to allocate equirect upload memory");
+        vk!.BindImageMemory(device, image, memory, 0);
+
+        var cmd = BeginSingleTimeCommands();
+        IblTransition(cmd, image, ImageLayout.Undefined, ImageLayout.TransferDstOptimal,
+            Lut2DRange());
+        BufferImageCopy region = new()
+        {
+            BufferOffset      = 0,
+            BufferRowLength   = 0,
+            BufferImageHeight = 0,
+            ImageSubresource  = new ImageSubresourceLayers
+            {
+                AspectMask     = ImageAspectFlags.ColorBit,
+                MipLevel       = 0,
+                BaseArrayLayer = 0,
+                LayerCount     = 1,
+            },
+            ImageOffset = new Offset3D(0, 0, 0),
+            ImageExtent = new Extent3D((uint)img.Width, (uint)img.Height, 1),
+        };
+        vk!.CmdCopyBufferToImage(cmd, staging, image, ImageLayout.TransferDstOptimal, 1, &region);
+        IblTransition(cmd, image, ImageLayout.TransferDstOptimal,
+            ImageLayout.ShaderReadOnlyOptimal, Lut2DRange());
+        EndSingleTimeCommands(cmd);
+
+        vk!.DestroyBuffer(device, staging, null);
+        vk!.FreeMemory(device, stagingMem, null);
+
+        ImageViewCreateInfo viewInfo = new()
+        {
+            SType    = StructureType.ImageViewCreateInfo,
+            Image    = image,
+            ViewType = ImageViewType.Type2D,
+            Format   = Format.R16G16B16A16Sfloat,
+            SubresourceRange = new ImageSubresourceRange
+            {
+                AspectMask     = ImageAspectFlags.ColorBit,
+                BaseMipLevel   = 0,
+                LevelCount     = 1,
+                BaseArrayLayer = 0,
+                LayerCount     = 1,
+            },
+        };
+        if (vk!.CreateImageView(device, &viewInfo, null, out view) != Result.Success)
+            throw new Exception("Failed to create equirect upload view");
+
+        SamplerCreateInfo samplerInfo = new()
+        {
+            SType         = StructureType.SamplerCreateInfo,
+            MagFilter     = Filter.Linear,
+            MinFilter     = Filter.Linear,
+            AddressModeU  = SamplerAddressMode.Repeat,        // longitude wraps
+            AddressModeV  = SamplerAddressMode.ClampToEdge,   // latitude clamps
+            AddressModeW  = SamplerAddressMode.ClampToEdge,
+            MipmapMode    = SamplerMipmapMode.Nearest,
+            MinLod        = 0f,
+            MaxLod        = 0f,
+            CompareEnable = false,
+        };
+        if (vk!.CreateSampler(device, &samplerInfo, null, out sampler) != Result.Success)
+            throw new Exception("Failed to create equirect sampler");
+    }
+
+    /// <summary>
+    /// Generates the envCube mip chain by chained vkCmdBlitImage calls. After
+    /// each blit, the source mip is finalized to ShaderReadOnlyOptimal (no more
+    /// reads from it) and the just-written destination is flipped to
+    /// TransferSrcOptimal to feed the next iteration. Last mip is finalized
+    /// after the loop. Entry contract: mip 0 in TransferSrcOptimal, mips 1..N
+    /// in TransferDstOptimal. Exit: every mip in ShaderReadOnlyOptimal.
+    /// </summary>
+    void BlitCubeMipChain(CommandBuffer cmd, VkImage image, uint baseSize, uint mipLevels)
+    {
+        uint srcSize = baseSize;
+        for (uint i = 1; i < mipLevels; i++)
+        {
+            uint dstSize = System.Math.Max(1u, srcSize / 2);
+
+            ImageBlit blit = new()
+            {
+                SrcOffsets = { Element0 = new Offset3D(0, 0, 0), Element1 = new Offset3D((int)srcSize, (int)srcSize, 1) },
+                SrcSubresource = new ImageSubresourceLayers
+                {
+                    AspectMask = ImageAspectFlags.ColorBit, MipLevel = i - 1,
+                    BaseArrayLayer = 0, LayerCount = 6,
+                },
+                DstOffsets = { Element0 = new Offset3D(0, 0, 0), Element1 = new Offset3D((int)dstSize, (int)dstSize, 1) },
+                DstSubresource = new ImageSubresourceLayers
+                {
+                    AspectMask = ImageAspectFlags.ColorBit, MipLevel = i,
+                    BaseArrayLayer = 0, LayerCount = 6,
+                },
+            };
+
+            vk!.CmdBlitImage(cmd,
+                image, ImageLayout.TransferSrcOptimal,
+                image, ImageLayout.TransferDstOptimal,
+                1, &blit, Filter.Linear);
+
+            // Source mip is done — never read from again — finalize it.
+            IblTransition(cmd, image, ImageLayout.TransferSrcOptimal, ImageLayout.ShaderReadOnlyOptimal,
+                CubeRange(i - 1, 1));
+            // Destination mip becomes source for the next iteration.
+            IblTransition(cmd, image, ImageLayout.TransferDstOptimal, ImageLayout.TransferSrcOptimal,
+                CubeRange(i, 1));
+
+            srcSize = dstSize;
+        }
+        // Last destination mip is still TransferSrc from the loop's tail
+        // transition — finalize it. Handles the edge case of a single-mip image
+        // by transitioning mip 0 from its TransferSrc entry state.
+        IblTransition(cmd, image, ImageLayout.TransferSrcOptimal, ImageLayout.ShaderReadOnlyOptimal,
+            CubeRange(mipLevels - 1, 1));
+    }
+
     void CleanupIblResources()
     {
+        DisposeIblBakePipelines();
+
         if (iblLutSampler.Handle != 0)         vk!.DestroySampler(device, iblLutSampler, null);
         if (iblCubeSampler.Handle != 0)        vk!.DestroySampler(device, iblCubeSampler, null);
 
