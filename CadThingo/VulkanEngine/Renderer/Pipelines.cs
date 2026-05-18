@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.ImGui;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -1882,7 +1883,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         // Renderer.prefilteredCubeMipLevels is set in CreateIblResources and never
         // changes — IBL bakes overwrite content, not metadata.
         ubo.prefilteredCubeMipLevels = Renderer.prefilteredCubeMipLevels;
-        ubo.scaleIBLAmbient = 1.0f;
+        ubo.scaleIBLAmbient = EditorState.IblIntensity;
         ubo.lightCount = count;
         ubo.tileCountX = tileX;
         ubo.tileCountY = tileY;
@@ -2442,7 +2443,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         ubo.tileCountY = tileCountY;
         ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
         ubo.prefilteredCubeMipLevels = Renderer.prefilteredCubeMipLevels;
-        ubo.scaleIBLAmbient          = 1.0f;
+        ubo.scaleIBLAmbient          = EditorState.IblIntensity;
 
         void* data = FrameUniformBuffers[frameIndex].mapped;
         new Span<TransparentFrameUBO>(data, 1).Fill(ubo);

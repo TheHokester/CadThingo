@@ -526,10 +526,48 @@ public unsafe partial class Renderer
     // prefiltered specular. Safe to call multiple times (rebake on environment
     // swap); device is waited on so prior IBL reads can't observe a torn state.
 
+    /// <summary>Path of the .hdr most recently loaded via LoadEnvironmentHdr —
+    /// empty when no environment has been baked yet. Surfaced in the Renderer
+    /// Settings panel as the "currently loaded" line.</summary>
+    public string CurrentEnvironmentPath { get; private set; } = string.Empty;
+
+    /// <summary>
+    /// Look for any .hdr file in Assets/Textures and bake from the first one
+    /// found. Called once at engine init so the scene has a sensible default
+    /// environment if the user has dropped an HDRI in there. Silent no-op if
+    /// the directory or file isn't present.
+    /// </summary>
+    internal void TryAutoLoadEnvironment()
+    {
+        string[] candidates =
+        {
+            System.IO.Path.Combine(System.AppContext.BaseDirectory, "Assets", "Textures"),
+            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Textures",
+        };
+
+        foreach (var dir in candidates)
+        {
+            if (!System.IO.Directory.Exists(dir)) continue;
+            var files = System.IO.Directory.GetFiles(dir, "*.hdr", System.IO.SearchOption.TopDirectoryOnly);
+            if (files.Length == 0) continue;
+            try
+            {
+                LoadEnvironmentHdr(files[0]);
+                System.Console.WriteLine($"Auto-loaded IBL environment: {System.IO.Path.GetFileName(files[0])}");
+                return;
+            }
+            catch (System.Exception e)
+            {
+                System.Console.WriteLine($"Auto-load failed for {files[0]}: {e.Message}");
+            }
+        }
+    }
+
     public void LoadEnvironmentHdr(string path)
     {
         var img = HdrLoader.Load(path);
         vk!.DeviceWaitIdle(device);
+        CurrentEnvironmentPath = path;
 
         // ── 1. Upload equirect as a 2D RGBA16F sampled image ─────────────
         UploadEquirectHalf(img, out var eqImage, out var eqMemory, out var eqView, out var eqSampler);

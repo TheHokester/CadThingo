@@ -384,7 +384,7 @@ public unsafe partial class Renderer
         transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
         // Skybox always updates — pass body is conditional on EditorState.SkyboxEnabled
         // so we can flip the toggle without re-recording the graph.
-        skyboxPipeline.UpdatePerFrame(currentFrame, camera, 1.0f);
+        skyboxPipeline.UpdatePerFrame(currentFrame, camera, ImGui.EditorState.SkyboxIntensity);
 
         // 5b. GPU cull pass — runs before the geometry pass and produces the
         // indirect command + post-cull instance buffers the geometry pass consumes.
@@ -733,10 +733,15 @@ public unsafe partial class Renderer
                     ImageLayout = ImageLayout.ColorAttachmentOptimal,
                     LoadOp = AttachmentLoadOp.Clear,
                     StoreOp = AttachmentStoreOp.Store,
-                    // Black behind the scene — sky pixels in the PBR pass take the
-                    // early-out path now, so this is what shows when the skybox
-                    // toggle is off. Phase 5 can expose a background color picker.
-                    ClearValue = new ClearValue() { Color = new ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f) }
+                    // Sky pixels take the early-out path in the PBR shader so this
+                    // clear is exactly what shows behind the scene when the skybox
+                    // toggle is off. Read from the panel each frame so the color
+                    // picker is fully live.
+                    ClearValue = new ClearValue() { Color = new ClearColorValue(
+                        ImGui.EditorState.BackgroundColor.X,
+                        ImGui.EditorState.BackgroundColor.Y,
+                        ImGui.EditorState.BackgroundColor.Z,
+                        1.0f) }
                 };
                 //Configure lighting pass rendeirng without depth testing 
                 //unnecessary since we're processing each pixel exactly once

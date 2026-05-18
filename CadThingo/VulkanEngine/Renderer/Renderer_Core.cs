@@ -285,6 +285,12 @@ public unsafe partial class Renderer
 
     private void CreateTestEntity()
     {
+        // First-launch convenience: bake IBL from whatever .hdr the user has
+        // already placed in Assets/Textures. The Renderer Settings panel can
+        // load a different file at any time. No HDR present → cubes stay black
+        // and the scene runs with direct lighting only.
+        TryAutoLoadEnvironment();
+
         // Wire ResourceManager → upload viking_room mesh → create entity with transform + mesh.
 
 
@@ -396,6 +402,56 @@ public unsafe partial class Renderer
         spotLight2->Initialize();
         // scene.AddEntity(spotLight2);
 
+    }
+
+    /// <summary>
+    /// Rebuild the deferred + transparent PBR pipelines. Use this after toggling
+    /// softShadowsEnabled — that flag is a fragment-stage specialization constant
+    /// so changes don't apply to a live pipeline. Cross-pipeline descriptor
+    /// writes (TLAS, tile buffers, shadow-alpha, IBL) are re-issued because the
+    /// new VkPipeline owns brand-new descriptor sets.
+    /// </summary>
+    public void RebuildPbrPipelines()
+    {
+        if (!initialized) return;
+        vk!.DeviceWaitIdle(device);
+
+        transparentPipeline?.Dispose();
+        PbrDeferredPipeline?.Dispose();
+
+        PbrDeferredPipeline = new PbrDeferredPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
+        PbrDeferredPipeline.Initialize();
+
+        transparentPipeline = new TransparentPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
+        transparentPipeline.Initialize();
+
+        // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
+        PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
+        transparentPipeline.WriteSharedLightingDescriptors(PbrDeferredPipeline, lightCullPipeline);
+        transparentPipeline.WriteIblDescriptors();
+        if (tlas.Handle != 0)
+        {
+            PbrDeferredPipeline.WriteTlasDescriptor(tlas);
+            transparentPipeline.WriteTlasDescriptor(tlas);
+            PbrDeferredPipeline.WriteShadowAlphaDescriptors();
+        }
+    }
+
+    /// <summary>
+    /// Rebuild the tonemap pipeline. Use this after changing tonemapOperator —
+    /// the operator selection is a fragment-stage spec constant. HDRColor view
+    /// is re-bound because Initialize() allocated a fresh descriptor set.
+    /// </summary>
+    public void RebuildTonemapPipeline()
+    {
+        if (!initialized) return;
+        vk!.DeviceWaitIdle(device);
+
+        tonemapPipeline?.Dispose();
+        tonemapPipeline = new TonemapPipeline(this) { Operator = tonemapOperator };
+        tonemapPipeline.Initialize();
+        tonemapPipeline.WriteHdrInputDescriptor(
+            scene.renderGraph.GetResource("HDRColor").ImageView, gBufferSampler);
     }
 
     public void Update(double d)

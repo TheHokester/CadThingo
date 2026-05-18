@@ -37,6 +37,7 @@ public static class ImGuiUI
         InspectorPanel.Draw();
         StatsPanel.Draw();
         CameraPanel.Draw();
+        RendererSettingsPanel.Draw();
     }
 
     static void DrawMainMenuBar()
@@ -49,7 +50,8 @@ public static class ImGuiUI
             ImGuiNET.ImGui.MenuItem("Scene Outliner", null, ref EditorState.ShowSceneOutliner);
             ImGuiNET.ImGui.MenuItem("Inspector",      null, ref EditorState.ShowInspector);
             ImGuiNET.ImGui.MenuItem("Stats",          null, ref EditorState.ShowStats);
-            ImGuiNET.ImGui.MenuItem("Camera",         null, ref EditorState.ShowCamera);
+            ImGuiNET.ImGui.MenuItem("Camera",            null, ref EditorState.ShowCamera);
+            ImGuiNET.ImGui.MenuItem("Renderer Settings", null, ref EditorState.ShowRendererSettings);
             ImGuiNET.ImGui.Separator();
             ImGuiNET.ImGui.MenuItem("Viewport fullscreen", "F11", ref EditorState.ViewportFullscreen);
             ImGuiNET.ImGui.EndMenu();

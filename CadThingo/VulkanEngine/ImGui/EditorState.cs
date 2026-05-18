@@ -29,11 +29,12 @@ public static unsafe class EditorState
     public static bool ViewportFocused;
     public static bool ViewportHovered;
 
-    public static bool ShowViewport      = true;
-    public static bool ShowSceneOutliner = true;
-    public static bool ShowInspector     = true;
-    public static bool ShowStats         = true;
-    public static bool ShowCamera        = true;
+    public static bool ShowViewport         = true;
+    public static bool ShowSceneOutliner    = true;
+    public static bool ShowInspector        = true;
+    public static bool ShowStats            = true;
+    public static bool ShowCamera           = true;
+    public static bool ShowRendererSettings = true;
 
     // ── Viewport panel state ─────────────────────────────────────
     public static ViewportFitMode ViewportFitMode    = ViewportFitMode.Fill;
@@ -59,9 +60,30 @@ public static unsafe class EditorState
     // ── Renderer settings ────────────────────────────────────────
     /// <summary>
     /// Toggles the skybox draw between the lighting and transparent passes.
-    /// When off, sky pixels show the lighting pass's black clear instead of
-    /// the env cube. Phase 5 surfaces this as a checkbox in the Renderer
-    /// Settings panel.
+    /// When off, sky pixels show the lighting clear (BackgroundColor) instead
+    /// of the env cube.
     /// </summary>
     public static bool SkyboxEnabled = true;
+
+    /// <summary>
+    /// Multiplier on the env-cube sample written by the skybox pass. Useful
+    /// when the HDR is too bright for a comfortable backdrop but you still
+    /// want IBL contributing at full strength to surface lighting.
+    /// </summary>
+    public static float SkyboxIntensity = 1.0f;
+
+    /// <summary>
+    /// scaleIBLAmbient — multiplier on the IBL ambient term in both the PBR
+    /// deferred and transparent forward+ shaders. The studio HDRIs that ship
+    /// with this project are quite bright; default tuned to land in the same
+    /// rough range as the pre-IBL flat ambient floor.
+    /// </summary>
+    public static float IblIntensity = 0.3f;
+
+    /// <summary>
+    /// Used as the lighting-pass clear color (the sky behind the scene when
+    /// the skybox is disabled). RGB only; alpha is always 1.
+    /// </summary>
+    public static System.Numerics.Vector3 BackgroundColor =
+        new System.Numerics.Vector3(0.0f, 0.0f, 0.0f);
 }
