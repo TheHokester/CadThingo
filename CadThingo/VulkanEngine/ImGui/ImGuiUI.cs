@@ -1,5 +1,5 @@
-using System.Numerics;
 using ImGuiNET;
+using CadThingo.VulkanEngine.ImGui.Panels;
 
 namespace CadThingo.VulkanEngine.ImGui;
 
@@ -7,37 +7,54 @@ public static class ImGuiUI
 {
     public static void Draw()
     {
-        DrawCameraOverlay();
+        // F11 toggles viewport fullscreen. Skip while a text-input has focus so
+        // the key doesn't get consumed mid-typing in a panel input.
+        if (!ImGuiNET.ImGui.GetIO().WantTextInput && ImGuiNET.ImGui.IsKeyPressed(ImGuiKey.F11))
+            EditorState.ViewportFullscreen = !EditorState.ViewportFullscreen;
+
+        // Always create the dockspace — even in fullscreen mode — so docked
+        // windows keep their dock-node attachments. In fullscreen we just skip
+        // drawing the chrome and let ViewportPanel paint a fullscreen overlay
+        // on top.
+        ImGuiNET.ImGui.DockSpaceOverViewport(ImGuiNET.ImGui.GetMainViewport().ID,
+            ImGuiNET.ImGui.GetMainViewport(),
+            ImGuiDockNodeFlags.PassthruCentralNode);
+
+        if (EditorState.ViewportFullscreen)
+        {
+            // Only the fullscreen viewport draws. The other panels (and the
+            // docked Viewport window) are simply not Begin()'d this frame —
+            // ImGui keeps their saved dock positions so the layout is intact
+            // when fullscreen toggles off.
+            ViewportPanel.Draw();
+            return;
+        }
+
+        DrawMainMenuBar();
+
+        ViewportPanel.Draw();
+        SceneOutlinerPanel.Draw();
+        InspectorPanel.Draw();
+        StatsPanel.Draw();
+        CameraPanel.Draw();
     }
 
-    static void DrawCameraOverlay()
+    static void DrawMainMenuBar()
     {
-        var camera = Engine.renderer?.Camera;
-        if (camera is null) return;
+        if (!ImGuiNET.ImGui.BeginMainMenuBar()) return;
 
-        const float pad = 10f;
-        var viewport = ImGuiNET.ImGui.GetMainViewport();
-        var pos = new Vector2(viewport.WorkPos.X + pad, viewport.WorkPos.Y + pad);
-        ImGuiNET.ImGui.SetNextWindowPos(pos, ImGuiCond.Always, new Vector2(0f, 0f));
-        ImGuiNET.ImGui.SetNextWindowBgAlpha(0.35f);
-
-        const ImGuiWindowFlags flags =
-            ImGuiWindowFlags.NoDecoration |
-            ImGuiWindowFlags.AlwaysAutoResize |
-            ImGuiWindowFlags.NoSavedSettings |
-            ImGuiWindowFlags.NoFocusOnAppearing |
-            ImGuiWindowFlags.NoNav |
-            ImGuiWindowFlags.NoMove;
-
-        if (ImGuiNET.ImGui.Begin("Camera", flags))
+        if (ImGuiNET.ImGui.BeginMenu("View"))
         {
-            var p = camera.GetPosition();
-            var f = camera.GetFront();
-            ImGuiNET.ImGui.Text("Camera");
+            ImGuiNET.ImGui.MenuItem("Viewport",       null, ref EditorState.ShowViewport);
+            ImGuiNET.ImGui.MenuItem("Scene Outliner", null, ref EditorState.ShowSceneOutliner);
+            ImGuiNET.ImGui.MenuItem("Inspector",      null, ref EditorState.ShowInspector);
+            ImGuiNET.ImGui.MenuItem("Stats",          null, ref EditorState.ShowStats);
+            ImGuiNET.ImGui.MenuItem("Camera",         null, ref EditorState.ShowCamera);
             ImGuiNET.ImGui.Separator();
-            ImGuiNET.ImGui.Text($"Pos   X:{p.X,8:F2} Y:{p.Y,8:F2} Z:{p.Z,8:F2}");
-            ImGuiNET.ImGui.Text($"Front X:{f.X,8:F2} Y:{f.Y,8:F2} Z:{f.Z,8:F2}");
+            ImGuiNET.ImGui.MenuItem("Viewport fullscreen", "F11", ref EditorState.ViewportFullscreen);
+            ImGuiNET.ImGui.EndMenu();
         }
-        ImGuiNET.ImGui.End();
+
+        ImGuiNET.ImGui.EndMainMenuBar();
     }
 }

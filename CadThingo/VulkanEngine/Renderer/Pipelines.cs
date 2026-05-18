@@ -556,7 +556,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         GeometryUBO ubo = new();
         if (camera != null)
         {
-            ubo.proj = camera.GetProjectionMatrix((float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+            ubo.proj = camera.GetProjectionMatrix((float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
             ubo.view = camera.GetViewMatrix();
             ubo.proj.M22 *= -1; // Vulkan clip space has Y down
         }
@@ -564,7 +564,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         {
             ubo.view = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), new Vector3(0, 0, 0), new Vector3(0, 0, 1));
             ubo.proj = Matrix4x4.CreatePerspectiveFieldOfView((float)(45 * Math.PI / 180),
-                (float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+                (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
             ubo.proj.M22 *= -1; // flip Y for Vulkan clip space
         }
 
@@ -871,7 +871,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         // Frustum.FromViewProjection assumes standard row-major Vulkan NDC.
         Matrix4x4 view = cam.GetViewMatrix();
         Matrix4x4 proj = cam.GetProjectionMatrix(
-            (float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+            (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
         Matrix4x4 vp   = view * proj;
         var frustum    = Frustum.FromViewProjection(vp, vulkanNDC: true);
 
@@ -1116,7 +1116,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
         Matrix4x4 view = cam.GetViewMatrix();
         Matrix4x4 proj = cam.GetProjectionMatrix(
-            (float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+            (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
         // The lighting fragment shader sees a Y-flipped projection (the geometry
         // pipeline flips proj.M22 in UpdateUbo). Build invViewProj from the SAME
         // flipped matrix so the cull frustum lines up with where pixels actually
@@ -1130,7 +1130,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         {
             InvViewProj = invVP,
             CamPos      = new Vector4(cam.GetPosition(), 1f),
-            ScreenSize  = new Vector2(Renderer.swapChainExtent.Width, Renderer.swapChainExtent.Height),
+            ScreenSize  = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height),
             TileCountX  = tileCountX,
             TileCountY  = tileCountY,
             LightCount  = lightCount,
@@ -1810,8 +1810,8 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         }
 
         // ── Frame UBO ──────────────────────────────────────────
-        uint tileX = (Renderer.swapChainExtent.Width  + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
-        uint tileY = (Renderer.swapChainExtent.Height + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
+        uint tileX = (Renderer.renderExtent.Width  + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
+        uint tileY = (Renderer.renderExtent.Height + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
 
         LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
@@ -1820,7 +1820,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         ubo.lightCount = count;
         ubo.tileCountX = tileX;
         ubo.tileCountY = tileY;
-        ubo.screenSize = new Vector2(Renderer.swapChainExtent.Width, Renderer.swapChainExtent.Height);
+        ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
 
         void* data = LightingUniformBuffers[frameIndex].mapped;
         new Span<LightingFrameUBO>(data, 1).Fill(ubo);
@@ -2316,7 +2316,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         if (camera != null)
         {
             ubo.proj = camera.GetProjectionMatrix(
-                (float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+                (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
             ubo.view = camera.GetViewMatrix();
             ubo.proj.M22 *= -1;
             ubo.camPos = new Vector4(camera.GetPosition(), 1.0f);
@@ -2325,14 +2325,14 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         {
             ubo.view   = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), Vector3.Zero, new Vector3(0, 0, 1));
             ubo.proj   = Matrix4x4.CreatePerspectiveFieldOfView((float)(45 * Math.PI / 180),
-                (float)Renderer.swapChainExtent.Width / Renderer.swapChainExtent.Height, 0.1f, 100.0f);
+                (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
             ubo.proj.M22 *= -1;
             ubo.camPos = new Vector4(2, 2, 2, 1);
         }
         ubo.lightCount = lightCount;
         ubo.tileCountX = tileCountX;
         ubo.tileCountY = tileCountY;
-        ubo.screenSize = new Vector2(Renderer.swapChainExtent.Width, Renderer.swapChainExtent.Height);
+        ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
 
         void* data = FrameUniformBuffers[frameIndex].mapped;
         new Span<TransparentFrameUBO>(data, 1).Fill(ubo);

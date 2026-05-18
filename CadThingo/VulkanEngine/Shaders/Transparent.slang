@@ -270,13 +270,18 @@ float4 PSMain(VSOutput input) : SV_TARGET
         float3 kD = float3(1.0, 1.0, 1.0) - kS;
         kD *= 1.0 - metallic;
 
-        Lo += (kD * baseColor.rgb / PI + specular) * radiance * NdotL;
+        Lo += (kD * baseColor.rgb / baseColor.a * PI + specular) * radiance * NdotL;
     }
 
     float3 ambient = float3(0.03, 0.03, 0.03) * baseColor.rgb * ao;
     float3 color   = ambient + Lo + emissiveTex;
 
-    // Output linear HDR with the material's alpha used by the blend stage.
-    // Tonemap pass downstream applies exposure + Reinhard + inverse gamma.
-    return float4(color, baseColor.a);
+    // Fresnel-modulated alpha: at grazing angles the surface becomes more reflective,
+    // so push alpha toward 1 there. Keeps specular highlights from being damped to
+    // matte by the SRC_ALPHA blend on low-alpha clearcoats/glass.
+    float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+    float outAlpha = saturate(baseColor.a + (1.0 - baseColor.a) * fresnel);
+
+    // Output linear HDR. Tonemap pass downstream applies exposure + Reinhard + inverse gamma.
+    return float4(color, outAlpha);
 }

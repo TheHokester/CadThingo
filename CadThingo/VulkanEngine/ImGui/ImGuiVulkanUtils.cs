@@ -10,19 +10,23 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
 {
     Vk vk = Globals.vk;
 
-    //Core vulkan resources for UI rendering
-    Buffer vertexBuffer; //Contains all the vertices of the UI
-
-    Buffer indexBuffer; //Contains all the indices of the UI
-
-    //geometry buffers memory
-    DeviceMemory vertexBufferMemory;
-    DeviceMemory indexBufferMemory;
-    void* vertexBufferMapped;
-    void* indexBufferMapped;
-
-    uint vertexCount; //current number of vertices in the UI for draw cmds
-    uint indexCount; //current number of indices in the UI for Draw cmds
+    // Per-frame vertex/index buffer ring. One slot per frame-in-flight so
+    // updateBuffers() can destroy + recreate its own slot freely — the
+    // renderer's WaitForFences(inFlightFences[currentFrame]) at the top of
+    // DrawFrame guarantees the GPU is done with this slot before we touch it,
+    // while the OTHER slots remain untouched and safe for any frame the GPU is
+    // still executing. Capacities track per-slot allocated count (not the
+    // current frame's required count) so we only grow, never thrash on
+    // alternating big/small frames.
+    readonly Buffer[]       vertexBuffers      = new Buffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly Buffer[]       indexBuffers       = new Buffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly DeviceMemory[] vertexBufferMems   = new DeviceMemory[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly DeviceMemory[] indexBufferMems    = new DeviceMemory[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    // Mapped pointers held as nint because C# doesn't allow void*[] fields.
+    readonly nint[]         vertexBufferMapped = new nint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly nint[]         indexBufferMapped  = new nint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly uint[]         vertexCapacities   = new uint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly uint[]         indexCapacities    = new uint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
 
     //texture for the UI font, contains the sampler, image, image view and memory.
     Texture fontTexture;
@@ -34,6 +38,13 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
     DescriptorPool descriptorPool; //for allocating descriptor sets
     DescriptorSetLayout descriptorSetLayout; //layout defining shader bindings for UI
     DescriptorSet descriptorSet; //actual resource bindings for font tex
+
+    // Second descriptor set sharing the font layout (binding 0 = CombinedImageSampler).
+    // Written lazily by the renderer once FinalColor's ImageView exists; sampled by
+    // the viewport panel via ImGui.Image(ViewportTextureId, size). Re-written on
+    // swapchain recreate because the underlying ImageView changes.
+    DescriptorSet viewportDescriptorSet;
+    Sampler       viewportSampler;
 
     //Vulkan Engine context 
     //references connect our ui system to the rest of the engine
@@ -58,9 +69,6 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
 
     PushConstBlock pC;
 
-    // Dynamic state tracking for performance optimization
-    bool needsUpdateBuffers = false; // Flag indicating buffer resize requirements
-
     // Tracks which ImGuiKeys we've already reported as down. Silk.NET's GLFW backend
     // fires KeyDown on every OS-level key-repeat, but ImGui has its own internal
     // repeat handling for IsKeyPressed(repeat=true). Forwarding repeats compounds
@@ -79,6 +87,46 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
     uint width;
     uint height;
 
+    /// <summary>
+    /// Texture ID for the viewport ImGui.Image call. Encodes the viewport
+    /// VkDescriptorSet handle so the per-cmd bind loop in DrawFrame can route
+    /// the right descriptor for that draw. Zero until WriteViewportDescriptor
+    /// has been called with a valid ImageView.
+    /// </summary>
+    public nint ViewportTextureId =>
+        viewportDescriptorSet.Handle == 0 ? 0 : (nint)viewportDescriptorSet.Handle;
+
+    /// <summary>
+    /// (Re-)binds the viewport descriptor set to the supplied <paramref name="view"/>.
+    /// Caller (renderer) is responsible for invoking this after the render graph's
+    /// FinalColor ImageView has been allocated (initial bind) and after every
+    /// swapchain recreation (the view changes whenever the graph is rebuilt).
+    /// Must be called outside any in-flight frame — i.e. after vkDeviceWaitIdle
+    /// or during initialization.
+    /// </summary>
+    public void WriteViewportDescriptor(ImageView view)
+    {
+        if (viewportDescriptorSet.Handle == 0) return;
+
+        DescriptorImageInfo info = new()
+        {
+            ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
+            ImageView   = view,
+            Sampler     = viewportSampler,
+        };
+        WriteDescriptorSet write = new()
+        {
+            SType           = StructureType.WriteDescriptorSet,
+            DstSet          = viewportDescriptorSet,
+            DstBinding      = 0,
+            DstArrayElement = 0,
+            DescriptorCount = 1,
+            DescriptorType  = DescriptorType.CombinedImageSampler,
+            PImageInfo      = &info,
+        };
+        vk!.UpdateDescriptorSets(device, 1, &write, 0, null);
+    }
+
     public ImGuiVulkanUtils(Renderer.Renderer renderer, uint graphicsQueueFamilyIndex)
     {
         this.renderer = renderer;
@@ -95,20 +143,37 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
 
         //Destroy resources in reverse creation order
         fontTexture.Dispose();
-        
-        vk!.DestroyBuffer(device, indexBuffer, null);
-        vk!.FreeMemory(device, indexBufferMemory, null);
-        vk!.DestroyBuffer(device, vertexBuffer, null);
-        vk!.FreeMemory(device, vertexBufferMemory, null);
+
+        for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            if (indexBufferMems[i].Handle != 0)
+            {
+                vk!.UnmapMemory(device, indexBufferMems[i]);
+                vk!.DestroyBuffer(device, indexBuffers[i], null);
+                vk!.FreeMemory(device, indexBufferMems[i], null);
+            }
+            if (vertexBufferMems[i].Handle != 0)
+            {
+                vk!.UnmapMemory(device, vertexBufferMems[i]);
+                vk!.DestroyBuffer(device, vertexBuffers[i], null);
+                vk!.FreeMemory(device, vertexBufferMems[i], null);
+            }
+        }
         
         vk!.DestroyPipeline(device, pipeline, null);
         vk!.DestroyPipelineLayout(device, pipelineLayout, null);
         
+        // DestroyDescriptorPool implicitly frees every descriptor set allocated
+        // from it (font + viewport), so no explicit FreeDescriptorSets call is
+        // needed for the viewport set.
         fixed(DescriptorSet* pDS = &descriptorSet)
             vk!.FreeDescriptorSets(device, descriptorPool, 1, pDS);
         vk!.DestroyDescriptorSetLayout(device, descriptorSetLayout, null);
         vk!.DestroyDescriptorPool(device, descriptorPool, null);
-        
+
+        if (viewportSampler.Handle != 0)
+            vk!.DestroySampler(device, viewportSampler, null);
+
         GC.SuppressFinalize(this);
     }
 
@@ -183,29 +248,16 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         fontTexture = Texture.CreateTextureFromMemory(renderer, fontData, (uint)texWidth,
             (uint)texHeight, Format.R8G8B8A8Unorm, fontExtent);
 
-        // Eagerly allocate vertex/index buffers at a reasonable starting size so the
-        // first frame doesn't pay create+map cost. Sizing covers a typical demo UI;
-        // updateBuffers() resizes on demand if a frame outgrows them.
+        // Eagerly allocate one vertex/index buffer per frame-in-flight at a
+        // reasonable starting size so the first frames don't pay create+map
+        // cost. updateBuffers() grows them on demand at 2x per growth.
         const uint initialVertexCount = 8192;
-        const uint initialIndexCount = 16384;
-        ulong initialVertexBytes = initialVertexCount * (ulong)sizeof(ImDrawVert);
-        ulong initialIndexBytes = initialIndexCount * sizeof(ushort);
-
-        renderer.CreateBuffer(initialVertexBytes, BufferUsageFlags.VertexBufferBit,
-            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out vertexBuffer, out vertexBufferMemory);
-        vertexCount = initialVertexCount;
-        void* vMapped = null;
-        vk!.MapMemory(device, vertexBufferMemory, 0, initialVertexBytes, 0, ref vMapped);
-        vertexBufferMapped = vMapped;
-
-        renderer.CreateBuffer(initialIndexBytes, BufferUsageFlags.IndexBufferBit,
-            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out indexBuffer, out indexBufferMemory);
-        indexCount = initialIndexCount;
-        void* iMapped = null;
-        vk!.MapMemory(device, indexBufferMemory, 0, initialIndexBytes, 0, ref iMapped);
-        indexBufferMapped = iMapped;
+        const uint initialIndexCount  = 16384;
+        for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            AllocateVertexSlot(i, initialVertexCount);
+            AllocateIndexSlot(i,  initialIndexCount);
+        }
 
         CreateDescriptorResources();
         CreatePipelineResources();
@@ -250,16 +302,9 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         ImGuiUI.Draw();
         ImGuiNET.ImGui.Render();
 
-        var drawData = ImGuiNET.ImGui.GetDrawData();
-        if (drawData.NativePtr != null && drawData.CmdListsCount > 0)
-        {
-            if (drawData.TotalVtxCount > vertexCount || drawData.TotalIdxCount > indexCount)
-            {
-                needsUpdateBuffers = true;
-                return true;
-            }
-        }
-
+        // Per-slot resize is now handled inside updateBuffers(); no need to
+        // gate it from here. Return value is unused by callers — kept so the
+        // signature doesn't churn unrelated code.
         return false;
     }
 
@@ -272,7 +317,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
     /// Standard ImGui Vulkan-backend pattern; vertex counts are small enough
     /// that fetching from host memory is well below noise.
     /// </summary>
-    public void updateBuffers()
+    public void updateBuffers(uint frameIndex)
     {
         ImDrawDataPtr drawData = ImGuiNET.ImGui.GetDrawData();
         if (drawData.NativePtr == null || drawData.CmdListsCount == 0)
@@ -280,39 +325,31 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
             return;
         }
 
-        ulong vertexBufferSize = (ulong)drawData.TotalVtxCount * (ulong)sizeof(ImDrawVert);
-        ulong indexBufferSize = (ulong)drawData.TotalIdxCount * sizeof(ushort);
+        int slot = (int)frameIndex;
 
-        // (Re)create + map vertex buffer when the frame's geometry outgrows it.
-        if (drawData.TotalVtxCount > vertexCount)
+        // Grow this slot's buffers when geometry outgrows capacity. Safe to
+        // destroy+recreate because the caller has already waited on this slot's
+        // in-flight fence — the GPU is done with it. Other slots are
+        // untouched, so frames still in flight there keep their valid handles.
+        uint requiredVtx = (uint)drawData.TotalVtxCount;
+        if (requiredVtx > vertexCapacities[slot])
         {
-            if (vertexBufferMemory.Handle != 0) vk!.UnmapMemory(device, vertexBufferMemory);
-            renderer.DestroyBuffer(vertexBuffer, vertexBufferMemory);
-            renderer.CreateBuffer(vertexBufferSize, BufferUsageFlags.VertexBufferBit,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-                out vertexBuffer, out vertexBufferMemory);
-            vertexCount = (uint)drawData.TotalVtxCount;
-            void* mapped = null;
-            vk!.MapMemory(device, vertexBufferMemory, 0, vertexBufferSize, 0, ref mapped);
-            vertexBufferMapped = mapped;
+            uint newCap = GrowCapacity(vertexCapacities[slot], requiredVtx);
+            FreeVertexSlot(slot);
+            AllocateVertexSlot(slot, newCap);
         }
 
-        if (drawData.TotalIdxCount > indexCount)
+        uint requiredIdx = (uint)drawData.TotalIdxCount;
+        if (requiredIdx > indexCapacities[slot])
         {
-            if (indexBufferMemory.Handle != 0) vk!.UnmapMemory(device, indexBufferMemory);
-            renderer.DestroyBuffer(indexBuffer, indexBufferMemory);
-            renderer.CreateBuffer(indexBufferSize, BufferUsageFlags.IndexBufferBit,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-                out indexBuffer, out indexBufferMemory);
-            indexCount = (uint)drawData.TotalIdxCount;
-            void* mapped = null;
-            vk!.MapMemory(device, indexBufferMemory, 0, indexBufferSize, 0, ref mapped);
-            indexBufferMapped = mapped;
+            uint newCap = GrowCapacity(indexCapacities[slot], requiredIdx);
+            FreeIndexSlot(slot);
+            AllocateIndexSlot(slot, newCap);
         }
 
         // One memcpy per CmdList, straight into mapped GPU memory.
-        var vtxDst = new Span<ImDrawVert>(vertexBufferMapped, drawData.TotalVtxCount);
-        var idxDst = new Span<ushort>(indexBufferMapped, drawData.TotalIdxCount);
+        var vtxDst = new Span<ImDrawVert>((void*)vertexBufferMapped[slot], drawData.TotalVtxCount);
+        var idxDst = new Span<ushort>   ((void*)indexBufferMapped[slot],  drawData.TotalIdxCount);
         int vtxOffset = 0;
         int idxOffset = 0;
         for (int i = 0; i < drawData.CmdListsCount; i++)
@@ -325,6 +362,62 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
             vtxOffset += srcVtx.Length;
             idxOffset += srcIdx.Length;
         }
+    }
+
+    // 2x exponential growth — doubles until capacity covers the requirement.
+    // First-time growth from 0 just sizes exactly to required.
+    static uint GrowCapacity(uint current, uint required)
+    {
+        if (current == 0) return required;
+        uint cap = current;
+        while (cap < required) cap *= 2;
+        return cap;
+    }
+
+    void AllocateVertexSlot(int slot, uint count)
+    {
+        ulong bytes = count * (ulong)sizeof(ImDrawVert);
+        renderer.CreateBuffer(bytes, BufferUsageFlags.VertexBufferBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out vertexBuffers[slot], out vertexBufferMems[slot]);
+        vertexCapacities[slot] = count;
+        void* mapped = null;
+        vk!.MapMemory(device, vertexBufferMems[slot], 0, bytes, 0, ref mapped);
+        vertexBufferMapped[slot] = (nint)mapped;
+    }
+
+    void AllocateIndexSlot(int slot, uint count)
+    {
+        ulong bytes = count * sizeof(ushort);
+        renderer.CreateBuffer(bytes, BufferUsageFlags.IndexBufferBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out indexBuffers[slot], out indexBufferMems[slot]);
+        indexCapacities[slot] = count;
+        void* mapped = null;
+        vk!.MapMemory(device, indexBufferMems[slot], 0, bytes, 0, ref mapped);
+        indexBufferMapped[slot] = (nint)mapped;
+    }
+
+    void FreeVertexSlot(int slot)
+    {
+        if (vertexBufferMems[slot].Handle == 0) return;
+        vk!.UnmapMemory(device, vertexBufferMems[slot]);
+        renderer.DestroyBuffer(vertexBuffers[slot], vertexBufferMems[slot]);
+        vertexBuffers[slot]      = default;
+        vertexBufferMems[slot]   = default;
+        vertexBufferMapped[slot] = 0;
+        vertexCapacities[slot]   = 0;
+    }
+
+    void FreeIndexSlot(int slot)
+    {
+        if (indexBufferMems[slot].Handle == 0) return;
+        vk!.UnmapMemory(device, indexBufferMems[slot]);
+        renderer.DestroyBuffer(indexBuffers[slot], indexBufferMems[slot]);
+        indexBuffers[slot]      = default;
+        indexBufferMems[slot]   = default;
+        indexBufferMapped[slot] = 0;
+        indexCapacities[slot]   = 0;
     }
     public void OnEvent(Event e)
     {
@@ -391,7 +484,10 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
     /// Caller is responsible for transitioning the underlying image into
     /// <see cref="ImageLayout.ColorAttachmentOptimal"/> beforehand and out of it
     /// afterward — this method only records the rendering pass, not barriers.</param>
-    public void DrawFrame(CommandBuffer cmdBuffer, ImageView targetView)
+    /// <param name="frameIndex">Which frame-in-flight slot's vertex/index buffer
+    /// to bind. Must match the slot fed to <see cref="updateBuffers"/> this
+    /// frame and must be guarded by the caller's per-slot fence wait.</param>
+    public void DrawFrame(CommandBuffer cmdBuffer, ImageView targetView, uint frameIndex)
     {
         ImDrawDataPtr drawData = ImGuiNET.ImGui.GetDrawData();
         if (drawData.NativePtr == null || drawData.CmdListsCount == 0)
@@ -443,19 +539,22 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         };
         vk!.CmdPushConstants(cmdBuffer, pipelineLayout, ShaderStageFlags.VertexBit, 0, (uint)sizeof(PushConstBlock),
             pPC);
-        //bind buffers
-        Buffer* pVB = stackalloc Buffer[] { vertexBuffer };
+        //bind buffers — this frame's slot only; other slots may still be
+        //in use by the previous in-flight frame and must not be touched.
+        int slot = (int)frameIndex;
+        Buffer* pVB = stackalloc Buffer[] { vertexBuffers[slot] };
         ulong offset = 0;
         vk!.CmdBindVertexBuffers(cmdBuffer, 0, 1, pVB, &offset);
-        vk!.CmdBindIndexBuffer(cmdBuffer, indexBuffer, 0, IndexType.Uint16);
+        vk!.CmdBindIndexBuffer(cmdBuffer, indexBuffers[slot], 0, IndexType.Uint16);
         
-        //bind font (and any UI texs) for this draw, move inside loop if needed in future.
-        fixed (DescriptorSet* pDS = &descriptorSet)
-        {
-            vk!.CmdBindDescriptorSets(cmdBuffer, PipelineBindPoint.Graphics, pipelineLayout,
-                0u, 1u, pDS, null);
-        }
-        
+        // Per-cmd descriptor binding: font set by default; switch to whichever
+        // VkDescriptorSet handle ImGui.Image() encoded into cmd.TextureId, then
+        // back. Tracks last-bound handle so font→font sequences don't rebind.
+        DescriptorSet boundDs = descriptorSet;
+        vk!.CmdBindDescriptorSets(cmdBuffer, PipelineBindPoint.Graphics, pipelineLayout,
+            0u, 1u, &boundDs, 0u, null);
+        ulong lastBoundHandle = descriptorSet.Handle;
+
         int vertexOffset = 0;
         int indexOffset = 0;
         for (int i = 0; i < drawData.CmdListsCount; i++)
@@ -464,6 +563,20 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
             for (int j = 0; j < cmdList.CmdBuffer.Size; j++)
             {
                 var cmd = cmdList.CmdBuffer[j];
+
+                // Resolve which descriptor set this cmd wants. TextureId == 0
+                // means "no Image() override" → use the font set.
+                ulong wantHandle = cmd.TextureId == 0
+                    ? descriptorSet.Handle
+                    : (ulong)cmd.TextureId;
+                if (wantHandle != lastBoundHandle)
+                {
+                    boundDs.Handle = wantHandle;
+                    vk!.CmdBindDescriptorSets(cmdBuffer, PipelineBindPoint.Graphics, pipelineLayout,
+                        0u, 1u, &boundDs, 0u, null);
+                    lastBoundHandle = wantHandle;
+                }
+
                 //clip per draw call
                 Rect2D scissor = new();
                 int sX = Math.Max((int)cmd.ClipRect.X, 0);
@@ -474,32 +587,44 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
                 scissor.Extent.Height = (uint)(cmd.ClipRect.W - sY);
                 vk!.CmdSetScissor(cmdBuffer, 0, 1, &scissor);
 
-                
-
                 //issue indexed draw for this UI data
                 vk!.CmdDrawIndexed(cmdBuffer, cmd.ElemCount, 1, (uint)indexOffset, vertexOffset, 0);
                 indexOffset += (int)cmd.ElemCount;
             }
-            
+
             vertexOffset += cmdList.VtxBuffer.Size;
         }
         vk!.CmdEndRendering(cmdBuffer);
     }
-    
-    
+
+    /// <summary>
+    /// Updates ImGui's surface size after a window resize. ImGui's coordinate
+    /// space (DisplaySize) and the dynamic-rendering pass dimensions
+    /// (width/height fields used by DrawFrame's viewport + RenderArea) both
+    /// need this — without the field update the UI would still record into the
+    /// pre-resize rectangle and get clipped or stretched against the new
+    /// swapchain extent.
+    /// </summary>
+    public void UpdateScreenSize(uint width, uint height)
+    {
+        this.width  = width;
+        this.height = height;
+        ImGuiNET.ImGui.GetIO().DisplaySize = new Vector2(width, height);
+    }
     
     private void CreateDescriptorResources()
     {
-        //Create descriptor pool
+        //Create descriptor pool — sized for two sets (font + viewport scene-image),
+        // both bound to the same single-binding layout below.
         var poolSize = new DescriptorPoolSize
         {
             Type = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1
+            DescriptorCount = 2
         };
         var poolInfo = new DescriptorPoolCreateInfo
         {
             SType = StructureType.DescriptorPoolCreateInfo,
-            MaxSets = 1,
+            MaxSets = 2,
             PoolSizeCount = 1,
             PPoolSizes = &poolSize
         };
@@ -533,6 +658,34 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         allocInfo.PSetLayouts = layouts;
 
         vk!.AllocateDescriptorSets(device, &allocInfo, out descriptorSet);
+
+        // Allocate the viewport descriptor set from the same pool & layout.
+        // Contents are filled in later via WriteViewportDescriptor — the renderer
+        // calls that after FinalColor's ImageView exists (post-graph-compile).
+        vk!.AllocateDescriptorSets(device, &allocInfo, out viewportDescriptorSet);
+
+        // Linear filter + clamp-to-edge: matches how DCC tools show a viewport
+        // texture — no wrapping artefacts at panel edges, smooth on scale changes.
+        SamplerCreateInfo samplerInfo = new()
+        {
+            SType                  = StructureType.SamplerCreateInfo,
+            MagFilter              = Filter.Linear,
+            MinFilter              = Filter.Linear,
+            MipmapMode             = SamplerMipmapMode.Linear,
+            AddressModeU           = SamplerAddressMode.ClampToEdge,
+            AddressModeV           = SamplerAddressMode.ClampToEdge,
+            AddressModeW           = SamplerAddressMode.ClampToEdge,
+            AnisotropyEnable       = false,
+            MaxAnisotropy          = 1.0f,
+            BorderColor            = BorderColor.IntOpaqueBlack,
+            UnnormalizedCoordinates= false,
+            CompareEnable          = false,
+            CompareOp              = CompareOp.Always,
+            MinLod                 = 0,
+            MaxLod                 = 0,
+            MipLodBias             = 0,
+        };
+        vk!.CreateSampler(device, &samplerInfo, null, out viewportSampler);
 
         //update descriptorset with font tex and sampler
         DescriptorImageInfo fontInfo = new()

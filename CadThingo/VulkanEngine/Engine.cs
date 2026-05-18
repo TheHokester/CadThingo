@@ -103,6 +103,12 @@ public class Engine
 
         window.Closing += Shutdown;
 
+        // Window resize must rebuild the swapchain + render targets and tell
+        // ImGui about the new surface size. Without this, AcquireNextImage's
+        // out-of-date error is the only trigger and one frame renders into the
+        // pre-resize extent — visible as ImGui drawing into a clipped corner
+        // until the next acquire.
+        window.Resize += _ => renderer.RecreateSwapChain();
     }
 
     private void Shutdown()

@@ -48,8 +48,10 @@ public unsafe partial class Renderer
 {
     private void CreateDepthResources()
     {
-        var width = swapChainExtent.Width;
-        var height = swapChainExtent.Height;
+        // Depth buffer matches the render target extent — sampled / depth-tested
+        // by the deferred passes which all run at renderExtent.
+        var width = renderExtent.Width;
+        var height = renderExtent.Height;
 
         depthImageResource = new ImageResource(vk, device, "Depth", Format.D32Sfloat, new Extent2D(width, height),
             ImageUsageFlags.DepthStencilAttachmentBit | ImageUsageFlags.InputAttachmentBit,
@@ -58,8 +60,10 @@ public unsafe partial class Renderer
 
     private void CreateGBufferResources()
     {
-        var width = swapChainExtent.Width;
-        var height = swapChainExtent.Height;
+        // G-buffers + lighting all run at the render extent (== panel size in
+        // editor mode), not necessarily the swapchain size.
+        var width = renderExtent.Width;
+        var height = renderExtent.Height;
         // SampledBit required: the lighting pass samples these via CombinedImageSampler descriptors.
         const ImageUsageFlags gBufferUsage =
             ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit | ImageUsageFlags.SampledBit;
@@ -304,6 +308,26 @@ public unsafe partial class Renderer
 
             sourceStage = PipelineStageFlags.ColorAttachmentOutputBit;
             destinationStage = PipelineStageFlags.BottomOfPipeBit;
+        }
+        // FinalColor: settled in ShaderReadOnlyOptimal by the render-graph final-layout barrier,
+        // briefly TransferSrcOptimal for the swapchain blit, then back. Prior shader reads must
+        // finish before the blit, and the blit's transfer reads must finish before the next
+        // ImGui sample.
+        else if (oldLayout == ImageLayout.ShaderReadOnlyOptimal && newLayout == ImageLayout.TransferSrcOptimal)
+        {
+            barrier.SrcAccessMask = AccessFlags.ShaderReadBit;
+            barrier.DstAccessMask = AccessFlags.TransferReadBit;
+
+            sourceStage = PipelineStageFlags.FragmentShaderBit;
+            destinationStage = PipelineStageFlags.TransferBit;
+        }
+        else if (oldLayout == ImageLayout.TransferSrcOptimal && newLayout == ImageLayout.ShaderReadOnlyOptimal)
+        {
+            barrier.SrcAccessMask = AccessFlags.TransferReadBit;
+            barrier.DstAccessMask = AccessFlags.ShaderReadBit;
+
+            sourceStage = PipelineStageFlags.TransferBit;
+            destinationStage = PipelineStageFlags.FragmentShaderBit;
         }
         else
         {

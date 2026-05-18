@@ -50,6 +50,7 @@ public unsafe partial class Renderer
     
     //world scene
     private Scene scene;
+    public Scene Scene => scene;
     private Entity* testEntity;
     
     private QueueFamilyIndices queueFamilyIndices;
@@ -78,6 +79,14 @@ public unsafe partial class Renderer
     private Image[] swapChainImages;
     internal Format swapChainImageFormat;
     internal Extent2D swapChainExtent;
+
+    // Render target extent — the size at which the deferred chain (gbuffers,
+    // HDRColor, FinalColor) and the lighting tile grid are sized. Distinct from
+    // swapChainExtent because the editor's viewport panel can be smaller than
+    // the OS window. Initialized to swapChainExtent and tracks it until the
+    // viewport panel posts a different requested size via EditorState.
+    internal Extent2D renderExtent;
+    public Extent2D RenderExtent => renderExtent;
     internal ImageView[] swapChainImageViews;
     private ImageLayout[] swapChainImageLayouts;
 
@@ -166,6 +175,9 @@ public unsafe partial class Renderer
         PickPhysicalDevice();
         CreateLogicalDevice();
         CreateSwapChain();
+        // Initial render extent tracks swapchain extent. ViewportPanel can later
+        // shrink it via EditorState.RequestedRenderExtent → ResizeRenderTargets.
+        renderExtent = swapChainExtent;
         CreateImageViews();
         SetupDynamicRendering();
 
@@ -194,9 +206,14 @@ public unsafe partial class Renderer
         // graph.Compile() inside SetupDeferredRenderer allocates the g-buffer
         // images. The PBR pipeline's set 1 binds those views, so PbrDeferredPipeline
         // must initialize AFTER this call.
-        SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);
+        SetupDeferredRenderer(scene.renderGraph, renderExtent.Width, renderExtent.Height);
         imGuiUtils = new ImGuiVulkanUtils(this, (uint)queueFamilyIndices.graphicsFamily! );
         imGuiUtils?.init(swapChainExtent.Width, swapChainExtent.Height);
+
+        // Bind FinalColor into the ImGui viewport descriptor so the Viewport panel
+        // can render the scene as an ImGui.Image. Re-bound on swapchain recreate
+        // because the underlying ImageView is rebuilt.
+        imGuiUtils?.WriteViewportDescriptor(scene.renderGraph.GetResource("FinalColor").ImageView);
 
         // ── Lighting + light-cull pipelines (depend on allocated g-buffer / lights SSBO) ──
         PbrDeferredPipeline = new PbrDeferredPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };

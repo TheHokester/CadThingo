@@ -263,7 +263,10 @@ public unsafe partial class Renderer
     // Rebuilds everything tied to the surface extent: swap chain, attachment
     // images, render graph (which captures width/height in its pass closures),
     // and the lighting pass's g-buffer descriptor writes.
-    private void RecreateSwapChain()
+    // Public so Engine can call it from window.Resize — otherwise the only
+    // trigger is AcquireNextImage returning ErrorOutOfDateKhr, which leaves
+    // one frame at the wrong dimensions on some platforms.
+    public void RecreateSwapChain()
     {
         // Block while the window is minimized (zero framebuffer). DoEvents pumps
         // the message loop so we still respond to restore.
@@ -273,9 +276,28 @@ public unsafe partial class Renderer
             window.DoEvents();
             fb = window.FramebufferSize;
         }
-
         vk!.DeviceWaitIdle(device);
 
+        CleanupSwapChain();
+        CreateSwapChain();
+        CreateImageViews();
+
+        // Window resized — bring renderExtent back to swapchain size by default.
+        // ViewportPanel will then drive it back down to panel size next frame if
+        // the panel is smaller. Setting both equal here avoids a brief frame at
+        // the wrong size before the panel's request lands.
+        RebuildRenderTargets(swapChainExtent.Width, swapChainExtent.Height);
+        imGuiUtils?.UpdateScreenSize(swapChainExtent.Width, swapChainExtent.Height);
+    }
+
+    /// <summary>
+    /// Reallocates depth + g-buffers + render graph at (<paramref name="width"/>,
+    /// <paramref name="height"/>) and re-binds every descriptor whose ImageView
+    /// changed. Caller must have invoked vkDeviceWaitIdle beforehand — none of
+    /// the disposed resources can be in flight.
+    /// </summary>
+    private void RebuildRenderTargets(uint width, uint height)
+    {
         // Order matters: render graph holds references to depth + g-buffer
         // ImageResources, so dispose it first. The ImageResource Dispose guard
         // makes the explicit calls below idempotent.
@@ -287,15 +309,13 @@ public unsafe partial class Renderer
         gBufferMaterial.Dispose();
         gBufferEmissive.Dispose();
 
-        CleanupSwapChain();
+        renderExtent = new Extent2D(width, height);
 
-        CreateSwapChain();
-        CreateImageViews();
         CreateDepthResources();
         CreateGBufferResources();
 
         scene.renderGraph = new RenderGraph(vk!, device, physicalDevice);
-        SetupDeferredRenderer(scene.renderGraph, swapChainExtent.Width, swapChainExtent.Height);
+        SetupDeferredRenderer(scene.renderGraph, renderExtent.Width, renderExtent.Height);
 
         // G-buffer ImageViews are fresh — re-bind them on the lighting pass set.
         PbrDeferredPipeline.WriteGBufferDescriptors();
@@ -304,10 +324,37 @@ public unsafe partial class Renderer
         // the tonemap pass's sampler binding.
         tonemapPipeline.WriteHdrInputDescriptor(
             scene.renderGraph.GetResource("HDRColor").ImageView, gBufferSampler);
+
+        // FinalColor ImageView is fresh — re-bind it for the ImGui viewport panel.
+        imGuiUtils?.WriteViewportDescriptor(scene.renderGraph.GetResource("FinalColor").ImageView);
+    }
+
+    /// <summary>
+    /// Public entry: blocks on vkDeviceWaitIdle and reallocates render targets at
+    /// the requested extent. Safe to call from outside the renderer (e.g.
+    /// ViewportPanel via EditorState → DrawFrame top-of-frame check).
+    /// </summary>
+    public void ResizeRenderTargets(uint width, uint height)
+    {
+        if (width == 0 || height == 0) return;
+        if (width == renderExtent.Width && height == renderExtent.Height) return;
+
+        vk!.DeviceWaitIdle(device);
+        RebuildRenderTargets(width, height);
     }
 
     public void DrawFrame()
     {
+        // 0. Apply any pending render-extent request from the ViewportPanel.
+        //    Requests are 1 frame stale (the panel computes size during ImGui
+        //    construction inside the previous frame's DrawFrame); that's fine.
+        //    ResizeRenderTargets is a no-op when the request matches current.
+        if (ImGui.EditorState.RequestedRenderExtent is var req && req.HasValue)
+        {
+            ResizeRenderTargets(req.Value.w, req.Value.h);
+            ImGui.EditorState.RequestedRenderExtent = null;
+        }
+
         // 1. CPU/GPU sync for this slot
         vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
 
@@ -369,8 +416,14 @@ public unsafe partial class Renderer
             PipelineStageFlags.TransferBit,
             0, 0, null, 0, null, 1, &toTransferDst);
 
-        // 7b. Blit FinalColor (TransferSrcOptimal — set by render-graph final-layout barrier) → swapchain
+        // 7b. Blit FinalColor → swapchain.
+        // FinalColor's graph-declared finalLayout is now ShaderReadOnlyOptimal (so the
+        // viewport panel can sample it), so we dance it through TransferSrcOptimal
+        // here and back to ShaderReadOnlyOptimal after the blit. The graph's layout
+        // tracker stays consistent because we end where the graph thinks it ends.
         var finalColor = scene.renderGraph.GetResource("FinalColor");
+        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.TransferSrcOptimal);
         var blit = new ImageBlit
         {
             SrcSubresource = new ImageSubresourceLayers
@@ -388,8 +441,10 @@ public unsafe partial class Renderer
                 LayerCount = 1,
             },
         };
+        // Src is FinalColor at renderExtent; Dst is the swapchain image at
+        // swapChainExtent. CmdBlitImage handles the scale when they differ.
         blit.SrcOffsets[0] = new Offset3D(0, 0, 0);
-        blit.SrcOffsets[1] = new Offset3D((int)swapChainExtent.Width, (int)swapChainExtent.Height, 1);
+        blit.SrcOffsets[1] = new Offset3D((int)renderExtent.Width, (int)renderExtent.Height, 1);
         blit.DstOffsets[0] = new Offset3D(0, 0, 0);
         blit.DstOffsets[1] = new Offset3D((int)swapChainExtent.Width, (int)swapChainExtent.Height, 1);
 
@@ -397,6 +452,11 @@ public unsafe partial class Renderer
             finalColor.Image, ImageLayout.TransferSrcOptimal,
             swapImage, ImageLayout.TransferDstOptimal,
             1, &blit, Filter.Linear);
+
+        // 7b-post. Return FinalColor to ShaderReadOnlyOptimal so the viewport ImGui
+        //     panel (and the render graph's layout tracker) can rely on it.
+        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+            ImageLayout.TransferSrcOptimal, ImageLayout.ShaderReadOnlyOptimal);
 
         // 7c. Swapchain TransferDstOptimal → ColorAttachmentOptimal so the UI overlay
         //     can render on top of the blitted scene.
@@ -407,9 +467,9 @@ public unsafe partial class Renderer
         if (imGuiUtils != null)
         {
             imGuiUtils.newFrame();
-            imGuiUtils.updateBuffers();
+            imGuiUtils.updateBuffers(currentFrame);
         }
-        imGuiUtils?.DrawFrame(cmd, swapChainImageViews[imageIndex]);
+        imGuiUtils?.DrawFrame(cmd, swapChainImageViews[imageIndex], currentFrame);
 
         // 7e. Swapchain ColorAttachmentOptimal → PresentSrcKhr.
         TransitionImageLayout(cmd, swapImage, swapChainImageFormat,
@@ -501,10 +561,12 @@ public unsafe partial class Renderer
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
 
         //configure finalcolor buffer for the completed lighting results
-        //standard color format with transfer capability for presentation or post processing
+        // SampledBit lets the ImGui viewport panel bind FinalColor as a CombinedImageSampler.
+        // finalLayout settles to ShaderReadOnlyOptimal each frame so ImGui draws sample valid
+        // contents — the per-frame blit to the swapchain transitions in and out manually.
         graph.AddResource("FinalColor", Format.R8G8B8A8Unorm, new Extent2D(width, height),
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit,
-            ImageLayout.Undefined, ImageLayout.TransferSrcOptimal);
+            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit | ImageUsageFlags.SampledBit,
+            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
         
         //set names of FInal and hdr color for debug
         

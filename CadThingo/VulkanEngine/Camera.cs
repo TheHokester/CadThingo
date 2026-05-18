@@ -1,4 +1,5 @@
-﻿using CadThingo.VulkanEngine.Renderer;
+﻿using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer;
 using Silk.NET.Input;
 
 namespace CadThingo.VulkanEngine;
@@ -33,6 +34,11 @@ public class Camera : IEventListener
     // Tick() reads these per frame so holding a key keeps moving — pure event
     // dispatch only fires on the press edge, which alone wouldn't sustain motion.
     private bool moveForward, moveBack, moveLeft, moveRight, moveUp, moveDown;
+
+    // RMB-drag rotation gate. Set true on RMB press inside the viewport;
+    // cleared on RMB release anywhere. While false, MouseMove events are
+    // ignored — so hovering panels doesn't spin the camera.
+    private bool _rotating;
     
     
     //Internal coordinate system maintenance
@@ -161,7 +167,7 @@ public class Camera : IEventListener
     }
 
     public Frustum GetFrustum() => default;
-    
+
     //--------------------------------------------------
     //property access methods for external systems
     //Provide controlled access to internal state without exposing implementation details (seperation of concerns)
@@ -169,18 +175,101 @@ public class Camera : IEventListener
     public Vec3 GetFront() => front;
     float GetZoom() => zoom;
 
+    // ── Editor-facing properties ─────────────────────────────────
+    // Yaw/Pitch setters re-derive front/right/up so callers don't have to remember
+    // to call UpdateCameraVectors; Pitch clamps to the same ±89° range as mouse input.
+    public Vec3 Position { get => position; set => position = value; }
+
+    public float Yaw
+    {
+        get => yaw;
+        set { yaw = value; UpdateCameraVectors(); }
+    }
+
+    public float Pitch
+    {
+        get => pitch;
+        set { pitch = Math.Clamp(value, -89.0f, 89.0f); UpdateCameraVectors(); }
+    }
+
+    public float Fov
+    {
+        get => zoom;
+        set => zoom = Math.Clamp(value, 1.0f, 120.0f);
+    }
+
+    public float MovementSpeed    { get => movementSpeed;    set => movementSpeed    = MathF.Max(0f, value); }
+    public float MouseSensitivity { get => mouseSensitivity; set => mouseSensitivity = MathF.Max(0f, value); }
+
+    // ── CAD view presets ─────────────────────────────────────────
+    // Snap orientation + position to canonical orthographic-style views, looking at
+    // the world origin from <paramref name="distance"/> along the relevant axis.
+    // Pan after positioning if the working set isn't origin-centric.
+    public void SetViewFront(float distance = 5f)  => SetView(0f,  0f,  distance, -90f,    0f);
+    public void SetViewBack(float distance = 5f)   => SetView(0f,  0f, -distance,  90f,    0f);
+    public void SetViewRight(float distance = 5f)  => SetView(distance, 0f, 0f,  180f,    0f);
+    public void SetViewLeft(float distance = 5f)   => SetView(-distance, 0f, 0f,   0f,    0f);
+    public void SetViewTop(float distance = 5f)    => SetView(0f, distance, 0f,  -90f, -89f);
+    public void SetViewBottom(float distance = 5f) => SetView(0f, -distance, 0f, -90f,  89f);
+    public void SetViewIso(float distance = 5f)
+    {
+        float d = distance / MathF.Sqrt(3f);
+        SetView(d, d, d, -135f, -30f);
+    }
+
+    private void SetView(float px, float py, float pz, float newYaw, float newPitch)
+    {
+        position = new Vec3(px, py, pz);
+        yaw      = newYaw;
+        pitch    = Math.Clamp(newPitch, -89.0f, 89.0f);
+        UpdateCameraVectors();
+    }
+
+    /// <summary>
+    /// Repositions the camera along its current view direction so a sphere of
+    /// <paramref name="radius"/> centred at <paramref name="target"/> fits inside the
+    /// current FOV with a small margin. Orientation is preserved — use a preset
+    /// first if the current direction doesn't suit.
+    /// </summary>
+    public void FocusOn(Vec3 target, float radius)
+    {
+        if (radius < 1e-4f) radius = 1f;
+        float halfFovRad = ToRadians(zoom * 0.5f);
+        // d = r / sin(halfFov) is the closest distance at which a sphere of radius
+        // r is fully inside the vertical FOV. 1.2× pads against the edges.
+        float distance = radius / MathF.Sin(halfFovRad) * 1.2f;
+        position = target - front * distance;
+    }
+
     public void OnEvent(Event evt)
     {
         switch (evt)
         {
             case KeyPressEvent kp:
-                SetMovementKey((Key)kp.GetKeyCode, true);
+                // Movement keys only register when the viewport panel has focus.
+                // Without this gate, typing into a panel's InputText would also
+                // pan the camera. Releases are always handled (below) so a
+                // press-then-defocus doesn't strand the movement flag in true.
+                if (EditorState.ViewportFocused)
+                    SetMovementKey((Key)kp.GetKeyCode, true);
                 break;
             case KeyReleaseEvent kr:
                 SetMovementKey((Key)kr.GetKeyCode, false);
                 break;
+            case MouseKeyDownEvent mbd when mbd.GetButton == MouseButton.Right:
+                // RMB-drag rotation: start only if the press began over the
+                // viewport image. Once true, rotation continues even if the
+                // mouse leaves the viewport during the drag — standard DCC
+                // convention.
+                if (EditorState.ViewportHovered)
+                    _rotating = true;
+                break;
+            case MouseKeyReleaseEvent mbu when mbu.GetButton == MouseButton.Right:
+                _rotating = false;
+                break;
             case MouseMoveEvent mm:
-                ProcessMouseMovement(mm.GetX(), mm.GetY(), true);
+                if (_rotating)
+                    ProcessMouseMovement(mm.GetX(), mm.GetY(), true);
                 break;
             case MouseScrollEvent:
                 // TODO: zoom on scroll
