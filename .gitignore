@@ -1,6 +1,6 @@
 bin/
 obj/
-assets/Models/
+
 .idea/
 .vs/
 *.user
