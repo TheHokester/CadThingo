@@ -113,6 +113,12 @@ public unsafe partial class Renderer
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
     public bool softShadowsEnabled = true;
 
+    // Pending rebuild flags posted by the Renderer Settings panel. Consumed at
+    // the top of DrawFrame so the rebuild never races a command buffer that
+    // already bound the old pipeline.
+    internal bool pendingPbrRebuild     = false;
+    internal bool pendingTonemapRebuild = false;
+
     // Tone-map curve selector — threaded into TonemapPipeline.Operator at
     // construction time as a specialization constant. Toggling requires a
     // pipeline rebuild.
@@ -429,6 +435,9 @@ public unsafe partial class Renderer
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         transparentPipeline.WriteSharedLightingDescriptors(PbrDeferredPipeline, lightCullPipeline);
         transparentPipeline.WriteIblDescriptors();
+        // LightCullPipeline survives the rebuild but its set 0 binding 0 still
+        // points at the freed PBR light SSBO — fix it up.
+        lightCullPipeline.RewriteLightsBinding();
         if (tlas.Handle != 0)
         {
             PbrDeferredPipeline.WriteTlasDescriptor(tlas);

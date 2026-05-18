@@ -162,8 +162,11 @@ public static class RendererSettingsPanel
             ImGuiNET.ImGui.SameLine();
             if (ImGuiNET.ImGui.Button("Apply##tonemap"))
             {
-                renderer.RebuildTonemapPipeline();
-                _tonemapRebuildPending = false;
+                // Queue the rebuild for the top of the next frame — running it
+                // here would tear down a pipeline this frame's command buffer
+                // has already bound, which is a use-after-free at submit time.
+                renderer.pendingTonemapRebuild = true;
+                _tonemapRebuildPending         = false;
             }
         }
     }
@@ -192,8 +195,9 @@ public static class RendererSettingsPanel
         {
             if (ImGuiNET.ImGui.Button("Apply##pbr"))
             {
-                renderer.RebuildPbrPipelines();
-                _pbrRebuildPending = false;
+                // Defer to next frame — see tonemap apply for reasoning.
+                renderer.pendingPbrRebuild = true;
+                _pbrRebuildPending         = false;
             }
         }
     }

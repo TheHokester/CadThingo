@@ -355,6 +355,13 @@ public unsafe partial class Renderer
             ImGui.EditorState.RequestedRenderExtent = null;
         }
 
+        // 0b. Apply any pending pipeline rebuilds posted by the Renderer Settings
+        //     panel. Has to happen here (before command-buffer recording) because
+        //     mid-frame disposal of a bound pipeline would corrupt the in-flight
+        //     command buffer's references.
+        if (pendingPbrRebuild)     { RebuildPbrPipelines();     pendingPbrRebuild     = false; }
+        if (pendingTonemapRebuild) { RebuildTonemapPipeline();  pendingTonemapRebuild = false; }
+
         // 1. CPU/GPU sync for this slot
         vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
 

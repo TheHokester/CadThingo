@@ -1057,6 +1057,37 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         }
     }
 
+    /// <summary>
+    /// Rewrites just binding 0 (the lights SSBO that PbrDeferredPipeline owns).
+    /// Called by RebuildPbrPipelines — when PBR is disposed + recreated the old
+    /// VkBuffer this descriptor pointed at is gone, so the consumer side has to
+    /// re-bind to the fresh handle.
+    /// </summary>
+    public void RewriteLightsBinding()
+    {
+        var pbr = Renderer.PbrDeferredPipeline
+                  ?? throw new InvalidOperationException("PbrDeferredPipeline not initialized.");
+
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            DescriptorBufferInfo bufLights = new()
+            {
+                Buffer = pbr.GetLightStorageBuffer((uint)i), Offset = 0,
+                Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
+            };
+            var write = new WriteDescriptorSet
+            {
+                SType           = StructureType.WriteDescriptorSet,
+                DstSet          = DescriptorSets[0][i],
+                DstBinding      = 0,
+                DescriptorType  = DescriptorType.StorageBuffer,
+                DescriptorCount = 1,
+                PBufferInfo     = &bufLights,
+            };
+            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
+        }
+    }
+
     protected override void WriteDescriptors()
     {
         // PbrDeferredPipeline owns the lights SSBO; this binding is the consumer side.
