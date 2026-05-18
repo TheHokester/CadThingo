@@ -460,7 +460,10 @@ public unsafe partial class Renderer
             new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 48 },
             new() { Type = DescriptorType.SampledImage,             DescriptorCount = MAX_BINDLESS_TEXTURES * MAX_CONCURRENT_FRAMES },
             new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
-            new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 16 },
+            // 5 g-buffer samplers (set 1) + 3 IBL samplers × MAX_FRAMES on set 0 +
+            // ImGui viewport + headroom. Cheap to oversize; 24 keeps the budget
+            // future-proof for skybox sampler bindings in a later phase.
+            new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 24 },
             new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 4 },
         };
         fixed (DescriptorPoolSize* poolSizesPtr = poolSizes)

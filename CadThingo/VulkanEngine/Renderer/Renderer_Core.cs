@@ -191,6 +191,11 @@ public unsafe partial class Renderer
         CreateGBufferResources();
         CreateGBufferSampler();
 
+        // IBL images allocated up-front, cleared to black. The PBR lighting set
+        // binds them unconditionally; Phase 2 compute passes fill the content
+        // when an HDR is loaded.
+        CreateIblResources();
+
         // ── Pipelines that don't depend on allocated g-buffer image views ──
         // Render-graph pass closures (registered in SetupDeferredRenderer) read
         // `geometryPipeline` / `drawCullPipeline` / `PbrDeferredPipeline` through
@@ -439,6 +444,9 @@ public unsafe partial class Renderer
 
         // ── G-buffer sampler ────────────────────────────────────
         if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
+
+        // ── IBL images + samplers ───────────────────────────────
+        CleanupIblResources();
 
         // ── Pipelines (each pipeline disposes its own buffers, sets, layouts) ─
         transparentPipeline?.Dispose();

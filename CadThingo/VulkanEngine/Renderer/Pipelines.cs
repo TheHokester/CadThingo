@@ -1347,6 +1347,34 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
                 StageFlags = ShaderStageFlags.FragmentBit,
                 PImmutableSamplers = null,
             },
+            // ── IBL split-sum (Phase 1: bound to black-cleared images; Phase 3
+            // adds the matching declarations to PbrShader.slang). The shader is
+            // free to declare fewer bindings than the layout exposes, so adding
+            // these now causes no SPIR-V change.
+            new() // irradianceCube — Lambert hemisphere convolution (diffuse IBL).
+            {
+                Binding = 5,
+                DescriptorType = DescriptorType.CombinedImageSampler,
+                DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
+                PImmutableSamplers = null,
+            },
+            new() // prefilteredCube — per-roughness GGX-prefiltered environment.
+            {
+                Binding = 6,
+                DescriptorType = DescriptorType.CombinedImageSampler,
+                DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
+                PImmutableSamplers = null,
+            },
+            new() // brdfLut — split-sum 2D LUT (NdotV × roughness → scale,bias).
+            {
+                Binding = 7,
+                DescriptorType = DescriptorType.CombinedImageSampler,
+                DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
+                PImmutableSamplers = null,
+            },
         };
 
         // ── Set 1: G-Buffer inputs ────────────────────────────────────────────
@@ -1543,6 +1571,41 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     {
         WriteLightFrameDescriptors();
         WriteGBufferDescriptors();
+        WriteIblDescriptors();
+    }
+
+    /// <summary>Writes bindings 5/6/7 (irradiance cube, prefiltered cube, BRDF LUT)
+    /// on every per-frame lighting set. The underlying VkImage handles don't
+    /// change when content is rebaked, so this only needs to be called when the
+    /// set is first allocated — and again if the renderer ever reallocates the
+    /// IBL images.</summary>
+    public void WriteIblDescriptors()
+    {
+        var imageInfos = stackalloc DescriptorImageInfo[3]
+        {
+            new() { ImageView = Renderer.irradianceCubeView,  Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.prefilteredCubeView, Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.brdfLutView,         Sampler = Renderer.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+        };
+
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            var writes = stackalloc WriteDescriptorSet[3];
+            for (uint b = 0; b < 3; b++)
+            {
+                writes[b] = new WriteDescriptorSet
+                {
+                    SType           = StructureType.WriteDescriptorSet,
+                    DstSet          = DescriptorSets[SetLighting][i],
+                    DstBinding      = 5 + b,
+                    DstArrayElement = 0,
+                    DescriptorType  = DescriptorType.CombinedImageSampler,
+                    DescriptorCount = 1,
+                    PImageInfo      = &imageInfos[b],
+                };
+            }
+            Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
+        }
     }
 
     private void WriteLightFrameDescriptors()
