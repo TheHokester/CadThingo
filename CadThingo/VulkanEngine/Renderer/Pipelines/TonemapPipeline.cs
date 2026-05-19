@@ -54,6 +54,36 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
         };
     }
 
+    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor)
+    {
+        BeginRendering(cmd,
+            ctx.RenderExtent,
+            [finalColor],
+            colorLoad: AttachmentLoadOp.DontCare
+            );
+       
+        Vk!.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, Handle);
+
+        Viewport vp = new()
+        {
+            X = 0, Y = 0,
+            Width = ctx.RenderExtent.Width, Height = ctx.RenderExtent.Height,
+            MinDepth = 0.0f, MaxDepth = 1.0f,
+        };
+        Rect2D scissor = new(new Offset2D(0, 0), ctx.RenderExtent);
+        Vk!.CmdSetViewport(cmd, 0, 1, &vp);
+        Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
+
+        var set = GetDescriptorSet(0, 0);
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
+            Layout, 0, 1, &set, 0, null);
+        PushConstants(cmd);
+
+        Vk!.CmdDraw(cmd, 3, 1, 0, 0);
+        
+        EndRendering(cmd);
+    }
+    
     // Fullscreen triangle — no vertex inputs, no depth, no blend, no culling.
 
     protected override PipelineDepthStencilStateCreateInfo BuildDepthStencil() => new()

@@ -710,53 +710,11 @@ public unsafe partial class Renderer
         graph.AddPass("SkyboxPass", new List<string>(),
             new List<string>{"HDRColor", "Depth"}, (buffer, frameContext) =>
             {
-                if (!CadThingo.VulkanEngine.ImGui.EditorState.SkyboxEnabled) return;
-
-                RenderingAttachmentInfoKHR colorAttachment = new()
-                {
-                    SType       = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView   = graph.GetResource("HDRColor").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp      = AttachmentLoadOp.Load,
-                    StoreOp     = AttachmentStoreOp.Store,
-                };
-                RenderingAttachmentInfoKHR depthAttachment = new()
-                {
-                    SType       = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView   = graph.GetResource("Depth").ImageView,
-                    ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
-                    LoadOp      = AttachmentLoadOp.Load,
-                    StoreOp     = AttachmentStoreOp.Store,
-                };
-                RenderingInfoKHR renderingInfo = new()
-                {
-                    SType                = StructureType.RenderingInfoKhr,
-                    RenderArea           = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
-                    LayerCount           = 1,
-                    ColorAttachmentCount = 1,
-                    PColorAttachments    = (RenderingAttachmentInfo*)&colorAttachment,
-                    PDepthAttachment     = (RenderingAttachmentInfo*)&depthAttachment,
-                };
-
-                vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, skyboxPipeline.Handle);
-
-                Viewport vp = new()
-                {
-                    X = 0, Y = 0,
-                    Width = width, Height = height,
-                    MinDepth = 0.0f, MaxDepth = 1.0f,
-                };
-                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
-                vk!.CmdSetViewport(buffer, 0, 1, &vp);
-                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
-
-                var set = skyboxPipeline.GetDescriptorSet(0, currentFrame);
-                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    skyboxPipeline.Layout, 0, 1, &set, 0, null);
-
-                vk!.CmdDraw(buffer, 3, 1, 0, 0);
-                vk!.CmdEndRendering(buffer);
+                SkyboxPipeline.Attachments attachments = new(
+                    hdrColor: graph.GetResource("HDRColor").ImageView,
+                    depth: graph.GetResource("Depth").ImageView
+                );
+                skyboxPipeline.Record(buffer, frameContext, attachments);
             });
 
         // Forward+ transparent pass — blends BLEND-mode materials into HDRColor on
@@ -768,71 +726,10 @@ public unsafe partial class Renderer
         graph.AddPass("TransparentPass", new List<string>(),
             new List<string>{"HDRColor", "Depth"}, (buffer, frameContext) =>
             {
-                RenderingAttachmentInfoKHR colorAttachment = new()
-                {
-                    SType       = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView   = graph.GetResource("HDRColor").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp      = AttachmentLoadOp.Load,                  // preserve lighting pass output
-                    StoreOp     = AttachmentStoreOp.Store,
-                };
-                RenderingAttachmentInfoKHR depthAttachment = new()
-                {
-                    SType       = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView   = graph.GetResource("Depth").ImageView,
-                    ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
-                    LoadOp      = AttachmentLoadOp.Load,                  // preserve geometry pass depth
-                    StoreOp     = AttachmentStoreOp.Store,
-                };
-                RenderingInfoKHR renderingInfo = new()
-                {
-                    SType                = StructureType.RenderingInfoKhr,
-                    RenderArea           = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
-                    LayerCount           = 1,
-                    ColorAttachmentCount = 1,
-                    PColorAttachments    = (RenderingAttachmentInfo*)&colorAttachment,
-                    PDepthAttachment     = (RenderingAttachmentInfo*)&depthAttachment,
-                };
-
-                vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, transparentPipeline.Handle);
-
-                Viewport vp = new()
-                {
-                    X = 0, Y = 0,
-                    Width = width, Height = height,
-                    MinDepth = 0.0f, MaxDepth = 1.0f,
-                };
-                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
-                vk!.CmdSetViewport(buffer, 0, 1, &vp);
-                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
-
-                // Set 0: own frame UBO + shared lights/TLAS/tile buffers.
-                // Set 1: bindless materials/instances/textures/samplers (shared with GeometryPipeline).
-                var frameSet    = transparentPipeline.GetDescriptorSet(0, currentFrame);
-                var bindlessSet = Engine.ResourceManager.GetBindlessSet(currentFrame);
-                var sets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
-                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    transparentPipeline.Layout, 0, 2, sets, 0, null);
-
-                // Bind global VB/IB once — every BLEND entity references offsets into these.
-                var vb = Engine.ResourceManager.GlobalVertexBuffer;
-                var ib = Engine.ResourceManager.GlobalIndexBuffer;
-                ulong vbOffset = 0;
-                vk!.CmdBindVertexBuffers(buffer, 0, 1, &vb, &vbOffset);
-                vk!.CmdBindIndexBuffer(buffer, ib, 0, IndexType.Uint32);
-
-                // One push-constant + draw per BLEND entity, in back-to-front order
-                // set by DrawCullPipeline.Record.
-                var draws = drawCullPipeline.LastTransparentDraws;
-                for (int di = 0; di < draws.Count; di++)
-                {
-                    var d = draws[di];
-                    transparentPipeline.PushDrawConstants(buffer, d.Model, d.MaterialIndex);
-                    vk!.CmdDrawIndexed(buffer, d.IndexCount, 1, d.FirstIndex, 0, 0);
-                }
-
-                vk!.CmdEndRendering(buffer);
+                TransparentPipeline.Attachments attachments = new(
+                    hdrColor: graph.GetResource("HDRColor").ImageView,
+                    depth: graph.GetResource("Depth").ImageView);
+                transparentPipeline.Record(buffer, frameContext, drawCullPipeline.LastTransparentDraws, attachments);
             });
 
         // Post-process: sample HDRColor, apply exposure + Reinhard + inverse gamma,
@@ -842,43 +739,7 @@ public unsafe partial class Renderer
         graph.AddPass("TonemapPass", new List<string>{"HDRColor"},
             new List<string>{"FinalColor"}, (buffer, frameContext) =>
             {
-                RenderingAttachmentInfoKHR colorAttachment = new()
-                {
-                    SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("FinalColor").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp = AttachmentLoadOp.DontCare,
-                    StoreOp = AttachmentStoreOp.Store,
-                };
-                RenderingInfoKHR renderingInfo = new()
-                {
-                    SType = StructureType.RenderingInfoKhr,
-                    RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
-                    LayerCount = 1,
-                    ColorAttachmentCount = 1,
-                    PColorAttachments = (RenderingAttachmentInfo*)&colorAttachment
-                };
-
-                vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, tonemapPipeline.Handle);
-
-                Viewport vp = new()
-                {
-                    X = 0, Y = 0,
-                    Width = width, Height = height,
-                    MinDepth = 0.0f, MaxDepth = 1.0f,
-                };
-                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
-                vk!.CmdSetViewport(buffer, 0, 1, &vp);
-                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
-
-                var set = tonemapPipeline.GetDescriptorSet(0, 0);
-                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    tonemapPipeline.Layout, 0, 1, &set, 0, null);
-                tonemapPipeline.PushConstants(buffer);
-
-                vk!.CmdDraw(buffer, 3, 1, 0, 0);
-                vk!.CmdEndRendering(buffer);
+                tonemapPipeline.Record(buffer, frameContext, graph.GetResource("FinalColor").ImageView);
             });
 
         graph.Compile();

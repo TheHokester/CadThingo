@@ -366,7 +366,8 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
         ReadOnlySpan<ImageView> colorViews,
         ImageView depthView = default,
         AttachmentLoadOp colorLoad = AttachmentLoadOp.Clear,
-        AttachmentLoadOp depthLoad = AttachmentLoadOp.Clear)
+        AttachmentLoadOp depthLoad = AttachmentLoadOp.Clear,
+        ReadOnlySpan<ClearValue> clearValues = default)
     {
         var colorAttachments = stackalloc RenderingAttachmentInfoKHR[colorViews.Length];
         for (int i = 0; i < colorViews.Length; i++)
@@ -379,6 +380,7 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
                 LoadOp = colorLoad,
                 StoreOp = AttachmentStoreOp.Store
             };
+            if (clearValues.Length > i) colorAttachments[i].ClearValue = clearValues[i];
         }
         var depthAttachment = new RenderingAttachmentInfoKHR()
         {

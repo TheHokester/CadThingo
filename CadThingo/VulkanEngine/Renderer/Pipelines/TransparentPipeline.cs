@@ -80,7 +80,60 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         foreach (var b in FrameUniformBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
+    internal readonly ref struct Attachments(ImageView hdrColor, ImageView depth)
+    {
+        internal readonly ImageView HdrColor = hdrColor;
+        internal readonly ImageView Depth = depth;
+    }
 
+    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, IReadOnlyList<TransparentDraw> transparentDraws,Attachments attachments)
+    {
+        BeginRendering(cmd,
+            ctx.RenderExtent,
+            [attachments.HdrColor],
+            depthView: attachments.Depth,
+            colorLoad: AttachmentLoadOp.Load,
+            depthLoad: AttachmentLoadOp.Load
+            );
+        Vk!.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, Handle);
+
+        Viewport vp = new()
+        {
+            X = 0, Y = 0,
+            Width = ctx.RenderExtent.Width, Height = ctx.RenderExtent.Height,
+            MinDepth = 0.0f, MaxDepth = 1.0f,
+        };
+        Rect2D scissor = new(new Offset2D(0, 0), ctx.RenderExtent);
+        Vk!.CmdSetViewport(cmd, 0, 1, &vp);
+        Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
+
+        // Set 0: own frame UBO + shared lights/TLAS/tile buffers.
+        // Set 1: bindless materials/instances/textures/samplers (shared with GeometryPipeline).
+        var frameSet    = GetDescriptorSet(0, ctx.FrameIndex);
+        var bindlessSet = Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex);
+        var sets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
+            Layout, 0, 2, sets, 0, null);
+
+        // Bind global VB/IB once — every BLEND entity references offsets into these.
+        var vb = Engine.ResourceManager.GlobalVertexBuffer;
+        var ib = Engine.ResourceManager.GlobalIndexBuffer;
+        ulong vbOffset = 0;
+        Vk!.CmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+        Vk!.CmdBindIndexBuffer(cmd, ib, 0, IndexType.Uint32);
+
+        // One push-constant + draw per BLEND entity, in back-to-front order
+        // set by DrawCullPipeline.Record.
+        
+        for (int di = 0; di < transparentDraws.Count; di++)
+        {
+            var d = transparentDraws[di];
+            PushDrawConstants(cmd, d.Model, d.MaterialIndex);
+            Vk!.CmdDrawIndexed(cmd, d.IndexCount, 1, d.FirstIndex, 0, 0);
+        }
+
+        EndRendering(cmd);
+    }
     // Wire constant_id 0 (SOFT_SHADOWS) on the fragment stage — mirrors PbrDeferredPipeline.
     protected override int FillSpecializationData(
         int stageIdx,
