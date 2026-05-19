@@ -200,6 +200,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     // this frame (cached as LastRenderableCount for the geometry pass).
     public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam, Scene scene)
     {
+        
         // ── Pack RenderableInput rows from the scene ─────────────────────
         // Opaque (OPAQUE + MASK) entities go through the GPU cull → indirect-draw path.
         // BLEND entities are siphoned into _transparentDraws for the forward+ pass.

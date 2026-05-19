@@ -359,6 +359,52 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
         for (int i = 0; i < stageDefs.Length; i++) SilkMarshal.Free(entryPtrs[i]);
         Vk.DestroyShaderModule(Device, module, null);
     }
+
+    protected void BeginRendering(
+        CommandBuffer cmd,
+        Extent2D extent,
+        ReadOnlySpan<ImageView> colorViews,
+        ImageView depthView = default,
+        AttachmentLoadOp colorLoad = AttachmentLoadOp.Clear,
+        AttachmentLoadOp depthLoad = AttachmentLoadOp.Clear)
+    {
+        var colorAttachments = stackalloc RenderingAttachmentInfoKHR[colorViews.Length];
+        for (int i = 0; i < colorViews.Length; i++)
+        {
+            colorAttachments[i] = new()
+            {
+                SType = StructureType.RenderingAttachmentInfoKhr,
+                ImageView = colorViews[i],
+                ImageLayout = ImageLayout.ColorAttachmentOptimal,
+                LoadOp = colorLoad,
+                StoreOp = AttachmentStoreOp.Store
+            };
+        }
+        var depthAttachment = new RenderingAttachmentInfoKHR()
+        {
+            SType = StructureType.RenderingAttachmentInfoKhr,
+            ImageView = depthView,
+            ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
+            LoadOp = depthLoad,
+            StoreOp = AttachmentStoreOp.Store,
+            ClearValue = new ClearValue() { DepthStencil = new ClearDepthStencilValue(1.0f, 0) }
+        };
+
+        var renderingInfo = new RenderingInfoKHR()
+        {
+            SType = StructureType.RenderingInfoKhr,
+            RenderArea = new Rect2D(new Offset2D(0, 0), extent),
+            LayerCount = 1,
+            ColorAttachmentCount = (uint)colorViews.Length,
+            PColorAttachments = (RenderingAttachmentInfo*)colorAttachments,
+            PDepthAttachment = (RenderingAttachmentInfo*)&depthAttachment,
+        };
+        Vk.CmdBeginRendering(cmd, (RenderingInfo*)&renderingInfo);
+    }
+
+    protected void EndRendering(CommandBuffer cmd) => Vk.CmdEndRendering(cmd);
+    
+    
 }
 
 public abstract unsafe class ComputePipeline : PipelineBase

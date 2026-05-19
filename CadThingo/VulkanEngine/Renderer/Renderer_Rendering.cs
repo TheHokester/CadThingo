@@ -342,9 +342,19 @@ public unsafe partial class Renderer
         vk!.DeviceWaitIdle(device);
         RebuildRenderTargets(width, height);
     }
-
+    public readonly ref struct FrameContext
+    {
+        public readonly uint     FrameIndex { get; init;}
+        public readonly Camera   Camera { get; init;}
+        public readonly Scene    Scene { get; init;}
+        public readonly Extent2D RenderExtent { get; init;}
+        // bindless descriptor set, current view/proj/inv matrices precomputed, etc.
+    }
     public void DrawFrame()
     {
+        
+        
+        
         // 0. Apply any pending render-extent request from the ViewportPanel.
         //    Requests are 1 frame stale (the panel computes size during ImGui
         //    construction inside the previous frame's DrawFrame); that's fine.
@@ -362,6 +372,13 @@ public unsafe partial class Renderer
         if (pendingPbrRebuild)     { RebuildPbrPipelines();     pendingPbrRebuild     = false; }
         if (pendingTonemapRebuild) { RebuildTonemapPipeline();  pendingTonemapRebuild = false; }
 
+        var ctx = new FrameContext()
+        {
+            FrameIndex = currentFrame,
+            Camera = camera,
+            RenderExtent = renderExtent,
+            Scene = scene
+        };
         // 1. CPU/GPU sync for this slot
         vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
 

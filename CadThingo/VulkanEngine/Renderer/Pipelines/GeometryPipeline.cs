@@ -1,4 +1,6 @@
 ﻿using System.Numerics;
+using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.GLTF;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
@@ -36,6 +38,106 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     {
         foreach (var ubo in GeometryUniformBuffers) Renderer.DestroyBuffer(ubo.buffer, ubo.alloc);
         base.Dispose();
+    }
+
+    public readonly ref struct Attachments(
+        ImageView position,
+        ImageView normal,
+        ImageView albedo,
+        ImageView material,
+        ImageView emissive,
+        ImageView depth)
+    {
+        public readonly ImageView Position = position, Normal = normal, Albedo = albedo, Material = material, Emissive = emissive, Depth = depth;
+    }
+
+    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, UboBuffer indirectCmd,
+        UboBuffer indirectCount, uint drawCount, Attachments attachments)
+    {
+        BeginRendering(cmd,
+            ctx.RenderExtent, 
+            [
+                attachments.Position,
+                attachments.Normal,
+                attachments.Albedo,
+                attachments.Material,
+                attachments.Emissive
+            ], 
+            attachments.Depth
+            );
+        
+        
+        // Pipeline + dynamic state
+        Vk!.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, Handle);
+
+        Viewport vp = new()
+        {
+            X = 0, Y = 0,
+            Width = ctx.RenderExtent.Width, Height = ctx.RenderExtent.Height,
+            MinDepth = 0.0f, MaxDepth = 1.0f,
+        };
+        Rect2D scissor = new(new Offset2D(0, 0), ctx.RenderExtent);
+        Vk!.CmdSetViewport(cmd, 0, 1, &vp);
+        Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
+
+        // Set 0 (FrameUBO) + Set 1 (bindless: materials/instances/textures/samplers)
+        // bound once. The whole geometry pass issues zero per-draw rebinds and zero
+        // push constants — model + materialIndex live in the per-instance SSBO.
+        var frameSet = GetDescriptorSet(0, ctx.FrameIndex);
+        var bindlessSet = Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex);
+        var geomSets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
+            Layout, 0, 2, geomSets, 0, null);
+
+        // Bind global VB/IB once — every mesh is packed into these
+        var vb = Engine.ResourceManager.GlobalVertexBuffer;
+        var ib = Engine.ResourceManager.GlobalIndexBuffer;
+        ulong vbOffset = 0;
+        Vk!.CmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+        Vk!.CmdBindIndexBuffer(cmd, ib, 0, IndexType.Uint32);
+
+        // ── Upload per-frame material SSBO ──────────────────────────────
+        // Copy every scene material followed by a fallback at slot [matCount] used by
+        // entities without a glTF material (legacy/proc geometry).
+        int matCount = ctx.Scene.MaterialCount;
+        if (matCount + 1 > (int)Renderer.MAX_MATERIALS)
+            throw new InvalidOperationException($"Scene material count ({matCount}) exceeds MAX_MATERIALS ({Renderer.MAX_MATERIALS}).");
+
+        PbrMaterial* matPtr = (PbrMaterial*)Engine.ResourceManager.GetMaterialMapped(ctx.FrameIndex);
+        for (int mi = 0; mi < matCount; mi++) matPtr[mi] = ctx.Scene.Materials[mi];
+
+        int fallbackMatIdx = matCount;
+        matPtr[fallbackMatIdx] = new PbrMaterial
+        {
+            BaseColorFactor       = new Vector4(1, 1, 1, 1),
+            EmissiveFactor        = Vector3.Zero,
+            AlphaCutoff           = 0f,
+            MetallicFactor        = 0.3f,
+            RoughnessFactor       = 0.7f,
+            Flags                 = 0,
+            BaseColorTex          = GltfDefaults.BaseColorIndex,
+            PhysicalDescriptorTex = GltfDefaults.MetallicRoughnessIndex,
+            NormalTex             = GltfDefaults.NormalIndex,
+            OcclusionTex          = GltfDefaults.OcclusionIndex,
+            EmissiveTex           = GltfDefaults.EmissiveIndex,
+        };
+
+        // ── GPU-driven indirect draw ────────────────────────────────────
+        // The draw-cull compute pass already populated:
+        //   - InstanceStorageBuffers (ResourceManager): per-visible-renderable model
+        //     + materialIndex, read by the VS via SV_InstanceID.
+        //   - IndirectCmdBuffers     (DrawCullPipeline): VkDrawIndexedIndirectCommand[]
+        //                                                visible mesh draws.
+        //   - IndirectCountBuffers   (DrawCullPipeline): single uint of valid entries.
+        // A single vkCmdDrawIndexedIndirectCount consumes them all.
+        if (drawCount > 0)
+        {
+            Vk!.CmdDrawIndexedIndirectCount(cmd,
+                indirectCmd.buffer, 0,
+                indirectCount.buffer, 0,
+                drawCount,
+                (uint)sizeof(DrawIndexedIndirectCommandGpu));
+        }
     }
     protected override void CreateDescriptorSetLayouts()
     {
