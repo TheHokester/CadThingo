@@ -45,7 +45,8 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         foreach (var b in FrameUniformBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
-
+    
+    
     // ── Pipeline state ─────────────────────────────────────────────────────
 
     // Depth test EQUAL @ 1.0. The vertex shader writes gl_Position.z = 1.0

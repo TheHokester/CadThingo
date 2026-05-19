@@ -2,6 +2,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
@@ -442,7 +443,7 @@ public unsafe partial class Renderer
         lightCullPipeline.Record(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
 
         // 6. Record all render-graph passes (geometry → lighting), record-only.
-        scene.renderGraph.Execute(cmd);
+        scene.renderGraph.Execute(cmd, frameContext: ctx);
 
         // 7. Blit FinalColor → swapchain image
         var swapImage = swapChainImages[imageIndex];
@@ -569,7 +570,7 @@ public unsafe partial class Renderer
     /// <summary>
     /// Refactor of existing rendering code in DrawFrame(), the logic unique to DrawFrame()
     /// </summary>
-    private void DrawDeferred(CommandBuffer cmd)
+    private void DrawDeferred(CommandBuffer cmd, FrameContext frameContext)
     {
         // Reflection-probe scheduler bookkeeping. Cheap CPU-only walk; the
         //     capture draw + prefilter dispatch land in Phase 4. Runs before the
@@ -610,7 +611,7 @@ public unsafe partial class Renderer
         lightCullPipeline.Record(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
 
         // 6. Record all render-graph passes (geometry → lighting), record-only.
-        scene.renderGraph.Execute(cmd);
+        scene.renderGraph.Execute(cmd, frameContext);
     }
 
     private void DrawRayQueried()
@@ -677,219 +678,27 @@ public unsafe partial class Renderer
         //configure geometry pass for G-buffer population
         //this pass renders all geometry and stores intermediate data for lighting calculations
         graph.AddPass("GeometryPass", default,
-            new List<string> { "GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "GBuffer_Emissive", "Depth" }, buffer =>
-            {
-                //Configure multiple render target attachments for GBuffer output
-                //each attachment corresponds to a seperate geometric property
-                RenderingAttachmentInfoKHR* colorAttachments = stackalloc RenderingAttachmentInfoKHR[5];
-                colorAttachments[0] = new()
-                {
-                    SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("GBuffer_Position").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp = AttachmentLoadOp.Clear,
-                    StoreOp = AttachmentStoreOp.Store
-                };
-                colorAttachments[1] = new()
-                {
-                    SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("GBuffer_Normal").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp = AttachmentLoadOp.Clear,
-                    StoreOp = AttachmentStoreOp.Store
-                };
-                colorAttachments[2] = new()
-                {
-                    SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("GBuffer_Albedo").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp = AttachmentLoadOp.Clear,
-                    StoreOp = AttachmentStoreOp.Store
-                };
-                colorAttachments[3] = new()
-                {
-                    SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("GBuffer_Material").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp = AttachmentLoadOp.Clear,
-                    StoreOp = AttachmentStoreOp.Store
-                };
-                colorAttachments[4] = new()
-                {
-                    SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("GBuffer_Emissive").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp = AttachmentLoadOp.Clear,
-                    StoreOp = AttachmentStoreOp.Store
-                };
-                //Configure depth attachment for occlusion culling
-                RenderingAttachmentInfoKHR depthAttachment = new()
-                {
-                    SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("Depth").ImageView,
-                    ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
-                    LoadOp = AttachmentLoadOp.Clear,
-                    StoreOp = AttachmentStoreOp.Store,
-                    ClearValue = new ClearValue() { DepthStencil = new ClearDepthStencilValue(1.0f, 0) }
-                };
-                //assemble complete rendering config
-                RenderingInfoKHR renderingInfo = new()
-                {
-                    SType = StructureType.RenderingInfoKhr,
-                    RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
-                    LayerCount = 1,
-                    ColorAttachmentCount = 5,
-                    PColorAttachments = (RenderingAttachmentInfo*)colorAttachments,
-                    PDepthAttachment = (RenderingAttachmentInfo*)&depthAttachment
-                };
+            new List<string> { "GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "GBuffer_Emissive", "Depth" },
+            (buffer, frameContext) => {
+                var indirectCmd = drawCullPipeline.GetIndirectCmdBuffer(frameContext.FrameIndex);
+                var indirectCount = drawCullPipeline.GetIndirectCountBuffer(frameContext.FrameIndex);
+                var drawCount = drawCullPipeline.LastRenderableCount;
+                var attachments = new GeometryPipeline.Attachments(
+                    position:  graph.GetResource("GBuffer_Position").ImageView,
+                    normal:    graph.GetResource("GBuffer_Normal").ImageView,
+                    albedo:    graph.GetResource("GBuffer_Albedo").ImageView,
+                    material:  graph.GetResource("GBuffer_Material").ImageView,
+                    emissive:  graph.GetResource("GBuffer_Emissive").ImageView,
+                    depth:     graph.GetResource("Depth").ImageView);
                 
-                //execute geometry rendering with dynamic rendering
-                vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-
-                // Pipeline + dynamic state
-                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, geometryPipeline.Handle);
-
-                Viewport vp = new()
-                {
-                    X = 0, Y = 0,
-                    Width = width, Height = height,
-                    MinDepth = 0.0f, MaxDepth = 1.0f,
-                };
-                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
-                vk!.CmdSetViewport(buffer, 0, 1, &vp);
-                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
-
-                // Set 0 (FrameUBO) + Set 1 (bindless: materials/instances/textures/samplers)
-                // bound once. The whole geometry pass issues zero per-draw rebinds and zero
-                // push constants — model + materialIndex live in the per-instance SSBO.
-                var frameSet = geometryPipeline.GetDescriptorSet(0, currentFrame);
-                var bindlessSet = Engine.ResourceManager.GetBindlessSet(currentFrame);
-                var geomSets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
-                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    geometryPipeline.Layout, 0, 2, geomSets, 0, null);
-
-                // Bind global VB/IB once — every mesh is packed into these
-                var vb = Engine.ResourceManager.GlobalVertexBuffer;
-                var ib = Engine.ResourceManager.GlobalIndexBuffer;
-                ulong vbOffset = 0;
-                vk!.CmdBindVertexBuffers(buffer, 0, 1, &vb, &vbOffset);
-                vk!.CmdBindIndexBuffer(buffer, ib, 0, IndexType.Uint32);
-
-                // ── Upload per-frame material SSBO ──────────────────────────────
-                // Copy every scene material followed by a fallback at slot [matCount] used by
-                // entities without a glTF material (legacy/proc geometry).
-                int matCount = scene.MaterialCount;
-                if (matCount + 1 > (int)MAX_MATERIALS)
-                    throw new InvalidOperationException($"Scene material count ({matCount}) exceeds MAX_MATERIALS ({MAX_MATERIALS}).");
-
-                PbrMaterial* matPtr = (PbrMaterial*)Engine.ResourceManager.GetMaterialMapped(currentFrame);
-                for (int mi = 0; mi < matCount; mi++) matPtr[mi] = scene.Materials[mi];
-
-                int fallbackMatIdx = matCount;
-                matPtr[fallbackMatIdx] = new PbrMaterial
-                {
-                    BaseColorFactor       = new Vector4(1, 1, 1, 1),
-                    EmissiveFactor        = Vector3.Zero,
-                    AlphaCutoff           = 0f,
-                    MetallicFactor        = 0.3f,
-                    RoughnessFactor       = 0.7f,
-                    Flags                 = 0,
-                    BaseColorTex          = GltfDefaults.BaseColorIndex,
-                    PhysicalDescriptorTex = GltfDefaults.MetallicRoughnessIndex,
-                    NormalTex             = GltfDefaults.NormalIndex,
-                    OcclusionTex          = GltfDefaults.OcclusionIndex,
-                    EmissiveTex           = GltfDefaults.EmissiveIndex,
-                };
-
-                // ── GPU-driven indirect draw ────────────────────────────────────
-                // The draw-cull compute pass already populated:
-                //   - InstanceStorageBuffers (ResourceManager): per-visible-renderable model
-                //     + materialIndex, read by the VS via SV_InstanceID.
-                //   - IndirectCmdBuffers     (DrawCullPipeline): VkDrawIndexedIndirectCommand[]
-                //                                                visible mesh draws.
-                //   - IndirectCountBuffers   (DrawCullPipeline): single uint of valid entries.
-                // A single vkCmdDrawIndexedIndirectCount consumes them all.
-                uint renderableCount = drawCullPipeline.LastRenderableCount;
-                if (renderableCount > 0)
-                {
-                    vk!.CmdDrawIndexedIndirectCount(buffer,
-                        drawCullPipeline.GetIndirectCmdBuffer  (currentFrame), 0,
-                        drawCullPipeline.GetIndirectCountBuffer(currentFrame), 0,
-                        renderableCount,
-                        (uint)sizeof(DrawIndexedIndirectCommandGpu));
-                }
-
-                vk!.CmdEndRendering(buffer);
+                geometryPipeline.Record(buffer, frameContext, indirectCmd, indirectCount, drawCount, attachments);
             });
         
         
         graph.AddPass("LightingPass", new List<string>{"GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "GBuffer_Emissive", "Depth"},
-            new List<string>{"HDRColor"}, buffer =>
+            new List<string>{"HDRColor"}, (buffer, frameContext) =>
             {
-                //configure single color output for final lighting result
-                RenderingAttachmentInfoKHR colorAttachment = new()
-                {
-                    SType = StructureType.RenderingAttachmentInfoKhr,
-                    ImageView = graph.GetResource("HDRColor").ImageView,
-                    ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                    LoadOp = AttachmentLoadOp.Clear,
-                    StoreOp = AttachmentStoreOp.Store,
-                    // Sky pixels take the early-out path in the PBR shader so this
-                    // clear is exactly what shows behind the scene when the skybox
-                    // toggle is off. Read from the panel each frame so the color
-                    // picker is fully live.
-                    ClearValue = new ClearValue() { Color = new ClearColorValue(
-                        ImGui.EditorState.BackgroundColor.X,
-                        ImGui.EditorState.BackgroundColor.Y,
-                        ImGui.EditorState.BackgroundColor.Z,
-                        1.0f) }
-                };
-                //Configure lighting pass rendeirng without depth testing 
-                //unnecessary since we're processing each pixel exactly once
-                RenderingInfoKHR renderingInfo = new()
-                {
-                    SType = StructureType.RenderingInfoKhr,
-                    RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(width, height)),
-                    LayerCount = 1,
-                    ColorAttachmentCount = 1,
-                    PColorAttachments = (RenderingAttachmentInfo*)&colorAttachment
-                };
-                
-                //execute screen space lighting calcs.
-                vk!.CmdBeginRendering(buffer, (RenderingInfo*)&renderingInfo);
-
-                vk!.CmdBindPipeline(buffer, PipelineBindPoint.Graphics, PbrDeferredPipeline.Handle);
-
-                Viewport vp = new()
-                {
-                    X = 0, Y = 0,
-                    Width = width, Height = height,
-                    MinDepth = 0.0f, MaxDepth = 1.0f,
-                };
-                Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(width, height));
-                vk!.CmdSetViewport(buffer, 0, 1, &vp);
-                vk!.CmdSetScissor(buffer, 0, 1, &scissor);
-
-                // Set 0 = per-frame LightingUBO + Lights SSBO + TLAS + tile cull buffers.
-                // Set 1 = shared G-buffer samplers (single allocation reused every frame).
-                // No push constants — lighting pass reads everything from descriptor bindings.
-                // Set 2 = shadow-alpha (ShadowEntityInfo + global vb/ib).
-                // Set 3 = bindless materials/textures/samplers, owned by ResourceManager.
-                // The shadow-ray Proceed loop in PbrShader.slang reads both at hit time.
-                var sets = stackalloc DescriptorSet[4]
-                {
-                    PbrDeferredPipeline.GetDescriptorSet(0, currentFrame),
-                    PbrDeferredPipeline.GetDescriptorSet(1, 0),
-                    PbrDeferredPipeline.GetDescriptorSet(2, 0),
-                    Engine.ResourceManager.GetBindlessSet(currentFrame),
-                };
-                vk!.CmdBindDescriptorSets(buffer, PipelineBindPoint.Graphics,
-                    PbrDeferredPipeline.Layout, 0, 4, sets, 0, null);
-
-                // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
-                vk!.CmdDraw(buffer, 3, 1, 0, 0);
-
-                vk!.CmdEndRendering(buffer);
+                PbrDeferredPipeline.Record(buffer, frameContext, graph.GetResource("HDRColor").ImageView);
             });
 
         // Skybox pass — runs between lighting and transparent. Depth-tested
@@ -899,7 +708,7 @@ public unsafe partial class Renderer
         // here LOAD_OP_LOAD preserves the lit framebuffer and the skybox just
         // overwrites the black sky.
         graph.AddPass("SkyboxPass", new List<string>(),
-            new List<string>{"HDRColor", "Depth"}, buffer =>
+            new List<string>{"HDRColor", "Depth"}, (buffer, frameContext) =>
             {
                 if (!CadThingo.VulkanEngine.ImGui.EditorState.SkyboxEnabled) return;
 
@@ -957,7 +766,7 @@ public unsafe partial class Renderer
         // and the current-layout tracker preserves HDR contents for blending.
         // Body is a stub for stage 3 — pipeline + attachments bind but no draws.
         graph.AddPass("TransparentPass", new List<string>(),
-            new List<string>{"HDRColor", "Depth"}, buffer =>
+            new List<string>{"HDRColor", "Depth"}, (buffer, frameContext) =>
             {
                 RenderingAttachmentInfoKHR colorAttachment = new()
                 {
@@ -1031,7 +840,7 @@ public unsafe partial class Renderer
         // (TransferSrcOptimal) is honoured by the post-pass barrier, keeping
         // the existing blit-to-swapchain path unchanged.
         graph.AddPass("TonemapPass", new List<string>{"HDRColor"},
-            new List<string>{"FinalColor"}, buffer =>
+            new List<string>{"FinalColor"}, (buffer, frameContext) =>
             {
                 RenderingAttachmentInfoKHR colorAttachment = new()
                 {
@@ -1171,7 +980,7 @@ public unsafe class RenderGraph : IDisposable
     /// <param name="inputs"></param>
     /// <param name="outputs"></param>
     /// <param name="executeFunc"></param>
-    public void AddPass(string name, List<string> inputs, List<string> outputs, Action<CommandBuffer> executeFunc)
+    public void AddPass(string name, List<string> inputs, List<string> outputs, Action<CommandBuffer, Renderer.FrameContext> executeFunc)
     {
         Pass pass = new(name, inputs, outputs)
         {
@@ -1285,7 +1094,7 @@ public unsafe class RenderGraph : IDisposable
     /// into the provided command buffer. Caller owns Begin/End/Submit and the
     /// imageAvailable/renderFinished semaphores.
     /// </summary>
-    public void Execute(CommandBuffer cmd)
+    public void Execute(CommandBuffer cmd, Renderer.FrameContext frameContext)
     {
         if (!_compiled)
             throw new InvalidOperationException("Call Compile() before Execute().");
@@ -1382,7 +1191,7 @@ public unsafe class RenderGraph : IDisposable
             }
 
             //----- Execute pass-------------------
-            pass.ExecuteFunc(cmd);
+            pass.ExecuteFunc(cmd, frameContext);
 
             //----- Barrier: transition outputs -> resource._finalLayout
             foreach (var outputName in pass._outputs)
@@ -1718,11 +1527,11 @@ public unsafe struct Pass
     public void AddInput(string input) => _inputs.Add(input);
     public void AddOutput(string output) => _outputs.Add(output);
 
-    public Action<CommandBuffer> ExecuteFunc { get; set; } = _ => { };
+    public Action<CommandBuffer, Renderer.FrameContext> ExecuteFunc { get; set; } = (_, _) => { };
     
     
     // Builder helpers — lets callers chain 
     public Pass ReadsFrom (string resourceName) { _inputs .Add(resourceName); return this; }
     public Pass WritesTo  (string resourceName) { _outputs.Add(resourceName); return this; }
-    public Pass Executes  (Action<CommandBuffer> fn) { ExecuteFunc = fn; return this; }
+    public Pass Executes  (Action<CommandBuffer, Renderer.FrameContext> fn) { ExecuteFunc = fn; return this; }
 }

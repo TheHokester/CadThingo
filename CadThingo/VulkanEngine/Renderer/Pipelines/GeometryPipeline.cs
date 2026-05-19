@@ -51,8 +51,8 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         public readonly ImageView Position = position, Normal = normal, Albedo = albedo, Material = material, Emissive = emissive, Depth = depth;
     }
 
-    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, UboBuffer indirectCmd,
-        UboBuffer indirectCount, uint drawCount, Attachments attachments)
+    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, Buffer indirectCmd,
+        Buffer indirectCount, uint drawCount, Attachments attachments)
     {
         BeginRendering(cmd,
             ctx.RenderExtent, 
@@ -133,11 +133,14 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         if (drawCount > 0)
         {
             Vk!.CmdDrawIndexedIndirectCount(cmd,
-                indirectCmd.buffer, 0,
-                indirectCount.buffer, 0,
+                indirectCmd, 0,
+                indirectCount, 0,
                 drawCount,
                 (uint)sizeof(DrawIndexedIndirectCommandGpu));
         }
+        
+        EndRendering(cmd);
+        
     }
     protected override void CreateDescriptorSetLayouts()
     {

@@ -78,6 +78,44 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         base.Dispose();
     }
 
+    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, ImageView HdrTarget)
+    {
+        //configure single color output for final lighting result
+
+        BeginRendering(cmd, ctx.RenderExtent, [HdrTarget]);
+        Vk!.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, Handle);
+
+        Viewport vp = new()
+        {
+            X = 0, Y = 0,
+            Width = ctx.RenderExtent.Width, Height = ctx.RenderExtent.Height,
+            MinDepth = 0.0f, MaxDepth = 1.0f,
+        };
+        Rect2D scissor = new(new Offset2D(0, 0), ctx.RenderExtent);
+        Vk!.CmdSetViewport(cmd, 0, 1, &vp);
+        Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
+
+        // Set 0 = per-frame LightingUBO + Lights SSBO + TLAS + tile cull buffers.
+        // Set 1 = shared G-buffer samplers (single allocation reused every frame).
+        // No push constants — lighting pass reads everything from descriptor bindings.
+        // Set 2 = shadow-alpha (ShadowEntityInfo + global vb/ib).
+        // Set 3 = bindless materials/textures/samplers, owned by ResourceManager.
+        // The shadow-ray Proceed loop in PbrShader.slang reads both at hit time.
+        var sets = stackalloc DescriptorSet[4]
+        {
+            GetDescriptorSet(0, ctx.FrameIndex),
+            GetDescriptorSet(1, 0),
+            GetDescriptorSet(2, 0),
+            Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex),
+        };
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
+            Layout, 0, 4, sets, 0, null);
+
+        // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
+        Vk!.CmdDraw(cmd, 3, 1, 0, 0);
+        
+        EndRendering(cmd);
+    }
     // ── Shader-stage overrides ─────────────────────────────────────────────
     // Lighting pass is a fullscreen triangle synthesized by SV_VertexID; depth
     // test is off, alpha blending off.
