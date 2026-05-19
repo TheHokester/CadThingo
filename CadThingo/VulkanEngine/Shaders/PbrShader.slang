@@ -11,7 +11,7 @@ struct LightingFrameUBO {
     float4 camPos;                      // Camera position for view-dependent effects
     float _padExposure;                 // formerly exposure — tone-map moved to dedicated post pass
     float _padGamma;                    // formerly gamma — tone-map moved to dedicated post pass
-    float prefilteredCubeMipLevels;     // IBL prefiltered environment map mip levels
+    float prefilteredCubeMipLevels;     // global IBL prefiltered env map mip levels
     float scaleIBLAmbient;              // IBL ambient contribution scale
     uint  lightCount;                   // Number of valid entries in lights[]
     uint  tileCountX;                   // Phase 4 — tiles across the screen
@@ -20,6 +20,26 @@ struct LightingFrameUBO {
     float2 screenSize;                  // pixels (matches CPU swapChainExtent)
     uint  _pad1;
     uint  _pad2;
+    // Reflection-probe cluster dims. Tile-only today (Z = 1); when 3D froxels
+    // land Z > 1 and the cluster index computation below picks up the slice.
+    uint  probeClusterDimsX;
+    uint  probeClusterDimsY;
+    uint  probeClusterDimsZ;
+    float probeMipLevels;               // mip count of probe cubemap array (256² → 9)
+};
+
+// Layout mirrors ReflectionProbeSystem.ProbeGpuRecord (32B std430).
+struct ProbeRecord {
+    float4 positionRadius;
+    uint   cubeArraySlot;
+    uint   _pad0;
+    uint   _pad1;
+    uint   _pad2;
+};
+// Layout mirrors ProbeClusterGrid.ClusterRange (8B std430).
+struct ProbeClusterRange {
+    uint offset;
+    uint count;
 };
 
 #include "PbrUtils.slang"
@@ -41,6 +61,14 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 [[vk::binding(5, 0)]] SamplerCube                           irradianceCube;
 [[vk::binding(6, 0)]] SamplerCube                           prefilteredCube;
 [[vk::binding(7, 0)]] Sampler2D                             brdfLut;
+
+// Reflection-probe bindings. Empty / zero-probe scenes still bind well-defined
+// resources — empty clusterRange.count makes the loop a no-op and the global
+// IBL fallback takes over.
+[[vk::binding(8,  0)]] SamplerCubeArray                     probeCubeArray;
+[[vk::binding(9,  0)]] StructuredBuffer<ProbeRecord>        probes;
+[[vk::binding(10, 0)]] StructuredBuffer<ProbeClusterRange>  probeClusterRange;
+[[vk::binding(11, 0)]] StructuredBuffer<uint>               probeIndexList;
 
 // Specialization constants — picked up via VkSpecializationInfo at pipeline build.
 // SOFT_SHADOWS off (default) → single-ray binary occlusion (the original path).
@@ -439,9 +467,62 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     float3 diffuseIBL    = irradianceVal * baseColor.rgb;
 
     float  maxMip          = max(ubo.prefilteredCubeMipLevels - 1.0, 0.0);
-    float3 prefilteredVal  = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
     float2 envBRDF         = brdfLut.SampleLevel(float2(NdotV_ibl, roughness), 0).xy;
-    float3 specularIBL     = prefilteredVal * (F_ibl * envBRDF.x + envBRDF.y);
+
+    // Probe-blend specular: walk the cluster's probe list and accumulate
+    // distance-weighted samples from probeCubeArray. Fragments outside any
+    // probe's influence sphere fall back to the global IBL prefiltered cube
+    // — this is the empty-scene / no-probe-yet path and matches pre-Phase-7
+    // output exactly when no probes are registered.
+    float3 specularInput = float3(0.0);
+    {
+        uint cx = min((uint)(input.Position.x) / TILE_SIZE_PX, ubo.probeClusterDimsX - 1u);
+        uint cy = min((uint)(input.Position.y) / TILE_SIZE_PX, ubo.probeClusterDimsY - 1u);
+        // Z slice = 0 today; when 3D froxels land cz is computed from view-Z
+        // and the same cluster index math handles it without further edits.
+        uint cz = 0u;
+        uint clusterIdx = cx + cy * ubo.probeClusterDimsX
+                       + cz * ubo.probeClusterDimsX * ubo.probeClusterDimsY;
+
+        ProbeClusterRange r = probeClusterRange[clusterIdx];
+
+        float maxMipProbe = max(ubo.probeMipLevels - 1.0, 0.0);
+        float3 accum = float3(0.0);
+        float  totalW = 0.0;
+        for (uint p = 0u; p < r.count; p++) {
+            uint probeIdx = probeIndexList[r.offset + p];
+            ProbeRecord rec = probes[probeIdx];
+
+            float3 d   = WorldPos - rec.positionRadius.xyz;
+            float dist = length(d);
+            float rad  = rec.positionRadius.w;
+            if (rad <= 0.0 || dist >= rad) continue;
+
+            // Plateau-then-fade weight: full strength out to ~half the radius,
+            // then a smooth cubic fall-off to 0 at the boundary. Quadratic /
+            // linear falloffs hand off to the global IBL too early — by
+            // half-radius the coverage is already < 0.5 and the probe barely
+            // shows.
+            float w = 1.0 - smoothstep(rad * 0.5, rad, dist);
+
+            float3 sample = probeCubeArray.SampleLevel(
+                float4(R, (float)rec.cubeArraySlot),
+                roughness * maxMipProbe).rgb;
+            accum += sample * w;
+            totalW += w;
+        }
+
+        // Use totalW as a coverage factor that lerps from global IBL → probe blend.
+        // Without this, the probes' normalized accumulation contributes at full
+        // strength right up to the influence sphere boundary then snaps to IBL —
+        // visible as a hard edge. With it, totalW≈0 (sphere edge) leans on the
+        // global cube; totalW≥1 (well inside one or more probes) is pure probe.
+        float3 globalIBL = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
+        float coverage   = saturate(totalW);
+        float3 probeBlend = (totalW > 1e-5) ? (accum / totalW) : float3(0.0);
+        specularInput = lerp(globalIBL, probeBlend, coverage);
+    }
+    float3 specularIBL     = specularInput * (F_ibl * envBRDF.x + envBRDF.y);
 
     float3 ambient = (kD_ibl * diffuseIBL + specularIBL) * ao * ubo.scaleIBLAmbient;
 

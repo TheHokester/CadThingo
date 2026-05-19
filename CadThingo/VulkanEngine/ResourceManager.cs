@@ -101,11 +101,11 @@ public unsafe class ResourceManager
     private Renderer.Renderer _renderer;
 
     private Buffer globalVertexBuffer;
-    private DeviceMemory globalVertexBufferMemory;
+    private SubAlloc globalVertexBufferAlloc;
     private int vertexWriteOffset;   // in vertices
 
     private Buffer globalIndexBuffer;
-    private DeviceMemory globalIndexBufferMemory;
+    private SubAlloc globalIndexBufferAlloc;
     private int indexWriteOffset;    // in indices
 
     private const int MAX_VERTICES = 1 << 22;   // 4M vertices
@@ -120,9 +120,6 @@ public unsafe class ResourceManager
 
     public Buffer GlobalVertexBuffer => globalVertexBuffer;
     public Buffer GlobalIndexBuffer  => globalIndexBuffer;
-
-    public DeviceMemory GlobalVertexBufferMemory => globalVertexBufferMemory;
-    public DeviceMemory GlobalIndexBufferMemory  => globalIndexBufferMemory;
     
     // Total vertices uploaded so far. Used as a conservative MaxVertex for AS builds —
     // safe because every mesh's index range is rebased into [0, VertexHighWater).
@@ -159,14 +156,14 @@ public unsafe class ResourceManager
             BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
-            out globalVertexBuffer, out globalVertexBufferMemory);
+            out globalVertexBuffer, out globalVertexBufferAlloc);
 
         renderer.CreateBuffer(ibSize,
             BufferUsageFlags.IndexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
             BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
-            out globalIndexBuffer, out globalIndexBufferMemory);
+            out globalIndexBuffer, out globalIndexBufferAlloc);
         
         CreateBindlessDescriptorSetLayout();
         for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
@@ -235,12 +232,15 @@ public unsafe class ResourceManager
         ReleaseAll();
         if (_renderer != null)
         {
-            _renderer.DestroyBuffer(globalVertexBuffer, globalVertexBufferMemory);
-            _renderer.DestroyBuffer(globalIndexBuffer,  globalIndexBufferMemory);
+            _renderer.DestroyBuffer(globalVertexBuffer, globalVertexBufferAlloc);
+            _renderer.DestroyBuffer(globalIndexBuffer,  globalIndexBufferAlloc);
 
             vk!.DestroySampler(device, defaultBindlessSampler, null);
-            _renderer.DestroyBuffer(MaterialStorageBuffers[0].buffer, MaterialStorageBuffers[0].memory);
-            _renderer.DestroyBuffer(InstanceStorageBuffers[0].buffer, InstanceStorageBuffers[0].memory);
+            for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+            {
+                _renderer.DestroyBuffer(MaterialStorageBuffers[i].buffer, MaterialStorageBuffers[i].alloc);
+                _renderer.DestroyBuffer(InstanceStorageBuffers[i].buffer, InstanceStorageBuffers[i].alloc);
+            }
 
             // Bindless descriptor set layout is created in CreateBindlessDescriptorSetLayout
             // and owned here — GeometryPipeline borrows it via GetBindlessLayout.

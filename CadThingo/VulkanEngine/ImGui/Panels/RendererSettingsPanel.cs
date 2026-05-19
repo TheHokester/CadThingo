@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using CadThingo.VulkanEngine.Renderer;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using ImGuiNET;
 
 namespace CadThingo.VulkanEngine.ImGui.Panels;
@@ -48,11 +49,80 @@ public static class RendererSettingsPanel
         }
 
         DrawEnvironment(renderer);
+        DrawReflectionProbes(renderer);
         DrawTonemap(renderer);
         DrawShadows(renderer);
         DrawBackground();
 
         ImGuiNET.ImGui.End();
+    }
+
+    // ── Reflection probes ─────────────────────────────────────────────────
+
+    static void DrawReflectionProbes(Renderer.Renderer renderer)
+    {
+        ImGuiNET.ImGui.SeparatorText("Reflection Probes");
+
+        var probeSys = renderer.reflectionProbeSystem;
+        if (probeSys == null)
+        {
+            ImGuiNET.ImGui.TextDisabled("Probe system not ready.");
+            return;
+        }
+
+        // Slot usage summary. Capture pipeline status is surfaced here so the
+        // user knows whether ProbeCapture.spv was found at startup — without
+        // it, registered probes register but never capture.
+        int used = probeSys.Probes.Count;
+        int total = (int)ReflectionProbeSystem.MaxProbes;
+        ImGuiNET.ImGui.Text($"Slots: {used} / {total}");
+        if (probeSys.capturePipeline == null)
+        {
+            ImGuiNET.ImGui.SameLine();
+            ImGuiNET.ImGui.TextColored(new Vector4(1f, 0.5f, 0.3f, 1f),
+                "  Capture shader missing (run shaderCompile.bat)");
+        }
+
+        if (ImGuiNET.ImGui.Button("Spawn probe at camera"))
+            SpawnProbeAtCamera(renderer);
+        ImGuiNET.ImGui.SameLine();
+        if (ImGuiNET.ImGui.Button("Force recapture all"))
+        {
+            foreach (var p in probeSys.Probes) p.Dirty = true;
+        }
+    }
+
+    static unsafe void SpawnProbeAtCamera(Renderer.Renderer renderer)
+    {
+        // Position the new probe at the camera's eye. The scheduler picks it up
+        // on the next frame (first-time probes go to the front of the queue),
+        // so the user sees the probe contribute within a frame or two.
+        var probeSys = renderer.reflectionProbeSystem;
+        if (probeSys.Probes.Count >= ReflectionProbeSystem.MaxProbes)
+        {
+            Console.WriteLine("[Probe] Cannot spawn — slot pool full.");
+            return;
+        }
+
+        var camPos = renderer.Camera.GetPosition();
+
+        Entity* e = Entity.Create($"Probe_{probeSys.Probes.Count}");
+        e->AddComponent(new TransformComponent());
+        e->GetComponent<TransformComponent>()?.SetPosition(camPos);
+        e->AddComponent(new ReflectionProbeComponent
+        {
+            InfluenceRadius = 8f,
+            UpdatePolicy    = ProbeUpdatePolicy.OnDirty,
+        });
+        e->Initialize();
+        renderer.Scene.AddEntity(e);
+
+        var probe = e->GetComponent<ReflectionProbeComponent>();
+        if (probe != null) probeSys.Register(probe);
+
+        // Auto-select the newly spawned probe so the user immediately sees its
+        // component in the Inspector and can tweak the radius.
+        EditorState.SelectedEntity = e;
     }
 
     // ── Environment / IBL ─────────────────────────────────────────────────

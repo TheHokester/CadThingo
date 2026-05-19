@@ -20,8 +20,8 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
     // alternating big/small frames.
     readonly Buffer[]       vertexBuffers      = new Buffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
     readonly Buffer[]       indexBuffers       = new Buffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    readonly DeviceMemory[] vertexBufferMems   = new DeviceMemory[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    readonly DeviceMemory[] indexBufferMems    = new DeviceMemory[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly SubAlloc[]     vertexBufferAllocs = new SubAlloc[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly SubAlloc[]     indexBufferAllocs  = new SubAlloc[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
     // Mapped pointers held as nint because C# doesn't allow void*[] fields.
     readonly nint[]         vertexBufferMapped = new nint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
     readonly nint[]         indexBufferMapped  = new nint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
@@ -146,18 +146,10 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
 
         for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            if (indexBufferMems[i].Handle != 0)
-            {
-                vk!.UnmapMemory(device, indexBufferMems[i]);
-                vk!.DestroyBuffer(device, indexBuffers[i], null);
-                vk!.FreeMemory(device, indexBufferMems[i], null);
-            }
-            if (vertexBufferMems[i].Handle != 0)
-            {
-                vk!.UnmapMemory(device, vertexBufferMems[i]);
-                vk!.DestroyBuffer(device, vertexBuffers[i], null);
-                vk!.FreeMemory(device, vertexBufferMems[i], null);
-            }
+            if (indexBufferAllocs[i].IsValid)
+                renderer.DestroyBuffer(indexBuffers[i], indexBufferAllocs[i]);
+            if (vertexBufferAllocs[i].IsValid)
+                renderer.DestroyBuffer(vertexBuffers[i], vertexBufferAllocs[i]);
         }
         
         vk!.DestroyPipeline(device, pipeline, null);
@@ -379,11 +371,9 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         ulong bytes = count * (ulong)sizeof(ImDrawVert);
         renderer.CreateBuffer(bytes, BufferUsageFlags.VertexBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out vertexBuffers[slot], out vertexBufferMems[slot]);
+            out vertexBuffers[slot], out vertexBufferAllocs[slot]);
         vertexCapacities[slot] = count;
-        void* mapped = null;
-        vk!.MapMemory(device, vertexBufferMems[slot], 0, bytes, 0, ref mapped);
-        vertexBufferMapped[slot] = (nint)mapped;
+        vertexBufferMapped[slot] = (nint)renderer.memAllocator.GetMapped(vertexBufferAllocs[slot]);
     }
 
     void AllocateIndexSlot(int slot, uint count)
@@ -391,33 +381,29 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         ulong bytes = count * sizeof(ushort);
         renderer.CreateBuffer(bytes, BufferUsageFlags.IndexBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out indexBuffers[slot], out indexBufferMems[slot]);
+            out indexBuffers[slot], out indexBufferAllocs[slot]);
         indexCapacities[slot] = count;
-        void* mapped = null;
-        vk!.MapMemory(device, indexBufferMems[slot], 0, bytes, 0, ref mapped);
-        indexBufferMapped[slot] = (nint)mapped;
+        indexBufferMapped[slot] = (nint)renderer.memAllocator.GetMapped(indexBufferAllocs[slot]);
     }
 
     void FreeVertexSlot(int slot)
     {
-        if (vertexBufferMems[slot].Handle == 0) return;
-        vk!.UnmapMemory(device, vertexBufferMems[slot]);
-        renderer.DestroyBuffer(vertexBuffers[slot], vertexBufferMems[slot]);
-        vertexBuffers[slot]      = default;
-        vertexBufferMems[slot]   = default;
-        vertexBufferMapped[slot] = 0;
-        vertexCapacities[slot]   = 0;
+        if (!vertexBufferAllocs[slot].IsValid) return;
+        renderer.DestroyBuffer(vertexBuffers[slot], vertexBufferAllocs[slot]);
+        vertexBuffers[slot]       = default;
+        vertexBufferAllocs[slot]  = default;
+        vertexBufferMapped[slot]  = 0;
+        vertexCapacities[slot]    = 0;
     }
 
     void FreeIndexSlot(int slot)
     {
-        if (indexBufferMems[slot].Handle == 0) return;
-        vk!.UnmapMemory(device, indexBufferMems[slot]);
-        renderer.DestroyBuffer(indexBuffers[slot], indexBufferMems[slot]);
-        indexBuffers[slot]      = default;
-        indexBufferMems[slot]   = default;
-        indexBufferMapped[slot] = 0;
-        indexCapacities[slot]   = 0;
+        if (!indexBufferAllocs[slot].IsValid) return;
+        renderer.DestroyBuffer(indexBuffers[slot], indexBufferAllocs[slot]);
+        indexBuffers[slot]       = default;
+        indexBufferAllocs[slot]  = default;
+        indexBufferMapped[slot]  = 0;
+        indexCapacities[slot]    = 0;
     }
     public void OnEvent(Event e)
     {

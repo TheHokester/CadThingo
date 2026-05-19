@@ -386,12 +386,34 @@ public unsafe partial class Renderer
             throw new Exception("Failed to begin command buffer");
 
         // 5. Update per-frame UBOs
+        // 5a. Reflection-probe scheduler bookkeeping. Cheap CPU-only walk; the
+        //     capture draw + prefilter dispatch land in Phase 4. Runs before the
+        //     geometry pass so the captured cube is visible to downstream
+        //     shaders within the same frame once it's hooked up.
+        reflectionProbeSystem.Tick(frameCounter, scene);
+
         geometryPipeline.UpdateUbo(currentFrame, camera);
         var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
         transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
         // Skybox always updates — pass body is conditional on EditorState.SkyboxEnabled
         // so we can flip the toggle without re-recording the graph.
         skyboxPipeline.UpdatePerFrame(currentFrame, camera, ImGui.EditorState.SkyboxIntensity);
+
+        // 5a-ter. Reflection-probe cluster cull. Tile-only today (zSlices=1);
+        // when 3D froxels land the shader-side index math stays identical.
+        // Cheap CPU work (~0.1ms for 16 probes × ~8000 tiles at 1080p).
+        float aspect = (float)renderExtent.Width / renderExtent.Height;
+        reflectionProbeSystem.BuildClusters(currentFrame, camera, aspect, 0.1f, 100f,
+            tileCountX, tileCountY);
+        // Refresh the per-probe SSBO read by the PBR lighting shader.
+        reflectionProbeSystem.WriteProbeRecords(currentFrame);
+
+        // 5a-bis. Reflection-probe capture for the next dirty probe (if any).
+        // Bounded to one probe per frame; the actual draw recording happens
+        // here so the captured cube is visible to any later sampling pass
+        // within the same command buffer. No-op if no probe needs capturing
+        // or if the capture shader wasn't compiled into ProbeCapture.spv.
+        reflectionProbeSystem.RecordCapture(cmd, currentFrame, frameCounter, scene);
 
         // 5b. GPU cull pass — runs before the geometry pass and produces the
         // indirect command + post-cull instance buffers the geometry pass consumes.
@@ -525,11 +547,66 @@ public unsafe partial class Renderer
         }
 
         currentFrame = (currentFrame + 1) % MAX_CONCURRENT_FRAMES;
+        frameCounter++;
     }
-    
-    
-    
-    
+    /// <summary>
+    /// Refactor of existing rendering code in DrawFrame(), the logic unique to DrawFrame()
+    /// </summary>
+    private void DrawDeferred(CommandBuffer cmd)
+    {
+        // Reflection-probe scheduler bookkeeping. Cheap CPU-only walk; the
+        //     capture draw + prefilter dispatch land in Phase 4. Runs before the
+        //     geometry pass so the captured cube is visible to downstream
+        //     shaders within the same frame once it's hooked up.
+        reflectionProbeSystem.Tick(frameCounter, scene);
+
+        geometryPipeline.UpdateUbo(currentFrame, camera);
+        var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
+        transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
+        // Skybox always updates — pass body is conditional on EditorState.SkyboxEnabled
+        // so we can flip the toggle without re-recording the graph.
+        skyboxPipeline.UpdatePerFrame(currentFrame, camera, ImGui.EditorState.SkyboxIntensity);
+
+        // 5a-ter. Reflection-probe cluster cull. Tile-only today (zSlices=1);
+        // when 3D froxels land the shader-side index math stays identical.
+        // Cheap CPU work (~0.1ms for 16 probes × ~8000 tiles at 1080p).
+        float aspect = (float)renderExtent.Width / renderExtent.Height;
+        reflectionProbeSystem.BuildClusters(currentFrame, camera, aspect, 0.1f, 100f,
+            tileCountX, tileCountY);
+        // Refresh the per-probe SSBO read by the PBR lighting shader.
+        reflectionProbeSystem.WriteProbeRecords(currentFrame);
+
+        // 5a-bis. Reflection-probe capture for the next dirty probe (if any).
+        // Bounded to one probe per frame; the actual draw recording happens
+        // here so the captured cube is visible to any later sampling pass
+        // within the same command buffer. No-op if no probe needs capturing
+        // or if the capture shader wasn't compiled into ProbeCapture.spv.
+        reflectionProbeSystem.RecordCapture(cmd, currentFrame, frameCounter, scene);
+
+        // 5b. GPU cull pass — runs before the geometry pass and produces the
+        // indirect command + post-cull instance buffers the geometry pass consumes.
+        drawCullPipeline.Record(cmd, currentFrame, camera, scene);
+
+        // 5c. Tiled light-cull — bins lights into per-tile slot lists for the
+        // lighting fragment shader. Buffer barrier inside makes the writes
+        // visible to the fragment stage of the lighting pass.
+        lightCullPipeline.Record(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
+
+        // 6. Record all render-graph passes (geometry → lighting), record-only.
+        scene.renderGraph.Execute(cmd);
+    }
+
+    private void DrawRayQueried()
+    {
+        
+    }
+    /// <summary>
+    /// placeholder for future RTPipeline implementation<br/>
+    /// </summary>
+    private void DrawRayTraced()
+    {
+        
+    }
     
     
     /// <summary>

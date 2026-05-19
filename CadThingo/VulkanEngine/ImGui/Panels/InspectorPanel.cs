@@ -1,4 +1,5 @@
 using System.Numerics;
+using CadThingo.VulkanEngine.Renderer;
 using ImGuiNET;
 
 namespace CadThingo.VulkanEngine.ImGui.Panels;
@@ -50,7 +51,10 @@ public static unsafe class InspectorPanel
         var light = entity->GetComponent<LightComponent>();
         if (light != null) DrawLight(light);
 
-        if (transform == null && mesh == null && light == null)
+        var probe = entity->GetComponent<ReflectionProbeComponent>();
+        if (probe != null) DrawProbe(probe);
+
+        if (transform == null && mesh == null && light == null && probe == null)
             ImGuiNET.ImGui.TextDisabled("Entity has no editable components.");
 
         ImGuiNET.ImGui.End();
@@ -224,6 +228,56 @@ public static unsafe class InspectorPanel
         // Radius drives ray-queried soft shadows. World-space radius for
         // point/spot; tan(angularRadius) for directional (sun ≈ 0.005).
         ImGuiNET.ImGui.DragFloat("Radius", ref l.Radius, 0.005f, 0f, float.MaxValue);
+    }
+
+    static void DrawProbe(ReflectionProbeComponent probe)
+    {
+        if (!ImGuiNET.ImGui.CollapsingHeader("Reflection Probe", ImGuiTreeNodeFlags.DefaultOpen))
+            return;
+
+        // Slot assignment & status. Slot < 0 = system didn't register the probe
+        // (out-of-slots) — the entity exists but never contributes to lighting.
+        if (probe.CubeArraySlot >= 0)
+            ImGuiNET.ImGui.Text($"Slot {probe.CubeArraySlot} / {ReflectionProbeSystem.MaxProbes - 1}");
+        else
+            ImGuiNET.ImGui.TextColored(new Vector4(1f, 0.5f, 0.3f, 1f),
+                "Unregistered — slot pool full at probe creation.");
+
+        ImGuiNET.ImGui.SameLine();
+        if (probe.Dirty)
+            ImGuiNET.ImGui.TextColored(new Vector4(1f, 0.85f, 0.2f, 1f), "  Dirty");
+        else
+            ImGuiNET.ImGui.TextDisabled($"  Last capture: frame {probe.LastCaptureFrame}");
+
+        // Influence sphere — the probe contributes specular within this radius.
+        // The shader uses smoothstep(0.5·r, r, dist) for the fall-off so doubling
+        // this slider widens both the plateau and the transition band linearly.
+        ImGuiNET.ImGui.DragFloat("Influence radius", ref probe.InfluenceRadius, 0.05f, 0.1f, 200f, "%.2f");
+
+        // Face resolution is captured at *registration* into the shared cube-
+        // array slot, so it's effectively read-only after registration. Show as
+        // a disabled field with a TODO note.
+        ImGuiNET.ImGui.BeginDisabled();
+        int faceSize = (int)probe.FaceSize;
+        ImGuiNET.ImGui.DragInt("Face size", ref faceSize);
+        ImGuiNET.ImGui.EndDisabled();
+        ImGuiNET.ImGui.TextDisabled("Face size is fixed per cube-array slot — Phase-9 work.");
+
+        // Update policy combo. Once / OnDirty / EveryNFrames mirror the
+        // ProbeUpdatePolicy enum exactly.
+        int policy = (int)probe.UpdatePolicy;
+        if (ImGuiNET.ImGui.Combo("Update policy", ref policy, "Once\0OnDirty\0EveryNFrames\0\0"))
+            probe.UpdatePolicy = (ProbeUpdatePolicy)policy;
+
+        if (probe.UpdatePolicy == ProbeUpdatePolicy.EveryNFrames)
+        {
+            int interval = (int)probe.UpdateIntervalFrames;
+            if (ImGuiNET.ImGui.DragInt("Interval (frames)", ref interval, 1f, 1, 3600))
+                probe.UpdateIntervalFrames = (uint)Math.Max(1, interval);
+        }
+
+        if (ImGuiNET.ImGui.Button("Force recapture"))
+            probe.Dirty = true;
     }
 
     // ── Euler ↔ Quaternion ──────────────────────────────────────

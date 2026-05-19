@@ -120,7 +120,7 @@ public unsafe partial class Renderer
     }
 
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out DeviceMemory memory)
+        out Buffer buffer, out SubAlloc alloc)
     {
         BufferCreateInfo bufferInfo = new()
         {
@@ -132,28 +132,10 @@ public unsafe partial class Renderer
         if (vk!.CreateBuffer(device, &bufferInfo, null, out buffer) != Result.Success)
             throw new Exception("Failed to create buffer");
 
-        vk!.GetBufferMemoryRequirements(device, buffer, out var memReqs);
-        MemoryAllocateInfo allocInfo = new()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = memReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits, memProps),
-        };
-        // If the buffer is going to be queried for a device address (e.g. AS build
-        // input or scratch), the memory allocation must carry DeviceAddressBit.
-        // Otherwise vkGetBufferDeviceAddress returns garbage and validation yells.
-        var flagsInfo = new MemoryAllocateFlagsInfo
-        {
-            SType = StructureType.MemoryAllocateFlagsInfo,
-            Flags = MemoryAllocateFlags.DeviceAddressBit,
-        };
-        if ((usage & BufferUsageFlags.ShaderDeviceAddressBit) != 0)
-            allocInfo.PNext = &flagsInfo;
-
-        if (vk!.AllocateMemory(device, &allocInfo, null, out memory) != Result.Success)
-            throw new Exception("Failed to allocate buffer memory");
-
-        vk!.BindBufferMemory(device, buffer, memory, 0);
+        // DeviceAddress flag is already baked into every buffer-bucket block by
+        // the allocator — no per-call PNext chain needed. Caller still has to set
+        // ShaderDeviceAddressBit in `usage` for the buffer itself, which they do.
+        alloc = memAllocator.AllocateForBuffer(buffer, memProps);
     }
 
     public void CopyBuffer(Buffer src, Buffer dst, ulong size)
@@ -173,26 +155,23 @@ public unsafe partial class Renderer
     {
         CreateBuffer(size, BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out var staging, out var stagingMem);
+            out var staging, out var stagingAlloc);
 
-        void* mapped = null;
-        vk!.MapMemory(device, stagingMem, 0, size, 0, ref mapped);
+        void* mapped = memAllocator.GetMapped(stagingAlloc);
         System.Buffer.MemoryCopy(srcData, mapped, (long)size, (long)size);
-        vk!.UnmapMemory(device, stagingMem);
-        
+
         var cmd = BeginSingleTimeCommands();
         BufferCopy region = new() { SrcOffset = 0, DstOffset = (ulong)dstOffset, Size = size };
         vk!.CmdCopyBuffer(cmd, staging, dst, 1, &region);
         EndSingleTimeCommands(cmd);
 
-        vk!.DestroyBuffer(device, staging, null);
-        vk!.FreeMemory(device, stagingMem, null);
+        DestroyBuffer(staging, stagingAlloc);
     }
 
-    public void DestroyBuffer(Buffer buffer, DeviceMemory memory)
+    public void DestroyBuffer(Buffer buffer, SubAlloc alloc)
     {
         if (buffer.Handle != 0) vk!.DestroyBuffer(device, buffer, null);
-        if (memory.Handle != 0) vk!.FreeMemory(device, memory, null);
+        memAllocator.Free(alloc);
     }
 
     private void CreateGBufferSampler()
@@ -232,18 +211,9 @@ public unsafe partial class Renderer
             SharingMode = SharingMode.Exclusive,
         };
         vk!.CreateBuffer(device, &bufferInfo, null, out ubo.buffer);
-
-        vk!.GetBufferMemoryRequirements(device, ubo.buffer, out MemoryRequirements memReqs);
-        MemoryAllocateInfo allocInfo = new()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = memReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit)
-        };
-        vk!.AllocateMemory(device, &allocInfo, null, out ubo.memory);
-        vk!.BindBufferMemory(device, ubo.buffer, ubo.memory, 0);
-        vk!.MapMemory(device, ubo.memory, 0, (ulong)sizeBytes, MemoryMapFlags.None, ref ubo.mapped);
+        ubo.alloc  = memAllocator.AllocateForBuffer(ubo.buffer,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
+        ubo.mapped = memAllocator.GetMapped(ubo.alloc);
     }
     
     public void TransitionImageLayout( CommandBuffer cmd, Image image, Format format,  ImageLayout oldLayout,
@@ -462,21 +432,23 @@ public unsafe partial class Renderer
             new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
             // 5 g-buffer samplers (set 1) + 3 IBL samplers × MAX_FRAMES on set 0
             // for both PBR + Transparent pipelines + ImGui viewport + headroom.
-            // Cheap to oversize.
-            new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 32 },
+            // Probe prefilter sets reuse iblCubeSampler — one CombinedImageSampler
+            // each. MaxProbes (16) × MipLevels (9) = 144. Cheap to oversize.
+            new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 32 + 200 },
             new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 4 },
             // IBL bake passes need StorageImage descriptors — one per dispatch.
             // Worst case is the prefilter chain (1 set × prefilteredCubeMipLevels
-            // mips) + equirect→cube + irradiance + BRDF LUT ≈ 11 sets. Oversize
-            // generously since these allocate/free transiently.
-            new() { Type = DescriptorType.StorageImage,             DescriptorCount = 24 },
+            // mips) + equirect→cube + irradiance + BRDF LUT ≈ 11 sets. Reflection
+            // probes pre-allocate one set per (slot, mip): MaxProbes (16) × MipLevels
+            // (9) = 144. Round up.
+            new() { Type = DescriptorType.StorageImage,             DescriptorCount = 24 + 200 },
         };
         fixed (DescriptorPoolSize* poolSizesPtr = poolSizes)
         {
             DescriptorPoolCreateInfo poolInfo = new()
             {
                 SType = StructureType.DescriptorPoolCreateInfo,
-                MaxSets = 48,
+                MaxSets = 48 + 200,
                 PoolSizeCount = (uint)poolSizes.Length,
                 PPoolSizes = poolSizesPtr,
                 Flags = DescriptorPoolCreateFlags.UpdateAfterBindBit | DescriptorPoolCreateFlags.FreeDescriptorSetBit,
@@ -526,18 +498,9 @@ public unsafe partial class Renderer
             SharingMode = SharingMode.Exclusive,
         };
         vk!.CreateBuffer(device, &bufferInfo, null, out ubo.buffer);
-
-        vk!.GetBufferMemoryRequirements(device, ubo.buffer, out var memReqs);
-        MemoryAllocateInfo allocInfo = new()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = memReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit),
-        };
-        vk!.AllocateMemory(device, &allocInfo, null, out ubo.memory);
-        vk!.BindBufferMemory(device, ubo.buffer, ubo.memory, 0);
-        vk!.MapMemory(device, ubo.memory, 0, sizeBytes, MemoryMapFlags.None, ref ubo.mapped);
+        ubo.alloc  = memAllocator.AllocateForBuffer(ubo.buffer,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
+        ubo.mapped = memAllocator.GetMapped(ubo.alloc);
     }
 
    
@@ -686,19 +649,15 @@ public struct DrawIndexedIndirectCommandGpu
 }
 
 
-unsafe struct UboBuffer : IDisposable
+// Per-frame mapped UBO/SSBO bundle. Storage is owned by the renderer's
+// GpuMemoryAllocator; Dispose is intentionally absent — callers free through
+// Renderer.DestroyBuffer(b.buffer, b.alloc) so both the VkBuffer handle AND
+// the suballocation are released together.
+unsafe struct UboBuffer
 {
-    public Device device;//for m alloc cleanup
-
-    public Buffer buffer;
-    public DeviceMemory memory;
-    public void* mapped;
-
-    public void Dispose()
-    {
-        Vk.GetApi().FreeMemory(device, memory, null);
-        Vk.GetApi().DestroyBuffer(device, buffer, null);
-    }
+    public Buffer    buffer;
+    public SubAlloc  alloc;
+    public void*     mapped;
 }
 
 // Mirrors PbrUtils.slang::PbrMaterial under std430. Layout chosen so the struct is
@@ -743,6 +702,7 @@ public unsafe class ImageResource : IDisposable
 {
     private readonly Vk     _vk;
     private readonly Device _device;
+    private readonly GpuMemoryAllocator _allocator;
     private bool            _disposed;
     public bool IsAllocated { get; set; }
 
@@ -755,7 +715,7 @@ public unsafe class ImageResource : IDisposable
 
 
     public VkImage Image;
-    public DeviceMemory ImageMemory;
+    public SubAlloc ImageAlloc;
     public ImageView ImageView;
 
 
@@ -768,6 +728,7 @@ public unsafe class ImageResource : IDisposable
     {
         _vk = vk;
         _device = device;
+        _allocator = Engine.renderer!.memAllocator;
         _name = name;
         _format = format;
         _extent = extent;
@@ -786,10 +747,11 @@ public unsafe class ImageResource : IDisposable
         Vk vk, Device device,
         string name, Format format, Extent2D extent,
         ImageUsageFlags usage,
-        VkImage image, DeviceMemory memory, ImageView view)
+        VkImage image, SubAlloc alloc, ImageView view)
     {
         _vk = vk;
         _device = device;
+        _allocator = Engine.renderer!.memAllocator;
         _name = name;
         _format = format;
         _extent = extent;
@@ -797,7 +759,7 @@ public unsafe class ImageResource : IDisposable
         _initialLayout = ImageLayout.ShaderReadOnlyOptimal;
         _finalLayout   = ImageLayout.ShaderReadOnlyOptimal;
         Image = image;
-        ImageMemory = memory;
+        ImageAlloc = alloc;
         ImageView = view;
         IsAllocated = true;
     }
@@ -823,25 +785,7 @@ public unsafe class ImageResource : IDisposable
             throw new Exception("Failed to create image for resource " + _name);
         }
 
-        //alloc backing memory
-        _vk.GetImageMemoryRequirements(_device, Image, out var memReqs);
-
-        var allocInfo = new MemoryAllocateInfo()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = memReqs.Size,
-            MemoryTypeIndex = Renderer.FindMemoryType(_vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.DeviceLocalBit)
-        };
-
-        if (_vk.AllocateMemory(_device, ref allocInfo, null, out ImageMemory) != Result.Success)
-        {
-            throw new Exception("Failed to allocate memory for image " + _name);
-        };
-        if (_vk.BindImageMemory(_device, Image, ImageMemory, 0) != Result.Success)
-        {
-            throw new Exception("Failed to bind image memory for resource " + _name);
-        }
+        ImageAlloc = _allocator.AllocateForImage(Image, MemoryPropertyFlags.DeviceLocalBit);
 
         // ── Create ImageView ──────────────────────────────────
         bool isDepth = _format is Format.D32Sfloat
@@ -882,7 +826,7 @@ public unsafe class ImageResource : IDisposable
         // Destroy in reverse-creation order — mirrors C++ RAII destruction
         if (ImageView.Handle   != 0) _vk.DestroyImageView(_device, ImageView,   null);
         if (Image.Handle  != 0)      _vk.DestroyImage    (_device, Image,  null);
-        if (ImageMemory.Handle != 0) _vk.FreeMemory      (_device, ImageMemory, null);
+        _allocator.Free(ImageAlloc);
 
         _disposed = true;
     }
@@ -949,12 +893,10 @@ public unsafe class Texture : IDisposable
         // Stage pixels in a host-visible buffer.
         renderer.CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out var staging, out var stagingMem);
+            out var staging, out var stagingAlloc);
 
-        void* mapped = null;
-        vk.MapMemory(device, stagingMem, 0, imageSize, 0, ref mapped);
+        void* mapped = renderer.memAllocator.GetMapped(stagingAlloc);
         System.Buffer.MemoryCopy(pixels, mapped, (long)imageSize, (long)imageSize);
-        vk.UnmapMemory(device, stagingMem);
 
         const ImageUsageFlags usage = ImageUsageFlags.TransferDstBit |ImageUsageFlags.TransferSrcBit | ImageUsageFlags.SampledBit;
         var extent2D = new Extent2D(extent.Width, extent.Height);
@@ -977,16 +919,7 @@ public unsafe class Texture : IDisposable
         if (vk.CreateImage(device, &imageInfo, null, out var image) != Result.Success)
             throw new Exception("Failed to create image for texture");
 
-        vk.GetImageMemoryRequirements(device, image, out var memReqs);
-        MemoryAllocateInfo alloc = new()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = memReqs.Size,
-            MemoryTypeIndex = Renderer.FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.DeviceLocalBit),
-        };
-        vk.AllocateMemory(device, &alloc, null, out var memory);
-        vk.BindImageMemory(device, image, memory, 0);
+        var imageAlloc = renderer.memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
         // Transition → copy → transition (single-time command).
         var cmd = renderer.BeginSingleTimeCommands();
@@ -1010,8 +943,7 @@ public unsafe class Texture : IDisposable
         renderer.GenerateMipMaps(cmd, image, format, width, height,mipLevels);
         renderer.EndSingleTimeCommands(cmd);
 
-        vk.DestroyBuffer(device, staging, null);
-        vk.FreeMemory(device, stagingMem, null);
+        renderer.DestroyBuffer(staging, stagingAlloc);
 
         ImageViewCreateInfo viewInfo = new()
         {
@@ -1050,7 +982,7 @@ public unsafe class Texture : IDisposable
         };
         vk.CreateSampler(device, &samplerInfo, null, out var sampler);
 
-        var resource = new ImageResource(vk, device, "FontTexture", format, extent2D, usage, image, memory, view);
+        var resource = new ImageResource(vk, device, "FontTexture", format, extent2D, usage, image, imageAlloc, view);
         return new Texture(vk, device, resource, sampler);
     } 
 

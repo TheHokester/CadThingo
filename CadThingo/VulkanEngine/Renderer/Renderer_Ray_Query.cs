@@ -42,40 +42,40 @@ public unsafe partial class Renderer
     {
         public AccelerationStructureKHR Handle;
         public Buffer        Storage;          // usage = AccelerationStructureStorageBitKhr | ShaderDeviceAddressBit
-        public DeviceMemory  StorageMem;
+        public SubAlloc      StorageAlloc;
         public ulong         DeviceAddress;    // from GetAccelerationStructureDeviceAddress (NOT GetBufferDeviceAddress)
     }
 
     // Single scene-wide TLAS. Rebuild on entity-set / transform changes; flag
     // tlasDirty so DrawFrame can pick it up at the top of a frame.
     private AccelerationStructureKHR tlas;
-    private Buffer       tlasStorage;
-    private DeviceMemory tlasStorageMem;
+    private Buffer    tlasStorage;
+    private SubAlloc  tlasStorageAlloc;
 
     // Instance buffer feeds Cmd*BuildAccelerationStructures with the per-instance
     // AccelerationStructureInstanceKHR records. Host-visible + coherent so we can
     // memcpy each frame; usage must include AccelerationStructureBuildInputReadOnlyBitKhr
     // and ShaderDeviceAddressBit (the build reads it via device address).
-    private Buffer       tlasInstanceBuffer;
-    private DeviceMemory tlasInstanceMem;
-    private void*        tlasInstanceMapped;
-    private uint         tlasInstanceCapacity;     // number of slots allocated, not bytes
+    private Buffer    tlasInstanceBuffer;
+    private SubAlloc  tlasInstanceAlloc;
+    private void*     tlasInstanceMapped;
+    private uint      tlasInstanceCapacity;     // number of slots allocated, not bytes
 
     // Persistent scratch buffer reused across builds. Sized to the largest
     // BuildScratchSize seen so far; reallocated if a bigger build comes along.
-    private Buffer       asScratchBuffer;
-    private DeviceMemory asScratchMem;
-    private ulong        asScratchSize;
+    private Buffer    asScratchBuffer;
+    private SubAlloc  asScratchAlloc;
+    private ulong     asScratchSize;
 
     // Per-entity shadow-alpha info. One ShadowEntityInfo per TLAS instance,
     // indexed by InstanceCustomIndex. Host-visible + coherent so RebuildTlas
     // writes them inline with the instance buffer. Grows alongside the instance
     // buffer; capacity is tracked separately because zero-entity scenes still
     // need a valid binding.
-    private Buffer       shadowInfoBuffer;
-    private DeviceMemory shadowInfoMem;
-    private void*        shadowInfoMapped;
-    private uint         shadowInfoCapacity;     // number of slots allocated, not bytes
+    private Buffer    shadowInfoBuffer;
+    private SubAlloc  shadowInfoAlloc;
+    private void*     shadowInfoMapped;
+    private uint      shadowInfoCapacity;     // number of slots allocated, not bytes
 
     /// <summary>Buffer holding ShadowEntityInfo records, indexed by InstanceCustomIndex.
     /// PbrDeferredPipeline binds this on its shadow-alpha descriptor set. Returns
@@ -123,8 +123,11 @@ public unsafe partial class Renderer
     /// </summary>
     private void CreateBufferWithDeviceAddress(
         ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out DeviceMemory memory)
+        out Buffer buffer, out SubAlloc alloc)
     {
+        // Allocator buffer blocks unconditionally carry MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+        // so this is now just a buffer create + bind. Caller still owns the
+        // ShaderDeviceAddressBit usage flag — the buffer needs both halves.
         BufferCreateInfo bufferInfo = new()
         {
             SType = StructureType.BufferCreateInfo,
@@ -134,27 +137,7 @@ public unsafe partial class Renderer
         };
         if (vk!.CreateBuffer(device, &bufferInfo, null, out buffer) != Result.Success)
             throw new Exception("Failed to create device-address buffer");
-
-        vk!.GetBufferMemoryRequirements(device, buffer, out var memReqs);
-
-        // Address bit must be on the alloc flags AND the buffer usage; without
-        // it vkGetBufferDeviceAddress returns garbage.
-        var flagsInfo = new MemoryAllocateFlagsInfo
-        {
-            SType = StructureType.MemoryAllocateFlagsInfo,
-            Flags = MemoryAllocateFlags.DeviceAddressBit,
-        };
-        MemoryAllocateInfo allocInfo = new()
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            PNext = &flagsInfo,
-            AllocationSize = memReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits, memProps),
-        };
-        if (vk!.AllocateMemory(device, &allocInfo, null, out memory) != Result.Success)
-            throw new Exception("Failed to allocate device-address buffer memory");
-
-        vk!.BindBufferMemory(device, buffer, memory, 0);
+        alloc = memAllocator.AllocateForBuffer(buffer, memProps);
     }
 
     /// <summary>
@@ -194,12 +177,12 @@ public unsafe partial class Renderer
         ulong padded = ((required + asScratchAlignment - 1) / asScratchAlignment) * asScratchAlignment;
         if (asScratchBuffer.Handle != 0 && asScratchSize >= padded) return;
 
-        if (asScratchBuffer.Handle != 0) DestroyBuffer(asScratchBuffer, asScratchMem);
+        if (asScratchBuffer.Handle != 0) DestroyBuffer(asScratchBuffer, asScratchAlloc);
 
         CreateBufferWithDeviceAddress(padded,
             BufferUsageFlags.StorageBufferBit | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit,
-            out asScratchBuffer, out asScratchMem);
+            out asScratchBuffer, out asScratchAlloc);
         asScratchSize = padded;
     }
 
@@ -212,10 +195,9 @@ public unsafe partial class Renderer
     {
         if (tlasInstanceCapacity >= requiredInstances) return;
 
-        if (tlasInstanceMem.Handle != 0)
+        if (tlasInstanceAlloc.IsValid)
         {
-            vk!.UnmapMemory(device, tlasInstanceMem);
-            DestroyBuffer(tlasInstanceBuffer, tlasInstanceMem);
+            DestroyBuffer(tlasInstanceBuffer, tlasInstanceAlloc);
             tlasInstanceMapped = null;
         }
 
@@ -226,11 +208,9 @@ public unsafe partial class Renderer
         CreateBufferWithDeviceAddress(sizeBytes,
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out tlasInstanceBuffer, out tlasInstanceMem);
+            out tlasInstanceBuffer, out tlasInstanceAlloc);
 
-        void* mapped = null;
-        vk!.MapMemory(device, tlasInstanceMem, 0, sizeBytes, 0, ref mapped);
-        tlasInstanceMapped = mapped;
+        tlasInstanceMapped = memAllocator.GetMapped(tlasInstanceAlloc);
         tlasInstanceCapacity = capacity;
     }
 
@@ -244,10 +224,9 @@ public unsafe partial class Renderer
         if (shadowInfoCapacity >= requiredInstances && shadowInfoBuffer.Handle != 0)
             return false;
 
-        if (shadowInfoMem.Handle != 0)
+        if (shadowInfoAlloc.IsValid)
         {
-            vk!.UnmapMemory(device, shadowInfoMem);
-            DestroyBuffer(shadowInfoBuffer, shadowInfoMem);
+            DestroyBuffer(shadowInfoBuffer, shadowInfoAlloc);
             shadowInfoMapped = null;
         }
 
@@ -255,29 +234,11 @@ public unsafe partial class Renderer
         while (capacity < requiredInstances) capacity <<= 1;
 
         ulong sizeBytes = (ulong)capacity * (ulong)sizeof(ShadowEntityInfo);
-        vk!.CreateBuffer(device, new BufferCreateInfo
-        {
-            SType       = StructureType.BufferCreateInfo,
-            Size        = sizeBytes,
-            Usage       = BufferUsageFlags.StorageBufferBit,
-            SharingMode = SharingMode.Exclusive,
-        }, null, out shadowInfoBuffer);
+        CreateBuffer(sizeBytes, BufferUsageFlags.StorageBufferBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out shadowInfoBuffer, out shadowInfoAlloc);
 
-        vk!.GetBufferMemoryRequirements(device, shadowInfoBuffer, out var memReqs);
-        var allocInfo = new MemoryAllocateInfo
-        {
-            SType           = StructureType.MemoryAllocateInfo,
-            AllocationSize  = memReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit),
-        };
-        if (vk!.AllocateMemory(device, &allocInfo, null, out shadowInfoMem) != Result.Success)
-            throw new Exception("Failed to allocate ShadowEntityInfo memory");
-        vk!.BindBufferMemory(device, shadowInfoBuffer, shadowInfoMem, 0);
-
-        void* mapped = null;
-        vk!.MapMemory(device, shadowInfoMem, 0, sizeBytes, 0, ref mapped);
-        shadowInfoMapped = mapped;
+        shadowInfoMapped = memAllocator.GetMapped(shadowInfoAlloc);
         shadowInfoCapacity = capacity;
         return true;
     }
@@ -335,9 +296,9 @@ public unsafe partial class Renderer
             &buildInfo, &primitiveCount, &sizes);
          
         //   - Allocate storage (CreateBufferWithDeviceAddress, AccelerationStructureStorageBitKhr | ShaderDeviceAddressBit)
-        CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize, 
+        CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize,
             BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
-            MemoryPropertyFlags.DeviceLocalBit, out var storage, out var storageMem);
+            MemoryPropertyFlags.DeviceLocalBit, out var storage, out var storageAlloc);
         
         // Grow scratch buffer (allocates if first call). Without this, the line
         // below that reads GetBufferDeviceAddress(asScratchBuffer) returns 0 and
@@ -367,7 +328,7 @@ public unsafe partial class Renderer
         {
             Handle = handle,
             Storage = storage,
-            StorageMem = storageMem,
+            StorageAlloc = storageAlloc,
             DeviceAddress = devAddr,
         };
         return blasCache[(nint)mesh];
@@ -492,12 +453,12 @@ public unsafe partial class Renderer
         if (tlas.Handle != 0)
         {
             khrAccelStruct.DestroyAccelerationStructure(device, tlas, null);
-            DestroyBuffer(tlasStorage, tlasStorageMem);
+            DestroyBuffer(tlasStorage, tlasStorageAlloc);
         }
         CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize,
             BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit,
-            out tlasStorage, out tlasStorageMem);
+            out tlasStorage, out tlasStorageAlloc);
 
         var createInfo = new AccelerationStructureCreateInfoKHR
         {
@@ -577,33 +538,27 @@ public unsafe partial class Renderer
     {
         if (khrAccelStruct == null) return;
 
-        // Unmap before freeing the host-visible instance buffer.
-        if (tlasInstanceMapped != null)
-        {
-            vk!.UnmapMemory(device, tlasInstanceMem);
-            tlasInstanceMapped = null;
-        }
+        // Host-visible mappings live for the lifetime of the parent block (the
+        // allocator owns the map/unmap). Just null the pointers — Free below
+        // releases the suballocation; the block stays mapped until allocator dispose.
+        tlasInstanceMapped = null;
+        shadowInfoMapped   = null;
 
-        if (shadowInfoMapped != null)
-        {
-            vk!.UnmapMemory(device, shadowInfoMem);
-            shadowInfoMapped = null;
-        }
-        if (shadowInfoBuffer.Handle != 0) DestroyBuffer(shadowInfoBuffer, shadowInfoMem);
+        if (shadowInfoBuffer.Handle != 0) DestroyBuffer(shadowInfoBuffer, shadowInfoAlloc);
 
         if (tlas.Handle != 0)
         {
             khrAccelStruct.DestroyAccelerationStructure(device, tlas, null);
             tlas = default;
         }
-        if (tlasStorage.Handle != 0)        DestroyBuffer(tlasStorage,        tlasStorageMem);
-        if (tlasInstanceBuffer.Handle != 0) DestroyBuffer(tlasInstanceBuffer, tlasInstanceMem);
-        if (asScratchBuffer.Handle != 0)    DestroyBuffer(asScratchBuffer,    asScratchMem);
+        if (tlasStorage.Handle != 0)        DestroyBuffer(tlasStorage,        tlasStorageAlloc);
+        if (tlasInstanceBuffer.Handle != 0) DestroyBuffer(tlasInstanceBuffer, tlasInstanceAlloc);
+        if (asScratchBuffer.Handle != 0)    DestroyBuffer(asScratchBuffer,    asScratchAlloc);
 
         foreach (var entry in blasCache.Values)
         {
             khrAccelStruct.DestroyAccelerationStructure(device, entry.Handle, null);
-            DestroyBuffer(entry.Storage, entry.StorageMem);
+            DestroyBuffer(entry.Storage, entry.StorageAlloc);
         }
         blasCache.Clear();
 

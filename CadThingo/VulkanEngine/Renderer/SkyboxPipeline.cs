@@ -11,7 +11,7 @@ namespace CadThingo.VulkanEngine.Renderer;
 //  depth buffer the geometry pass left behind.
 // ────────────────────────────────────────────────────────────────────────────
 
-public sealed unsafe class SkyboxPipeline : GraphicsPipeline
+public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
 {
     // Mirrors Skybox.slang::SkyboxUBO. Std140 — invViewProj is 64B, then 16B
     // camPos, then intensity + 3×4B trailing pad to round to 96B total.
@@ -42,7 +42,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
 
     public override void Dispose()
     {
-        foreach (var b in FrameUniformBuffers) b.Dispose();
+        foreach (var b in FrameUniformBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 

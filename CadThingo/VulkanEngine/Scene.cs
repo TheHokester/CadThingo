@@ -175,6 +175,24 @@ public class Scene
     }
 
     /// <summary>
+    /// Appends every <see cref="ReflectionProbeComponent"/> attached to an active
+    /// entity (alongside the entity pointer cast to nint — C# rejects Entity* as
+    /// a generic type argument). Callers re-cast back: <c>(Entity*)tuple.entity</c>.
+    /// </summary>
+    public unsafe void EnumerateProbes(List<(nint entity, ReflectionProbeComponent probe)> output)
+    {
+        output.Clear();
+        foreach (var ptr in _entityList)
+        {
+            var e = (Entity*)ptr;
+            if (e == null || !e->IsActive) continue;
+            var probe = e->GetComponent<ReflectionProbeComponent>();
+            if (probe == null) continue;
+            output.Add(((nint)e, probe));
+        }
+    }
+
+    /// <summary>
     /// Registers a bindless material on the scene. Returns the int index stored on
     /// MeshComponent.materialIndex so the geometry pass can resolve the material in
     /// the per-frame material SSBO.

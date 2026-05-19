@@ -2,6 +2,7 @@
 using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -44,6 +45,27 @@ public unsafe partial class Renderer
     private readonly List<string> deviceExtensions = new() { KhrSwapchain.ExtensionName };
     internal Device device;
 
+    public enum RenderMode : uint
+    {
+        Deferred = 0,
+        ForwardPlus = 1,
+        RayCompute = 2,
+        RayTrace =3
+    }
+    RenderMode renderMode = RenderMode.Deferred;
+    
+    
+    // Suballocates VkDeviceMemory blocks so we don't burn one slot of
+    // maxMemoryAllocationCount per resource. Owned for the lifetime of the
+    // renderer; constructed right after CreateLogicalDevice, disposed last in
+    // Cleanup so every other resource can free through it.
+    internal GpuMemoryAllocator memAllocator = null!;
+
+    // Runtime reflection probes — GPU resources + CPU registry. Allocated after
+    // the IBL cubemaps because it reuses the same prefilter pipeline. Phase 2
+    // stops at resource allocation; capture / shader integration come later.
+    internal ReflectionProbeSystem reflectionProbeSystem = null!;
+
     // Silk.NET 2.23 ships no KhrRayQuery wrapper (ray-query has zero host functions —
     // it's a pure SPIR-V capability), so we hardcode the extension string ourselves.
     private const string KhrRayQueryExtensionName = "VK_KHR_ray_query";
@@ -62,6 +84,9 @@ public unsafe partial class Renderer
     private bool robustness2Enabled = false;
     private bool accelerationStructureEnabled = false;
     private bool rayQueryEnabled = false;
+    // Vulkan 1.1 multiview. Required for the reflection-probe capture pass that
+    // renders all 6 faces of a cubemap in one draw via gl_ViewIndex.
+    internal bool multiviewEnabled = false;
 
     /// <summary>
     /// True iff both KHR_acceleration_structure and KHR_ray_query are enabled with their
@@ -128,8 +153,6 @@ public unsafe partial class Renderer
     CommandPool commandPool;
     CommandBuffer[] commandBuffers;
     
-    CullingSystem cullingSystem;
-    
     //Camera
     Camera camera;
     public Camera Camera => camera;
@@ -139,6 +162,10 @@ public unsafe partial class Renderer
     Semaphore[] renderFinishedSemaphores;
     Fence[] inFlightFences;
     uint currentFrame;
+    // Monotonic frame counter — incremented once per DrawFrame. Distinct from
+    // currentFrame which cycles 0..MAX_CONCURRENT_FRAMES-1. Used by the probe
+    // scheduler for EveryNFrames bookkeeping and capture timing.
+    internal ulong frameCounter;
     
     //upload timeline semaphore
     Semaphore uploadsTimeline;
@@ -181,6 +208,8 @@ public unsafe partial class Renderer
         CreateSurface();
         PickPhysicalDevice();
         CreateLogicalDevice();
+        // Must exist before ANY buffer/image allocation downstream.
+        memAllocator = new GpuMemoryAllocator(vk!, device, physicalDevice);
         CreateSwapChain();
         // Initial render extent tracks swapchain extent. ViewportPanel can later
         // shrink it via EditorState.RequestedRenderExtent → ResizeRenderTargets.
@@ -206,6 +235,11 @@ public unsafe partial class Renderer
         // BRDF LUT is view-independent — bake once at init and reuse for every
         // environment that gets loaded later.
         BakeBrdfLut();
+
+        // Reflection-probe GPU resources (cubemap array + per-probe SSBO).
+        // Reuses the IBL prefilter pipeline at capture time, so it has to be
+        // constructed after CreateIblBakePipelines.
+        reflectionProbeSystem = new ReflectionProbeSystem(this);
 
         // ── Pipelines that don't depend on allocated g-buffer image views ──
         // Render-graph pass closures (registered in SetupDeferredRenderer) read
@@ -240,6 +274,10 @@ public unsafe partial class Renderer
 
         // Wire light-cull tile buffers into the PBR lighting set now that both exist.
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
+        // Same idea for the reflection-probe bindings — the cube array, probe
+        // records SSBO, cluster range / index list SSBOs are all stable for the
+        // renderer's lifetime so we write once at init.
+        PbrDeferredPipeline.WriteProbeDescriptors();
 
         // Tone-map / post pass — reads HDRColor produced by the lighting pass, writes
         // the LDR FinalColor that the swapchain blit sources. Initialized after
@@ -258,6 +296,8 @@ public unsafe partial class Renderer
         // IBL bindings live on Renderer-owned VkImages that exist before any
         // pipeline initializes; write them straight after Initialize.
         transparentPipeline.WriteIblDescriptors();
+        // Probe bindings — same stable-handle story as IBL. Wired once at init.
+        transparentPipeline.WriteProbeDescriptors();
 
         // Skybox renders the envCube into HDRColor between lighting and transparent.
         // EditorState.SkyboxEnabled gates the draw without re-recording the graph.
@@ -342,6 +382,29 @@ public unsafe partial class Renderer
             "Bistro", Engine.ResourceManager, this, scene);
         
         SpawnTestLights();
+        SpawnTestProbe();
+    }
+
+    // Phase 3 smoke test — a single reflection probe at the scene origin. Once
+    // Phase 4 lands its capture shader, this probe will start producing actual
+    // prefiltered cubemap content. Until then the registration / scheduler path
+    // is what gets exercised.
+    private void SpawnTestProbe()
+    {
+        Entity* probeEntity = Entity.Create("TestProbe");
+        probeEntity->AddComponent(new TransformComponent());
+        probeEntity->GetComponent<TransformComponent>()?.SetPosition(new Vector3(-7f, 2f, 4f));
+        probeEntity->AddComponent(new ReflectionProbeComponent
+        {
+            InfluenceRadius = 12f,
+            UpdatePolicy    = ProbeUpdatePolicy.OnDirty,
+        });
+        probeEntity->Initialize();
+        scene.AddEntity(probeEntity);
+
+        var probe = probeEntity->GetComponent<ReflectionProbeComponent>();
+        if (probe != null && !reflectionProbeSystem.Register(probe))
+            Console.WriteLine("[Probe] Out of cube-array slots — test probe not registered");
     }
 
     private void SpawnTestLights()
@@ -433,8 +496,10 @@ public unsafe partial class Renderer
 
         // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
+        PbrDeferredPipeline.WriteProbeDescriptors();
         transparentPipeline.WriteSharedLightingDescriptors(PbrDeferredPipeline, lightCullPipeline);
         transparentPipeline.WriteIblDescriptors();
+        transparentPipeline.WriteProbeDescriptors();
         // LightCullPipeline survives the rebuild but its set 0 binding 0 still
         // points at the freed PBR light SSBO — fix it up.
         lightCullPipeline.RewriteLightsBinding();
@@ -523,6 +588,9 @@ public unsafe partial class Renderer
         // ── G-buffer sampler ────────────────────────────────────
         if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
 
+        // ── Reflection probes ───────────────────────────────────
+        reflectionProbeSystem?.Dispose();
+
         // ── IBL images + samplers ───────────────────────────────
         CleanupIblResources();
 
@@ -543,6 +611,12 @@ public unsafe partial class Renderer
 
         // ── Swap chain + image views ────────────────────────────
         CleanupSwapChain();
+
+        // ── Memory allocator (frees every VkDeviceMemory block) ─
+        // Must run after every other Vk*Destroy above — those don't free memory,
+        // they only release the buffer/image handle. The allocator is what owns
+        // the underlying allocations.
+        memAllocator?.Dispose();
 
         // ── Device, debug, surface, instance ────────────────────
         vk.DestroyDevice(device, null);
@@ -883,7 +957,9 @@ public unsafe partial class Renderer
             coreSupported.Features.SamplerAnisotropy &&
             coreSupported.Features.MultiDrawIndirect &&
             coreSupported.Features.DrawIndirectFirstInstance &&
+            coreSupported.Features.ImageCubeArray &&
             vulkan11Supported.ShaderDrawParameters &&
+            vulkan11Supported.Multiview &&
             vulkan12Supported.TimelineSemaphore &&
             vulkan12Supported.VulkanMemoryModel &&
             vulkan12Supported.BufferDeviceAddress &&
@@ -907,6 +983,9 @@ public unsafe partial class Renderer
         // this feature the spec requires firstInstance=0 and drivers silently clamp
         // it, making every primitive read instances[0].
         features.Features.DrawIndirectFirstInstance = true;
+        // Cube-array views (VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) — required by the
+        // ReflectionProbeSystem to sample all probes from a single descriptor.
+        features.Features.ImageCubeArray = true;
         //rayQuery shader uses indexing into a large sampled-image array.
         if (coreSupported.Features.ShaderSampledImageArrayDynamicIndexing)
             features.Features.ShaderSampledImageArrayDynamicIndexing = true;
@@ -914,6 +993,9 @@ public unsafe partial class Renderer
         //vulkan 1.1
         PhysicalDeviceVulkan11Features vulkan11Features = new(){SType = StructureType.PhysicalDeviceVulkan11Features};
         vulkan11Features.ShaderDrawParameters = true;
+        // Multiview — gl_ViewIndex in vertex shaders so cubemap-face capture can
+        // render all 6 layers in one draw call. Required for reflection probes.
+        vulkan11Features.Multiview = true;
 
         //vulkan 1.2 — rolls in Timeline, MemoryModel, BufferDeviceAddress, 8-bit storage,
         //DescriptorIndexing, and DrawIndirectCount (used by vkCmdDrawIndexedIndirectCount).
@@ -1023,6 +1105,7 @@ public unsafe partial class Renderer
         robustness2Enabled = hasRobust2 && (robust2Enable.RobustBufferAccess2 || robust2Enable.RobustImageAccess2 || robust2Enable.NullDescriptor);
         accelerationStructureEnabled = hasAccelerationStructure && accelerationstructureEnable.AccelerationStructure;
         rayQueryEnabled = hasRayQuery && rayQueryEnable.RayQuery;
+        multiviewEnabled = vulkan11Features.Multiview;
 
         Console.WriteLine($"----> RayShadowsSupported: {RayShadowsSupported} " +
                           $"(rayQuery={rayQueryEnabled}, accelStruct={accelerationStructureEnabled})");

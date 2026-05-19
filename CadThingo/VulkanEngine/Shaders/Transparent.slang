@@ -19,6 +19,25 @@ struct FrameUBO {
     // PbrShader.slang::LightingFrameUBO so the CPU update path stays symmetric).
     float  prefilteredCubeMipLevels;
     float  scaleIBLAmbient;
+    // Reflection-probe cluster dims + mip count — mirrors the deferred path so
+    // both shaders compute the same cluster index for the same fragment.
+    uint   probeClusterDimsX;
+    uint   probeClusterDimsY;
+    uint   probeClusterDimsZ;
+    float  probeMipLevels;
+};
+
+// Layout mirrors ReflectionProbeSystem.ProbeGpuRecord (32B std430).
+struct ProbeRecord {
+    float4 positionRadius;
+    uint   cubeArraySlot;
+    uint   _pad0;
+    uint   _pad1;
+    uint   _pad2;
+};
+struct ProbeClusterRange {
+    uint offset;
+    uint count;
 };
 
 struct DrawPC {
@@ -44,6 +63,14 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 [[vk::binding(5, 0)]] SamplerCube                           irradianceCube;
 [[vk::binding(6, 0)]] SamplerCube                           prefilteredCube;
 [[vk::binding(7, 0)]] Sampler2D                             brdfLut;
+
+// Probe bindings mirror PbrShader.slang set 0 slots 8-11. Empty / unregistered
+// slots leave clusterRange.count == 0 so the loop is a no-op and the global
+// IBL fallback (via the lerp coverage path) takes over cleanly.
+[[vk::binding(8,  0)]] SamplerCubeArray                     probeCubeArray;
+[[vk::binding(9,  0)]] StructuredBuffer<ProbeRecord>        probes;
+[[vk::binding(10, 0)]] StructuredBuffer<ProbeClusterRange>  probeClusterRange;
+[[vk::binding(11, 0)]] StructuredBuffer<uint>               probeIndexList;
 
 // Set 1 — bindless materials/instances/textures/samplers (shared layout with GeometryPipeline).
 [[vk::binding(0, 1)]] StructuredBuffer<PbrMaterial>         materials;
@@ -293,9 +320,47 @@ float4 PSMain(VSOutput input) : SV_TARGET
     float3 diffuseIBL    = irradianceVal * baseColor.rgb;
 
     float  maxMip          = max(frame.prefilteredCubeMipLevels - 1.0, 0.0);
-    float3 prefilteredVal  = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
     float2 envBRDF         = brdfLut.SampleLevel(float2(NdotV_ibl, roughness), 0).xy;
-    float3 specularIBL     = prefilteredVal * (F_ibl * envBRDF.x + envBRDF.y);
+
+    // Probe-blend specular — same cluster walk + lerp coverage as PbrShader.slang.
+    // Kept inline (vs. an #include) so each shader stays self-contained for the
+    // existing pipeline-per-file build path.
+    float3 specularInput = float3(0.0);
+    {
+        uint cx = min((uint)(input.Position.x) / TILE_SIZE_PX, frame.probeClusterDimsX - 1u);
+        uint cy = min((uint)(input.Position.y) / TILE_SIZE_PX, frame.probeClusterDimsY - 1u);
+        uint cz = 0u;   // 3D froxels arrive here later without altering shader-side math
+        uint clusterIdx = cx + cy * frame.probeClusterDimsX
+                       + cz * frame.probeClusterDimsX * frame.probeClusterDimsY;
+
+        ProbeClusterRange r = probeClusterRange[clusterIdx];
+
+        float maxMipProbe = max(frame.probeMipLevels - 1.0, 0.0);
+        float3 accum = float3(0.0);
+        float  totalW = 0.0;
+        for (uint p = 0u; p < r.count; p++) {
+            uint probeIdx = probeIndexList[r.offset + p];
+            ProbeRecord rec = probes[probeIdx];
+
+            float3 d   = WorldPos - rec.positionRadius.xyz;
+            float dist = length(d);
+            float rad  = rec.positionRadius.w;
+            if (rad <= 0.0 || dist >= rad) continue;
+
+            float w = 1.0 - smoothstep(rad * 0.5, rad, dist);
+            float3 sample = probeCubeArray.SampleLevel(
+                float4(R, (float)rec.cubeArraySlot),
+                roughness * maxMipProbe).rgb;
+            accum += sample * w;
+            totalW += w;
+        }
+
+        float3 globalIBL  = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
+        float  coverage   = saturate(totalW);
+        float3 probeBlend = (totalW > 1e-5) ? (accum / totalW) : float3(0.0);
+        specularInput = lerp(globalIBL, probeBlend, coverage);
+    }
+    float3 specularIBL     = specularInput * (F_ibl * envBRDF.x + envBRDF.y);
 
     float3 ambient = (kD_ibl * diffuseIBL + specularIBL) * ao * frame.scaleIBLAmbient;
     float3 color   = ambient + Lo + emissiveTex;

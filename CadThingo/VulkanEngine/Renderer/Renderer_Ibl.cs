@@ -30,21 +30,21 @@ public unsafe partial class Renderer
     // because ImageResource hard-codes 2D / single layer / single mip — cubemaps
     // need ArrayLayers=6 + CubeCompatible + variable mips.
     internal VkImage        envCubeImage;
-    internal DeviceMemory   envCubeMemory;
+    internal SubAlloc       envCubeAlloc;
     internal ImageView      envCubeView;        // VK_IMAGE_VIEW_TYPE_CUBE, all mips
     internal uint           envCubeMipLevels;
 
     internal VkImage        irradianceCubeImage;
-    internal DeviceMemory   irradianceCubeMemory;
+    internal SubAlloc       irradianceCubeAlloc;
     internal ImageView      irradianceCubeView;
 
     internal VkImage        prefilteredCubeImage;
-    internal DeviceMemory   prefilteredCubeMemory;
+    internal SubAlloc       prefilteredCubeAlloc;
     internal ImageView      prefilteredCubeView;
     internal uint           prefilteredCubeMipLevels;
 
     internal VkImage        brdfLutImage;
-    internal DeviceMemory   brdfLutMemory;
+    internal SubAlloc       brdfLutAlloc;
     internal ImageView      brdfLutView;
 
     // Two shared samplers — one for the cubemaps (linear + mipmap linear,
@@ -63,25 +63,25 @@ public unsafe partial class Renderer
             EnvCubeFaceSize, envCubeMipLevels, Format.R16G16B16A16Sfloat,
             ImageUsageFlags.SampledBit | ImageUsageFlags.StorageBit |
             ImageUsageFlags.TransferDstBit | ImageUsageFlags.TransferSrcBit,
-            out envCubeImage, out envCubeMemory, out envCubeView);
+            out envCubeImage, out envCubeAlloc, out envCubeView);
 
         // ── irradiance cube — sampled + storage-written
         CreateCubemapImage(
             IrradianceCubeFaceSize, 1, Format.R16G16B16A16Sfloat,
             ImageUsageFlags.SampledBit | ImageUsageFlags.StorageBit | ImageUsageFlags.TransferDstBit,
-            out irradianceCubeImage, out irradianceCubeMemory, out irradianceCubeView);
+            out irradianceCubeImage, out irradianceCubeAlloc, out irradianceCubeView);
 
         // ── prefiltered cube — sampled + storage-written per mip
         CreateCubemapImage(
             PrefilteredCubeFaceSize, prefilteredCubeMipLevels, Format.R16G16B16A16Sfloat,
             ImageUsageFlags.SampledBit | ImageUsageFlags.StorageBit | ImageUsageFlags.TransferDstBit,
-            out prefilteredCubeImage, out prefilteredCubeMemory, out prefilteredCubeView);
+            out prefilteredCubeImage, out prefilteredCubeAlloc, out prefilteredCubeView);
 
         // ── BRDF LUT — 2D, sampled + storage-written, no mips
         CreateLutImage(
             BrdfLutSize, Format.R16G16Sfloat,
             ImageUsageFlags.SampledBit | ImageUsageFlags.StorageBit | ImageUsageFlags.TransferDstBit,
-            out brdfLutImage, out brdfLutMemory, out brdfLutView);
+            out brdfLutImage, out brdfLutAlloc, out brdfLutView);
 
         // ── Samplers ─────────────────────────────────────────────
         SamplerCreateInfo cubeSamplerInfo = new()
@@ -129,7 +129,7 @@ public unsafe partial class Renderer
 
     void CreateCubemapImage(
         uint faceSize, uint mipLevels, Format format, ImageUsageFlags usage,
-        out VkImage image, out DeviceMemory memory, out ImageView cubeView)
+        out VkImage image, out SubAlloc alloc, out ImageView cubeView)
     {
         ImageCreateInfo info = new()
         {
@@ -149,17 +149,7 @@ public unsafe partial class Renderer
         if (vk!.CreateImage(device, &info, null, out image) != Result.Success)
             throw new System.Exception("Failed to create IBL cubemap image");
 
-        vk!.GetImageMemoryRequirements(device, image, out var memReqs);
-        MemoryAllocateInfo alloc = new()
-        {
-            SType           = StructureType.MemoryAllocateInfo,
-            AllocationSize  = memReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.DeviceLocalBit),
-        };
-        if (vk!.AllocateMemory(device, &alloc, null, out memory) != Result.Success)
-            throw new System.Exception("Failed to allocate IBL cubemap memory");
-        vk!.BindImageMemory(device, image, memory, 0);
+        alloc = memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
         ImageViewCreateInfo viewInfo = new()
         {
@@ -182,7 +172,7 @@ public unsafe partial class Renderer
 
     void CreateLutImage(
         uint size, Format format, ImageUsageFlags usage,
-        out VkImage image, out DeviceMemory memory, out ImageView view)
+        out VkImage image, out SubAlloc alloc, out ImageView view)
     {
         ImageCreateInfo info = new()
         {
@@ -201,17 +191,7 @@ public unsafe partial class Renderer
         if (vk!.CreateImage(device, &info, null, out image) != Result.Success)
             throw new System.Exception("Failed to create BRDF LUT image");
 
-        vk!.GetImageMemoryRequirements(device, image, out var memReqs);
-        MemoryAllocateInfo alloc = new()
-        {
-            SType           = StructureType.MemoryAllocateInfo,
-            AllocationSize  = memReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.DeviceLocalBit),
-        };
-        if (vk!.AllocateMemory(device, &alloc, null, out memory) != Result.Success)
-            throw new System.Exception("Failed to allocate BRDF LUT memory");
-        vk!.BindImageMemory(device, image, memory, 0);
+        alloc = memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
         ImageViewCreateInfo viewInfo = new()
         {
@@ -570,7 +550,7 @@ public unsafe partial class Renderer
         CurrentEnvironmentPath = path;
 
         // ── 1. Upload equirect as a 2D RGBA16F sampled image ─────────────
-        UploadEquirectHalf(img, out var eqImage, out var eqMemory, out var eqView, out var eqSampler);
+        UploadEquirectHalf(img, out var eqImage, out var eqAlloc, out var eqView, out var eqSampler);
 
         // ── 2. EquirectToCube: write envCube mip 0 layers 0..5 ───────────
         var cubeMip0View = CreateCubeStorageView(envCubeImage, Format.R16G16B16A16Sfloat, mipLevel: 0);
@@ -681,7 +661,7 @@ public unsafe partial class Renderer
         vk!.DestroySampler(device, eqSampler, null);
         vk!.DestroyImageView(device, eqView, null);
         vk!.DestroyImage(device, eqImage, null);
-        vk!.FreeMemory(device, eqMemory, null);
+        memAllocator.Free(eqAlloc);
     }
 
     /// <summary>
@@ -691,7 +671,7 @@ public unsafe partial class Renderer
     /// anyway, so banding from 11-bit mantissa truncation can't survive.
     /// </summary>
     void UploadEquirectHalf(HdrLoader.HdrImage img,
-        out VkImage image, out DeviceMemory memory, out ImageView view, out Sampler sampler)
+        out VkImage image, out SubAlloc alloc, out ImageView view, out Sampler sampler)
     {
         int texelCount = img.Width * img.Height;
         ulong byteSize = (ulong)texelCount * 4UL * 2UL; // 4 channels × 2 bytes (Half)
@@ -700,13 +680,11 @@ public unsafe partial class Renderer
         // unsafe block writes straight into the mapped staging buffer.
         CreateBuffer(byteSize, BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out var staging, out var stagingMem);
+            out var staging, out var stagingAlloc);
 
-        void* mapped = null;
-        vk!.MapMemory(device, stagingMem, 0, byteSize, 0, ref mapped);
+        void* mapped = memAllocator.GetMapped(stagingAlloc);
         var halfSpan = new Span<Half>(mapped, texelCount * 4);
         for (int i = 0; i < texelCount * 4; i++) halfSpan[i] = (Half)img.Pixels[i];
-        vk!.UnmapMemory(device, stagingMem);
 
         ImageCreateInfo info = new()
         {
@@ -725,17 +703,7 @@ public unsafe partial class Renderer
         if (vk!.CreateImage(device, &info, null, out image) != Result.Success)
             throw new Exception("Failed to create equirect upload image");
 
-        vk!.GetImageMemoryRequirements(device, image, out var memReqs);
-        MemoryAllocateInfo alloc = new()
-        {
-            SType           = StructureType.MemoryAllocateInfo,
-            AllocationSize  = memReqs.Size,
-            MemoryTypeIndex = FindMemoryType(vk, physicalDevice, memReqs.MemoryTypeBits,
-                MemoryPropertyFlags.DeviceLocalBit),
-        };
-        if (vk!.AllocateMemory(device, &alloc, null, out memory) != Result.Success)
-            throw new Exception("Failed to allocate equirect upload memory");
-        vk!.BindImageMemory(device, image, memory, 0);
+        alloc = memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
         var cmd = BeginSingleTimeCommands();
         IblTransition(cmd, image, ImageLayout.Undefined, ImageLayout.TransferDstOptimal,
@@ -760,8 +728,7 @@ public unsafe partial class Renderer
             ImageLayout.ShaderReadOnlyOptimal, Lut2DRange());
         EndSingleTimeCommands(cmd);
 
-        vk!.DestroyBuffer(device, staging, null);
-        vk!.FreeMemory(device, stagingMem, null);
+        DestroyBuffer(staging, stagingAlloc);
 
         ImageViewCreateInfo viewInfo = new()
         {
@@ -859,18 +826,18 @@ public unsafe partial class Renderer
 
         if (brdfLutView.Handle != 0)           vk!.DestroyImageView(device, brdfLutView, null);
         if (brdfLutImage.Handle != 0)          vk!.DestroyImage(device, brdfLutImage, null);
-        if (brdfLutMemory.Handle != 0)         vk!.FreeMemory(device, brdfLutMemory, null);
+        memAllocator.Free(brdfLutAlloc);
 
         if (prefilteredCubeView.Handle != 0)   vk!.DestroyImageView(device, prefilteredCubeView, null);
         if (prefilteredCubeImage.Handle != 0)  vk!.DestroyImage(device, prefilteredCubeImage, null);
-        if (prefilteredCubeMemory.Handle != 0) vk!.FreeMemory(device, prefilteredCubeMemory, null);
+        memAllocator.Free(prefilteredCubeAlloc);
 
         if (irradianceCubeView.Handle != 0)    vk!.DestroyImageView(device, irradianceCubeView, null);
         if (irradianceCubeImage.Handle != 0)   vk!.DestroyImage(device, irradianceCubeImage, null);
-        if (irradianceCubeMemory.Handle != 0)  vk!.FreeMemory(device, irradianceCubeMemory, null);
+        memAllocator.Free(irradianceCubeAlloc);
 
         if (envCubeView.Handle != 0)           vk!.DestroyImageView(device, envCubeView, null);
         if (envCubeImage.Handle != 0)          vk!.DestroyImage(device, envCubeImage, null);
-        if (envCubeMemory.Handle != 0)         vk!.FreeMemory(device, envCubeMemory, null);
+        memAllocator.Free(envCubeAlloc);
     }
 }

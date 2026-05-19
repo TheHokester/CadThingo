@@ -11,3 +11,4 @@ D:\VulkanSDK\Bin\slangc.exe IrradianceConvolve.slang -target spirv -o ../../Asse
 D:\VulkanSDK\Bin\slangc.exe PrefilterEnv.slang -target spirv -o ../../Assets/Shaders/PrefilterEnv.spv
 D:\VulkanSDK\Bin\slangc.exe BrdfLutGen.slang -target spirv -o ../../Assets/Shaders/BrdfLutGen.spv
 D:\VulkanSDK\Bin\slangc.exe Skybox.slang -target spirv -o ../../Assets/Shaders/Skybox.spv
+D:\VulkanSDK\Bin\slangc.exe ProbeCapture.slang -target spirv -o ../../Assets/Shaders/ProbeCapture.spv
