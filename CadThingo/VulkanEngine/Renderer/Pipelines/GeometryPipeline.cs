@@ -109,17 +109,26 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         int fallbackMatIdx = matCount;
         matPtr[fallbackMatIdx] = new PbrMaterial
         {
-            BaseColorFactor       = new Vector4(1, 1, 1, 1),
-            EmissiveFactor        = Vector3.Zero,
-            AlphaCutoff           = 0f,
-            MetallicFactor        = 0.3f,
-            RoughnessFactor       = 0.7f,
-            Flags                 = 0,
-            BaseColorTex          = GltfDefaults.BaseColorIndex,
-            PhysicalDescriptorTex = GltfDefaults.MetallicRoughnessIndex,
-            NormalTex             = GltfDefaults.NormalIndex,
-            OcclusionTex          = GltfDefaults.OcclusionIndex,
-            EmissiveTex           = GltfDefaults.EmissiveIndex,
+            BaseColorFactor          = new Vector4(1, 1, 1, 1),
+            EmissiveFactor           = Vector3.Zero,
+            AlphaCutoff              = 0f,
+            MetallicFactor           = 0.3f,
+            RoughnessFactor          = 0.7f,
+            Flags                    = 0,
+            BaseColorTex             = GltfDefaults.BaseColorIndex,
+            PhysicalDescriptorTex    = GltfDefaults.MetallicRoughnessIndex,
+            NormalTex                = GltfDefaults.NormalIndex,
+            OcclusionTex             = GltfDefaults.OcclusionIndex,
+            EmissiveTex              = GltfDefaults.EmissiveIndex,
+            // KHR extension fields — glTF defaults (no transmission, no coat).
+            TransmissionFactor       = 0f,
+            Ior                      = 1.5f,
+            ClearcoatFactor          = 0f,
+            ClearcoatRoughnessFactor = 0f,
+            TransmissionTex          = GltfDefaults.OcclusionIndex,  // white = 1.0 multiplier
+            ClearcoatTex             = GltfDefaults.OcclusionIndex,
+            ClearcoatRoughnessTex    = GltfDefaults.OcclusionIndex,
+            ClearcoatNormalTex       = GltfDefaults.NormalIndex,
         };
 
         // ── GPU-driven indirect draw ────────────────────────────────────

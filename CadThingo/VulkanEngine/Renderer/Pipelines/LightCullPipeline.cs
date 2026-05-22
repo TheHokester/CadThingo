@@ -134,7 +134,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         {
             DescriptorBufferInfo bufLights = new()
             {
-                Buffer = pbr.GetLightStorageBuffer((uint)i), Offset = 0,
+                Buffer = Renderer.GetLightStorageBuffer((uint)i), Offset = 0,
                 Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
             };
             var write = new WriteDescriptorSet
@@ -161,7 +161,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         {
             DescriptorBufferInfo bufLights = new()
             {
-                Buffer = pbr.GetLightStorageBuffer((uint)i), Offset = 0,
+                Buffer = Renderer.GetLightStorageBuffer((uint)i), Offset = 0,
                 Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
             };
             DescriptorBufferInfo bufTileCount = new()
@@ -265,21 +265,3 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
             0, 0, null, 2, postBarriers, 0, null);
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-//  PBR deferred lighting pass — fullscreen triangle, samples G-buffer +
-//  per-tile light list, optional ray-queried shadows.
-// ────────────────────────────────────────────────────────────────────────────
-
-// ────────────────────────────────────────────────────────────────────────────
-//  Tone-map / post pass — samples HDRColor, writes FinalColor (LDR)
-// ────────────────────────────────────────────────────────────────────────────
-
-// Matches the TONEMAP_OPERATOR spec constant in Tonemap.slang. Read once at
-// pipeline build; changing the operator requires Dispose + rebuild.
-
-// ────────────────────────────────────────────────────────────────────────────
-//  Transparent forward+ pass — renders BLEND-mode materials into HDRColor with
-//  src-alpha / one-minus-src-alpha blending, depth-tested LE against the
-//  geometry pass's depth buffer (no depth write).
-// ────────────────────────────────────────────────────────────────────────────

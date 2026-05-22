@@ -22,6 +22,7 @@ public unsafe partial class Renderer
         Extent2D extent = ChooseSwapExtent(swapChainSupport.Capabilities);
         
         
+        
         //choose image count
         uint imageCount = swapChainSupport.Capabilities.MinImageCount + 1;
         if (swapChainSupport.Capabilities.MaxImageCount > 0 && imageCount > swapChainSupport.Capabilities.MaxImageCount)
@@ -310,10 +311,16 @@ public unsafe partial class Renderer
         gBufferMaterial.Dispose();
         gBufferEmissive.Dispose();
 
+        // Pathtracer storage images live outside the graph but share the
+        // renderExtent — recreate them too so per-pixel work stays in sync.
+        ptAccumulator?.Dispose();
+        ptOutColor?.Dispose();
+
         renderExtent = new Extent2D(width, height);
 
         CreateDepthResources();
         CreateGBufferResources();
+        CreatePathTracingResources(renderExtent.Width, renderExtent.Height);
 
         scene.renderGraph = new RenderGraph(vk!, device, physicalDevice);
         SetupDeferredRenderer(scene.renderGraph, renderExtent.Width, renderExtent.Height);
@@ -328,6 +335,11 @@ public unsafe partial class Renderer
 
         // FinalColor ImageView is fresh — re-bind it for the ImGui viewport panel.
         imGuiUtils?.WriteViewportDescriptor(scene.renderGraph.GetResource("FinalColor").ImageView);
+
+        // PT storage image views are fresh too. WriteStorageImageDescriptors calls
+        // MarkAccumulatorDirty internally so the next dispatch clears the
+        // (also-fresh) accumulator instead of reading garbage memory.
+        ptComputePipeline?.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
     }
 
     /// <summary>
@@ -373,6 +385,21 @@ public unsafe partial class Renderer
         if (pendingPbrRebuild)     { RebuildPbrPipelines();     pendingPbrRebuild     = false; }
         if (pendingTonemapRebuild) { RebuildTonemapPipeline();  pendingTonemapRebuild = false; }
 
+        // 0c. Render-mode change: rebind tonemap's HDR input so its single
+        //     shared descriptor set points at the right source. DeviceWaitIdle
+        //     ensures no in-flight frame is still using the old binding.
+        //     Mode flips are user-driven (ImGui combo), so the hitch is
+        //     acceptable; per-frame double-buffered descriptors would avoid it.
+        if (renderMode != _lastRenderMode)
+        {
+            vk!.DeviceWaitIdle(device);
+            ImageView source = renderMode == RenderMode.RayCompute
+                ? ptOutColor.ImageView
+                : scene.renderGraph.GetResource("HDRColor").ImageView;
+            tonemapPipeline.WriteHdrInputDescriptor(source, gBufferSampler);
+            _lastRenderMode = renderMode;
+        }
+
         var ctx = new FrameContext()
         {
             FrameIndex = currentFrame,
@@ -403,47 +430,26 @@ public unsafe partial class Renderer
         if (vk!.BeginCommandBuffer(cmd, &beginInfo) != Result.Success)
             throw new Exception("Failed to begin command buffer");
 
-        // 5. Update per-frame UBOs
-        // 5a. Reflection-probe scheduler bookkeeping. Cheap CPU-only walk; the
-        //     capture draw + prefilter dispatch land in Phase 4. Runs before the
-        //     geometry pass so the captured cube is visible to downstream
-        //     shaders within the same frame once it's hooked up.
-        reflectionProbeSystem.Tick(frameCounter, scene);
-
-        geometryPipeline.UpdateUbo(currentFrame, camera);
-        var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
-        transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
-        // Skybox always updates — pass body is conditional on EditorState.SkyboxEnabled
-        // so we can flip the toggle without re-recording the graph.
-        skyboxPipeline.UpdatePerFrame(currentFrame, camera, ImGui.EditorState.SkyboxIntensity);
-
-        // 5a-ter. Reflection-probe cluster cull. Tile-only today (zSlices=1);
-        // when 3D froxels land the shader-side index math stays identical.
-        // Cheap CPU work (~0.1ms for 16 probes × ~8000 tiles at 1080p).
-        float aspect = (float)renderExtent.Width / renderExtent.Height;
-        reflectionProbeSystem.BuildClusters(currentFrame, camera, aspect, 0.1f, 100f,
-            tileCountX, tileCountY);
-        // Refresh the per-probe SSBO read by the PBR lighting shader.
-        reflectionProbeSystem.WriteProbeRecords(currentFrame);
-
-        // 5a-bis. Reflection-probe capture for the next dirty probe (if any).
-        // Bounded to one probe per frame; the actual draw recording happens
-        // here so the captured cube is visible to any later sampling pass
-        // within the same command buffer. No-op if no probe needs capturing
-        // or if the capture shader wasn't compiled into ProbeCapture.spv.
-        reflectionProbeSystem.RecordCapture(cmd, currentFrame, frameCounter, scene);
-
-        // 5b. GPU cull pass — runs before the geometry pass and produces the
-        // indirect command + post-cull instance buffers the geometry pass consumes.
-        drawCullPipeline.Record(cmd, currentFrame, camera, scene);
-
-        // 5c. Tiled light-cull — bins lights into per-tile slot lists for the
-        // lighting fragment shader. Buffer barrier inside makes the writes
-        // visible to the fragment stage of the lighting pass.
-        lightCullPipeline.Record(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
-
-        // 6. Record all render-graph passes (geometry → lighting), record-only.
-        scene.renderGraph.Execute(cmd, frameContext: ctx);
+        switch (renderMode)
+        {
+            case RenderMode.Deferred:
+                DrawDeferred(cmd, ctx);
+                break;
+            case RenderMode.ForwardPlus:
+                DrawRayQueried(cmd, ctx);
+                break;
+            case RenderMode.RayCompute:
+                DrawPathtraced(cmd, ctx);
+                break;
+            case RenderMode.RayTrace:
+                // RT pipeline path not implemented — fall through to deferred so the
+                // viewport stays alive.
+                DrawDeferred(cmd, ctx);
+                break;
+            default:
+                DrawDeferred(cmd, ctx);
+                break;
+        }
 
         // 7. Blit FinalColor → swapchain image
         var swapImage = swapChainImages[imageIndex];
@@ -613,17 +619,123 @@ public unsafe partial class Renderer
         // 6. Record all render-graph passes (geometry → lighting), record-only.
         scene.renderGraph.Execute(cmd, frameContext);
     }
-
-    private void DrawRayQueried()
+    /// <summary>
+    /// Uses RT in a compute shader
+    /// </summary>
+    private void DrawRayQueried(CommandBuffer cmd, FrameContext frameContext)
     {
-        
+
     }
+
+    /// <summary>
+    /// Progressive ray-query pathtracer. Dispatches PTCompute.spv into
+    /// ptAccumulator + ptOutColor, then blits ptOutColor into FinalColor so the
+    /// viewport panel (which samples FinalColor) shows the result.
+    ///
+    /// Does NOT run the render graph — the deferred chain is bypassed entirely.
+    /// FinalColor's layout tracker stays valid because the graph's _currentLayout
+    /// settles at ShaderReadOnly per its declared finalLayout, and this method
+    /// leaves FinalColor in that same state.
+    /// </summary>
+    private void DrawPathtraced(CommandBuffer cmd, FrameContext frameContext)
+    {
+        // Camera motion → restart accumulation. Cheap structural-equality check
+        // against last frame's snapshot; only runs when PT is active. If the
+        // camera class ever grows a built-in dirty flag, swap this out for that.
+        if (camera != null)
+        {
+            var view = camera.GetViewMatrix();
+            var pos  = camera.GetPosition();
+            if (view != _ptLastCameraView || pos != _ptLastCameraPos)
+            {
+                MarkAccumulatorDirty();
+                _ptLastCameraView = view;
+                _ptLastCameraPos  = pos;
+            }
+        }
+
+        // Refresh the per-frame lights SSBO — renderer-owned, shared with
+        // every rendering path. No tile-cull or PbrDeferred-UBO work needed
+        // for the pathtracer.
+        uint lightCount = UpdateLights(currentFrame, scene);
+
+        // Bridge Renderer's dirty signal into the pipeline's accumulator-reset.
+        if (accumulatorDirty)
+        {
+            ptComputePipeline.MarkAccumulatorDirty();
+            accumulatorDirty = false;
+        }
+
+        ptComputePipeline.UpdatePerFrame(currentFrame, camera, lightCount, renderExtent);
+
+        // ── Pre-dispatch barrier ──────────────────────────────────────────────
+        // ptAccumulator: previous frame's compute read+write → this frame's same.
+        // ptOutColor:    previous frame's tonemap fragment read (or first-frame
+        //                Undefined→General) → this frame's compute write.
+        // Both stay in General the whole time; tonemap reads ptOutColor in
+        // ShaderReadOnly between dispatch and end-of-frame, but is re-stamped
+        // back to General before the next dispatch lands here.
+        var preBarriers = stackalloc ImageMemoryBarrier[2];
+        preBarriers[0] = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.General,
+            NewLayout = ImageLayout.General,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = ptAccumulator.Image,
+            SrcAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
+            DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
+            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
+        };
+        preBarriers[1] = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.General,
+            NewLayout = ImageLayout.General,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = ptOutColor.Image,
+            SrcAccessMask = AccessFlags.ShaderReadBit,
+            DstAccessMask = AccessFlags.ShaderWriteBit,
+            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
+        };
+        vk!.CmdPipelineBarrier(cmd,
+            PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.FragmentShaderBit,
+            PipelineStageFlags.ComputeShaderBit,
+            0, 0, null, 0, null, 2, preBarriers);
+
+        // ── Dispatch ──────────────────────────────────────────────────────────
+        ptComputePipeline.Record(cmd, frameContext);
+
+        // ── Tonemap into FinalColor ───────────────────────────────────────────
+        // Tonemap's HDR input descriptor was rebound to ptOutColor at the top of
+        // DrawFrame on the mode-change boundary. It expects the image in
+        // ShaderReadOnly and writes FinalColor as a color attachment.
+        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
+            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
+
+        var finalColor = scene.renderGraph.GetResource("FinalColor");
+        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
+
+        tonemapPipeline.Record(cmd, frameContext, finalColor.ImageView);
+
+        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+            ImageLayout.ColorAttachmentOptimal, ImageLayout.ShaderReadOnlyOptimal);
+
+        // ptOutColor back to General so next frame's dispatch + pre-barrier
+        // path are layout-uniform.
+        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
+    }
+
     /// <summary>
     /// placeholder for future RTPipeline implementation<br/>
     /// </summary>
     private void DrawRayTraced()
     {
-        
+
     }
     
     
@@ -669,8 +781,11 @@ public unsafe partial class Renderer
         // SampledBit lets the ImGui viewport panel bind FinalColor as a CombinedImageSampler.
         // finalLayout settles to ShaderReadOnlyOptimal each frame so ImGui draws sample valid
         // contents — the per-frame blit to the swapchain transitions in and out manually.
+        // TransferDstBit lets the pathtracer path blit its ptOutColor into FinalColor —
+        // the viewport panel samples FinalColor regardless of render mode, so PT
+        // pixels need to land here for the user to see them.
         graph.AddResource("FinalColor", Format.R8G8B8A8Unorm, new Extent2D(width, height),
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit | ImageUsageFlags.SampledBit,
+            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
         
         //set names of FInal and hdr color for debug
@@ -745,6 +860,38 @@ public unsafe partial class Renderer
         graph.Compile();
     }
 
+
+    private void CreatePathTracingResources(uint width, uint height)
+    {
+        // ptOutColor needs TransferSrcBit so DrawPathtraced can blit it into
+        // FinalColor (the viewport's source) at the end of the dispatch.
+        ptAccumulator = new ImageResource(vk, device, "accumulator", Format.R32G32B32A32Sfloat,
+            new Extent2D(width, height),
+            ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
+            ImageLayout.Undefined, ImageLayout.General);
+
+        ptOutColor = new ImageResource(vk, device, "outColor", Format.R32G32B32A32Sfloat,
+            new Extent2D(width, height),
+            ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit | ImageUsageFlags.TransferSrcBit,
+            ImageLayout.Undefined, ImageLayout.General);
+
+        // Render graph normally calls Allocate inside Compile — these images live
+        // outside the graph, so allocate explicitly.
+        ptAccumulator.Allocate(physicalDevice);
+        ptOutColor.Allocate(physicalDevice);
+
+        // One-shot Undefined → General transition so the very first dispatch can
+        // do imageStore without a per-frame "first use" branch. Subsequent
+        // dispatches keep both images in General between frames.
+        var cmd = BeginSingleTimeCommands();
+        TransitionImageLayout(cmd, ptAccumulator.Image, ptAccumulator._format,
+            ImageLayout.Undefined, ImageLayout.General);
+        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
+            ImageLayout.Undefined, ImageLayout.General);
+        EndSingleTimeCommands(cmd);
+    }
+
+    
 
 
     

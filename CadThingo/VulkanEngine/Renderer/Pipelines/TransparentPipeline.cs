@@ -310,13 +310,13 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
     /// <summary>Bind the per-frame lights SSBO + the tile cull output buffers
     /// produced by LightCullPipeline. Call once at startup after both producer
     /// pipelines exist.</summary>
-    public void WriteSharedLightingDescriptors(PbrDeferredPipeline pbr, LightCullPipeline lightCull)
+    public void WriteSharedLightingDescriptors(LightCullPipeline lightCull)
     {
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
             DescriptorBufferInfo lightsInfo = new()
             {
-                Buffer = pbr.GetLightStorageBuffer((uint)i),
+                Buffer = Renderer.GetLightStorageBuffer((uint)i),
                 Offset = 0,
                 Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
             };

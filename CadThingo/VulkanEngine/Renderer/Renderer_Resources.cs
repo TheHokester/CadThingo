@@ -299,9 +299,61 @@ public unsafe partial class Renderer
             sourceStage = PipelineStageFlags.TransferBit;
             destinationStage = PipelineStageFlags.FragmentShaderBit;
         }
+        // ── Pathtracer storage-image transitions ─────────────────────────────
+        // Fresh storage image — one-shot init in CreatePathTracingResources.
+        // No prior work to wait on; the next user is a compute shader.
+        else if (oldLayout == ImageLayout.Undefined && newLayout == ImageLayout.General)
+        {
+            barrier.SrcAccessMask = 0;
+            barrier.DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit;
+
+            sourceStage      = PipelineStageFlags.TopOfPipeBit;
+            destinationStage = PipelineStageFlags.ComputeShaderBit;
+        }
+        // PT dispatch finished writing ptOutColor; tonemap is about to sample it
+        // as a CombinedImageSampler.  Compute-write → fragment-read.
+        else if (oldLayout == ImageLayout.General && newLayout == ImageLayout.ShaderReadOnlyOptimal)
+        {
+            barrier.SrcAccessMask = AccessFlags.ShaderWriteBit;
+            barrier.DstAccessMask = AccessFlags.ShaderReadBit;
+
+            sourceStage      = PipelineStageFlags.ComputeShaderBit;
+            destinationStage = PipelineStageFlags.FragmentShaderBit;
+        }
+        // ptOutColor back to General for the next frame's dispatch.  The reader
+        // was tonemap's fragment shader; the next user is the compute dispatch.
+        else if (oldLayout == ImageLayout.ShaderReadOnlyOptimal && newLayout == ImageLayout.General)
+        {
+            barrier.SrcAccessMask = AccessFlags.ShaderReadBit;
+            barrier.DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit;
+
+            sourceStage      = PipelineStageFlags.FragmentShaderBit;
+            destinationStage = PipelineStageFlags.ComputeShaderBit;
+        }
+        // FinalColor was sitting in ShaderReadOnly (viewport sample / last frame's
+        // graph end-state); tonemap is about to write it as a color attachment.
+        else if (oldLayout == ImageLayout.ShaderReadOnlyOptimal && newLayout == ImageLayout.ColorAttachmentOptimal)
+        {
+            barrier.SrcAccessMask = AccessFlags.ShaderReadBit;
+            barrier.DstAccessMask = AccessFlags.ColorAttachmentWriteBit;
+
+            sourceStage      = PipelineStageFlags.FragmentShaderBit;
+            destinationStage = PipelineStageFlags.ColorAttachmentOutputBit;
+        }
+        // Tonemap finished writing FinalColor; next consumers are the swapchain
+        // blit (transfer read) and the ImGui viewport sampler (fragment read).
+        // Cover both downstream stages so neither needs an extra barrier.
+        else if (oldLayout == ImageLayout.ColorAttachmentOptimal && newLayout == ImageLayout.ShaderReadOnlyOptimal)
+        {
+            barrier.SrcAccessMask = AccessFlags.ColorAttachmentWriteBit;
+            barrier.DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.TransferReadBit;
+
+            sourceStage      = PipelineStageFlags.ColorAttachmentOutputBit;
+            destinationStage = PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.TransferBit;
+        }
         else
         {
-            throw new Exception("Unsupported layout transition");
+            throw new Exception($"Unsupported layout transition: {oldLayout} -> {newLayout}");
         }
         
         vk.CmdPipelineBarrier(cmd,
@@ -467,7 +519,10 @@ public unsafe partial class Renderer
     // textures).
     internal const uint MAX_MATERIALS         = 256;
     internal const uint MAX_INSTANCES         = 4096;
-    internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 5;
+    // Must match ResourceManager.MAX_BINDLESS_TEXTURES — both bound the same
+    // descriptor array. 9 = worst-case textures per material post-extensions
+    // (5 core + transmission + 3× clearcoat).
+    internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 9;
 
     // Lighting pipeline set 0 binding 1 — per-frame StructuredBuffer<PbrLight>.
     // Cap chosen to keep the SSBO at 64KB (1024 × 64B); raise if needed.
@@ -501,6 +556,91 @@ public unsafe partial class Renderer
         ubo.alloc  = memAllocator.AllocateForBuffer(ubo.buffer,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
         ubo.mapped = memAllocator.GetMapped(ubo.alloc);
+    }
+
+    // ─── Lights SSBO ───────────────────────────────────────────────────────
+    // Lives on Renderer (not PbrDeferredPipeline) so the pathtracer can read
+    // it without depending on the deferred lighting pipeline existing. The
+    // scene owns the LightComponents; this is just the per-frame GPU mirror.
+
+    internal UboBuffer[] lightStorageBuffers = new UboBuffer[MAX_CONCURRENT_FRAMES];
+    private readonly List<LightComponent> _lightScratch = new();
+
+    /// <summary>Buffer holding packed PbrLightGpu records for the given frame
+    /// slot. Bound by every pipeline that needs scene lighting. Stable for the
+    /// renderer's lifetime.</summary>
+    public Buffer GetLightStorageBuffer(uint frame) => lightStorageBuffers[frame].buffer;
+
+    /// <summary>Number of valid lights packed by the most recent UpdateLights.</summary>
+    public uint LightCount { get; private set; }
+
+    private void CreateLightBuffers()
+    {
+        for (int i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            CreateMappedStorageBuffer(
+                (ulong)(MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
+                ref lightStorageBuffers[i]);
+        }
+    }
+
+    private void DestroyLightBuffers()
+    {
+        for (int i = 0; i < lightStorageBuffers.Length; i++)
+        {
+            if (lightStorageBuffers[i].buffer.Handle != 0)
+                DestroyBuffer(lightStorageBuffers[i].buffer, lightStorageBuffers[i].alloc);
+        }
+    }
+
+    /// <summary>Walks scene lights into the per-frame light SSBO. Returns the
+    /// packed light count, also cached in <see cref="LightCount"/>. Every
+    /// rendering path (deferred, forward+, pathtracer) calls this once per frame
+    /// before recording its draws.</summary>
+    public uint UpdateLights(uint frameIndex, Scene scene)
+    {
+        scene.EnumerateLights(_lightScratch);
+
+        PbrLightGpu* lightPtr = (PbrLightGpu*)lightStorageBuffers[frameIndex].mapped;
+        uint count = 0;
+        foreach (var light in _lightScratch)
+        {
+            if (count >= MAX_LIGHTS) break;
+
+            // World-space position from the owner transform if present.
+            Vector3 worldPos = Vector3.Zero;
+            if (light.Owner != null)
+            {
+                var t = light.Owner->GetComponent<TransformComponent>();
+                if (t != null)
+                {
+                    var w = *t.GetWorldMatrix();
+                    worldPos = new Vector3(w.M41, w.M42, w.M43);
+                }
+            }
+
+            // Normalize direction — guard against zero-vector default.
+            Vector3 dir = light.Direction.LengthSquared() > 1e-8f
+                ? Vector3.Normalize(light.Direction)
+                : new Vector3(0, -1, 0);
+
+            // Range: -1 sentinel marks directional lights so the shader can branch
+            // on attenuation without inspecting Type for the most common test.
+            float range = light.Type == LightType.Directional ? -1f : light.Range;
+
+            lightPtr[count] = new PbrLightGpu
+            {
+                positionRange  = new Vector4(worldPos, range),
+                colorIntensity = new Vector4(light.Color, light.Intensity),
+                directionType  = new Vector4(dir, (float)(uint)light.Type),
+                spotCones      = new Vector4(light.InnerConeCos, light.OuterConeCos,
+                    light.CastShadows ? 1f : 0f, light.Radius),
+            };
+            count++;
+        }
+
+        LightCount = count;
+        return count;
     }
 
    
@@ -660,9 +800,12 @@ unsafe struct UboBuffer
     public void*     mapped;
 }
 
-// Mirrors PbrUtils.slang::PbrMaterial under std430. Layout chosen so the struct is
-// exactly 64B with zero padding on either side: vec4 first, then vec3 (16B-aligned)
-// with the trailing AlphaCutoff packed into the vec3's std430 slack, then scalars/ints.
+// Mirrors PbrUtils.slang::PbrMaterial under std430. First 64B holds the core
+// glTF metallic-roughness block (laid out so the vec3 emissive factor's
+// trailing 4B slack absorbs AlphaCutoff). The next 32B carries KHR extension
+// data — transmission, IOR, clearcoat. All scalar / 4B-aligned so std430
+// packs them with zero padding. Fields the shaders don't yet consume sit
+// here as data only; uploaded every frame regardless. Total: 96B.
 [StructLayout(LayoutKind.Sequential)]
 public struct PbrMaterial
 {
@@ -677,6 +820,19 @@ public struct PbrMaterial
     public int NormalTex;
     public int OcclusionTex;
     public int EmissiveTex;
+
+    // KHR_materials_transmission + KHR_materials_ior
+    public float TransmissionFactor;     // 0 = opaque, 1 = full transmission
+    public float Ior;                    // index of refraction; glTF default 1.5
+
+    // KHR_materials_clearcoat
+    public float ClearcoatFactor;        // 0 = no coat, 1 = full coat
+    public float ClearcoatRoughnessFactor;
+
+    public int TransmissionTex;          // R channel multiplies TransmissionFactor
+    public int ClearcoatTex;             // R channel multiplies ClearcoatFactor
+    public int ClearcoatRoughnessTex;    // G channel multiplies ClearcoatRoughnessFactor
+    public int ClearcoatNormalTex;       // tangent-space normal for the coat layer
 }
 
 public enum AlphaMode : uint

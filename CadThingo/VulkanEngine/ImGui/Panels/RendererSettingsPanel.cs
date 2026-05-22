@@ -48,6 +48,8 @@ public static class RendererSettingsPanel
             return;
         }
 
+        DrawRenderMode(renderer);
+        DrawPathtracer(renderer);
         DrawEnvironment(renderer);
         DrawReflectionProbes(renderer);
         DrawTonemap(renderer);
@@ -55,6 +57,149 @@ public static class RendererSettingsPanel
         DrawBackground();
 
         ImGuiNET.ImGui.End();
+    }
+
+    // ── Render mode ────────────────────────────────────────────────────────
+
+    static readonly string[] _renderModeLabels =
+    {
+        "Deferred",
+        "Forward+ (ray-queried)",
+        "Pathtracer (compute + ray query)",
+        "Pathtracer (RT pipeline) [TODO]",
+    };
+
+    static void DrawRenderMode(Renderer.Renderer renderer)
+    {
+        ImGuiNET.ImGui.SeparatorText("Render Mode");
+
+        int modeIdx = (int)renderer.renderMode;
+        if (ImGuiNET.ImGui.Combo("Mode", ref modeIdx, _renderModeLabels, _renderModeLabels.Length))
+        {
+            renderer.renderMode = (Renderer.Renderer.RenderMode)modeIdx;
+            // Mode switch invalidates whatever was in FinalColor — drop any in-
+            // progress PT accumulation so we don't get a frame of stale pixels
+            // when toggling back on.
+            renderer.MarkAccumulatorDirty();
+        }
+    }
+
+    // ── Pathtracer ─────────────────────────────────────────────────────────
+    // Visible only when render mode is RayCompute. Sliders push their value
+    // straight to the pipeline and mark the accumulator dirty so the next
+    // frame restarts integration.
+
+    static readonly string[] _cameraModeLabels =
+    {
+        "Pinhole",
+        "Thin lens (DoF)",
+        "Generalized Panini",
+        "Fisheye (equidistant)",
+        "Orthographic [TODO]",
+    };
+
+    static void DrawPathtracer(Renderer.Renderer renderer)
+    {
+        if (renderer.renderMode != Renderer.Renderer.RenderMode.RayCompute) return;
+
+        var pt = renderer.ptComputePipeline;
+        if (pt == null)
+        {
+            ImGuiNET.ImGui.SeparatorText("Pathtracer");
+            ImGuiNET.ImGui.TextDisabled("Pathtracer pipeline not initialized.");
+            return;
+        }
+
+        ImGuiNET.ImGui.SeparatorText("Pathtracer");
+
+        // Sample counter (progressive accumulation depth) — read-only feedback.
+        ImGuiNET.ImGui.Text($"Samples accumulated: {pt.CurrentSampleCount}");
+        ImGuiNET.ImGui.SameLine();
+        if (ImGuiNET.ImGui.SmallButton("Restart")) renderer.MarkAccumulatorDirty();
+
+        // Bounce cap. Hard ceiling MAX_BOUNCES is baked into the pipeline at
+        // build (spec const); this slider clamps below that at runtime.
+        uint bounceCap = pt.BounceCap;
+        int  bounceTmp = (int)bounceCap;
+        if (ImGuiNET.ImGui.SliderInt("Bounce cap", ref bounceTmp, 1, (int)pt.MaxBouncesHardCap))
+        {
+            pt.BounceCap = (uint)bounceTmp;
+            renderer.MarkAccumulatorDirty();
+        }
+
+        // FOV is used by every projection mode — vertical FOV in degrees, the
+        // pipeline derives radians + tanHalfFov for the UBO.
+        float fov = pt.FovDeg;
+        if (ImGuiNET.ImGui.SliderFloat("FOV (deg)", ref fov, 10f, 170f, "%.1f"))
+        {
+            pt.FovDeg = fov;
+            renderer.MarkAccumulatorDirty();
+        }
+
+        // Camera mode — switches which PSO Record binds. No rebuild, no hitch.
+        int modeIdx = (int)pt.Mode;
+        if (ImGuiNET.ImGui.Combo("Camera mode", ref modeIdx, _cameraModeLabels, _cameraModeLabels.Length))
+        {
+            pt.Mode = (PTComputePipeline.CameraMode)modeIdx;
+            renderer.MarkAccumulatorDirty();
+        }
+
+        // Mode-specific sliders. Branch on the just-set Mode so the UI updates
+        // the same frame the user changes mode.
+        switch (pt.Mode)
+        {
+            case PTComputePipeline.CameraMode.ThinLens:
+                DrawThinLensSliders(renderer, pt);
+                break;
+            case PTComputePipeline.CameraMode.Panini:
+                DrawPaniniSliders(renderer, pt);
+                break;
+            case PTComputePipeline.CameraMode.Fisheye:
+                ImGuiNET.ImGui.TextDisabled("Equidistant fisheye uses just FOV — no extra controls.");
+                break;
+            case PTComputePipeline.CameraMode.Pinhole:
+            case PTComputePipeline.CameraMode.Orthographic:
+                // no extra sliders
+                break;
+        }
+    }
+
+    static void DrawThinLensSliders(Renderer.Renderer renderer, PTComputePipeline pt)
+    {
+        ImGuiNET.ImGui.Indent();
+        float aperture = pt.Aperture;
+        if (ImGuiNET.ImGui.SliderFloat("Aperture radius", ref aperture, 0f, 0.5f, "%.3f"))
+        {
+            pt.Aperture = aperture;
+            renderer.MarkAccumulatorDirty();
+        }
+        float focus = pt.FocusDistance;
+        if (ImGuiNET.ImGui.SliderFloat("Focus distance", ref focus, 0.1f, 50f, "%.2f"))
+        {
+            pt.FocusDistance = focus;
+            renderer.MarkAccumulatorDirty();
+        }
+        ImGuiNET.ImGui.TextDisabled("aperture = focalLength / (2 · fStop) — set to 0 to disable DoF.");
+        ImGuiNET.ImGui.Unindent();
+    }
+
+    static void DrawPaniniSliders(Renderer.Renderer renderer, PTComputePipeline pt)
+    {
+        ImGuiNET.ImGui.Indent();
+        float d = pt.PaniniDistance;
+        if (ImGuiNET.ImGui.SliderFloat("Panini distance (d)", ref d, 0f, 1f, "%.2f"))
+        {
+            pt.PaniniDistance = d;
+            renderer.MarkAccumulatorDirty();
+        }
+        float vc = pt.VerticalCompression;
+        if (ImGuiNET.ImGui.SliderFloat("Vertical compression", ref vc, 0f, 1f, "%.2f"))
+        {
+            pt.VerticalCompression = vc;
+            renderer.MarkAccumulatorDirty();
+        }
+        ImGuiNET.ImGui.TextDisabled("d=0 collapses to pinhole; d=1 is the classic Panini look.");
+        ImGuiNET.ImGui.Unindent();
     }
 
     // ── Reflection probes ─────────────────────────────────────────────────

@@ -12,3 +12,4 @@ D:\VulkanSDK\Bin\slangc.exe PrefilterEnv.slang -target spirv -o ../../Assets/Sha
 D:\VulkanSDK\Bin\slangc.exe BrdfLutGen.slang -target spirv -o ../../Assets/Shaders/BrdfLutGen.spv
 D:\VulkanSDK\Bin\slangc.exe Skybox.slang -target spirv -o ../../Assets/Shaders/Skybox.spv
 D:\VulkanSDK\Bin\slangc.exe ProbeCapture.slang -target spirv -o ../../Assets/Shaders/ProbeCapture.spv
+D:\VulkanSDK\Bin\slangc.exe PTCompute.slang -target spirv -capability spvRayQueryKHR -o ../../Assets/Shaders/PTCompute.spv

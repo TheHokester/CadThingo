@@ -54,27 +54,21 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     private const int SetShadowAlpha  = 2;
     private const int SetBindless     = 3;
 
-    // Per-frame data owned by this pipeline. UpdatePerFrame fills both each frame.
+    // Per-frame data owned by this pipeline. The lights SSBO it formerly owned
+    // now lives on Renderer (Renderer.lightStorageBuffers) so the pathtracer +
+    // forward+ pass can read it without depending on this pipeline existing.
     private UboBuffer[] LightingUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
-    private UboBuffer[] LightStorageBuffers    = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
-
-    public Buffer GetLightStorageBuffer(uint frame) => LightStorageBuffers[frame].buffer;
 
     /// <summary>True = wire the PCSS-style soft-shadow specialization constant on,
     /// pulled into the fragment shader as <c>constant_id 0</c>. Read once at
     /// pipeline build; toggling requires Dispose + rebuild.</summary>
     public bool SoftShadowsEnabled { get; init; } = true;
 
-    // Reusable scratch list filled by Scene.EnumerateLights — keeps allocations
-    // out of the per-frame path.
-    private readonly List<LightComponent> _lightScratch = new();
-
     public PbrDeferredPipeline(Renderer renderer) : base(renderer) { }
 
     public override void Dispose()
     {
         foreach (var b in LightingUniformBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
-        foreach (var b in LightStorageBuffers)    Renderer.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 
@@ -401,9 +395,6 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
             Renderer.CreateMappedUniformBuffer(sizeof(LightingFrameUBO), ref LightingUniformBuffers[i]);
-            Renderer.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
-                ref LightStorageBuffers[i]);
         }
     }
 
@@ -531,7 +522,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
             };
             DescriptorBufferInfo lightsInfo = new()
             {
-                Buffer = LightStorageBuffers[i].buffer,
+                Buffer = Renderer.GetLightStorageBuffer((uint)i),
                 Offset = 0,
                 Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
             };
@@ -814,46 +805,9 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     public (uint lightCount, uint tileCountX, uint tileCountY) UpdatePerFrame(
         uint frameIndex, Camera camera, Scene scene)
     {
-        scene.EnumerateLights(_lightScratch);
-
-        // ── Pack lights ────────────────────────────────────────
-        PbrLightGpu* lightPtr = (PbrLightGpu*)LightStorageBuffers[frameIndex].mapped;
-        uint count = 0;
-        foreach (var light in _lightScratch)
-        {
-            if (count >= Renderer.MAX_LIGHTS) break;
-
-            // World-space position from the owner transform if present.
-            Vector3 worldPos = Vector3.Zero;
-            if (light.Owner != null)
-            {
-                var t = light.Owner->GetComponent<TransformComponent>();
-                if (t != null)
-                {
-                    var w = *t.GetWorldMatrix();
-                    worldPos = new Vector3(w.M41, w.M42, w.M43);
-                }
-            }
-
-            // Normalize direction — guard against zero-vector default.
-            Vector3 dir = light.Direction.LengthSquared() > 1e-8f
-                ? Vector3.Normalize(light.Direction)
-                : new Vector3(0, -1, 0);
-
-            // Range: -1 sentinel marks directional lights so the shader can branch
-            // on attenuation without inspecting Type for the most common test.
-            float range = light.Type == LightType.Directional ? -1f : light.Range;
-
-            lightPtr[count] = new PbrLightGpu
-            {
-                positionRange  = new Vector4(worldPos, range),
-                colorIntensity = new Vector4(light.Color, light.Intensity),
-                directionType  = new Vector4(dir, (float)(uint)light.Type),
-                spotCones      = new Vector4(light.InnerConeCos, light.OuterConeCos,
-                    light.CastShadows ? 1f : 0f, light.Radius),
-            };
-            count++;
-        }
+        // Lights SSBO is renderer-owned; this just refreshes its contents from
+        // the current scene. Other rendering paths call the same method.
+        uint count = Renderer.UpdateLights(frameIndex, scene);
 
         // ── Frame UBO ──────────────────────────────────────────
         uint tileX = (Renderer.renderExtent.Width  + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;

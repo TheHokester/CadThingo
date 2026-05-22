@@ -52,7 +52,13 @@ public unsafe partial class Renderer
         RayCompute = 2,
         RayTrace =3
     }
-    RenderMode renderMode = RenderMode.Deferred;
+    public RenderMode renderMode = RenderMode.Deferred;
+    // Tracks the last mode DrawFrame actually rendered. When this differs from
+    // `renderMode` at the top of a frame, tonemap's HDR-input descriptor is
+    // rebound to the appropriate source (HDRColor vs ptOutColor) under
+    // DeviceWaitIdle. Initialized to the same default so the first frame
+    // doesn't trigger a spurious rebind.
+    private RenderMode _lastRenderMode = RenderMode.Deferred;
     
     
     // Suballocates VkDeviceMemory blocks so we don't burn one slot of
@@ -133,6 +139,7 @@ public unsafe partial class Renderer
     internal TonemapPipeline      tonemapPipeline;       // post-process: HDRColor → FinalColor
     internal TransparentPipeline  transparentPipeline;   // forward+ BLEND-mode pass between lighting and tonemap
     internal SkyboxPipeline       skyboxPipeline;        // background env-cube draw, between lighting and transparent
+    internal PTComputePipeline    ptComputePipeline;
 
     // Specialization-constant gate for soft (PCSS-style) ray-queried shadows.
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
@@ -183,7 +190,22 @@ public unsafe partial class Renderer
     internal ImageResource gBufferEmissive;
 
     internal Sampler gBufferSampler;
+    
+    //ImageResources for Path tracing
+    bool accumulatorDirty = false;
+    public void MarkAccumulatorDirty() => accumulatorDirty = true;
+    private ImageResource ptAccumulator;
+    private ImageResource ptOutColor;
 
+    // Previous-frame camera snapshot. DrawPathtraced compares against this and
+    // flips accumulatorDirty when either differs, so any camera move restarts
+    // progressive integration. Identity / zero defaults mean the first PT
+    // frame after switching modes always restarts (which is what we want).
+    private Matrix4x4 _ptLastCameraView = Matrix4x4.Identity;
+    private Vector3   _ptLastCameraPos  = Vector3.Zero;
+    
+    
+    
     internal DescriptorPool descriptorPool;
      
     
@@ -226,6 +248,11 @@ public unsafe partial class Renderer
         CreateDepthResources();
         CreateGBufferResources();
         CreateGBufferSampler();
+        CreatePathTracingResources(renderExtent.Width, renderExtent.Height);
+        // Lights SSBO lives on Renderer so every rendering path (deferred,
+        // forward+, pathtracer) reads from the same buffer. Must exist before
+        // any pipeline that wants to bind it.
+        CreateLightBuffers();
 
         // IBL images allocated up-front, cleared to black. The PBR lighting set
         // binds them unconditionally; the compute bake passes fill the content
@@ -271,14 +298,24 @@ public unsafe partial class Renderer
 
         lightCullPipeline = new LightCullPipeline(this);
         lightCullPipeline.Initialize();
-
+        
         // Wire light-cull tile buffers into the PBR lighting set now that both exist.
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         // Same idea for the reflection-probe bindings — the cube array, probe
         // records SSBO, cluster range / index list SSBOs are all stable for the
         // renderer's lifetime so we write once at init.
         PbrDeferredPipeline.WriteProbeDescriptors();
-
+        
+        
+        ptComputePipeline = new PTComputePipeline(this);
+        ptComputePipeline.Initialize();
+        ptComputePipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
+        ptComputePipeline.WriteGeometryDescriptors();
+        ptComputePipeline.WriteLightsDescriptor();
+        // Same as the transparent / deferred pipelines: IBL images are Renderer-
+        // owned and stable across rebakes, so set 3 only needs writing once.
+        ptComputePipeline.WriteIblDescriptors();
+        
         // Tone-map / post pass — reads HDRColor produced by the lighting pass, writes
         // the LDR FinalColor that the swapchain blit sources. Initialized after
         // SetupDeferredRenderer so the HDRColor ImageView exists for the descriptor write.
@@ -292,7 +329,7 @@ public unsafe partial class Renderer
         // with PbrDeferredPipeline; shares the bindless set with GeometryPipeline.
         transparentPipeline = new TransparentPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
         transparentPipeline.Initialize();
-        transparentPipeline.WriteSharedLightingDescriptors(PbrDeferredPipeline, lightCullPipeline);
+        transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
         // IBL bindings live on Renderer-owned VkImages that exist before any
         // pipeline initializes; write them straight after Initialize.
         transparentPipeline.WriteIblDescriptors();
@@ -320,10 +357,12 @@ public unsafe partial class Renderer
         {
             PbrDeferredPipeline.WriteTlasDescriptor(tlas);
             transparentPipeline.WriteTlasDescriptor(tlas);
+            ptComputePipeline.WriteTlasDescriptor(tlas);
             // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
             // path in the PBR lighting shadow rays. Has to happen after
             // InitRayQuery because the SSBO is allocated inside RebuildTlas.
             PbrDeferredPipeline.WriteShadowAlphaDescriptors();
+            ptComputePipeline.WriteShadowInfoDescriptor();
         }
 
         initialized = true;
@@ -368,18 +407,18 @@ public unsafe partial class Renderer
         //
         
         //Chess scene 
-        // Entity* chessScene = GltfLoader.Load(@"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\ABeautifulGame.glb",
-        //     "ChessScene", Engine.ResourceManager, this, scene);
+        Entity* chessScene = GltfLoader.Load(@"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\ABeautifulGame.glb",
+            "ChessScene", Engine.ResourceManager, this, scene);
         
-        //930 turbo
-        Entity* turbo930 = GltfLoader.Load(
-            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Props\free_1975_porsche_911_930_turbo.glb", 
-            "Turbo930", Engine.ResourceManager, this, scene);
-        turbo930->GetComponent<TransformComponent>()?.SetPosition(new Vector3(-1f, 0.05f, 7.7f));
-        turbo930->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(4.25f, 0, 0));
-        
-        Entity* Bistro = GltfLoader.Load(@"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\Bistro_Godot.glb",
-            "Bistro", Engine.ResourceManager, this, scene);
+        // 930 turbo
+         // Entity* turbo930 = GltfLoader.Load(
+         //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Props\free_1975_porsche_911_930_turbo.glb", 
+         //     "Turbo930", Engine.ResourceManager, this, scene);
+         // turbo930->GetComponent<TransformComponent>()?.SetPosition(new Vector3(-1f, 0.05f, 7.7f));
+         // turbo930->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(4.25f, 0, 0));
+         //
+         // Entity* Bistro = GltfLoader.Load(@"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\Bistro_Godot.glb",
+         //     "Bistro", Engine.ResourceManager, this, scene);
         
         SpawnTestLights();
         SpawnTestProbe();
@@ -497,7 +536,7 @@ public unsafe partial class Renderer
         // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         PbrDeferredPipeline.WriteProbeDescriptors();
-        transparentPipeline.WriteSharedLightingDescriptors(PbrDeferredPipeline, lightCullPipeline);
+        transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
         transparentPipeline.WriteIblDescriptors();
         transparentPipeline.WriteProbeDescriptors();
         // LightCullPipeline survives the rebuild but its set 0 binding 0 still
@@ -585,6 +624,14 @@ public unsafe partial class Renderer
         gBufferMaterial?.Dispose();
         gBufferEmissive?.Dispose();
 
+        // Pathtracer storage images — same size class as the g-buffers, separate
+        // owner because they aren't render-graph resources.
+        ptAccumulator?.Dispose();
+        ptOutColor?.Dispose();
+
+        // Lights SSBO — renderer-owned mirror of Scene's LightComponents.
+        DestroyLightBuffers();
+
         // ── G-buffer sampler ────────────────────────────────────
         if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
 
@@ -595,6 +642,7 @@ public unsafe partial class Renderer
         CleanupIblResources();
 
         // ── Pipelines (each pipeline disposes its own buffers, sets, layouts) ─
+        ptComputePipeline  ?.Dispose();
         skyboxPipeline     ?.Dispose();
         transparentPipeline?.Dispose();
         tonemapPipeline    ?.Dispose();

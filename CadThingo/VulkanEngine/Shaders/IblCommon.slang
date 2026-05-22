@@ -1,3 +1,6 @@
+#ifndef IBL_COMMON_INCLUDED
+#define IBL_COMMON_INCLUDED
+
 // Shared utilities for the IBL bake compute shaders. Cube face math, low-
 // discrepancy sequences, GGX importance sampling. All routines are pure / re-
 // entrant and depend only on inputs — no descriptor reads happen here.
@@ -83,3 +86,5 @@ float G_Smith_IBL(float NdotV, float NdotL, float roughness)
 {
     return G_SchlickGGX_IBL(NdotV, roughness) * G_SchlickGGX_IBL(NdotL, roughness);
 }
+
+#endif // IBL_COMMON_INCLUDED

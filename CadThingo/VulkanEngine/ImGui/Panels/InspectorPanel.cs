@@ -80,16 +80,25 @@ public static unsafe class InspectorPanel
 
         var pos = t.GetPosition();
         if (ImGuiNET.ImGui.DragFloat3("Position", ref pos, 0.05f))
+        {
             t.SetPosition(pos);
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
         var quat = t.GetRotation();
         var euler = GetEulerDeg(entity, quat);
         if (ImGuiNET.ImGui.DragFloat3("Rotation", ref euler, 0.5f, 0f, 0f, "%.2f°"))
+        {
             SetEulerDeg(entity, euler, t);
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
         var scale = t.GetScale();
         if (ImGuiNET.ImGui.DragFloat3("Scale", ref scale, 0.01f, 0.0001f, float.MaxValue))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
             t.SetScale(scale);
+        }
 
         if (t.Parent != null)
             ImGuiNET.ImGui.TextDisabled($"Parent: {t.Parent->Name}");
@@ -120,7 +129,10 @@ public static unsafe class InspectorPanel
         int matMax = Math.Max(0, matCount - 1);
         int matMin = -1;
         if (ImGuiNET.ImGui.DragInt("Material", ref matIdx, 0.1f, matMin, matMax))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
             m.materialIndex = matIdx;
+        }
         ImGuiNET.ImGui.SameLine();
         ImGuiNET.ImGui.TextDisabled($"of {matCount}");
 
@@ -140,15 +152,28 @@ public static unsafe class InspectorPanel
         ImGuiNET.ImGui.SeparatorText($"Material {idx}");
         ref var mat = ref scene.MaterialsMutable[idx];
 
-        ImGuiNET.ImGui.ColorEdit4("Base color", ref mat.BaseColorFactor,
-            ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreview | ImGuiColorEditFlags.Float);
+        if (ImGuiNET.ImGui.ColorEdit4("Base color", ref mat.BaseColorFactor,
+                ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreview | ImGuiColorEditFlags.Float))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
         // Emissive is HDR — strength can exceed 1.0 (KHR_materials_emissive_strength).
-        ImGuiNET.ImGui.ColorEdit3("Emissive", ref mat.EmissiveFactor,
-            ImGuiColorEditFlags.Float | ImGuiColorEditFlags.HDR);
+        if (ImGuiNET.ImGui.ColorEdit3("Emissive", ref mat.EmissiveFactor,
+                ImGuiColorEditFlags.Float | ImGuiColorEditFlags.HDR))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
-        ImGuiNET.ImGui.SliderFloat("Metallic",  ref mat.MetallicFactor,  0f, 1f);
-        ImGuiNET.ImGui.SliderFloat("Roughness", ref mat.RoughnessFactor, 0f, 1f);
+        if (ImGuiNET.ImGui.SliderFloat("Metallic", ref mat.MetallicFactor, 0f, 1f))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
+        }
+
+        if (ImGuiNET.ImGui.SliderFloat("Roughness", ref mat.RoughnessFactor, 0f, 1f))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
         // Alpha flags — Mask and Blend are conceptually mutually exclusive
         // (glTF treats them that way). We don't enforce here; the runtime
@@ -158,16 +183,65 @@ public static unsafe class InspectorPanel
         bool alphaBlend   = (mat.Flags & 0x4u) != 0u;
 
         if (ImGuiNET.ImGui.Checkbox("Alpha mask", ref alphaMask))
+        {
             mat.Flags = SetBit(mat.Flags, 0x1u, alphaMask);
+            Engine.renderer.MarkAccumulatorDirty();
+        }
         ImGuiNET.ImGui.SameLine();
         if (ImGuiNET.ImGui.Checkbox("Double sided", ref doubleSided))
+        {
             mat.Flags = SetBit(mat.Flags, 0x2u, doubleSided);
+            Engine.renderer.MarkAccumulatorDirty();
+        }
         ImGuiNET.ImGui.SameLine();
         if (ImGuiNET.ImGui.Checkbox("Alpha blend", ref alphaBlend))
+        {
             mat.Flags = SetBit(mat.Flags, 0x4u, alphaBlend);
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
         if (alphaMask)
-            ImGuiNET.ImGui.SliderFloat("Alpha cutoff", ref mat.AlphaCutoff, 0f, 1f);
+            if (ImGuiNET.ImGui.SliderFloat("Alpha cutoff", ref mat.AlphaCutoff, 0f, 1f))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
+            }
+
+        // ── KHR_materials_transmission + KHR_materials_ior ─────────────────
+        // Transmission only matters for non-opaque dielectrics; collapsed by
+        // default so opaque-material editing stays uncluttered, but always
+        // visible because flipping a material to transmissive is a one-slider
+        // operation now.
+        if (ImGuiNET.ImGui.TreeNode("Transmission / IOR"))
+        {
+            if (ImGuiNET.ImGui.SliderFloat("Transmission", ref mat.TransmissionFactor, 0f, 1f))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
+            }
+            // 1.0 = vacuum / no refraction, 2.4 covers everything up to diamond.
+            // Glass sits at 1.5, water 1.33, plastic 1.46–1.55.
+            if (ImGuiNET.ImGui.SliderFloat("IOR", ref mat.Ior, 1.0f, 2.5f))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
+            }
+            ImGuiNET.ImGui.TreePop();
+        }
+
+        // ── KHR_materials_clearcoat ────────────────────────────────────────
+        // Same collapsed-by-default treatment. Pathtracer currently doesn't
+        // sample clearcoat; uploaded for future BSDF work + the deferred
+        // renderer can read it whenever that lobe lands too.
+        if (ImGuiNET.ImGui.TreeNode("Clearcoat"))
+        {
+            if (ImGuiNET.ImGui.SliderFloat("Clearcoat", ref mat.ClearcoatFactor, 0f, 1f))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
+            };
+            if (ImGuiNET.ImGui.SliderFloat("Clearcoat roughness", ref mat.ClearcoatRoughnessFactor, 0f, 1f))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
+            }
+            ImGuiNET.ImGui.TreePop();
+        }
 
         // Texture binding indices — bindless slot numbers into the texture
         // descriptor array. -1 = none. Read-only until the texture browser
@@ -175,6 +249,9 @@ public static unsafe class InspectorPanel
         ImGuiNET.ImGui.TextDisabled(
             $"Tex base={FmtTex(mat.BaseColorTex)}  mr={FmtTex(mat.PhysicalDescriptorTex)}  " +
             $"nrm={FmtTex(mat.NormalTex)}  ao={FmtTex(mat.OcclusionTex)}  em={FmtTex(mat.EmissiveTex)}");
+        ImGuiNET.ImGui.TextDisabled(
+            $"Ext trans={FmtTex(mat.TransmissionTex)}  cc={FmtTex(mat.ClearcoatTex)}  " +
+            $"ccR={FmtTex(mat.ClearcoatRoughnessTex)}  ccN={FmtTex(mat.ClearcoatNormalTex)}");
     }
 
     static uint SetBit(uint flags, uint bit, bool on) => on ? (flags | bit) : (flags & ~bit);
@@ -191,18 +268,30 @@ public static unsafe class InspectorPanel
 
         int type = (int)l.Type;
         if (ImGuiNET.ImGui.Combo("Type", ref type, "Directional\0Point\0Spot\0\0"))
+        {
             l.Type = (LightType)type;
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
         var color = l.Color;
         if (ImGuiNET.ImGui.ColorEdit3("Color", ref color, ImGuiColorEditFlags.Float))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
             l.Color = color;
+        }
 
-        ImGuiNET.ImGui.DragFloat("Intensity", ref l.Intensity, 0.05f, 0f, float.MaxValue);
+        if (ImGuiNET.ImGui.DragFloat("Intensity", ref l.Intensity, 0.05f, 0f, float.MaxValue))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
         // Range is meaningless for directional lights — the shader encodes
         // directional as range=-1, so don't expose the slider in that mode.
         if (l.Type != LightType.Directional)
-            ImGuiNET.ImGui.DragFloat("Range", ref l.Range, 0.1f, 0f, float.MaxValue);
+            if (ImGuiNET.ImGui.DragFloat("Range", ref l.Range, 0.1f, 0f, float.MaxValue))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
+            }
 
         // Direction is consumed by directional + spot only. Renormalise on edit
         // so accidental zero vectors don't drift the shader's lighting math.
@@ -210,7 +299,10 @@ public static unsafe class InspectorPanel
         {
             var dir = l.Direction;
             if (ImGuiNET.ImGui.DragFloat3("Direction", ref dir, 0.01f))
+            {
                 l.Direction = dir.LengthSquared() > 1e-6f ? Vector3.Normalize(dir) : Vector3.UnitY * -1f;
+                Engine.renderer.MarkAccumulatorDirty();
+            }
         }
 
         // Spot cones — stored as cos for shader-side fast comparison. Edit in
@@ -220,14 +312,23 @@ public static unsafe class InspectorPanel
             float innerDeg = MathF.Acos(Math.Clamp(l.InnerConeCos, -1f, 1f)) * (180f / MathF.PI);
             float outerDeg = MathF.Acos(Math.Clamp(l.OuterConeCos, -1f, 1f)) * (180f / MathF.PI);
             if (ImGuiNET.ImGui.DragFloat("Inner cone", ref innerDeg, 0.25f, 0f, 89f, "%.2f°"))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
                 l.InnerConeCos = MathF.Cos(innerDeg * (MathF.PI / 180f));
+            }
             if (ImGuiNET.ImGui.DragFloat("Outer cone", ref outerDeg, 0.25f, 0f, 89f, "%.2f°"))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
                 l.OuterConeCos = MathF.Cos(outerDeg * (MathF.PI / 180f));
+            }
         }
 
         // Radius drives ray-queried soft shadows. World-space radius for
         // point/spot; tan(angularRadius) for directional (sun ≈ 0.005).
-        ImGuiNET.ImGui.DragFloat("Radius", ref l.Radius, 0.005f, 0f, float.MaxValue);
+        if (ImGuiNET.ImGui.DragFloat("Radius", ref l.Radius, 0.005f, 0f, float.MaxValue))
+        {
+            Engine.renderer.MarkAccumulatorDirty();
+        };
     }
 
     static void DrawProbe(ReflectionProbeComponent probe)

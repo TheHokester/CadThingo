@@ -373,16 +373,27 @@ public unsafe partial class Renderer
                 blas = BuildBlas(meshComp.mesh);
 
             // Lookup the entity's material so we can flag non-opaque instances
-            // (MASK + BLEND) as ForceNoOpaque — that's what gives the ray query
-            // a chance to alpha-test in the Proceed loop on the GPU. Materials
-            // are scene-owned so this is a cheap host lookup, no GPU readback.
-            uint matFlags = 0u;
-            int  matIdx   = meshComp.materialIndex;
+            // (MASK + BLEND + KHR_materials_transmission) as ForceNoOpaque —
+            // that's what gives the ray query a chance to alpha-test / fresnel-
+            // test in the Proceed loop on the GPU. Materials are scene-owned so
+            // this is a cheap host lookup, no GPU readback.
+            uint  matFlags        = 0u;
+            float matTransmission = 0f;
+            int   matIdx          = meshComp.materialIndex;
             if (matIdx >= 0)
-                matFlags = scene.GetMaterial(matIdx).Flags;
+            {
+                var mat = scene.GetMaterial(matIdx);
+                matFlags        = mat.Flags;
+                matTransmission = mat.TransmissionFactor;
+            }
 
             var instFlags = GeometryInstanceFlagsKHR.TriangleFacingCullDisableBitKhr;
-            if ((matFlags & 5u) != 0u)   // bit 0 = MASK, bit 2 = BLEND
+            // Mask=0x1, Blend=0x4 → either alpha mode flips the instance to
+            // non-opaque so the Proceed loop can stochastic-test alpha.
+            // Transmission > 0 likewise — the PT shadow ray + traceRay both
+            // need to see the candidate so transmissive surfaces can let the
+            // ray pass through (or refract on a hit-commit).
+            if ((matFlags & 5u) != 0u || matTransmission > 0f)
                 instFlags |= GeometryInstanceFlagsKHR.ForceNoOpaqueBitKhr;
 
             sDst[i] = new ShadowEntityInfo

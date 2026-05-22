@@ -115,8 +115,13 @@ public unsafe class ResourceManager
     // PbrMaterial entries reference. The renderer's bindless descriptor set sees this slot
     // through the StructuredBuffer<Texture2D> array binding. Indices never shift mid-run;
     // freed slots go onto _bindlessFree for reuse.
-    private readonly List<Texture> _bindlessTable = new();
-    private readonly Stack<int>    _bindlessFree  = new();
+    private readonly List<Texture>          _bindlessTable        = new();
+    private readonly Stack<int>             _bindlessFree         = new();
+    // Reverse index — same Texture handle should ever only consume one slot.
+    // Without this, materials referencing the same glTF image (very common with
+    // KHR_materials_clearcoat where coat / roughness / normal often share an
+    // ORM-style atlas) would burn through bindless slots redundantly.
+    private readonly Dictionary<Texture, int> _bindlessIndexByTexture = new();
 
     public Buffer GlobalVertexBuffer => globalVertexBuffer;
     public Buffer GlobalIndexBuffer  => globalIndexBuffer;
@@ -134,7 +139,10 @@ public unsafe class ResourceManager
     
     internal const uint MAX_MATERIALS         = 256;
     internal const uint MAX_INSTANCES         = 4096;
-    internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 5;
+    // 9 = the worst-case fields-with-textures count on PbrMaterial after the
+    // KHR extensions (5 core + transmission + 3× clearcoat). Sized for the
+    // worst case so a clearcoated/transmissive asset can't exhaust the table.
+    internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 9;
     
     DescriptorSetLayout MaterialBindlessLayout;
     
@@ -266,6 +274,12 @@ public unsafe class ResourceManager
         if (_renderer == null)
             throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called");
 
+        // Same Texture handle → same bindless index. Reference equality is what
+        // we want here — the resource manager already dedups Texture instances
+        // by id at the load layer, so identical content shares the same handle.
+        if (_bindlessIndexByTexture.TryGetValue(tex, out int existing))
+            return existing;
+
         int index;
         if (_bindlessFree.Count > 0)
         {
@@ -278,6 +292,7 @@ public unsafe class ResourceManager
             _bindlessTable.Add(tex);
         }
 
+        _bindlessIndexByTexture[tex] = index;
         _renderer.WriteBindlessTexture(index, tex, bindlessDescriptorSets, 2);
         return index;
     }
@@ -291,28 +306,28 @@ public unsafe class ResourceManager
                 Binding = 0,
                 DescriptorType = DescriptorType.StorageBuffer,
                 DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit,
+                StageFlags = ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
             },
             new()
             {
                 Binding = 1,
                 DescriptorType = DescriptorType.StorageBuffer,
                 DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.VertexBit|ShaderStageFlags.FragmentBit,
+                StageFlags = ShaderStageFlags.VertexBit|ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
             },
             new()
             {
                 Binding = 2,
                 DescriptorType = DescriptorType.SampledImage,
                 DescriptorCount = MAX_MATERIALS * 5,
-                StageFlags = ShaderStageFlags.FragmentBit,
+                StageFlags = ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
             }, 
             new()
             {
                 Binding = 3,
                 DescriptorType = DescriptorType.Sampler,
                 DescriptorCount = 8,
-                StageFlags = ShaderStageFlags.FragmentBit,
+                StageFlags = ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
             }
         };
         
