@@ -3,10 +3,8 @@ using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
-// ────────────────────────────────────────────────────────────────────────────
 //  Draw-cull compute pass — frustum-tests scene renderables and emits
 //  VkDrawIndexedIndirectCommand[] consumed by the geometry pass.
-// ────────────────────────────────────────────────────────────────────────────
 public sealed unsafe class DrawCullPipeline : ComputePipeline
 {
     // Push constants pushed at every dispatch. 100 bytes — within the
@@ -201,7 +199,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam, Scene scene)
     {
         
-        // ── Pack RenderableInput rows from the scene ─────────────────────
+        // Pack RenderableInput rows from the scene
         // Opaque (OPAQUE + MASK) entities go through the GPU cull → indirect-draw path.
         // BLEND entities are siphoned into _transparentDraws for the forward+ pass.
         RenderableInputGpu* inputPtr = (RenderableInputGpu*)RenderableInputBuffers[frameIndex].mapped;
@@ -270,10 +268,10 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         LastRenderableCount = count;
         if (count == 0) return 0;
 
-        // ── 1. Reset the count buffer to 0 via vkCmdFillBuffer ───────────
+        // 1. Reset the count buffer to 0 via vkCmdFillBuffer
         Vk.CmdFillBuffer(cmd, IndirectCountBuffers[frameIndex].buffer, 0, sizeof(uint), 0);
 
-        // ── 2. Barrier: transfer write -> compute shader access on count buffer ─
+        //  2. Barrier: transfer write -> compute shader access on count buffer 
         var fillBarrier = new BufferMemoryBarrier
         {
             SType         = StructureType.BufferMemoryBarrier,
@@ -290,7 +288,6 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
             PipelineStageFlags.ComputeShaderBit,
             0, 0, null, 1, &fillBarrier, 0, null);
 
-        // ── 3. Bind pipeline + descriptor set + push constants, dispatch ──
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, PipelineHandle);
         var dset = DescriptorSets[0][frameIndex];
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute,
@@ -322,7 +319,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         uint groups = (count + 63u) / 64u;
         Vk.CmdDispatch(cmd, groups, 1, 1);
 
-        // ── 4. Barrier: compute writes -> indirect/vertex stage reads ────
+        // 4. Barrier: compute writes -> indirect/vertex stage reads
         var postBarriers = stackalloc BufferMemoryBarrier[3];
         postBarriers[0] = new BufferMemoryBarrier
         {

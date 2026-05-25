@@ -11,9 +11,8 @@ public enum TonemapOperator : uint
     Filmic   = 1,
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// 
 //  Tone-map / post pass — samples HDRColor, writes FinalColor (LDR)
-// ────────────────────────────────────────────────────────────────────────────
 public sealed unsafe class TonemapPipeline : GraphicsPipeline
 {
     // Push constants — fragment-only, 8 bytes total, well under the 128B
@@ -133,8 +132,8 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
         return 0;
     }
 
-    // ── Descriptor layout — set 0, binding 0 = HDR input sampler ───────────
-
+    //  Descriptor layout — set 0, binding 0 = HDR input sampler
+    
     protected override void CreateDescriptorSetLayouts()
     {
         DescriptorSetLayouts = new DescriptorSetLayout[1];

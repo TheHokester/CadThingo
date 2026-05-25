@@ -16,7 +16,13 @@ namespace CadThingo.VulkanEngine.GLTF;
 /// </summary>
 public static unsafe class GltfLoader
 {
-    public static Entity* Load(
+    /// <summary>
+    /// Loads a glTF/glb into the engine and returns a <see cref="LoadResult"/>
+    /// — root entity plus a manifest the editor can replay to free everything
+    /// the load produced (mesh ranges, texture VkImages, bindless slots,
+    /// material entries, entity native memory).
+    /// </summary>
+    public static LoadResult Load(
         string path,
         string idPrefix,
         ResourceManager rm,
@@ -24,7 +30,12 @@ public static unsafe class GltfLoader
         Scene scene)
     {
         // 1. Fallback textures must exist before any material build runs.
+        //    Run BEFORE opening the manifest capture so the global defaults
+        //    don't get attributed to this file (they're shared across loads).
         GltfDefaults.EnsureRegistered(rm, renderer);
+
+        var manifest = new LoadManifest();
+        using var _ = rm.BeginManifestCapture(manifest);
 
         // 2. Parse the .glb/.gltf file. SharpGLTF reads embedded image bytes for .glb
         //    and resolves relative URIs for .gltf — both work through this single API.
@@ -39,6 +50,7 @@ public static unsafe class GltfLoader
             var pbr = GltfMaterialResource.BuildAndRegister(idPrefix, matIdx, gltfMat, rm, renderer);
             int sceneMatIdx = scene.AddMaterial(pbr);
             materialIndexMap[gltfMat] = sceneMatIdx;
+            manifest.MaterialIndices.Add(sceneMatIdx);
         }
 
         // 4. Meshes pass — extract vertex/index arrays per primitive and upload via
@@ -60,6 +72,7 @@ public static unsafe class GltfLoader
                 rm.Load<MeshResource>(meshId, _ => new GltfMeshResource(meshId, rm, verts, indices));
                 Mesh* meshPtr = rm.GetMesh(meshId);
                 primitiveMeshMap[(meshIdx, primIdx)] = (nint)meshPtr;
+                manifest.MeshPtrs.Add((nint)meshPtr);
 
                 int sceneMatIdx = -1;
                 if (prim.Material != null && materialIndexMap.TryGetValue(prim.Material, out var found))
@@ -73,6 +86,11 @@ public static unsafe class GltfLoader
         //    Scene.AddChild so the hierarchical TransformComponent.Parent chain is set.
         var defaultScene = model.DefaultScene ?? model.LogicalScenes[0];
 
+        // Snapshot scene entity count so we can hand the manifest the slice of
+        // entities created by this load (GltfLoader's only writer is AddEntity /
+        // AddChild called from VisitNode, both of which append to the list).
+        int entityStart = scene.EntityCount;
+
         // Synthetic root so the caller has a single handle to the whole asset.
         Entity* root = Entity.Create($"{idPrefix}_root");
         root->AddComponent(new TransformComponent());
@@ -83,7 +101,18 @@ public static unsafe class GltfLoader
             VisitNode(node, root, model, scene, idPrefix, primitiveMeshMap, primitiveMaterialMap);
         }
 
-        return root;
+        for (int i = entityStart; i < scene.EntityCount; i++)
+            manifest.Entities.Add((nint)scene.GetEntity(i));
+
+        return new LoadResult { Root = root, Manifest = manifest };
+    }
+
+    /// <summary>Return value of <see cref="Load"/>. The manifest is the thing
+    /// to keep alive if the caller might later want to free everything.</summary>
+    public struct LoadResult
+    {
+        public Entity*      Root;
+        public LoadManifest Manifest;
     }
 
     private static void VisitNode(

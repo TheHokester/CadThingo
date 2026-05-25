@@ -35,8 +35,9 @@ public static unsafe class EditorState
     public static bool ShowStats            = true;
     public static bool ShowCamera           = true;
     public static bool ShowRendererSettings = true;
+    public static bool ShowFileBrowser      = true;
 
-    // ── Viewport panel state ─────────────────────────────────────
+    //  Viewport panel state 
     public static ViewportFitMode ViewportFitMode    = ViewportFitMode.Fill;
     public static bool            ViewportAutoResolution = true;
     public static bool            ViewportFullscreen     = false;
@@ -48,7 +49,7 @@ public static unsafe class EditorState
     /// </summary>
     public static (uint w, uint h)? RequestedRenderExtent;
 
-    // ── Scene Outliner state ─────────────────────────────────────
+    // Scene Outliner state 
     /// <summary>
     /// When on, the Scene Outliner skips entities that carry neither a
     /// MeshComponent nor a LightComponent — i.e. pure transform-only
@@ -57,7 +58,7 @@ public static unsafe class EditorState
     /// </summary>
     public static bool HideEmptyEntities = false;
 
-    // ── Renderer settings ────────────────────────────────────────
+    //  Renderer settings 
     /// <summary>
     /// Toggles the skybox draw between the lighting and transparent passes.
     /// When off, sky pixels show the lighting clear (BackgroundColor) instead

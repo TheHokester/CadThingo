@@ -21,7 +21,7 @@ public unsafe partial class Renderer
     // Face sizes. envCube needs to be large enough that prefilter taps don't
     // alias; 512 is the standard sweet spot. brdfLut at 512 gives plenty of
     // resolution along both axes without measurable cost.
-    internal const uint EnvCubeFaceSize        = 512;
+    internal const uint EnvCubeFaceSize        = 4096;
     internal const uint IrradianceCubeFaceSize = 32;
     internal const uint PrefilteredCubeFaceSize = 128;
     internal const uint BrdfLutSize            = 512;
@@ -58,32 +58,32 @@ public unsafe partial class Renderer
         envCubeMipLevels         = (uint)System.Math.Floor(System.Math.Log2(EnvCubeFaceSize)) + 1;
         prefilteredCubeMipLevels = (uint)System.Math.Floor(System.Math.Log2(PrefilteredCubeFaceSize)) + 1;
 
-        // ── env cube — sampled, storage-written by EquirectToCube, blitted for mips
+        // env cube — sampled, storage-written by EquirectToCube, blitted for mips
         CreateCubemapImage(
             EnvCubeFaceSize, envCubeMipLevels, Format.R16G16B16A16Sfloat,
             ImageUsageFlags.SampledBit | ImageUsageFlags.StorageBit |
             ImageUsageFlags.TransferDstBit | ImageUsageFlags.TransferSrcBit,
             out envCubeImage, out envCubeAlloc, out envCubeView);
 
-        // ── irradiance cube — sampled + storage-written
+        // irradiance cube — sampled + storage-written
         CreateCubemapImage(
             IrradianceCubeFaceSize, 1, Format.R16G16B16A16Sfloat,
             ImageUsageFlags.SampledBit | ImageUsageFlags.StorageBit | ImageUsageFlags.TransferDstBit,
             out irradianceCubeImage, out irradianceCubeAlloc, out irradianceCubeView);
 
-        // ── prefiltered cube — sampled + storage-written per mip
+        // prefiltered cube — sampled + storage-written per mip
         CreateCubemapImage(
             PrefilteredCubeFaceSize, prefilteredCubeMipLevels, Format.R16G16B16A16Sfloat,
             ImageUsageFlags.SampledBit | ImageUsageFlags.StorageBit | ImageUsageFlags.TransferDstBit,
             out prefilteredCubeImage, out prefilteredCubeAlloc, out prefilteredCubeView);
 
-        // ── BRDF LUT — 2D, sampled + storage-written, no mips
+        // BRDF LUT — 2D, sampled + storage-written, no mips
         CreateLutImage(
             BrdfLutSize, Format.R16G16Sfloat,
             ImageUsageFlags.SampledBit | ImageUsageFlags.StorageBit | ImageUsageFlags.TransferDstBit,
             out brdfLutImage, out brdfLutAlloc, out brdfLutView);
 
-        // ── Samplers ─────────────────────────────────────────────
+        // Samplers
         SamplerCreateInfo cubeSamplerInfo = new()
         {
             SType            = StructureType.SamplerCreateInfo,
@@ -300,7 +300,7 @@ public unsafe partial class Renderer
         vk!.CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
     }
 
-    // ── Bake pipelines ─────────────────────────────────────────────────────
+    // Bake pipelines
     // Created once at engine init; live for the lifetime of the renderer. The
     // BRDF LUT bake runs immediately after construction (the result is view-
     // independent — same LUT for every environment). The other three pipelines
@@ -354,7 +354,7 @@ public unsafe partial class Renderer
         equirectToCubePipeline?.Dispose();
     }
 
-    // ── Storage-image views ────────────────────────────────────────────────
+    // Storage-image views
     // The cube ImageViews from Phase 1 are sample-only (ViewType.Cube). Storage
     // writes need a 2D-array view at a specific mip level. Created on demand
     // during a bake, destroyed immediately after.
@@ -403,7 +403,7 @@ public unsafe partial class Renderer
         return view;
     }
 
-    // ── Layout transitions ─────────────────────────────────────────────────
+    // Layout transitions
     // Phase 2 dispatches mix sampling (ShaderRead) and storage writes (General)
     // on the same image, sometimes per-mip. This helper takes an explicit
     // subresource range and chooses access/stage masks from old→new layout.
@@ -466,7 +466,7 @@ public unsafe partial class Renderer
         LayerCount     = 1,
     };
 
-    // ── BRDF LUT bake ──────────────────────────────────────────────────────
+    // BRDF LUT bake
     // Runs once at engine init. The split-sum integral is view-independent so
     // we never need to re-bake it. ~262k integration runs, milliseconds on any
     // modern GPU.
@@ -501,7 +501,7 @@ public unsafe partial class Renderer
         brdfLutGenPipeline.FreeDescriptorSet(set);
     }
 
-    // ── Full HDR → IBL chain ───────────────────────────────────────────────
+    // Full HDR → IBL chain
     // Drives equirect upload → cube unwrap → mip generation → irradiance →
     // prefiltered specular. Safe to call multiple times (rebake on environment
     // swap); device is waited on so prior IBL reads can't observe a torn state.
@@ -549,10 +549,10 @@ public unsafe partial class Renderer
         vk!.DeviceWaitIdle(device);
         CurrentEnvironmentPath = path;
 
-        // ── 1. Upload equirect as a 2D RGBA16F sampled image ─────────────
+        // 1. Upload equirect as a 2D RGBA16F sampled image
         UploadEquirectHalf(img, out var eqImage, out var eqAlloc, out var eqView, out var eqSampler);
 
-        // ── 2. EquirectToCube: write envCube mip 0 layers 0..5 ───────────
+        // 2. EquirectToCube: write envCube mip 0 layers 0..5
         var cubeMip0View = CreateCubeStorageView(envCubeImage, Format.R16G16B16A16Sfloat, mipLevel: 0);
         var eqCubeSet    = equirectToCubePipeline.AllocateDescriptorSet();
         equirectToCubePipeline.WriteDescriptors(eqCubeSet, cubeMip0View, eqView, eqSampler);
@@ -574,7 +574,7 @@ public unsafe partial class Renderer
         uint cubeGroups = (EnvCubeFaceSize + 15) / 16;
         vk!.CmdDispatch(cmd, cubeGroups, cubeGroups, 6);
 
-        // ── 3. envCube mip chain via vkCmdBlitImage ──────────────────────
+        // 3. envCube mip chain via vkCmdBlitImage
         // mip 0 was just written via storage → needs General→TransferSrc.
         // mips 1..N were freshly transitioned to General (TopOfPipe) → need
         // General→TransferDst before the first blit lands on them.
@@ -588,7 +588,7 @@ public unsafe partial class Renderer
         // + prefilter dispatches below sample envCube directly.
         BlitCubeMipChain(cmd, envCubeImage, EnvCubeFaceSize, envCubeMipLevels);
 
-        // ── 4. Irradiance convolution ────────────────────────────────────
+        // 4. Irradiance convolution
         var irrView = CreateCubeStorageView(irradianceCubeImage, Format.R16G16B16A16Sfloat, mipLevel: 0);
         var irrSet  = irradianceConvolvePipeline.AllocateDescriptorSet();
         irradianceConvolvePipeline.WriteDescriptors(irrSet, irrView, envCubeView, iblCubeSampler);
@@ -608,7 +608,7 @@ public unsafe partial class Renderer
         IblTransition(cmd, irradianceCubeImage, ImageLayout.General,
             ImageLayout.ShaderReadOnlyOptimal, CubeRange(0, 1));
 
-        // ── 5. Prefilter — per-mip dispatches with per-mip storage views ──
+        // 5. Prefilter — per-mip dispatches with per-mip storage views
         var prefilterMipViews = new ImageView[prefilteredCubeMipLevels];
         var prefilterSets     = new DescriptorSet[prefilteredCubeMipLevels];
 
@@ -647,7 +647,7 @@ public unsafe partial class Renderer
 
         EndSingleTimeCommands(cmd);
 
-        // ── 6. Cleanup transient bake resources ──────────────────────────
+        // 6. Cleanup transient bake resources
         vk!.DestroyImageView(device, cubeMip0View, null);
         vk!.DestroyImageView(device, irrView, null);
         for (int m = 0; m < prefilterMipViews.Length; m++)

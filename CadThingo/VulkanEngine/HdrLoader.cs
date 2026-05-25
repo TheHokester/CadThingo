@@ -16,8 +16,8 @@ public static class HdrLoader
     public static HdrImage Load(string path)
     {
         using var fs = File.OpenRead(path);
-
-        // ── Header ──
+        
+        //fileheader
         // The magic line is "#?RADIANCE" (modern) or "#?RGBE" (legacy). Everything
         // before the first blank line is metadata; we only validate FORMAT and
         // then look for the resolution line that follows the blank.

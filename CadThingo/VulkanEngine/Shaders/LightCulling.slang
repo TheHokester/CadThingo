@@ -76,7 +76,7 @@ void Main(uint3 gid : SV_GroupID, uint flatIdx : SV_GroupIndex)
     if (tx >= params.tileCounts.x || ty >= params.tileCounts.y) return;
     uint tileIdx = ty * params.tileCounts.x + tx;
 
-    // ── Thread 0 builds the per-tile state ────────────────────────────
+    //  Thread 0 builds the per-tile state 
     if (flatIdx == 0)
     {
         sharedCount = 0u;
@@ -112,7 +112,8 @@ void Main(uint3 gid : SV_GroupID, uint flatIdx : SV_GroupIndex)
     // All threads wait for thread 0 to publish sharedPlanes + sharedCount.
     GroupMemoryBarrierWithGroupSync();
 
-    // ── Cooperative light classification ──────────────────────────────
+    //  Cooperative light classification
+    
     // 256 threads stride through the light list: thread `flatIdx` tests
     // lights at indices flatIdx, 256+flatIdx, 512+flatIdx, ...
     for (uint li = flatIdx; li < params.lightCount; li += 256u)

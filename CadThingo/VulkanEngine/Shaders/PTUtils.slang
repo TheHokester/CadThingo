@@ -5,7 +5,6 @@
 // and the GGX/Smith/Schlick BRDF terms used by evaluatePbrBrdf below.
 #include "PbrUtils.slang"
 
-// ────────────────────────────────────────────────────────────────────────────
 //  Pathtracer utility helpers — raygen for the four camera modes.
 //
 //  All helpers take height-NDC with aspect baked into x:
@@ -18,7 +17,6 @@
 //  Caller transforms to world space via the camera basis (rows of invView).
 //  NDC convention: ndc.y > 0 = bottom of screen; helpers flip internally so
 //  the returned direction has world +Y = up.
-// ────────────────────────────────────────────────────────────────────────────
 
 // PI already lives in PbrUtils.slang (included by PTCompute.slang first).
 // HALF_PI is local so PTUtils parses standalone without depending on it.
@@ -50,8 +48,10 @@ struct HitInfo {
     float bitangentSign;       //  4B - glTF tangent.w; B = cross(N, T) * bitangentSign
     float3 emissive;           // 12B - factor * texture
     float ior;                 //  4B - index of refraction (~1.5 default)
-    float3 ambient;            // 12B - usually unused in a pathtracer; legacy slot
-    float F0;                  //  4B - dielectric F0; consider float3 for tinted dielectrics
+    float3 clearcoatNormal;    // 12B - normal for the coat lobe (usually = shading N)
+    float clearcoat;           //  4B - KHR_materials_clearcoat factor × tex.r
+    float F0;                  //  4B - dielectric F0; derived from IOR
+    float clearcoatRoughness;  //  4B - clearcoat lobe roughness (factor × tex.g)
     float2 uv;                 //  8B - interpolated UV at the hit
     float transmission;        //  4B - glass / transparency factor [0..1]
     int alphaMode;             //  4B - 0=opaque, 1=mask, 4=blend (mat.flags bits)
@@ -64,7 +64,7 @@ struct HitInfo {
 };
 
 
-// ─── Camera-space → world-space ────────────────────────────────────────────
+// Camera-space → world-space
 // Every raygen helper emits its ray in camera space (origin near 0, forward
 // = -Z).  Apply this once on the result to plant the ray at the actual
 // camera position pointing along the actual view direction.
@@ -86,7 +86,7 @@ RayDesc transformRayToWorld(RayDesc cameraSpace, float4x4 invView) {
 }
 
 
-// ─── Pinhole ───────────────────────────────────────────────────────────────
+// Pinhole
 // Standard perspective. tanHalfFovY = tan(verticalFOV / 2). Aspect is
 // already in ndc.x, so no aspect parameter here.
 RayDesc generatePinholeRay(float2 ndc, float tanHalfFovY) {
@@ -98,7 +98,7 @@ RayDesc generatePinholeRay(float2 ndc, float tanHalfFovY) {
 }
 
 
-// ─── Thin lens / DoF ───────────────────────────────────────────────────────
+// Thin lens / DoF
 // Builds the pinhole ray, picks a focal point along it at `focusDistance`,
 // then re-aims from a sampled point on the aperture disk through that focal
 // point. `lensUV` is a uniform [0,1]² random pair (one per ray sample).
@@ -126,7 +126,7 @@ RayDesc generateThinLensRay(float2 ndc, float tanHalfFovY, float2 lensUV,
 }
 
 
-// ─── Generalized Panini ───────────────────────────────────────────────────
+// Generalized Panini
 // `cameraFovAngle` is the full FOV (radians) you want at the screen edge in
 // the Panini-projected image. `paniniDistance` d ∈ [0, 1]: 0 collapses to
 // pinhole, 1 is the classic Panini look. `verticalCompression` ∈ [0, 1]
@@ -160,7 +160,7 @@ RayDesc generatePaniniRay(float2 ndc, float cameraFovAngle, float paniniDistance
 }
 
 
-// ─── Equidistant fisheye ──────────────────────────────────────────────────
+// Equidistant fisheye
 // True equidistant projection: r ∝ θ from the optical axis (not lat/long).
 // `cameraFovAngle` is the full diameter FOV in radians (PI = 180° fisheye).
 // Pixels outside the fisheye circle return TMax = RAY_INVALID_TMAX; the
@@ -200,8 +200,15 @@ uint jenkinsHash(uint x) {
     return x;
 }
 
+// Mix both pixel coordinates and the frame into the seed via independent
+// prime multipliers, then jenkins-hash. The previous formula collapsed when
+// the local thread index was 0, giving identical seeds along every 8th
+// column → visible vertical streaks in the noise. `gtid` is no longer needed
+// for decorrelation; left in the signature for callers that still pass it.
 uint initRNG(uint2 pixel, uint2 gtid, uint frame) {
-    uint seed = dot(pixel, uint2(1, gtid.x)) ^ jenkinsHash(frame);
+    uint seed = pixel.x * 1973u
+              ^ pixel.y * 9277u
+              ^ frame   * 26699u;
     return jenkinsHash(seed);
 }
 
@@ -224,7 +231,7 @@ float luminance(float3 c) {
     return 0.2126 * c.r +  0.7152 * c.g +  0.0722 * c.b;
 }
 
-// ─── Orthonormal basis from a single normal ───────────────────────────────
+// Orthonormal basis from a single normal
 // Pixar / Frisvad revised: branchless, handles N.z < 0 without the original
 // 2003 numerical breakdown near -Z. Use to lift a tangent-space sample into
 // world space when you only have N (no vertex tangent / bitangent).
@@ -258,11 +265,16 @@ float3 sampleCosineHemisphere(float3 N, inout uint rngState, out float pdf) {
     return normalize(worldDir);
 }
 
-// ─── glTF metallic-roughness BRDF eval ────────────────────────────────────
+// Clearcoat F0 is fixed by KHR_materials_clearcoat — the coat layer is always
+// IOR 1.5, so Schlick reduces to the standard dielectric 0.04.
+static const float CLEARCOAT_F0 = 0.04;
+
+// glTF metallic-roughness BRDF eval
 // Returns f_r(V, L) WITHOUT the cosine term — caller multiplies by NdotL.
 // Mirrors the inline math in PbrShader.slang's lighting loop; consolidating
 // it here lets both NEE (light-sampled) and the BSDF-sampled indirect leg of
-// the pathtracer reuse the same evaluation.
+// the pathtracer reuse the same evaluation. This is the BASE BRDF only —
+// callers that want the clearcoat layer on top use evaluateFullBrdf below.
 float3 evaluatePbrBrdf(HitInfo h, float3 V, float3 L) {
     float3 N     = h.normal;
     float  NdotL = dot(N, L);
@@ -289,7 +301,48 @@ float3 evaluatePbrBrdf(HitInfo h, float3 V, float3 L) {
     return diffuse + specular;
 }
 
-// ─── Smith G1 for GGX (sampling-side, closed-form) ────────────────────────
+// Clearcoat lobe
+// Pure GGX-Smith reflection with the clearcoat's fixed IOR-1.5 Fresnel.
+// Returns the raw lobe BRDF — caller multiplies by NdotL.  No diffuse / no
+// transmission: the spec is reflection-only.  Uses `clearcoatNormal` so a
+// separate normal-mapped coat (orange peel) just plugs in when populated.
+float evaluateClearcoatBrdf(HitInfo h, float3 V, float3 L) {
+    float3 N    = h.clearcoatNormal;
+    float NdotL = dot(N, L);
+    float NdotV = dot(N, V);
+    if (NdotL <= 0.0 || NdotV <= 0.0) return 0.0;
+
+    float3 H    = normalize(V + L);
+    float NdotH = saturate(dot(N, H));
+    float HdotV = saturate(dot(H, V));
+
+    float D = DistributionGGX(NdotH, h.clearcoatRoughness);
+    float G = GeometrySmith(NdotV, NdotL, h.clearcoatRoughness);
+    float F = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - HdotV, 5.0);
+
+    return (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
+}
+
+// Full layered BRDF: base + clearcoat
+// Single-Fresnel approximation: light reflected by the coat is removed from
+// what reaches the base via baseAtten = (1 - clearcoat * F_cc(NdotV)). The
+// "correct" two-fresnel version applies the same factor on the way out too
+// (squared), which is darker. Single-fresnel matches what UE / Filament /
+// most realtime PBRs do; swap to squared if you want stricter physical
+// correctness at the cost of energy.
+float3 evaluateFullBrdf(HitInfo h, float3 V, float3 L) {
+    float3 base = evaluatePbrBrdf(h, V, L);
+    if (h.clearcoat <= 0.0) return base;
+
+    float NdotV = max(dot(h.clearcoatNormal, V), 0.0);
+    float Fcc_v = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - NdotV, 5.0);
+    float baseAtten = 1.0 - h.clearcoat * Fcc_v;
+
+    float ccBrdf = evaluateClearcoatBrdf(h, V, L);
+    return base * baseAtten + float3(ccBrdf * h.clearcoat);
+}
+
+// Smith G1 for GGX (sampling-side, closed-form)
 // Heitz's VNDF derivation uses the true Smith G1; the PbrUtils
 // `GeometrySmith` is the Schlick-GGX approximation that's cheaper but won't
 // match the sampling pdf exactly. Using the proper form here keeps the
@@ -301,7 +354,7 @@ float G1_GGX_Smith(float NdotX, float roughness) {
     return 2.0 * NdotX / max(NdotX + sqrt(a2 + (1.0 - a2) * n2), 1e-6);
 }
 
-// ─── GGX VNDF half-vector sample (Heitz 2018) ─────────────────────────────
+// GGX VNDF half-vector sample (Heitz 2018)
 // Samples only those microfacet normals visible from V — eliminates the
 // "wasted samples behind the horizon" that plain GGX H sampling produces.
 // `Vt` is the view direction in tangent space (N = +Z). Returns a sampled
@@ -336,7 +389,7 @@ float3 sampleGGXVNDF(float3 Vt, float roughness, float u1, float u2) {
     return normalize(float3(alpha * Nh.x, alpha * Nh.y, max(0.0, Nh.z)));
 }
 
-// ─── Split BSDF sample (diffuse + GGX specular + delta transmission) ─────
+// Split BSDF sample (diffuse + GGX specular + delta transmission)
 // Three lobes picked stochastically per call:
 //   * Specular reflect  : GGX VNDF importance sample
 //   * Specular transmit : delta refraction (Snell + Fresnel), smooth glass
@@ -362,6 +415,37 @@ struct BsdfSample {
     bool   transmit;   // wi crosses the surface (refraction)
 };
 
+// Combined non-delta direction PDF given the lobe pick probabilities. Used
+// for the spec / diffuse / clearcoat branches; the delta transmit lobe has
+// zero contribution to non-delta directions and is excluded.
+float bsdfCombinedPdf(HitInfo h, float3 V, float3 wi,
+                     float Pcc, float Pspec, float Pdiff) {
+    float NdotV = max(dot(h.normal, V), 0.0);
+    float NdotL = max(dot(h.normal, wi), 0.0);
+    if (NdotL <= 0.0 || NdotV <= 0.0) return 0.0;
+
+    float3 H     = normalize(V + wi);
+    float  NdotH = saturate(dot(h.normal, H));
+
+    float pdfDiff = NdotL * INV_PI;
+
+    float D_b   = DistributionGGX(NdotH, h.roughness);
+    float G1V_b = G1_GGX_Smith(NdotV, h.roughness);
+    float pdfSpec = (G1V_b * D_b) / max(4.0 * NdotV, 1e-6);
+
+    float pdfCC = 0.0;
+    if (Pcc > 0.0) {
+        // Clearcoat normal currently mirrors shading normal; revisit when a
+        // separate clearcoat tangent frame is plumbed for the orange-peel
+        // normal-map case.
+        float D_cc   = DistributionGGX(NdotH, h.clearcoatRoughness);
+        float G1V_cc = G1_GGX_Smith(NdotV, h.clearcoatRoughness);
+        pdfCC = (G1V_cc * D_cc) / max(4.0 * NdotV, 1e-6);
+    }
+
+    return Pcc * pdfCC + Pspec * pdfSpec + Pdiff * pdfDiff;
+}
+
 BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     BsdfSample s;
     s.wi       = float3(0.0);
@@ -370,7 +454,7 @@ BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     s.valid    = false;
     s.transmit = false;
 
-    float3 N    = h.normal;
+    float3 N     = h.normal;
     float  NdotV = dot(N, V);
     if (NdotV <= 0.0) return s;
 
@@ -379,86 +463,97 @@ BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     buildOrthonormalBasis(N, T, B);
     float3 Vt = float3(dot(V, T), dot(V, B), NdotV);
 
-    // Fresnel at NdotV drives the reflect-vs-rest split.
+    // Lobe weighting
+    // Clearcoat sits on top: its Fresnel determines what fraction of energy
+    // it grabs before light reaches the base. The remaining (1 - cc*Fcc_v)
+    // splits between the base lobes (spec / transmit / diffuse) just like
+    // before. Metals push spec high; transmissive materials push transmit
+    // high; clearcoated materials reserve some energy for the coat lobe.
     float3 F0  = lerp(float3(h.F0), h.baseColor.rgb, h.metallic);
     float3 Fv  = FresnelSchlick(NdotV, F0);
     float  Fl  = clamp(luminance(Fv), 0.05, 0.95);
 
-    float  Tl  = (1.0 - Fl) * h.transmission;
-    float  Dl  = (1.0 - Fl) * (1.0 - h.transmission) * (1.0 - h.metallic);
-    float  Sum = Fl + Tl + Dl;
+    float Fcc_v     = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - NdotV, 5.0);
+    float ccRaw     = h.clearcoat * Fcc_v;
+    float baseAtten = 1.0 - ccRaw;
+
+    float Pcc_raw   = ccRaw;
+    float Pspec_raw = Fl * baseAtten;
+    float Pt_raw    = (1.0 - Fl) * h.transmission * baseAtten;
+    float Pd_raw    = (1.0 - Fl) * (1.0 - h.transmission) * (1.0 - h.metallic) * baseAtten;
+    float Sum = Pcc_raw + Pspec_raw + Pt_raw + Pd_raw;
     if (Sum <= 1e-6) return s;
 
-    float specProb     = Fl / Sum;
-    float transmitProb = Tl / Sum;
-    float diffuseProb  = Dl / Sum;
+    float Pcc     = Pcc_raw   / Sum;
+    float Pspec   = Pspec_raw / Sum;
+    float Ptrans  = Pt_raw    / Sum;
+    float Pdiff   = Pd_raw    / Sum;
 
-    float u = rand(rngState);
+    float u  = rand(rngState);
 
-    if (u < specProb) {
-        // ─── Specular GGX-VNDF reflection ─────────────────────────────────
+    if (u < Pcc) {
+        // Clearcoat GGX-VNDF reflection
+        float u1 = rand(rngState);
+        float u2 = rand(rngState);
+        float3 Ht = sampleGGXVNDF(Vt, h.clearcoatRoughness, u1, u2);
+        float3 Lt = reflect(-Vt, Ht);
+        if (Lt.z <= 0.0) return s;
+
+        s.wi  = normalize(Lt.x * T + Lt.y * B + Lt.z * N);
+        s.pdf = bsdfCombinedPdf(h, V, s.wi, Pcc, Pspec, Pdiff);
+        if (s.pdf <= 0.0) return s;
+
+        float NdotL = Lt.z;
+        s.weight = evaluateFullBrdf(h, V, s.wi) * NdotL / s.pdf;
+        s.valid  = true;
+        return s;
+    }
+
+    if (u < Pcc + Pspec) {
+        // Base specular GGX-VNDF reflection
         float u1 = rand(rngState);
         float u2 = rand(rngState);
         float3 Ht = sampleGGXVNDF(Vt, h.roughness, u1, u2);
         float3 Lt = reflect(-Vt, Ht);
         if (Lt.z <= 0.0) return s;
 
-        s.wi = normalize(Lt.x * T + Lt.y * B + Lt.z * N);
-
-        float NdotL = Lt.z;
-        float3 H_w  = normalize(V + s.wi);
-        float  NdotH = saturate(dot(N, H_w));
-
-        float pdfDiff = NdotL * INV_PI;
-        float D       = DistributionGGX(NdotH, h.roughness);
-        float G1V     = G1_GGX_Smith(NdotV, h.roughness);
-        float pdfSpec = (G1V * D) / max(4.0 * NdotV, 1e-6);
-
-        // Delta transmit lobe contributes 0 to non-delta directions.
-        s.pdf = specProb * pdfSpec + diffuseProb * pdfDiff;
+        s.wi  = normalize(Lt.x * T + Lt.y * B + Lt.z * N);
+        s.pdf = bsdfCombinedPdf(h, V, s.wi, Pcc, Pspec, Pdiff);
         if (s.pdf <= 0.0) return s;
 
-        float3 brdf = evaluatePbrBrdf(h, V, s.wi);
-        s.weight    = brdf * NdotL / s.pdf;
-        s.valid     = true;
+        float NdotL = Lt.z;
+        s.weight = evaluateFullBrdf(h, V, s.wi) * NdotL / s.pdf;
+        s.valid  = true;
         return s;
     }
 
-    if (u < specProb + transmitProb) {
-        // ─── Delta refraction (smooth glass) ──────────────────────────────
-        // frontFace=true → ray entering the medium (air → glass).
-        // traceRay already flips the normal so dot(N,V) > 0 either way;
-        // pick η ratio according to which side we're on.
+    if (u < Pcc + Pspec + Ptrans) {
+        // Delta refraction (smooth glass)
         float etaI = h.frontFace ? 1.0   : h.ior;
         float etaT = h.frontFace ? h.ior : 1.0;
         float eta  = etaI / etaT;
 
-        // Snell + TIR test. cos²θ_t = 1 - η² (1 - cos²θ_i).
         float cos2t = 1.0 - eta * eta * (1.0 - NdotV * NdotV);
-        if (cos2t < 0.0) return s;   // TIR — could redirect to spec reflect,
-                                     // but the spec lobe is already importance-
-                                     // sampled with probability specProb, so
-                                     // bailing here just discards this sample.
+        if (cos2t < 0.0) return s;   // TIR — bail; spec lobe handles it via
+                                     // its own importance sample with Pspec.
 
-        // refract() takes the incoming direction (into the surface).
         float3 wt = refract(-V, N, eta);
         if (dot(wt, wt) < 1e-6) return s;
         s.wi       = normalize(wt);
         s.transmit = true;
 
-        // Delta-lobe weight. The Fresnel transmittance is (1 - F) at this
-        // angle. baseColor tints the transmitted light (thin-glass absorption).
-        // eta² accounts for the radiance compression / expansion when crossing
-        // an IOR boundary — standard radiometric refraction term.
+        // Delta weight. baseAtten scales the transmitted energy because light
+        // first has to pass through the clearcoat layer. eta² is the standard
+        // radiometric refraction term for the change in solid-angle measure.
         float  transmittance = 1.0 - Fl;
         float3 tint          = h.baseColor.rgb;
-        s.pdf    = transmitProb;
-        s.weight = tint * transmittance * (eta * eta) / max(transmitProb, 1e-6);
+        s.pdf    = Ptrans;
+        s.weight = tint * transmittance * (eta * eta) * baseAtten / max(Ptrans, 1e-6);
         s.valid  = true;
         return s;
     }
 
-    // ─── Cosine-weighted diffuse ──────────────────────────────────────────
+    // Cosine-weighted diffuse
     float u1 = rand(rngState);
     float u2 = rand(rngState);
     float r   = sqrt(u1);
@@ -469,20 +564,11 @@ BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     float NdotL = Lt.z;
     if (NdotL <= 0.0) return s;
 
-    float3 H_w  = normalize(V + s.wi);
-    float  NdotH = saturate(dot(N, H_w));
-
-    float pdfDiff = NdotL * INV_PI;
-    float D       = DistributionGGX(NdotH, h.roughness);
-    float G1V     = G1_GGX_Smith(NdotV, h.roughness);
-    float pdfSpec = (G1V * D) / max(4.0 * NdotV, 1e-6);
-
-    s.pdf = specProb * pdfSpec + diffuseProb * pdfDiff;
+    s.pdf = bsdfCombinedPdf(h, V, s.wi, Pcc, Pspec, Pdiff);
     if (s.pdf <= 0.0) return s;
 
-    float3 brdf = evaluatePbrBrdf(h, V, s.wi);
-    s.weight    = brdf * NdotL / s.pdf;
-    s.valid     = true;
+    s.weight = evaluateFullBrdf(h, V, s.wi) * NdotL / s.pdf;
+    s.valid  = true;
     return s;
 }
 

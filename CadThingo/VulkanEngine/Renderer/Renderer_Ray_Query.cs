@@ -18,9 +18,8 @@ public struct ShadowEntityInfo
 
 public unsafe partial class Renderer
 {
-    // ──────────────────────────────────────────────────────────
+    
     //  State
-    // ──────────────────────────────────────────────────────────
 
     // Silk.NET dispatch table for VK_KHR_acceleration_structure. Loaded once via
     // TryGetDeviceExtension after the logical device is created. Null when the
@@ -91,10 +90,18 @@ public unsafe partial class Renderer
 
     private bool tlasDirty = true;
 
+    /// <summary>
+    /// Flags the TLAS as stale. Consumed at the top of DrawFrame which runs a
+    /// single <see cref="OnSceneEntitiesChanged"/> per frame regardless of how
+    /// many edits accumulated the previous frame. Use this from the editor side
+    /// (InspectorPanel transforms, FileBrowserPanel visibility) — direct
+    /// per-mutation RebuildTlas calls would stall the device on every slider tick.
+    /// </summary>
+    public void MarkTlasDirty() => tlasDirty = true;
+    public bool IsTlasDirty => tlasDirty;
 
-    // ──────────────────────────────────────────────────────────
+
     //  Helpers — finished
-    // ──────────────────────────────────────────────────────────
 
     private ulong GetBufferDeviceAddress(Buffer buffer)
     {
@@ -107,9 +114,9 @@ public unsafe partial class Renderer
     }
 
 
-    // ──────────────────────────────────────────────────────────
+    // 
     //  Helpers — TODO
-    // ──────────────────────────────────────────────────────────
+    // 
 
     /// <summary>
     /// Same shape as the existing CreateBuffer helper but chains
@@ -163,9 +170,9 @@ public unsafe partial class Renderer
     }
 
 
-    // ──────────────────────────────────────────────────────────
+    //
     //  Allocator helpers (used by both BuildBlas and RebuildTlas)
-    // ──────────────────────────────────────────────────────────
+    //
 
     /// <summary>
     /// Grows the persistent scratch buffer if `required` exceeds current size.
@@ -244,9 +251,9 @@ public unsafe partial class Renderer
     }
 
 
-    // ──────────────────────────────────────────────────────────
+    //
     //  Building blocks
-    // ──────────────────────────────────────────────────────────
+    //
 
     private BlasEntry BuildBlas(Mesh* mesh)
     {
@@ -333,7 +340,8 @@ public unsafe partial class Renderer
         };
         return blasCache[(nint)mesh];
     }
-
+    //tlas previous entry count(ensures that if all are removed old tlas isnt used)
+    private static uint PreviousCount = 0;
     private void RebuildTlas()
     {
         // 1. Make sure the persistently-mapped instance buffer can hold a
@@ -361,6 +369,9 @@ public unsafe partial class Renderer
             sDst[i] = default;
 
             Entity* e = scene.GetEntity(i);
+            
+            if(!e->IsActive) continue;
+            
             if (e == null) continue;
             var transform = e->GetComponent<TransformComponent>();
             var meshComp  = e->GetComponent<MeshComponent>();
@@ -418,13 +429,15 @@ public unsafe partial class Renderer
                 AccelerationStructureReference         = blas.DeviceAddress,
             };
         }
-
-        if (count == 0)
+        //if 
+        if (count == 0 && PreviousCount == 0)
         {
             tlasDirty = false;
             return;
         }
-
+        PreviousCount = count;
+        
+        
         // 3. Geometry — instance data lives at tlasInstanceBuffer's device address.
         uint instanceCount = count;
         var geo = new AccelerationStructureGeometryKHR
@@ -502,9 +515,7 @@ public unsafe partial class Renderer
     }
 
 
-    // ──────────────────────────────────────────────────────────
     //  Orchestrators
-    // ──────────────────────────────────────────────────────────
 
     private void InitRayQuery()
     {
@@ -543,6 +554,72 @@ public unsafe partial class Renderer
         }
         
         RebuildTlas();
+    }
+
+    /// <summary>
+    /// Destroys cached BLAS entries for every mesh pointer in
+    /// <paramref name="meshPtrs"/>. Pairs with file destroy in the editor.
+    /// Caller is responsible for DeviceWaitIdle before calling (typically via
+    /// the editor's destroy path, which also frees mesh/texture resources).
+    /// </summary>
+    public void DestroyBlasFor(IEnumerable<nint> meshPtrs)
+    {
+        if (khrAccelStruct == null) return;
+        foreach (var ptr in meshPtrs)
+        {
+            if (!blasCache.TryGetValue(ptr, out var entry)) continue;
+            khrAccelStruct.DestroyAccelerationStructure(device, entry.Handle, null);
+            DestroyBuffer(entry.Storage, entry.StorageAlloc);
+            blasCache.Remove(ptr);
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds BLAS for any newly-seen meshes and re-runs RebuildTlas. Re-writes
+    /// the TLAS and (if its underlying VkBuffer reallocated) the ShadowEntityInfo
+    /// descriptor on every consumer pipeline. Safe to call after a scene-edit
+    /// from the editor; performs a DeviceWaitIdle internally so it doesn't race
+    /// in-flight command buffers.
+    /// </summary>
+    public void OnSceneEntitiesChanged()
+    {
+        if (!initialized) return;
+        // Pathtracer always cares because changing the scene invalidates the
+        // accumulator regardless of whether ray shadows are supported.
+        MarkAccumulatorDirty();
+
+        if (!RayShadowsSupported || khrAccelStruct == null) return;
+
+        vk!.DeviceWaitIdle(device);
+
+        // Build BLAS for any meshes that joined the scene since last build.
+        for (int i = 0; i < scene.EntityCount; i++)
+        {
+            Entity* e = scene.GetEntity(i);
+            if (e == null) continue;
+            var meshComp = e->GetComponent<MeshComponent>();
+            if (meshComp == null || meshComp.mesh == null) continue;
+            if (blasCache.ContainsKey((nint)meshComp.mesh)) continue;
+            BuildBlas(meshComp.mesh);
+        }
+
+        RebuildTlas();
+
+        // TLAS handle changes on every rebuild — re-bind it on every consumer
+        // descriptor set even when the shadow-info buffer didn't grow.
+        if (tlas.Handle != 0)
+        {
+            PbrDeferredPipeline?.WriteTlasDescriptor(tlas);
+            transparentPipeline?.WriteTlasDescriptor(tlas);
+            ptComputePipeline?.WriteTlasDescriptor(tlas);
+        }
+
+        if (shadowInfoBufferResized)
+        {
+            PbrDeferredPipeline?.WriteShadowAlphaDescriptors();
+            ptComputePipeline?.WriteShadowInfoDescriptor();
+            shadowInfoBufferResized = false;
+        }
     }
 
     private void CleanupRayQuery()

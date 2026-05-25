@@ -59,7 +59,7 @@ public static class RendererSettingsPanel
         ImGuiNET.ImGui.End();
     }
 
-    // ── Render mode ────────────────────────────────────────────────────────
+    //  Render mode
 
     static readonly string[] _renderModeLabels =
     {
@@ -84,7 +84,7 @@ public static class RendererSettingsPanel
         }
     }
 
-    // ── Pathtracer ─────────────────────────────────────────────────────────
+    //  Pathtracer 
     // Visible only when render mode is RayCompute. Sliders push their value
     // straight to the pipeline and mark the accumulator dirty so the next
     // frame restarts integration.
@@ -202,7 +202,7 @@ public static class RendererSettingsPanel
         ImGuiNET.ImGui.Unindent();
     }
 
-    // ── Reflection probes ─────────────────────────────────────────────────
+    // Reflection probes
 
     static void DrawReflectionProbes(Renderer.Renderer renderer)
     {
@@ -270,7 +270,7 @@ public static class RendererSettingsPanel
         EditorState.SelectedEntity = e;
     }
 
-    // ── Environment / IBL ─────────────────────────────────────────────────
+    //  Environment / IBL 
 
     static void DrawEnvironment(Renderer.Renderer renderer)
     {
@@ -343,7 +343,7 @@ public static class RendererSettingsPanel
         if (_hdrSelected < 0 && _hdrFiles.Length > 0) _hdrSelected = 0;
     }
 
-    // ── Tonemap ────────────────────────────────────────────────────────────
+    // Tonemap
 
     static void DrawTonemap(Renderer.Renderer renderer)
     {
@@ -386,7 +386,7 @@ public static class RendererSettingsPanel
         }
     }
 
-    // ── Shadows ────────────────────────────────────────────────────────────
+    // Shadows
 
     static void DrawShadows(Renderer.Renderer renderer)
     {
@@ -417,7 +417,7 @@ public static class RendererSettingsPanel
         }
     }
 
-    // ── Background ────────────────────────────────────────────────────────
+    // Background
 
     static void DrawBackground()
     {

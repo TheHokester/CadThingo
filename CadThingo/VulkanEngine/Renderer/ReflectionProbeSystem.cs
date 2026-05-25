@@ -53,7 +53,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     private readonly Vk       _vk;
     private readonly Device   _device;
 
-    // ── GPU resources ────────────────────────────────────────────
+    // GPU resources
 
     // Prefiltered cubemap array: 6×MaxProbes layers, mipped (split-sum specular).
     // VK_IMAGE_VIEW_TYPE_CUBE_ARRAY view — sampled by the PBR shader as
@@ -109,7 +109,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     private ImageView[,]    _prefilterStorageViews = null!;
     private DescriptorSet[,] _prefilterSets         = null!;
 
-    // ── CPU-side registry ────────────────────────────────────────
+    // CPU-side registry
 
     // All probes the system knows about. Insertion-ordered; slot index is
     // assigned at Register and stays stable.
@@ -192,7 +192,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         capturePipeline.Initialize();
     }
 
-    // ── Registry ────────────────────────────────────────────────
+    // Registry
 
     /// <summary>
     /// Assigns <paramref name="probe"/> a cube-array slot and marks it dirty
@@ -235,7 +235,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         }
     }
 
-    // ── GPU resource lifetime ───────────────────────────────────
+    // GPU resource lifetime
 
     private void CreatePrefilteredArray()
     {
@@ -332,7 +332,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
 
     private void CreateCaptureAttachments()
     {
-        // ── Color cube ────────────────────────────────────────────
+        // Color cube
         ImageCreateInfo colorInfo = new()
         {
             SType         = StructureType.ImageCreateInfo,
@@ -381,7 +381,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         if (_vk.CreateImageView(_device, &colorSampleViewInfo, null, out captureCubeSampleView) != Result.Success)
             throw new Exception("Failed to create probe capture cube-sample view");
 
-        // ── Depth cube ────────────────────────────────────────────
+        // Depth cube
         ImageCreateInfo depthInfo = new()
         {
             SType         = StructureType.ImageCreateInfo,
@@ -417,7 +417,6 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
             throw new Exception("Failed to create probe capture depth view");
     }
 
-    // ── Scheduler / capture helpers ─────────────────────────────
 
     /// <summary>
     /// Picks the next probe to capture this frame. Pass priority: probes that
@@ -573,7 +572,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         // Position cached by Tick — no per-capture scene walk.
         Vector3 probePos = probe.WorldPosition;
 
-        // ── Build + upload per-face VP UBO ─────────────────────
+        // Build + upload per-face VP UBO
         Span<Matrix4x4> views = stackalloc Matrix4x4[6];
         BuildCaptureMatrices(probePos, 0.1f, 200f, views, out var proj);
         var ubo = new ProbeCapturePipeline.CaptureUbo
@@ -584,7 +583,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         };
         capturePipeline.WriteUbo(frameIndex, in ubo);
 
-        // ── Layout transitions: cube + depth to attachment layouts ──
+        // Layout transitions: cube + depth to attachment layouts
         ImageMemoryBarrier* preBarriers = stackalloc ImageMemoryBarrier[2];
         preBarriers[0] = new()
         {
@@ -615,7 +614,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
             PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit,
             0, 0, null, 0, null, 2, preBarriers);
 
-        // ── Begin multiview rendering ──────────────────────────
+        // Begin multiview rendering
         var colorAttach = new RenderingAttachmentInfo
         {
             SType       = StructureType.RenderingAttachmentInfo,
@@ -665,7 +664,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         _vk.CmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
         _vk.CmdBindIndexBuffer(cmd, ib, 0, IndexType.Uint32);
 
-        // ── Per-entity direct draws ─────────────────────────────
+        // Per-entity direct draws
         // No GPU cull for probe captures yet — every renderable goes through.
         // For typical CAD scenes (≤ ~1k draws) this is well under the 1ms budget
         // and avoids standing up a separate cull pass per probe.
@@ -690,7 +689,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
 
         _vk.CmdEndRendering(cmd);
 
-        // ── Transition cube → ShaderReadOnly so prefilter compute can sample it ─
+        // Transition cube → ShaderReadOnly so prefilter compute can sample it 
         // Also transition the destination probe slot's layers in the prefiltered
         // array from ShaderReadOnly → General for storage writes. Combined into
         // one CmdPipelineBarrier so we pay the sync cost once.
@@ -725,7 +724,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
             PipelineStageFlags.ComputeShaderBit,
             0, 0, null, 0, null, 2, postBarriers);
 
-        // ── Prefilter dispatch: per-mip GGX importance sample into the slot ─
+        // Prefilter dispatch: per-mip GGX importance sample into the slot
         var prefilter = _renderer.prefilterEnvPipeline;
         _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilter.Handle);
         uint slot = (uint)probe.CubeArraySlot;
@@ -751,7 +750,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
             _vk.CmdDispatch(cmd, groups, groups, 6);
         }
 
-        // ── Transition slot's layers back to ShaderReadOnly ──────
+        // Transition slot's layers back to ShaderReadOnly
         ImageMemoryBarrier slotReadBarrier = new()
         {
             SType               = StructureType.ImageMemoryBarrier,

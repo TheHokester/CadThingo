@@ -6,7 +6,7 @@ using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 
-// ────────────────────────────────────────────────────────────────────────────
+//
 //  Path-tracer compute pipeline (ray query + progressive accumulation).
 //
 //  Owns:    PathFrameUBO per frame; 4 PSOs (one per camera mode) baked via
@@ -21,7 +21,6 @@ namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 //  Inherits from PipelineBase (not ComputePipeline) because the base's
 //  CreatePipeline is sealed and has no spec-constant hook — we need full
 //  control to build one PSO per camera mode at init.
-// ────────────────────────────────────────────────────────────────────────────
 public sealed unsafe class PTComputePipeline : PipelineBase
 {
     // Matches PTCompute.slang::PathFrameUBO byte-for-byte.
@@ -70,13 +69,13 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     // rebuild. Indices match CameraMode values 0..3 (Orthographic re-uses 0).
     private Pipeline[] _modePipelines = new Pipeline[4];
 
-    // ── Compile-time tunables (baked into spec constants at Initialize) ────
+    //  Compile-time tunables (baked into spec constants at Initialize) 
     // Change after Initialize requires Dispose + rebuild.
     public bool EnableNee         { get; init; } = true;
     public bool RussianRoulette   { get; init; } = true;
     public uint MaxBouncesHardCap { get; init; } = 8;
 
-    // ── Per-frame runtime state (uploaded via PathFrameUBO each frame) ─────
+    //  Per-frame runtime state (uploaded via PathFrameUBO each frame) 
     public CameraMode Mode                { get; set; } = CameraMode.Pinhole;
     public uint       BounceCap           { get; set; } = 8;
     public float      Aperture            { get; set; } = 0.0f;
@@ -103,7 +102,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     public uint CurrentSampleCount => _accumSamples;
 
 
-    // ── Descriptor set layouts ─────────────────────────────────────────────
+    // Descriptor set layouts
     protected override void CreateDescriptorSetLayouts()
     {
         DescriptorSetLayouts            = new DescriptorSetLayout[4];
@@ -132,11 +131,11 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         // ResourceManager.MaterialBindlessLayout if you see that.
         DescriptorSetLayouts[SetBindless] = Engine.ResourceManager.GetBindlessLayout();
 
-        // Set 3: IBL cubes + BRDF LUT.
-        var set3 = stackalloc DescriptorSetLayoutBinding[3];
-        for (uint b = 0; b < 3; b++)
+        // Set 3: IBL cubes + BRDF LUT + full-res envCube.
+        var set3 = stackalloc DescriptorSetLayoutBinding[4];
+        for (uint b = 0; b < 4; b++)
             set3[b] = new() { Binding = b, DescriptorType = DescriptorType.CombinedImageSampler, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        CreateLayout(set3, 3, out DescriptorSetLayouts[SetIbl]);
+        CreateLayout(set3, 4, out DescriptorSetLayouts[SetIbl]);
     }
 
     private void CreateLayout(DescriptorSetLayoutBinding* bindings, uint count, out DescriptorSetLayout layout)
@@ -152,7 +151,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     }
 
 
-    // ── Pipeline build: one PSO per camera mode ────────────────────────────
+    // Pipeline build: one PSO per camera mode
     protected override void CreatePipeline()
     {
         byte[] code     = File.ReadAllBytes(ShaderPath);
@@ -218,7 +217,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     }
 
 
-    // ── Per-pipeline-owned resources (just the per-frame UBO) ──────────────
+    // Per-pipeline-owned resources (just the per-frame UBO)
     protected override void CreateResources()
     {
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
@@ -226,7 +225,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     }
 
 
-    // ── Descriptor set allocation ──────────────────────────────────────────
+    // Descriptor set allocation
     protected override void CreateDescriptorSets()
     {
         DescriptorSets = new DescriptorSet[4][];
@@ -280,7 +279,6 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     }
 
 
-    // ── Descriptor writes ──────────────────────────────────────────────────
     // Only the things this pipeline owns are written from WriteDescriptors.
     // The rest are external — each has a public Write* method the renderer
     // calls once the producer exists (TLAS after InitRayQuery, lights after
@@ -424,19 +422,21 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         MarkAccumulatorDirty();
     }
 
-    /// <summary>Set 3 bindings 0/1/2: irradiance + prefiltered cube + BRDF LUT.
-    /// Call once after CreateIblResources; underlying VkImage handles persist
-    /// across IBL rebakes so content updates don't require re-writes.</summary>
+    /// <summary>Set 3 bindings 0/1/2/3: irradiance + prefiltered cube + BRDF LUT
+    /// + full-res envCube. Call once after CreateIblResources; underlying
+    /// VkImage handles persist across IBL rebakes so content updates don't
+    /// require re-writes.</summary>
     public void WriteIblDescriptors()
     {
-        var imageInfos = stackalloc DescriptorImageInfo[3]
+        var imageInfos = stackalloc DescriptorImageInfo[4]
         {
             new() { ImageView = Renderer.irradianceCubeView,  Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
             new() { ImageView = Renderer.prefilteredCubeView, Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
             new() { ImageView = Renderer.brdfLutView,         Sampler = Renderer.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.envCubeView,         Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
         };
-        var writes = stackalloc WriteDescriptorSet[3];
-        for (uint b = 0; b < 3; b++)
+        var writes = stackalloc WriteDescriptorSet[4];
+        for (uint b = 0; b < 4; b++)
         {
             writes[b] = new WriteDescriptorSet
             {
@@ -448,11 +448,11 @@ public sealed unsafe class PTComputePipeline : PipelineBase
                 PImageInfo      = &imageInfos[b],
             };
         }
-        Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
+        Vk.UpdateDescriptorSets(Device, 4, writes, 0, null);
     }
 
 
-    // ── Per-frame UBO upload ───────────────────────────────────────────────
+    // Per-frame UBO upload
     /// <summary>Fills the PathFrameUBO. Returns true when this dispatch will
     /// reset the accumulator (camera move / scene edit / extent change since
     /// the last sample).</summary>
@@ -512,7 +512,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     }
 
 
-    // ── Record ─────────────────────────────────────────────────────────────
+    // Record
     /// <summary>Records the dispatch. The caller is responsible for:
     ///   - Having called UpdatePerFrame this frame.
     ///   - Having written all external descriptors (TLAS, lights, shadow info,
@@ -544,7 +544,6 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     }
 
 
-    // ── Dispose ────────────────────────────────────────────────────────────
     public override void Dispose()
     {
         // Mode 0 is aliased to PipelineHandle — base.Dispose destroys it.

@@ -38,11 +38,19 @@ public static class ImGuiUI
         StatsPanel.Draw();
         CameraPanel.Draw();
         RendererSettingsPanel.Draw();
+        FileBrowserPanel.Draw();
     }
 
     static void DrawMainMenuBar()
     {
         if (!ImGuiNET.ImGui.BeginMainMenuBar()) return;
+
+        if (ImGuiNET.ImGui.BeginMenu("File"))
+        {
+            if (ImGuiNET.ImGui.MenuItem("Open...", "Ctrl+O"))
+                FileBrowserPanel.BrowseAndLoad();
+            ImGuiNET.ImGui.EndMenu();
+        }
 
         if (ImGuiNET.ImGui.BeginMenu("View"))
         {
@@ -52,6 +60,7 @@ public static class ImGuiUI
             ImGuiNET.ImGui.MenuItem("Stats",          null, ref EditorState.ShowStats);
             ImGuiNET.ImGui.MenuItem("Camera",            null, ref EditorState.ShowCamera);
             ImGuiNET.ImGui.MenuItem("Renderer Settings", null, ref EditorState.ShowRendererSettings);
+            ImGuiNET.ImGui.MenuItem("Files",             null, ref EditorState.ShowFileBrowser);
             ImGuiNET.ImGui.Separator();
             ImGuiNET.ImGui.MenuItem("Viewport fullscreen", "F11", ref EditorState.ViewportFullscreen);
             ImGuiNET.ImGui.EndMenu();

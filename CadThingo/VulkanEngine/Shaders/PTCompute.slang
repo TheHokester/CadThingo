@@ -47,11 +47,14 @@ struct ShadowEntityInfo {
 [[vk::binding(2, 2)]] Texture2D textures[];
 [[vk::binding(3, 2)]] SamplerState samplers[];
 
-//Set 3 IBL + Lights 
-//Sampled on miss  (sky contribution) and clamped fallback 
+//Set 3 IBL + Lights
+//Sampled on miss  (sky contribution) and clamped fallback
 [[vk::binding(0, 3)]] SamplerCube irradianceCube;
 [[vk::binding(1, 3)]] SamplerCube prefilteredCube;
 [[vk::binding(2, 3)]] Sampler2D brdfLUT;
+// Full-res environment (512²); prefilteredCube is 128² GGX-convolved, so use
+// envCube for sharp miss-ray background sampling.
+[[vk::binding(3, 3)]] SamplerCube envCube;
 
 //camera mode enum
 enum CameraMode : uint{
@@ -123,7 +126,7 @@ float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 baryc
 }
 
 
-// ─── Trace + shade resolve ────────────────────────────────────────────────
+// Trace + shade resolve
 // One call per bounce.  Walks the alpha-test Proceed loop for non-opaque
 // candidates, then on a committed hit fetches geometry + material and
 // returns a fully-populated HitInfo ready for BSDF math.  On miss, returns
@@ -166,7 +169,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
         return h;   // miss — h.hit stays false, caller samples env / breaks
     }
 
-    // ── Hit was committed.  Resolve geometry first, material second. ──────
+    // Hit was committed.  Resolve geometry first, material second.
     h.hit      = true;
     h.instID   = q.CommittedInstanceID();
     h.hitT     = q.CommittedRayT();
@@ -227,7 +230,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
         h.geometricNormal = -h.geometricNormal;
     }
 
-    // ── Material sample. ──────────────────────────────────────────────────
+    // Material sample.
     PbrMaterial  mat = materials[h.matidx];
     SamplerState s   = samplers[0];
 
@@ -256,7 +259,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
         h.normal  = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
     }
 
-    // ── Classification + transmission / IOR from KHR_materials_transmission
+    // Classification + transmission / IOR from KHR_materials_transmission
     //    + KHR_materials_ior. transmissionTex .r multiplies the factor; full
     //    glass = factor 1, opaque PBR = factor 0 (the default).
     h.alphaMode    = (int)(mat.flags & 0x5u);   // bit 0 = MASK, bit 2 = BLEND
@@ -272,12 +275,36 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
     // historical 0.04 dielectric default at IOR=1.5 (glass) and gives correct
     // values everywhere else — water 1.33 → ~0.02, diamond 2.4 → ~0.17.
     float f0_eta = (mat.ior - 1.0) / (mat.ior + 1.0);
-    h.F0      = f0_eta * f0_eta;
-    h.ambient = float3(0.0);
+    h.F0 = f0_eta * f0_eta;
+
+    // KHR_materials_clearcoat
+    // Clearcoat is a thin dielectric coat over the base — fixed IOR 1.5 per
+    // spec, so its F0 is the canonical 0.04 (constant in the eval below).
+    // glTF: clearcoatTexture uses R channel, clearcoatRoughnessTexture uses G.
+    h.clearcoat = mat.clearcoatFactor;
+    if (mat.clearcoatTex >= 0) {
+        h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].Sample(s, h.uv).r;
+    }
+    h.clearcoatRoughness = mat.clearcoatRoughnessFactor;
+    if (mat.clearcoatRoughnessTex >= 0) {
+        h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].Sample(s, h.uv).g;
+    }
+    // Clamp roughness to a small floor — GGX D(roughness=0) is 0 everywhere
+    // except the mirror direction where it's 0/0 = NaN, so a literal zero
+    // produces a coat that contributes nothing despite "full clearcoat".
+    // 0.045 maps to GGX alpha ≈ 0.002, sharp-but-evaluable. Same floor on
+    // the base lobe so a manually-zeroed roughness slider doesn't kill it.
+    h.clearcoatRoughness = max(h.clearcoatRoughness, 0.045);
+    h.roughness          = max(h.roughness,          0.045);
+    // Clearcoat normal — for now reuse the shading normal. Real KHR clearcoat
+    // supports a *separate* normal map for the coat (orange peel effect); add
+    // when you have a test asset with one. Sampled separately because the
+    // coat's TBN and the base's TBN differ.
+    h.clearcoatNormal = h.normal;
 
     return h;
 }
-// ─── Shadow ray (NEE visibility) ──────────────────────────────────────────
+// Shadow ray (NEE visibility)
 // ACCEPT_FIRST_HIT_AND_END_SEARCH: traversal stops on the first committed
 // hit, which is all NEE needs. MASK passes through alpha-test; BLEND
 // (glass-tagged) geometry is treated as fully transparent for shadow
@@ -330,7 +357,7 @@ bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngState) {
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
-// ─── RIS light pick ────────────────────────────────────────────────────────
+// RIS light pick
 // Reservoir-style RIS over M=RIS_LIGHT_SAMPLE_COUNT uniform candidates.
 //   p_source = 1 / lightCount     (uniform pick)
 //   p_target = luminance(unshadowed_radiance) * NdotL
@@ -441,9 +468,10 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
     for (uint b = 0u; b < cap; ++b) {
         HitInfo hit = traceRay(ray, rngState);
 
-        // ── Miss: sample environment (mip 0 = sharpest) and terminate. ──
+        // Miss: sample environment (full-res envCube, not the 128²
+        //    GGX-prefiltered chain) and terminate.
         if (!hit.hit) {
-            float3 env  = prefilteredCube.SampleLevel(ray.Direction, 0.0).rgb;
+            float3 env  = envCube.SampleLevel(ray.Direction, 0.0).rgb;
             float3 envC = throughput * env * frameUBO.scaleIBLAmbient;
             float  m    = max(max(envC.r, envC.g), envC.b);
             if (m > FIREFLY_CLAMP) envC *= FIREFLY_CLAMP / m;
@@ -462,7 +490,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
 
         float3 V = -ray.Direction;   // toward camera/incoming ray's origin
 
-        // ── NEE: pick a light, shadow-test, add f * Le * cosθ * W. ──
+        // NEE: pick a light, shadow-test, add f * Le * cosθ * W.
         if (ENABLE_NEE && frameUBO.lightCount > 0u) {
             LightPick pick = sampleLightRIS(rngState, hit.worldPos, hit.normal);
             if (pick.valid) {
@@ -475,7 +503,10 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
                     bool   shadowed     = pick.sample.castShadows &&
                                           isOccluded(shadowOrigin, pick.sample.L, tMax, rngState);
                     if (!shadowed) {
-                        float3 brdf = evaluatePbrBrdf(hit, V, pick.sample.L);
+                        // evaluateFullBrdf includes the clearcoat lobe + base
+                        // attenuation; for materials without clearcoat (factor=0)
+                        // it collapses to the standard PBR BRDF.
+                        float3 brdf = evaluateFullBrdf(hit, V, pick.sample.L);
                         float3 neeC = throughput * brdf * pick.sample.radiance
                                                  * NdotL * pick.weight;
                         float  mn   = max(max(neeC.r, neeC.g), neeC.b);
@@ -486,7 +517,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
             }
         }
 
-        // ── BSDF sample for indirect. Split diffuse / GGX-VNDF sampler —
+        // BSDF sample for indirect. Split diffuse / GGX-VNDF sampler
         //    Fresnel-weighted lobe pick keeps glossy surfaces actually finding
         //    their highlights instead of relying on the diffuse lobe to ever
         //    hit them by accident.
@@ -500,7 +531,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
         // the pixel renders black for the rest of the session.
         if (any(isnan(throughput)) || any(isinf(throughput))) break;
 
-        // ── Russian roulette after the first MIN_BOUNCES bounces. Floor at
+        // Russian roulette after the first MIN_BOUNCES bounces. Floor at
         //    0.05 stops near-black throughput from killing the path before
         //    it can pick up an emissive / NEE contribution downstream.
         if (b >= MIN_BOUNCES && RUSSIAN_ROULETTE) {

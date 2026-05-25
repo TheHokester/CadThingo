@@ -16,7 +16,7 @@ using Vec3  = Silk.NET.Maths.Vector3D<float>;
 
 public static class NormalMatrixOps
 {
-    // ── Extract upper-left 3×3 from a 4×4 ────────────────────
+    // Extract upper-left 3×3 from a 4×4
     // glm::mat3(mat4)
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Mat3 ExtractMat3(Mat4 m) => new(
@@ -24,7 +24,6 @@ public static class NormalMatrixOps
         m.M21, m.M22, m.M23,
         m.M31, m.M32, m.M33);
  
-    // ── Transpose ─────────────────────────────────────────────
     // glm::transpose(mat3)
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Mat3 Transpose(Mat3 m) => new(
@@ -32,7 +31,7 @@ public static class NormalMatrixOps
         m.M12, m.M22, m.M32,
         m.M13, m.M23, m.M33);
  
-    // ── Inverse via adjugate ──────────────────────────────────
+    //  Inverse via adjugate
     // Silk.NET.Maths has no Matrix3X3.Ops file, so we implement
     // this ourselves using the cofactor / adjugate method.
     public static Mat3 Invert(Mat3 m)
@@ -61,7 +60,7 @@ public static class NormalMatrixOps
             c13 * r, c23 * r, c33 * r);
     }
  
-    // ── Combined: glm::transpose(glm::inverse(glm::mat3(m4))) ─
+    // Combined: glm::transpose(glm::inverse(glm::mat3(m4)))
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Mat3 NormalMatrix(Mat4 modelMatrix)
         => Transpose(Invert(ExtractMat3(modelMatrix)));

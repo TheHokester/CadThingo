@@ -1,6 +1,5 @@
 ﻿using System.Numerics;
 using CadThingo.Graphics.Rendering;
-using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Core;
@@ -268,7 +267,7 @@ public unsafe partial class Renderer
         // constructed after CreateIblBakePipelines.
         reflectionProbeSystem = new ReflectionProbeSystem(this);
 
-        // ── Pipelines that don't depend on allocated g-buffer image views ──
+        // Pipelines that don't depend on allocated g-buffer image views 
         // Render-graph pass closures (registered in SetupDeferredRenderer) read
         // `geometryPipeline` / `drawCullPipeline` / `PbrDeferredPipeline` through
         // `this`, so they must exist (be non-null) by the time the closures *run*
@@ -292,7 +291,7 @@ public unsafe partial class Renderer
         // because the underlying ImageView is rebuilt.
         imGuiUtils?.WriteViewportDescriptor(scene.renderGraph.GetResource("FinalColor").ImageView);
 
-        // ── Lighting + light-cull pipelines (depend on allocated g-buffer / lights SSBO) ──
+        //  Lighting + light-cull pipelines (depend on allocated g-buffer / lights SSBO) 
         PbrDeferredPipeline = new PbrDeferredPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
         PbrDeferredPipeline.Initialize();
 
@@ -376,50 +375,8 @@ public unsafe partial class Renderer
         // and the scene runs with direct lighting only.
         TryAutoLoadEnvironment();
 
-        // Wire ResourceManager → upload viking_room mesh → create entity with transform + mesh.
-
-
-
-        // glTF demo: DamagedHelmet to the side of viking_room so both render together.
-        // Entity* blue_agent = GltfLoader.Load(
-        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\props\sas_blue.glb",
-        //     "BlueAgent", Engine.ResourceManager, this, scene);
-        // blue_agent->GetComponent<TransformComponent>()?.SetScale(new Vector3(25f));
-        // blue_agent->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(0, 0, MathF.PI / 2));
-        // blue_agent->GetComponent<TransformComponent>()?.SetPosition(new Vector3(6f, 0f, 0f));
-        //
-        
-        // Entity* helmetRoot = GltfLoader.Load(
-        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\DamagedHelmet.glb",
-        //     "DamagedHelmet", Engine.ResourceManager, this, scene);
-        // var helmetTransform = helmetRoot->GetComponent<TransformComponent>();
-        // helmetTransform?.SetPosition(new Vector3(0f, 1f, 0f));
-        //
-        // Phase 2 smoke test — three LightComponents (directional / point / spot)
-        // confirming the per-frame StructuredBuffer<PbrLight> path lights the helmet.
-        
-        //Sponza scene
-        // Entity* sponza = GltfLoader.Load(
-        //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\sponza.glb",
-        //     "Sponza", Engine.ResourceManager, this, scene);
-        // var sponzaTransform = sponza->GetComponent<TransformComponent>();
-        // sponzaTransform?.SetPosition(new Vector3(0f, 0f, 0f));
-        //
-        
-        //Chess scene 
-        Entity* chessScene = GltfLoader.Load(@"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\ABeautifulGame.glb",
-            "ChessScene", Engine.ResourceManager, this, scene);
-        
-        // 930 turbo
-         // Entity* turbo930 = GltfLoader.Load(
-         //     @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Props\free_1975_porsche_911_930_turbo.glb", 
-         //     "Turbo930", Engine.ResourceManager, this, scene);
-         // turbo930->GetComponent<TransformComponent>()?.SetPosition(new Vector3(-1f, 0.05f, 7.7f));
-         // turbo930->GetComponent<TransformComponent>()?.SetRotation(Quaternion.CreateFromYawPitchRoll(4.25f, 0, 0));
-         //
-         // Entity* Bistro = GltfLoader.Load(@"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models\Environment\Bistro_Godot.glb",
-         //     "Bistro", Engine.ResourceManager, this, scene);
-        
+        // Scene loads are driven by FileBrowserPanel (File → Open). Lights and
+        // the test probe stay here because they aren't tied to a glTF import.
         SpawnTestLights();
         SpawnTestProbe();
     }
@@ -583,7 +540,7 @@ public unsafe partial class Renderer
         // Drain GPU work so nothing references resources we're about to destroy.
         vk!.DeviceWaitIdle(device);
 
-        // ── Frame sync ──────────────────────────────────────────
+        //  Frame sync
         for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
         {
             if (renderFinishedSemaphores[i].Handle != 0)
@@ -594,26 +551,25 @@ public unsafe partial class Renderer
                 vk.DestroyFence(device, inFlightFences[i], null);
         }
         
-        // ── ECS-owned native memory ─────────────────────────────
         if (testEntity != null)
         {
             Entity.Destroy(testEntity);
             testEntity = null;
         }
 
-        // ── Ray-query AS handles + scratch + instance buffer ────
+        //  Ray-query AS handles + scratch + instance buffer
         // Must come before ResourceManager.Dispose so the BLAS storage destroys cleanly
         // (BLAS doesn't reference VB/IB after build, but order is least-surprising this way).
         CleanupRayQuery();
 
-        // ── Mesh pool (global VB/IB) ────────────────────────────
+        //  Mesh pool (global VB/IB)
         Engine.ResourceManager.Dispose();
         
-        //── ImGUI dispose ────────────────────────────────────────
+        // ImGUI dispose
         imGuiUtils?.Dispose();
         
         
-        // ── Render graph + size-dependent attachments ───────────
+        // Render graph + size-dependent attachments
         // RenderGraph.Dispose disposes resources it owns; ImageResource.Dispose
         // is idempotent so the explicit calls below are safe redundant cleanup.
         scene?.renderGraph?.Dispose();
@@ -632,16 +588,16 @@ public unsafe partial class Renderer
         // Lights SSBO — renderer-owned mirror of Scene's LightComponents.
         DestroyLightBuffers();
 
-        // ── G-buffer sampler ────────────────────────────────────
+        // G-buffer sampler
         if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
 
-        // ── Reflection probes ───────────────────────────────────
+        // Reflection probes
         reflectionProbeSystem?.Dispose();
 
-        // ── IBL images + samplers ───────────────────────────────
+        // IBL images + samplers
         CleanupIblResources();
 
-        // ── Pipelines (each pipeline disposes its own buffers, sets, layouts) ─
+        // Pipelines (each pipeline disposes its own buffers, sets, layouts)
         ptComputePipeline  ?.Dispose();
         skyboxPipeline     ?.Dispose();
         transparentPipeline?.Dispose();
@@ -651,22 +607,22 @@ public unsafe partial class Renderer
         drawCullPipeline   ?.Dispose();
         geometryPipeline   ?.Dispose();
 
-        // ── Descriptor pool (frees the descriptor sets owned by the pipelines) ─
+        // Descriptor pool (frees the descriptor sets owned by the pipelines)
         if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
 
-        // ── Command pool (frees buffers) ────────────────────────
+        // Command pool (frees buffers)
         if (commandPool.Handle != 0) vk.DestroyCommandPool(device, commandPool, null);
 
-        // ── Swap chain + image views ────────────────────────────
+        // Swap chain + image views
         CleanupSwapChain();
 
-        // ── Memory allocator (frees every VkDeviceMemory block) ─
+        // Memory allocator (frees every VkDeviceMemory block) 
         // Must run after every other Vk*Destroy above — those don't free memory,
         // they only release the buffer/image handle. The allocator is what owns
         // the underlying allocations.
         memAllocator?.Dispose();
 
-        // ── Device, debug, surface, instance ────────────────────
+        // Device, debug, surface, instance
         vk.DestroyDevice(device, null);
         if (enableValidationLayers && debugUtils != null)
             debugUtils.DestroyDebugUtilsMessenger(instance, debugMessenger, null);

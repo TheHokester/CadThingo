@@ -4,10 +4,9 @@ using CadThingo.VulkanEngine.ImGui;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
-// ────────────────────────────────────────────────────────────────────────────
+
 //  PBR deferred lighting pass — fullscreen triangle, samples G-buffer +
 //  per-tile light list, optional ray-queried shadows.
-// ────────────────────────────────────────────────────────────────────────────
 public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 {
     // Matches PbrShader.slang's LightingFrameUBO (binding 0 of set 0).
@@ -110,7 +109,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         
         EndRendering(cmd);
     }
-    // ── Shader-stage overrides ─────────────────────────────────────────────
+    // Shader-stage overrides 
     // Lighting pass is a fullscreen triangle synthesized by SV_VertexID; depth
     // test is off, alpha blending off.
 
@@ -161,7 +160,6 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         return 0;
     }
 
-    // ── Descriptor set layouts ─────────────────────────────────────────────
 
     protected override void CreateDescriptorSetLayouts()
     {
@@ -170,7 +168,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         DescriptorSetLayouts = new DescriptorSetLayout[4];
         OwnedDescriptorSetLayoutIndices = new[] { 0, 1, 2 };
 
-        // ── Set 0: LightingFrameUBO + Light SSBO + TLAS + Tile cull buffers ───
+        //  Set 0: LightingFrameUBO + Light SSBO + TLAS + Tile cull buffers 
         // Only the fragment shader reads lights, camPos, exposure, gamma etc.
         // The vertex shader is a procedural fullscreen triangle (SV_VertexID only).
         var set0Bindings = new DescriptorSetLayoutBinding[]
@@ -215,7 +213,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
                 StageFlags = ShaderStageFlags.FragmentBit,
                 PImmutableSamplers = null,
             },
-            // ── IBL split-sum (Phase 1: bound to black-cleared images; Phase 3
+            //  IBL split-sum (Phase 1: bound to black-cleared images; Phase 3
             // adds the matching declarations to PbrShader.slang). The shader is
             // free to declare fewer bindings than the layout exposes, so adding
             // these now causes no SPIR-V change.
@@ -243,7 +241,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
                 StageFlags = ShaderStageFlags.FragmentBit,
                 PImmutableSamplers = null,
             },
-            // ── Reflection-probe bindings (Phase 7) ──
+            // Reflection-probe bindings (Phase 7)
             // 8: probeCubeArray (sampled cube array of every probe's prefiltered specular)
             // 9: probes         (per-probe ProbeGpuRecord SSBO; world pos + radius + slot)
             // 10: clusterRange  (per-cluster (offset,count) into probeIndexList)
@@ -282,7 +280,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
             },
         };
 
-        // ── Set 1: G-Buffer inputs ────────────────────────────────────────────
+        // Set 1: G-Buffer inputs
         // Five samplers written by the geometry pass, read here for lighting.
         var set1Bindings = new DescriptorSetLayoutBinding[]
         {
@@ -293,7 +291,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
             new() { Binding = 4, DescriptorType = DescriptorType.CombinedImageSampler, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit, PImmutableSamplers = null },
         };
 
-        // ── Set 2: shadow-alpha plumbing ──────────────────────────────────────
+        // Set 2: shadow-alpha plumbing
         // ShadowEntityInfo (per-entity index/material lookup), globalIndices,
         // globalVertices. All three are read in the fragment stage by the
         // ray-query Proceed loop only when the candidate is non-opaque.
@@ -388,7 +386,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         DescriptorSetLayouts[SetBindless] = Engine.ResourceManager.GetBindlessLayout();
     }
 
-    // ── Resources ──────────────────────────────────────────────────────────
+    // Resources
 
     protected override void CreateResources()
     {
@@ -398,7 +396,6 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         }
     }
 
-    // ── Descriptor sets ────────────────────────────────────────────────────
 
     protected override void CreateDescriptorSets()
     {
@@ -461,7 +458,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         DescriptorSets[SetBindless] = null;
     }
 
-    // ── Descriptor writes ──────────────────────────────────────────────────
+    // Descriptor writes
     // Writes split into three phases so cross-pipeline / TLAS deps can be wired
     // post-Initialize:
     //   - WriteDescriptors  (auto from Initialize): bindings 0,1 of set 0 + set 1 g-buffer.
@@ -797,7 +794,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         Vk.UpdateDescriptorSets(Device, 5, writes, 0, null);
     }
 
-    // ── Per-frame upload ────────────────────────────────────────────────────
+    // Per-frame upload
     // Walks scene lights into the per-frame Light SSBO and updates the lighting
     // UBO with camera + tile counts. Returns (lightCount, tileX, tileY) so the
     // renderer can drive the light-cull dispatch without recomputing.
@@ -809,7 +806,6 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         // the current scene. Other rendering paths call the same method.
         uint count = Renderer.UpdateLights(frameIndex, scene);
 
-        // ── Frame UBO ──────────────────────────────────────────
         uint tileX = (Renderer.renderExtent.Width  + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
         uint tileY = (Renderer.renderExtent.Height + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
 

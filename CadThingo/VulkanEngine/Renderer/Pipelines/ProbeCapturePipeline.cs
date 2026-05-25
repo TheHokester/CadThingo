@@ -52,7 +52,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
         DepthAttachmentFormat = Format.D32Sfloat;
     }
 
-    // ── GraphicsPipeline overrides ──────────────────────────────
+    // GraphicsPipeline overrides
 
     protected override string ShaderPath { get; } =
         @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\ProbeCapture.spv";
@@ -85,7 +85,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
         DepthBiasEnable         = false,
     };
 
-    // ── Resource lifetime ──────────────────────────────────────
+    // Resource lifetime
 
     protected override void CreateDescriptorSetLayouts()
     {
@@ -178,7 +178,6 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
         base.Dispose();
     }
 
-    // ── Public helpers ──────────────────────────────────────────
 
     /// <summary>
     /// Uploads <paramref name="ubo"/> into the frame slot's mapped UBO. Cheap

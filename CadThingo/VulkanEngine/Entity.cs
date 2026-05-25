@@ -16,7 +16,7 @@ namespace CadThingo.VulkanEngine;
 /// </summary>
 public unsafe struct Entity : IDisposable
 {
-    // ── Fields ───────────────────────────────────────────────
+    // Fields
 
     // Fixed-capacity component slot array — avoids List<T> and its
     // managed array resizing entirely.
@@ -33,7 +33,7 @@ public unsafe struct Entity : IDisposable
 
     public bool IsActive;
 
-    // ── Factory helpers ──────────────────────────────────────
+    // Factory helpers 
 
     /// <summary>Allocates an Entity in unmanaged memory.</summary>
     public static Entity* Create(string name)
@@ -54,14 +54,12 @@ public unsafe struct Entity : IDisposable
         NativeMemory.Free(e);
     }
 
-    // ── Accessors ────────────────────────────────────────────
 
     public string Name => (string)_nameHandle.Target!;
 
     private Dictionary<Type, int> ComponentMap =>
         (Dictionary<Type, int>)_mapHandle.Target!;
 
-    // ── Lifecycle ────────────────────────────────────────────
 
     public void Initialize()
     {
@@ -83,7 +81,7 @@ public unsafe struct Entity : IDisposable
             GetComponentAtSlot(i)?.Render();
     }
     
-        // ── Component management ─────────────────────────────────
+        // Component management
  
     /// <summary>
     /// Attaches a component. A Pinned GCHandle is stored in the fixed slot
@@ -158,7 +156,7 @@ public unsafe struct Entity : IDisposable
         return true;
     }
  
-    // ── Private helpers ──────────────────────────────────────
+    // Private helpers
  
     private T* GetTypedPointer<T>(int slot) where T : Component
     {
@@ -190,7 +188,6 @@ public unsafe struct Entity : IDisposable
         }
     }
  
-    // ── IDisposable ──────────────────────────────────────────
  
     public void Dispose()
     {

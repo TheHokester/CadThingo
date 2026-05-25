@@ -6,11 +6,11 @@ using Silk.NET.Vulkan;
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 
 
-// ────────────────────────────────────────────────────────────────────────────
+//
 //  Transparent forward+ pass — renders BLEND-mode materials into HDRColor with
 //  src-alpha / one-minus-src-alpha blending, depth-tested LE against the
 //  geometry pass's depth buffer (no depth write).
-// ────────────────────────────────────────────────────────────────────────────
+//
 public sealed unsafe class TransparentPipeline : GraphicsPipeline
 {
     // Matches Transparent.slang::FrameUBO. View+proj feed the VS; camPos +
@@ -157,7 +157,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         return 0;
     }
 
-    // ── Pipeline state overrides ───────────────────────────────────────────
+    // Pipeline state overrides
 
     protected override PipelineDepthStencilStateCreateInfo BuildDepthStencil() => new()
     {
@@ -207,7 +207,6 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
     protected override VertexInputBindingDescription[]   GetVertexInputBindings()   => [Vertex.GetBindingDescription()];
     protected override VertexInputAttributeDescription[] GetVertexInputAttributes() => Vertex.GetAttributeDescriptions();
 
-    // ── Descriptor layouts ─────────────────────────────────────────────────
 
     protected override void CreateDescriptorSetLayouts()
     {

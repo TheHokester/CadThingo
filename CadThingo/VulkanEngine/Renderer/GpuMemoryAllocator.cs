@@ -188,7 +188,7 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
         _buckets.Clear();
     }
 
-    // ─── internals ──────────────────────────────────────────────
+    // internals
 
     private SubAlloc Allocate(MemoryRequirements reqs, MemoryPropertyFlags props, BucketKind kind)
     {
@@ -357,7 +357,6 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
         _vk.FreeMemory(_device, block.Memory, null);
     }
 
-    // ─── node slot management ───────────────────────────────────
 
     private int NewNode(Block block, ulong offset, ulong size, bool free, int prev, int next)
     {

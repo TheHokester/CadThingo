@@ -175,7 +175,7 @@ public class Camera : IEventListener
     public Vec3 GetFront() => front;
     float GetZoom() => zoom;
 
-    // ── Editor-facing properties ─────────────────────────────────
+    // Editor-facing properties
     // Yaw/Pitch setters re-derive front/right/up so callers don't have to remember
     // to call UpdateCameraVectors; Pitch clamps to the same ±89° range as mouse input.
     public Vec3 Position { get => position; set => position = value; }
@@ -201,7 +201,6 @@ public class Camera : IEventListener
     public float MovementSpeed    { get => movementSpeed;    set => movementSpeed    = MathF.Max(0f, value); }
     public float MouseSensitivity { get => mouseSensitivity; set => mouseSensitivity = MathF.Max(0f, value); }
 
-    // ── CAD view presets ─────────────────────────────────────────
     // Snap orientation + position to canonical orthographic-style views, looking at
     // the world origin from <paramref name="distance"/> along the relevant axis.
     // Pan after positioning if the working set isn't origin-centric.

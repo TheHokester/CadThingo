@@ -83,6 +83,7 @@ public static unsafe class InspectorPanel
         {
             t.SetPosition(pos);
             Engine.renderer.MarkAccumulatorDirty();
+            Engine.renderer.MarkTlasDirty();
         }
 
         var quat = t.GetRotation();
@@ -91,12 +92,14 @@ public static unsafe class InspectorPanel
         {
             SetEulerDeg(entity, euler, t);
             Engine.renderer.MarkAccumulatorDirty();
+            Engine.renderer.MarkTlasDirty();
         }
 
         var scale = t.GetScale();
         if (ImGuiNET.ImGui.DragFloat3("Scale", ref scale, 0.01f, 0.0001f, float.MaxValue))
         {
             Engine.renderer.MarkAccumulatorDirty();
+            Engine.renderer.MarkTlasDirty();
             t.SetScale(scale);
         }
 
@@ -206,7 +209,7 @@ public static unsafe class InspectorPanel
                 Engine.renderer.MarkAccumulatorDirty();
             }
 
-        // ── KHR_materials_transmission + KHR_materials_ior ─────────────────
+        // KHR_materials_transmission + KHR_materials_ior
         // Transmission only matters for non-opaque dielectrics; collapsed by
         // default so opaque-material editing stays uncluttered, but always
         // visible because flipping a material to transmissive is a one-slider
@@ -226,7 +229,7 @@ public static unsafe class InspectorPanel
             ImGuiNET.ImGui.TreePop();
         }
 
-        // ── KHR_materials_clearcoat ────────────────────────────────────────
+        // KHR_materials_clearcoat
         // Same collapsed-by-default treatment. Pathtracer currently doesn't
         // sample clearcoat; uploaded for future BSDF work + the deferred
         // renderer can read it whenever that lobe lands too.
@@ -381,7 +384,7 @@ public static unsafe class InspectorPanel
             probe.Dirty = true;
     }
 
-    // ── Euler ↔ Quaternion ──────────────────────────────────────
+    // Euler ↔ Quaternion
     // ZYX-intrinsic (= XYZ-extrinsic) Tait-Bryan. Pick any convention and stay
     // consistent — the cache below means we only round-trip when the quaternion
     // changes externally, so accumulated drift during dragging stays at zero.

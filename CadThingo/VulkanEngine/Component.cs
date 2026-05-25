@@ -21,7 +21,7 @@ public abstract unsafe class Component : IDisposable
     // Called only by Entity — not public API.
     internal void SetOwner(Entity* owner) => _owner = owner;
  
-    // ── Lifecycle ────────────────────────────────────────────
+    //  Lifecycle 
  
     public void Initialize()
     {
@@ -45,7 +45,7 @@ public abstract unsafe class Component : IDisposable
     public virtual void Update(float deltaTime) { }
     public virtual void Render()               { }
  
-    // ── IDisposable ──────────────────────────────────────────
+    //  IDisposable
  
     public void Dispose()
     {

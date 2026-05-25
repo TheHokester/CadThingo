@@ -4,12 +4,11 @@ using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer;
 
-// ────────────────────────────────────────────────────────────────────────────
+
 //  Skybox pass — samples envCube along per-pixel view rays. Renders between
 //  the deferred lighting pass and the transparent forward+ pass; depth test
 //  EQUAL against 1.0 so it lights up only the cleared (sky) pixels of the
 //  depth buffer the geometry pass left behind.
-// ────────────────────────────────────────────────────────────────────────────
 
 public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
 {
@@ -87,7 +86,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         EndRendering(cmd);
     }
     
-    // ── Pipeline state ─────────────────────────────────────────────────────
+    //  Pipeline state 
 
     // Depth test EQUAL @ 1.0. The vertex shader writes gl_Position.z = 1.0
     // (post-divide depth = 1.0), so only pixels still at the cleared far value
@@ -114,7 +113,6 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         DepthBiasEnable         = false,
     };
 
-    // ── Descriptors ────────────────────────────────────────────────────────
 
     protected override void CreateDescriptorSetLayouts()
     {
@@ -222,7 +220,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         }
     }
 
-    // ── Per-frame upload ────────────────────────────────────────────────────
+    // Per-frame upload
 
     public void UpdatePerFrame(uint frameIndex, Camera camera, float intensity)
     {

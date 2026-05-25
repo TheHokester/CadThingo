@@ -6,7 +6,7 @@ using SixLabors.ImageSharp.PixelFormats;
 namespace CadThingo.VulkanEngine.GLTF;
 
 /// <summary>
-/// Static helpers to decode glTF-embedded image bytes (PNG/JPG) into a Vulkan Texture
+/// Static helpers to decode glTF-embedded image bytes (PNG/JPG/WebP) into a Vulkan Texture
 /// and register it as a TextureResource in the ResourceManager. The returned Texture
 /// is what gets bound into a material descriptor set; the TextureResource exists for
 /// lifetime/disposal tracking.
@@ -14,15 +14,15 @@ namespace CadThingo.VulkanEngine.GLTF;
 /// glTF can carry four image MIME types in total:
 ///   • image/jpeg       — supported
 ///   • image/png        — supported
+///   • image/webp       — supported (EXT_texture_webp, decoded via ImageSharp's built-in WebP decoder)
 ///   • image/ktx2       — NOT supported yet (KHR_texture_basisu, supercompressed)
-///   • image/webp       — NOT supported yet (EXT_texture_webp)
 /// Anything outside the supported set throws so unsupported assets fail loudly
 /// instead of producing garbled output.
 /// </summary>
 public static unsafe class GltfTextureResource
 {
     /// <summary>
-    /// Decode <paramref name="encodedBytes"/> (PNG/JPG only), upload as a Vulkan texture
+    /// Decode <paramref name="encodedBytes"/> (PNG/JPG/WebP), upload as a Vulkan texture
     /// in the requested <paramref name="format"/> (sRGB for color, Unorm for data),
     /// and register a TextureResource keyed by <paramref name="id"/>. If a texture
     /// with this id is already registered, returns its underlying Texture.
@@ -39,25 +39,24 @@ public static unsafe class GltfTextureResource
         // sharing the same image don't re-decode/upload.
         if (rm.HasResource<TextureResource>(id))
         {
-            return rm.GetResource<TextureResource>(id)->Texture;
+            return rm.GetResource<TextureResource>(id)!.Texture;
         }
 
-        // Reject unsupported image formats up-front. KTX2 (KHR_texture_basisu) and WebP
-        // (EXT_texture_webp) need dedicated decode paths we haven't built yet.
+        // Reject unsupported image formats up-front. KTX2 (KHR_texture_basisu) still
+        // needs a dedicated decode path we haven't built yet; PNG/JPEG/WebP all funnel
+        // through ImageSharp's auto-detecting Load<Rgba32>.
         switch (mimeType)
         {
             case "image/png":
             case "image/jpeg":
+            case "image/webp":
                 break;
             case "image/ktx2":
                 throw new NotSupportedException(
                     $"glTF image '{id}' is image/ktx2 (KHR_texture_basisu). KTX2 decoding is not implemented yet.");
-            case "image/webp":
-                throw new NotSupportedException(
-                    $"glTF image '{id}' is image/webp (EXT_texture_webp). WebP decoding is not implemented yet.");
             default:
                 throw new NotSupportedException(
-                    $"glTF image '{id}' has unrecognised MIME type '{mimeType}'. Only image/png and image/jpeg are supported.");
+                    $"glTF image '{id}' has unrecognised MIME type '{mimeType}'. Only image/png, image/jpeg, and image/webp are supported.");
         }
 
         using var img = ImageSharp.Image.Load<Rgba32>(encodedBytes.Span);

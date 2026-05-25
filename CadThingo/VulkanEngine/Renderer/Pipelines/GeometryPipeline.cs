@@ -4,9 +4,9 @@ using CadThingo.VulkanEngine.GLTF;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
-// ────────────────────────────────────────────────────────────────────────────
+//
 //  Geometry pass — writes the G-buffer
-// ────────────────────────────────────────────────────────────────────────────
+//
 public sealed unsafe class GeometryPipeline : GraphicsPipeline
 {
     struct GeometryUBO
@@ -96,42 +96,11 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         Vk!.CmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
         Vk!.CmdBindIndexBuffer(cmd, ib, 0, IndexType.Uint32);
 
-        // ── Upload per-frame material SSBO ──────────────────────────────
-        // Copy every scene material followed by a fallback at slot [matCount] used by
-        // entities without a glTF material (legacy/proc geometry).
-        int matCount = ctx.Scene.MaterialCount;
-        if (matCount + 1 > (int)Renderer.MAX_MATERIALS)
-            throw new InvalidOperationException($"Scene material count ({matCount}) exceeds MAX_MATERIALS ({Renderer.MAX_MATERIALS}).");
-
-        PbrMaterial* matPtr = (PbrMaterial*)Engine.ResourceManager.GetMaterialMapped(ctx.FrameIndex);
-        for (int mi = 0; mi < matCount; mi++) matPtr[mi] = ctx.Scene.Materials[mi];
-
-        int fallbackMatIdx = matCount;
-        matPtr[fallbackMatIdx] = new PbrMaterial
-        {
-            BaseColorFactor          = new Vector4(1, 1, 1, 1),
-            EmissiveFactor           = Vector3.Zero,
-            AlphaCutoff              = 0f,
-            MetallicFactor           = 0.3f,
-            RoughnessFactor          = 0.7f,
-            Flags                    = 0,
-            BaseColorTex             = GltfDefaults.BaseColorIndex,
-            PhysicalDescriptorTex    = GltfDefaults.MetallicRoughnessIndex,
-            NormalTex                = GltfDefaults.NormalIndex,
-            OcclusionTex             = GltfDefaults.OcclusionIndex,
-            EmissiveTex              = GltfDefaults.EmissiveIndex,
-            // KHR extension fields — glTF defaults (no transmission, no coat).
-            TransmissionFactor       = 0f,
-            Ior                      = 1.5f,
-            ClearcoatFactor          = 0f,
-            ClearcoatRoughnessFactor = 0f,
-            TransmissionTex          = GltfDefaults.OcclusionIndex,  // white = 1.0 multiplier
-            ClearcoatTex             = GltfDefaults.OcclusionIndex,
-            ClearcoatRoughnessTex    = GltfDefaults.OcclusionIndex,
-            ClearcoatNormalTex       = GltfDefaults.NormalIndex,
-        };
-
-        // ── GPU-driven indirect draw ────────────────────────────────────
+        // Material SSBO upload moved to Renderer.UpdateMaterials so every
+        // rendering path (deferred / forward+ / pathtracer) sees the same
+        // per-frame snapshot. Inline upload here was deferred-only and PT mode
+        // never saw inspector edits as a result.
+        
         // The draw-cull compute pass already populated:
         //   - InstanceStorageBuffers (ResourceManager): per-visible-renderable model
         //     + materialIndex, read by the VS via SV_InstanceID.

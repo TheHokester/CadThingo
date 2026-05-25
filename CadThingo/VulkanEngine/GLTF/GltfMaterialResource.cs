@@ -64,7 +64,7 @@ public static class GltfMaterialResource
         var mrChannel        = gltfMat.FindChannel("MetallicRoughness");
         var emChannel        = gltfMat.FindChannel("Emissive");
 
-        // ── KHR_materials_transmission + KHR_materials_ior ─────────────────
+        // KHR_materials_transmission + KHR_materials_ior
         // Missing channels return null → factor stays at the glTF default
         // (transmission 0, IOR 1.5) and the texture slot points at the
         // white fallback (1.0 multiplier, so the factor controls the result).
@@ -78,7 +78,7 @@ public static class GltfMaterialResource
         // Default is 1.5 (dielectric / glass).
         float ior = gltfMat.IndexOfRefraction;
 
-        // ── KHR_materials_clearcoat ────────────────────────────────────────
+        // KHR_materials_clearcoat
         var clearcoatChannel          = gltfMat.FindChannel("ClearCoat");
         var clearcoatRoughnessChannel = gltfMat.FindChannel("ClearCoatRoughness");
         var clearcoatNormalChannel    = gltfMat.FindChannel("ClearCoatNormal");

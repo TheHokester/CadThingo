@@ -1,5 +1,6 @@
 ﻿using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.GLTF;
 using ImGuiNET;
 using Silk.NET.Vulkan;
 
@@ -299,7 +300,7 @@ public unsafe partial class Renderer
             sourceStage = PipelineStageFlags.TransferBit;
             destinationStage = PipelineStageFlags.FragmentShaderBit;
         }
-        // ── Pathtracer storage-image transitions ─────────────────────────────
+        // Pathtracer storage-image transitions
         // Fresh storage image — one-shot init in CreatePathTracingResources.
         // No prior work to wait on; the next user is a compute shader.
         else if (oldLayout == ImageLayout.Undefined && newLayout == ImageLayout.General)
@@ -558,7 +559,7 @@ public unsafe partial class Renderer
         ubo.mapped = memAllocator.GetMapped(ubo.alloc);
     }
 
-    // ─── Lights SSBO ───────────────────────────────────────────────────────
+    // Lights SSBO
     // Lives on Renderer (not PbrDeferredPipeline) so the pathtracer can read
     // it without depending on the deferred lighting pipeline existing. The
     // scene owns the LightComponents; this is just the per-frame GPU mirror.
@@ -591,6 +592,51 @@ public unsafe partial class Renderer
             if (lightStorageBuffers[i].buffer.Handle != 0)
                 DestroyBuffer(lightStorageBuffers[i].buffer, lightStorageBuffers[i].alloc);
         }
+    }
+
+    /// <summary>
+    /// Copy every scene material into the per-frame material SSBO, plus a
+    /// fallback entry at slot [MaterialCount] for legacy / procedural geometry
+    /// without an assigned material index. Every rendering path (deferred,
+    /// forward+, pathtracer) calls this once per frame so live edits in the
+    /// inspector show up on the next frame regardless of which renderer is
+    /// active. Returns the material count actually written (excluding the
+    /// fallback).
+    /// </summary>
+    public uint UpdateMaterials(uint frameIndex, Scene scene)
+    {
+        int matCount = scene.MaterialCount;
+        if (matCount + 1 > (int)MAX_MATERIALS)
+            throw new InvalidOperationException(
+                $"Scene material count ({matCount}) exceeds MAX_MATERIALS ({MAX_MATERIALS}).");
+
+        PbrMaterial* matPtr = (PbrMaterial*)Engine.ResourceManager.GetMaterialMapped(frameIndex);
+        for (int mi = 0; mi < matCount; mi++) matPtr[mi] = scene.Materials[mi];
+
+        matPtr[matCount] = new PbrMaterial
+        {
+            BaseColorFactor          = new Vector4(1, 1, 1, 1),
+            EmissiveFactor           = Vector3.Zero,
+            AlphaCutoff              = 0f,
+            MetallicFactor           = 0.3f,
+            RoughnessFactor          = 0.7f,
+            Flags                    = 0,
+            BaseColorTex             = GltfDefaults.BaseColorIndex,
+            PhysicalDescriptorTex    = GltfDefaults.MetallicRoughnessIndex,
+            NormalTex                = GltfDefaults.NormalIndex,
+            OcclusionTex             = GltfDefaults.OcclusionIndex,
+            EmissiveTex              = GltfDefaults.EmissiveIndex,
+            TransmissionFactor       = 0f,
+            Ior                      = 1.5f,
+            ClearcoatFactor          = 0f,
+            ClearcoatRoughnessFactor = 0f,
+            TransmissionTex          = GltfDefaults.OcclusionIndex,
+            ClearcoatTex             = GltfDefaults.OcclusionIndex,
+            ClearcoatRoughnessTex    = GltfDefaults.OcclusionIndex,
+            ClearcoatNormalTex       = GltfDefaults.NormalIndex,
+        };
+
+        return (uint)matCount;
     }
 
     /// <summary>Walks scene lights into the per-frame light SSBO. Returns the
@@ -943,12 +989,10 @@ public unsafe class ImageResource : IDisposable
 
         ImageAlloc = _allocator.AllocateForImage(Image, MemoryPropertyFlags.DeviceLocalBit);
 
-        // ── Create ImageView ──────────────────────────────────
         bool isDepth = _format is Format.D32Sfloat
             or Format.D24UnormS8Uint
             or Format.D16Unorm;
 
-        //Create image view
         var viewInfo = new ImageViewCreateInfo()
         {
             SType = StructureType.ImageViewCreateInfo,

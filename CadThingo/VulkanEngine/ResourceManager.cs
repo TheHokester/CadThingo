@@ -29,10 +29,10 @@ public unsafe class ResourceHandle<T> where T : Resource
     }
     
 
-    public T? Get() 
+    public T? Get()
     {
         if (_manager == null) return default;
-        return *_manager.GetResource<T>(_ID);
+        return _manager.GetResource<T>(_ID);
     }
     
     bool IsValid() => _manager != null && _manager.HasResource<T>(_ID);
@@ -82,10 +82,34 @@ public unsafe class Resource(string id)
 }
 
 
+/// <summary>
+/// Per-file capture of every resource ResourceManager produced during a load.
+/// Filled when an active <see cref="ResourceManager.BeginManifestCapture"/>
+/// scope is open. Lets the editor walk every mesh / texture / bindless slot a
+/// file owns when it wants to free them.
+///
+/// Materials, entities, and BLAS keys are filled by GltfLoader / the panel —
+/// ResourceManager doesn't see those.
+/// </summary>
+public sealed class LoadManifest
+{
+    public readonly Dictionary<Type, List<string>> ResourceIdsByType = new();
+    public readonly List<int> BindlessIndices = new();
+    // Filled by GltfLoader / panel.
+    public readonly List<int>  MaterialIndices = new();
+    public readonly List<nint> Entities        = new();
+    public readonly List<nint> MeshPtrs        = new();
+}
+
 public unsafe class ResourceManager
 {
     //2 level storage system, organise by type then unique identifier
     Dictionary<Type, Dictionary<string, Resource>> _resources = new();
+
+    // Currently-active manifest capture, set by BeginManifestCapture and read
+    // by Load<T> and RegisterBindless. Null when no load is in progress, in
+    // which case both paths skip the tracking branch (cheap nullable check).
+    private LoadManifest? _activeManifest;
 
     // Two-level reference counting system for automatic resource lifecycle management
     // First level maps resource type, second level maps resource IDs to their data
@@ -108,8 +132,16 @@ public unsafe class ResourceManager
     private SubAlloc globalIndexBufferAlloc;
     private int indexWriteOffset;    // in indices
 
-    private const int MAX_VERTICES = 1 << 22;   // 4M vertices
-    private const int MAX_INDICES  = 1 << 24;   // 16M indices
+    // Free-list of returned ranges keyed by (offset, count), sorted ascending by
+    // offset and coalesced on insert. UploadMesh first-fits the free-list before
+    // bumping the watermark. FreeMesh inserts back. The two lists stay
+    // independent because the VB and IB ranges for a single mesh land in
+    // separate-sized slots most of the time.
+    private readonly List<(int offset, int count)> _vbFreeList = new();
+    private readonly List<(int offset, int count)> _ibFreeList = new();
+
+    private const int MAX_VERTICES = 1 << 23;   // 4M vertices
+    private const int MAX_INDICES  = 1 << 25;   // 16M indices
 
     // Bindless texture table — every Texture registered here gets a stable int index that
     // PbrMaterial entries reference. The renderer's bindless descriptor set sees this slot
@@ -187,19 +219,21 @@ public unsafe class ResourceManager
     {
         if (_renderer == null)
             throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called");
-        if (vertexWriteOffset + vertices.Length > MAX_VERTICES)
-            throw new Exception($"Global vertex buffer full: {vertexWriteOffset + vertices.Length} > {MAX_VERTICES}");
-        if (indexWriteOffset + indices.Length > MAX_INDICES)
-            throw new Exception($"Global index buffer full: {indexWriteOffset + indices.Length} > {MAX_INDICES}");
 
-        uint baseVertex = (uint)vertexWriteOffset;
+        int vbOffset = AllocateRange(_vbFreeList, vertices.Length, ref vertexWriteOffset, MAX_VERTICES, "vertex");
+        int ibOffset = AllocateRange(_ibFreeList, indices.Length,  ref indexWriteOffset,  MAX_INDICES,  "index");
+
+        // Rebase against the actual allocated VB offset (may be a freed slot
+        // below vertexWriteOffset, not the watermark) so the indices point at
+        // the new vertices wherever they landed.
+        uint baseVertex = (uint)vbOffset;
         var rebased = new uint[indices.Length];
         for (int i = 0; i < indices.Length; i++) rebased[i] = indices[i] + baseVertex;
 
         ulong vbBytes     = (ulong)(vertices.Length * sizeof(Vertex));
         ulong ibBytes     = (ulong)(indices.Length  * sizeof(uint));
-        ulong vbDstOffset = (ulong)(vertexWriteOffset * sizeof(Vertex));
-        ulong ibDstOffset = (ulong)(indexWriteOffset  * sizeof(uint));
+        ulong vbDstOffset = (ulong)(vbOffset * sizeof(Vertex));
+        ulong ibDstOffset = (ulong)(ibOffset * sizeof(uint));
 
         fixed (Vertex* vPtr = vertices)
             _renderer.UploadBufferData(globalVertexBuffer, (long)vbDstOffset, vPtr, vbBytes);
@@ -226,13 +260,88 @@ public unsafe class ResourceManager
 
         var mesh = new Mesh
         {
-            offset      = indexWriteOffset,
-            count       = indices.Length,
-            sphereLocal = new Vector4(center, radius),
+            offset       = ibOffset,
+            count        = indices.Length,
+            sphereLocal  = new Vector4(center, radius),
+            vertexOffset = vbOffset,
+            vertexCount  = vertices.Length,
         };
-        vertexWriteOffset += vertices.Length;
-        indexWriteOffset  += indices.Length;
         return mesh;
+    }
+
+    /// <summary>
+    /// First-fit allocator across the free-list with a watermark fallback. When
+    /// no free-list entry is large enough we append at the high-water mark and
+    /// bump it. Hard-fails when neither path can satisfy the request.
+    /// </summary>
+    private static int AllocateRange(List<(int offset, int count)> freeList,
+                                     int needed,
+                                     ref int watermark,
+                                     int capacity,
+                                     string label)
+    {
+        for (int i = 0; i < freeList.Count; i++)
+        {
+            var (off, cnt) = freeList[i];
+            if (cnt < needed) continue;
+
+            if (cnt == needed) freeList.RemoveAt(i);
+            else               freeList[i] = (off + needed, cnt - needed);
+            return off;
+        }
+
+        if (watermark + needed > capacity)
+            throw new Exception($"Global {label} buffer full: {watermark + needed} > {capacity}");
+
+        int allocated = watermark;
+        watermark += needed;
+        return allocated;
+    }
+
+    /// <summary>Returns a range to the free-list and coalesces with adjacent neighbours.</summary>
+    private static void ReleaseRange(List<(int offset, int count)> freeList, int offset, int count)
+    {
+        if (count <= 0) return;
+
+        // Sorted insert by offset.
+        int i = 0;
+        while (i < freeList.Count && freeList[i].offset < offset) i++;
+        freeList.Insert(i, (offset, count));
+
+        // Coalesce with right neighbour first (cheaper bookkeeping when we
+        // remove a later index), then with left.
+        if (i + 1 < freeList.Count &&
+            freeList[i].offset + freeList[i].count == freeList[i + 1].offset)
+        {
+            freeList[i] = (freeList[i].offset, freeList[i].count + freeList[i + 1].count);
+            freeList.RemoveAt(i + 1);
+        }
+        if (i > 0 &&
+            freeList[i - 1].offset + freeList[i - 1].count == freeList[i].offset)
+        {
+            freeList[i - 1] = (freeList[i - 1].offset, freeList[i - 1].count + freeList[i].count);
+            freeList.RemoveAt(i);
+        }
+    }
+
+    /// <summary>
+    /// Returns the VB and IB ranges owned by <paramref name="mesh"/> to the
+    /// free-lists so a future UploadMesh can reuse them. Caller is responsible
+    /// for ensuring no in-flight GPU work still references the ranges
+    /// (DeviceWaitIdle before calling, typically driven by the editor).
+    /// </summary>
+    public void FreeMesh(Mesh mesh)
+    {
+        ReleaseRange(_vbFreeList, mesh.vertexOffset, mesh.vertexCount);
+        ReleaseRange(_ibFreeList, mesh.offset,       mesh.count);
+    }
+
+    /// <summary>Sum of free-list bytes for the global VB and IB. Editor stat.</summary>
+    public (long vbFreeBytes, long ibFreeBytes) GetMeshFreeStats()
+    {
+        long vb = 0; foreach (var e in _vbFreeList) vb += (long)e.count * sizeof(Vertex);
+        long ib = 0; foreach (var e in _ibFreeList) ib += (long)e.count * sizeof(uint);
+        return (vb, ib);
     }
 
     public void Dispose()
@@ -294,7 +403,57 @@ public unsafe class ResourceManager
 
         _bindlessIndexByTexture[tex] = index;
         _renderer.WriteBindlessTexture(index, tex, bindlessDescriptorSets, 2);
+        // Only newly-allocated slots land on the manifest; dedup hits returned
+        // above without writing a fresh descriptor, so the caller-file doesn't
+        // own those slots and shouldn't unregister them later.
+        _activeManifest?.BindlessIndices.Add(index);
         return index;
+    }
+
+    /// <summary>
+    /// Releases a bindless slot. The slot's descriptor is rewritten to point at
+    /// the white BaseColor default (a stable always-loaded texture) so any stale
+    /// material entry still referencing the slot reads safe data instead of a
+    /// freed VkImage. Future <see cref="RegisterBindless"/> can reuse the slot.
+    /// No-op if the slot wasn't currently allocated.
+    /// </summary>
+    public void UnregisterBindless(int index, Texture fallback)
+    {
+        if (_renderer == null) return;
+        if (index < 0 || index >= _bindlessTable.Count) return;
+
+        var existing = _bindlessTable[index];
+        if (existing == null) return; // already freed
+
+        _bindlessTable[index] = null!;
+        _bindlessIndexByTexture.Remove(existing);
+        _bindlessFree.Push(index);
+
+        // Point the descriptor at a known-good default. Validation would yell
+        // if a shader sampled a slot whose underlying VkImage we destroyed
+        // before this rewrite landed — callers must DeviceWaitIdle first.
+        _renderer.WriteBindlessTexture(index, fallback, bindlessDescriptorSets, 2);
+    }
+
+    /// <summary>
+    /// Opens a manifest-capture scope. While the returned IDisposable is alive,
+    /// every Load&lt;T&gt; and every newly-allocated bindless slot is appended
+    /// to <paramref name="manifest"/>. Nesting / concurrency are not supported
+    /// — only one capture may be active at a time.
+    /// </summary>
+    public IDisposable BeginManifestCapture(LoadManifest manifest)
+    {
+        if (_activeManifest != null)
+            throw new InvalidOperationException("A manifest capture is already active.");
+        _activeManifest = manifest;
+        return new ManifestScope(this);
+    }
+
+    private sealed class ManifestScope : IDisposable
+    {
+        private readonly ResourceManager _rm;
+        public ManifestScope(ResourceManager rm) => _rm = rm;
+        public void Dispose() => _rm._activeManifest = null;
     }
     
     private void CreateBindlessDescriptorSetLayout()
@@ -499,6 +658,18 @@ public unsafe class ResourceManager
         //Cache successful resource and initialize tracking
         typeResources[resourceID] = resource;
 
+        // Only newly-created resources land on the manifest. Cache hits don't
+        // — the file that gets the dedup'd handle doesn't own the resource.
+        if (_activeManifest != null)
+        {
+            if (!_activeManifest.ResourceIdsByType.TryGetValue(typeof(T), out var ids))
+            {
+                ids = new List<string>();
+                _activeManifest.ResourceIdsByType[typeof(T)] = ids;
+            }
+            ids.Add(resourceID);
+        }
+
         return new ResourceHandle<T>(this, resourceID);
     }
 
@@ -516,16 +687,10 @@ public unsafe class ResourceManager
     /// <param name="resourceID"></param>
     /// <typeparam name="T"></typeparam>
     /// <returns>Pointer to the resource requested by resourceID</returns>
-    public T* GetResource<T>(string resourceID) where T : Resource
+    public T? GetResource<T>(string resourceID) where T : Resource
     {
-        var typeResources = _resources[typeof(T)];
-
-        if (typeResources.TryGetValue(resourceID, out var resource))
-        {//resource found for this type
-            return (T*)&resource;
-        }
-        //resource not found
-        return null;
+        if (!_resources.TryGetValue(typeof(T), out var typeResources)) return null;
+        return typeResources.TryGetValue(resourceID, out var resource) ? (T)resource : null;
     }
 
     /// <summary>
@@ -635,10 +800,13 @@ public unsafe class MeshResource : Resource
 
     public override void Unload()
     {
-        // Per-mesh destruction (GPU data) is not yet implemented — global VB/IB is grow-only
-        // until compaction/free-list is added. Refcounts still drive logical lifetime.
+        // Return VB + IB ranges to the global free-list so a future upload can
+        // reuse them. Caller (typically FileBrowserPanel.Destroy) must have
+        // drained in-flight GPU work first — ranges go onto the free stack
+        // immediately and nothing here checks fence state.
         if (mesh != null)
         {
+            manager.FreeMesh(*mesh);
             NativeMemory.Free(mesh);
             mesh = null;
         }

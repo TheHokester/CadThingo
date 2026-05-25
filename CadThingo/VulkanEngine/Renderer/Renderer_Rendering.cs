@@ -328,10 +328,15 @@ public unsafe partial class Renderer
         // G-buffer ImageViews are fresh — re-bind them on the lighting pass set.
         PbrDeferredPipeline.WriteGBufferDescriptors();
 
-        // HDRColor ImageView is also fresh after the graph rebuild — re-bind it on
-        // the tonemap pass's sampler binding.
-        tonemapPipeline.WriteHdrInputDescriptor(
-            scene.renderGraph.GetResource("HDRColor").ImageView, gBufferSampler);
+        // Tonemap's HDR input is mode-dependent: HDRColor (the render-graph
+        // HDR target) for the deferred / forward+ paths, ptOutColor for the
+        // pathtracer. Both ImageViews are fresh post-rebuild — pick the right
+        // one or PT-mode resize ends up reading from the empty HDRColor and
+        // the screen goes black until the next mode flip rebinds it.
+        ImageView hdrInput = renderMode == RenderMode.RayCompute
+            ? ptOutColor.ImageView
+            : scene.renderGraph.GetResource("HDRColor").ImageView;
+        tonemapPipeline.WriteHdrInputDescriptor(hdrInput, gBufferSampler);
 
         // FinalColor ImageView is fresh — re-bind it for the ImGui viewport panel.
         imGuiUtils?.WriteViewportDescriptor(scene.renderGraph.GetResource("FinalColor").ImageView);
@@ -385,7 +390,22 @@ public unsafe partial class Renderer
         if (pendingPbrRebuild)     { RebuildPbrPipelines();     pendingPbrRebuild     = false; }
         if (pendingTonemapRebuild) { RebuildTonemapPipeline();  pendingTonemapRebuild = false; }
 
-        // 0c. Render-mode change: rebind tonemap's HDR input so its single
+        // 0c. Stale TLAS flush. tlasDirty is flipped by editor mutations
+        //     (transform sliders, visibility toggles) and consumed here so we
+        //     do at most one RebuildTlas per frame regardless of how many
+        //     slider ticks landed last frame. OnSceneEntitiesChanged also
+        //     re-runs the BLAS build pass for any new meshes and re-binds the
+        //     TLAS / shadow-info descriptors.
+        if (tlasDirty)
+        {
+            OnSceneEntitiesChanged();
+            // RebuildTlas already clears tlasDirty on success; for hardware
+            // paths where ray shadows aren't supported (RebuildTlas never runs)
+            // we still need to clear it so the next frame doesn't re-enter.
+            tlasDirty = false;
+        }
+
+        // 0d. Render-mode change: rebind tonemap's HDR input so its single
         //     shared descriptor set points at the right source. DeviceWaitIdle
         //     ensures no in-flight frame is still using the old binding.
         //     Mode flips are user-driven (ImGui combo), so the hitch is
@@ -584,6 +604,11 @@ public unsafe partial class Renderer
         //     shaders within the same frame once it's hooked up.
         reflectionProbeSystem.Tick(frameCounter, scene);
 
+        // Per-frame material SSBO snapshot — needs to land before the geometry
+        // pass reads it. PT does the same in DrawPathtraced so inspector edits
+        // are visible in either renderer.
+        UpdateMaterials(currentFrame, scene);
+
         geometryPipeline.UpdateUbo(currentFrame, camera);
         var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
         transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
@@ -654,10 +679,11 @@ public unsafe partial class Renderer
             }
         }
 
-        // Refresh the per-frame lights SSBO — renderer-owned, shared with
-        // every rendering path. No tile-cull or PbrDeferred-UBO work needed
-        // for the pathtracer.
+        // Refresh per-frame SSBOs — lights AND materials. PT used to skip the
+        // material upload (only the deferred geometry pass did it), which is
+        // why inspector edits never landed in PT mode.
         uint lightCount = UpdateLights(currentFrame, scene);
+        UpdateMaterials(currentFrame, scene);
 
         // Bridge Renderer's dirty signal into the pipeline's accumulator-reset.
         if (accumulatorDirty)
@@ -668,7 +694,7 @@ public unsafe partial class Renderer
 
         ptComputePipeline.UpdatePerFrame(currentFrame, camera, lightCount, renderExtent);
 
-        // ── Pre-dispatch barrier ──────────────────────────────────────────────
+        //  Pre-dispatch barrier 
         // ptAccumulator: previous frame's compute read+write → this frame's same.
         // ptOutColor:    previous frame's tonemap fragment read (or first-frame
         //                Undefined→General) → this frame's compute write.
@@ -705,10 +731,9 @@ public unsafe partial class Renderer
             PipelineStageFlags.ComputeShaderBit,
             0, 0, null, 0, null, 2, preBarriers);
 
-        // ── Dispatch ──────────────────────────────────────────────────────────
         ptComputePipeline.Record(cmd, frameContext);
 
-        // ── Tonemap into FinalColor ───────────────────────────────────────────
+        // Tonemap into FinalColor
         // Tonemap's HDR input descriptor was rebound to ptOutColor at the top of
         // DrawFrame on the mode-change boundary. It expects the image in
         // ShaderReadOnly and writes FinalColor as a color attachment.
@@ -1343,9 +1368,6 @@ public unsafe struct Plane
 
 
 
-// ────────────────────────────────────────────────────────────
-// Frustum
-// ────────────────────────────────────────────────────────────
  
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct Frustum
@@ -1356,7 +1378,7 @@ public unsafe struct Frustum
     //   0 Left  1 Right  2 Bottom  3 Top  4 Near  5 Far
     private fixed float _planeData[6 * 4]; // 6 planes × 4 floats (Vector4)
  
-    // ── Index constants ──────────────────────────────────────
+    // Index constants
     public const int Left   = 0;
     public const int Right  = 1;
     public const int Bottom = 2;
@@ -1364,7 +1386,7 @@ public unsafe struct Frustum
     public const int Near   = 4;
     public const int Far    = 5;
  
-    // ── Plane accessors ──────────────────────────────────────
+    // Plane accessors
  
     /// <summary>
     /// Read or write a plane by index.
@@ -1402,7 +1424,7 @@ public unsafe struct Frustum
     public Plane PlaneNear   { get => GetPlane(Near);   set => SetPlane(Near,   value); }
     public Plane PlaneFar    { get => GetPlane(Far);    set => SetPlane(Far,    value); }
  
-    // ── Construction ─────────────────────────────────────────
+    // Construction
  
     /// <summary>
     /// Extracts the six frustum planes from a combined view-projection matrix.
@@ -1464,7 +1486,6 @@ public unsafe struct Frustum
         return f;
     }
  
-    // ── Intersection test ─────────────────────────────────────
  
     /// <summary>
     /// Tests whether an axis-aligned bounding box intersects or is inside

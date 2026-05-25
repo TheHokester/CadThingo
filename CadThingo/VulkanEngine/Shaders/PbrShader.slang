@@ -83,7 +83,7 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 [[vk::binding(3, 1)]] Sampler2D gBufferMaterialSampler;
 [[vk::binding(4, 1)]] Sampler2D gBufferEmissiveSampler;
 
-// ── Set 2: shadow-alpha plumbing ───────────────────────────────────────────
+// Set 2: shadow-alpha plumbing
 // ShadowEntityInfo[i] = info for the entity whose TLAS InstanceCustomIndex == i.
 // Filled CPU-side in Renderer_Ray_Query.cs::RebuildTlas. Read in the shadow-ray
 // Proceed loop when the candidate is non-opaque (CPU sets ForceNoOpaqueBit on
@@ -99,7 +99,7 @@ struct ShadowEntityInfo {
 [[vk::binding(1, 2)]] ByteAddressBuffer                  globalIndices;
 [[vk::binding(2, 2)]] ByteAddressBuffer                  globalVertices;
 
-// ── Set 3: bindless materials/instances/textures/samplers ──────────────────
+// Set 3: bindless materials/instances/textures/samplers
 // Layout shared with the geometry pass (owned by ResourceManager). Only the
 // alpha-test path reads materials + textures + samplers; instances[] is
 // layout parity only.
@@ -362,7 +362,7 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
         float  intensity = lt.colorIntensity.a;
         if (intensity <= 0.0) continue;
 
-        // ── Per-type direction + attenuation ──
+        // Per-type direction + attenuation 
         float3 L;
         float  distance;
         float  attenuation;

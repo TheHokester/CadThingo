@@ -94,7 +94,8 @@ float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness){
     return F0 + (max(float3(1.0 - roughness, 1.0 - roughness, 1.0 - roughness), F0) - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
-// ─── Analytic-light evaluation ────────────────────────────────────────────
+//  Analytic-light evaluation
+
 // Resolves a PbrLight against a shading point into the canonical direct-light
 // terms every consumer (deferred PBR, transparent, pathtracer NEE) needs:
 //   * L         — unit vector FROM surface TO light (or -dir for directional)

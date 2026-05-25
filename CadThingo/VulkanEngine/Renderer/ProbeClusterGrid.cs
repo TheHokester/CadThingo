@@ -106,7 +106,7 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
         Pack(frameIndex, clusterCount);
     }
 
-    // ── World-space cluster bounds ───────────────────────────────
+    // World-space cluster bounds
 
     private void BuildClusterBounds(Camera camera, float aspect, float nearZ, float farZ,
         uint dimsX, uint dimsY, uint dimsZ)
@@ -160,7 +160,7 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
         return new Vector3(p.X, p.Y, p.Z) / p.W;
     }
 
-    // ── Sphere-AABB binning ───────────────────────────────────────
+    // Sphere-AABB binning
 
     private void BinProbe(uint probeSlot, Vector3 center, float radius, uint clusterCount)
     {
@@ -181,7 +181,7 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
         }
     }
 
-    // ── GPU upload ────────────────────────────────────────────────
+    // GPU upload
 
     private void Pack(uint frameIndex, uint clusterCount)
     {

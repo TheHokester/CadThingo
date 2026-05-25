@@ -83,7 +83,7 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 // Mirror of PbrShader.slang's SOFT_SHADOWS spec constant; same toggle path.
 [[vk::constant_id(0)]] const bool SOFT_SHADOWS = false;
 
-// ── Shadow helpers (copy of PbrShader.slang's; keeps each shader self-contained) ──
+//  Shadow helpers (copy of PbrShader.slang's; keeps each shader self-contained) 
 
 static const float SHADOW_RAY_EPS  = 0.002;
 static const int   PENUMBRA_SAMPLES = 8;
@@ -158,7 +158,7 @@ float softShadow(float3 origin, float3 L, float distanceToLight, float lightRadi
     return unblocked / float(PENUMBRA_SAMPLES);
 }
 
-// ── Vertex / fragment ────────────────────────────────────────────────────
+// Vertex / fragment
 
 struct VSInput {
     float3 Position : POSITION;

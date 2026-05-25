@@ -4,9 +4,9 @@ using Silk.NET.Vulkan.Extensions.KHR;
 
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 
-// ────────────────────────────────────────────────────────────────────────────
+
 //  Pipeline wrapper layout
-// ────────────────────────────────────────────────────────────────────────────
+//
 //  Three layers:
 //    1. PipelineBase      — owns the handle, layout, cache, descriptor set
 //                           layouts, push-constant ranges, and the lifecycle.
@@ -19,7 +19,6 @@ namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 //  Concrete pipelines (Geometry, PbrDeferred, DrawCull, LightCull, …)
 //  inherit from layer 2/3 and own their own SSBOs/UBOs, push-constant
 //  structs, descriptor sets, and Record(...) entry points.
-// ────────────────────────────────────────────────────────────────────────────
 
 public abstract unsafe class PipelineBase : IDisposable
 {
@@ -131,11 +130,10 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
 
     protected GraphicsPipeline(Renderer renderer) : base(renderer) { }
 
-    // ── Required overrides ──────────────────────────────────────────────────
     protected abstract string   ShaderPath              { get; }
     protected abstract Format[] ColorAttachmentFormats  { get; }
 
-    // ── Optional hooks (defaults match the common case) ─────────────────────
+    // Optional hooks (defaults match the common case)
     protected virtual Format DepthAttachmentFormat { get; init; } = Format.Undefined;
 
     // Multiview view mask threaded into VkPipelineRenderingCreateInfo.viewMask.

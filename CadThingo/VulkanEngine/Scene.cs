@@ -18,6 +18,12 @@ public unsafe struct Mesh
     public int offset;
     public int count;
     public Vector4 sphereLocal;
+    // VB-side range — only consumed by ResourceManager.FreeMesh so the global
+    // VB free-list can reclaim the vertex slot when the owning MeshResource
+    // unloads. Renderer/shader code addresses vertices through the index buffer,
+    // so these fields don't need to be GPU-visible.
+    public int vertexOffset;
+    public int vertexCount;
 }
 
 public class Scene
@@ -54,6 +60,13 @@ public class Scene
     // The geometry pipeline uploads this list into a per-frame StructuredBuffer<PbrMaterial>
     // before recording the geometry pass. Index -1 means "use the default material at slot 0".
     private readonly List<PbrMaterial> _materials = new();
+
+    // Indices freed via ReleaseMaterial. AddMaterial pops from here before
+    // extending the list, so a destroy/reload cycle reuses slots instead of
+    // burning through the MAX_MATERIALS budget. Freed slots are zeroed in the
+    // backing list so the per-frame upload of [0, MaterialCount) doesn't keep
+    // shipping stale bindless texture indices.
+    private readonly Stack<int> _materialFree = new();
 
     public int EntityCount   => _entityList.Count;
     public int MaterialCount => _materials.Count;
@@ -154,6 +167,63 @@ public class Scene
     public unsafe Entity* GetEntity(int index) => (Entity*)_entityList[index];
 
     /// <summary>
+    /// Removes a single entity from the scene's flat list and hierarchy mirror.
+    /// TransformComponent.Parent is left intact so a later AddEntity rebuilds
+    /// the same parent-child edge. The entity's native memory is NOT freed —
+    /// callers that want a destroy should Entity.Destroy() after removal.
+    /// </summary>
+    public unsafe void RemoveEntity(Entity* entity)
+    {
+        if (entity == null) return;
+        var ptr = (nint)entity;
+        _entityList.Remove(ptr);
+        _roots.Remove(ptr);
+
+        var t = entity->GetComponent<TransformComponent>();
+        if (t != null && t.Parent != null
+            && _childrenOf.TryGetValue((nint)t.Parent, out var siblings))
+        {
+            siblings.Remove(ptr);
+            if (siblings.Count == 0)
+                _childrenOf.Remove((nint)t.Parent);
+        }
+
+        // Drop our own children mirror entry — descendants are expected to be
+        // removed by the caller (RemoveSubtree handles this) but the bookkeeping
+        // entry would otherwise leak if a child was destroyed first.
+        _childrenOf.Remove(ptr);
+    }
+
+    /// <summary>
+    /// Collects an entity and every descendant in pre-order, then RemoveEntity's
+    /// each. Returns the ordered list so callers can re-add them later via
+    /// <see cref="AddEntity"/> in the same order (the AddEntity path rebuilds
+    /// parent edges from each entity's TransformComponent.Parent, which we
+    /// deliberately leave intact).
+    /// </summary>
+    public unsafe List<nint> RemoveSubtree(Entity* root)
+    {
+        var collected = new List<nint>();
+        if (root == null) return collected;
+
+        Collect(root, collected);
+        foreach (var ptr in collected)
+            RemoveEntity((Entity*)ptr);
+        return collected;
+
+        void Collect(Entity* e, List<nint> output)
+        {
+            output.Add((nint)e);
+            if (!_childrenOf.TryGetValue((nint)e, out var children)) return;
+            // Snapshot — Collect's grandchildren-recursion mutates nothing,
+            // but RemoveEntity below will, so we copy the list defensively.
+            var snapshot = children.ToArray();
+            foreach (var c in snapshot)
+                Collect((Entity*)c, output);
+        }
+    }
+
+    /// <summary>
     /// Appends every enabled <see cref="LightComponent"/> attached to an active entity
     /// to <paramref name="output"/>. Used by <c>UpdateLightingBuffers</c> to pack the
     /// per-frame StructuredBuffer&lt;PbrLight&gt;.
@@ -199,8 +269,28 @@ public class Scene
     /// </summary>
     public int AddMaterial(PbrMaterial mat)
     {
+        if (_materialFree.Count > 0)
+        {
+            int idx = _materialFree.Pop();
+            _materials[idx] = mat;
+            return idx;
+        }
         _materials.Add(mat);
         return _materials.Count - 1;
+    }
+
+    /// <summary>
+    /// Returns the material slot at <paramref name="idx"/> to the free pool so a
+    /// later <see cref="AddMaterial"/> can reuse it. Backing list entry is zeroed
+    /// so the per-frame upload doesn't keep shipping stale bindless texture
+    /// indices that might have been re-bound to a different texture in the
+    /// meantime. No-op for out-of-range / already-free indices.
+    /// </summary>
+    public void ReleaseMaterial(int idx)
+    {
+        if (idx < 0 || idx >= _materials.Count) return;
+        _materials[idx] = default;
+        _materialFree.Push(idx);
     }
 
     /// <summary>
