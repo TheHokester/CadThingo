@@ -1,11 +1,9 @@
-#ifndef PT_UTILS_INCLUDED
-#define PT_UTILS_INCLUDED
-
-// PbrUtils brings in PI, PbrLight, PbrMaterial, LightSample, evaluateLight,
-// and the GGX/Smith/Schlick BRDF terms used by evaluatePbrBrdf below.
-#include "PbrUtils.slang"
-
-//  Pathtracer utility helpers — raygen for the four camera modes.
+// PTUtils — pathtracer math: raygen for the four camera modes, RNG, BSDF
+// sampling + layered (base + clearcoat) BRDF evaluation.
+//
+// `module PTUtils;` with `__exported import PbrUtils;` so PTCompute gets the
+// shared BRDF terms (DistributionGGX / GeometrySmith / FresnelSchlick),
+// evaluateLight / LightSample, and the CommonTypes layer transitively.
 //
 //  All helpers take height-NDC with aspect baked into x:
 //
@@ -18,49 +16,49 @@
 //  NDC convention: ndc.y > 0 = bottom of screen; helpers flip internally so
 //  the returned direction has world +Y = up.
 
-// PI already lives in PbrUtils.slang (included by PTCompute.slang first).
-// HALF_PI is local so PTUtils parses standalone without depending on it.
-static const float HALF_PI    = 1.57079632679;
-static const float TWO_PI     = 6.28318530718;
-static const float INV_PI     = 0.31830988618;
-static const float INV_TWO_PI = 0.15915494309;
-static const float INFINITY   = asfloat(0x7F800000);
+module PTUtils;
+
+__exported import PbrUtils;
+
+// PI / TWO_PI / INV_PI / HALF_PI / INV_TWO_PI come from CommonTypes. The
+// constants below are pathtracer-specific and stay local.
+public static const float INFINITY        = asfloat(0x7F800000);
 
 // Sentinel returned by raygen helpers for pixels that fall outside the
 // projection's valid region (fisheye corner clip, etc.). Caller skips the
 // pixel when TMax < 0.
-static const float RAY_INVALID_TMAX = -1.0;
-static const uint MIN_BOUNCES = 1;
+public static const float RAY_INVALID_TMAX = -1.0;
+public static const uint  MIN_BOUNCES      = 1;
 
 // Per-hit shading info returned by traceRay().  Lives in registers across the
 // bounce loop — size affects occupancy more than direct perf.  Fields slotted
 // so float3 + float pairs pack into 16B vectors.
-struct HitInfo {
-    RayDesc ray;              // 32B - input ray (handy for outgoing dir = -ray.Direction)
-    float3 worldPos;           // 12B - world-space hit position
-    float metallic;            //  4B - packs with worldPos
-    float4 baseColor;          // 16B - factor * texture; .a kept for alpha-blend math
-    float3 normal;             // 12B - SHADING normal (after normal-map perturbation)
-    float roughness;           //  4B - packs with normal
-    float3 geometricNormal;    // 12B - geometry-only; use for ray offset + front/back test
-    float hitT;                //  4B - committed ray distance; worldPos = ray.Origin + dir*hitT
-    float3 tangent;            // 12B - world-space T axis of the TBN frame
-    float bitangentSign;       //  4B - glTF tangent.w; B = cross(N, T) * bitangentSign
-    float3 emissive;           // 12B - factor * texture
-    float ior;                 //  4B - index of refraction (~1.5 default)
-    float3 clearcoatNormal;    // 12B - normal for the coat lobe (usually = shading N)
-    float clearcoat;           //  4B - KHR_materials_clearcoat factor × tex.r
-    float F0;                  //  4B - dielectric F0; derived from IOR
-    float clearcoatRoughness;  //  4B - clearcoat lobe roughness (factor × tex.g)
-    float2 uv;                 //  8B - interpolated UV at the hit
-    float transmission;        //  4B - glass / transparency factor [0..1]
-    int alphaMode;             //  4B - 0=opaque, 1=mask, 4=blend (mat.flags bits)
-    uint instID;               //  4B - committed instance — debug
-    uint matidx;               //  4B - material index
-    bool hit;                  //  4B - false ⇒ ray missed the scene
-    bool frontFace;            //  4B - dot(geometricNormal, ray.Direction) < 0
-    bool isGlass;              //  4B
-    bool isLiquid;             //  4B
+public struct HitInfo {
+    public RayDesc ray;              // 32B - input ray (handy for outgoing dir = -ray.Direction)
+    public float3 worldPos;           // 12B - world-space hit position
+    public float metallic;            //  4B - packs with worldPos
+    public float4 baseColor;          // 16B - factor * texture; .a kept for alpha-blend math
+    public float3 normal;             // 12B - SHADING normal (after normal-map perturbation)
+    public float roughness;           //  4B - packs with normal
+    public float3 geometricNormal;    // 12B - geometry-only; use for ray offset + front/back test
+    public float hitT;                //  4B - committed ray distance; worldPos = ray.Origin + dir*hitT
+    public float3 tangent;            // 12B - world-space T axis of the TBN frame
+    public float bitangentSign;       //  4B - glTF tangent.w; B = cross(N, T) * bitangentSign
+    public float3 emissive;           // 12B - factor * texture
+    public float ior;                 //  4B - index of refraction (~1.5 default)
+    public float3 clearcoatNormal;    // 12B - normal for the coat lobe (usually = shading N)
+    public float clearcoat;           //  4B - KHR_materials_clearcoat factor × tex.r
+    public float F0;                  //  4B - dielectric F0; derived from IOR
+    public float clearcoatRoughness;  //  4B - clearcoat lobe roughness (factor × tex.g)
+    public float2 uv;                 //  8B - interpolated UV at the hit
+    public float transmission;        //  4B - glass / transparency factor [0..1]
+    public int alphaMode;             //  4B - 0=opaque, 1=mask, 4=blend (mat.flags bits)
+    public uint instID;               //  4B - committed instance — debug
+    public uint matidx;               //  4B - material index
+    public bool hit;                  //  4B - false ⇒ ray missed the scene
+    public bool frontFace;            //  4B - dot(geometricNormal, ray.Direction) < 0
+    public bool isGlass;              //  4B
+    public bool isLiquid;             //  4B
 };
 
 
@@ -75,7 +73,7 @@ struct HitInfo {
 //
 // Preserves the TMax < 0 sentinel from generateFisheyeRay so out-of-circle
 // pixels still short-circuit downstream.
-RayDesc transformRayToWorld(RayDesc cameraSpace, float4x4 invView) {
+public RayDesc transformRayToWorld(RayDesc cameraSpace, float4x4 invView) {
     if (cameraSpace.TMax < 0.0) return cameraSpace;
     RayDesc world;
     world.Origin    = mul(invView, float4(cameraSpace.Origin, 1.0)).xyz;
@@ -89,7 +87,7 @@ RayDesc transformRayToWorld(RayDesc cameraSpace, float4x4 invView) {
 // Pinhole
 // Standard perspective. tanHalfFovY = tan(verticalFOV / 2). Aspect is
 // already in ndc.x, so no aspect parameter here.
-RayDesc generatePinholeRay(float2 ndc, float tanHalfFovY) {
+public RayDesc generatePinholeRay(float2 ndc, float tanHalfFovY) {
     float3 dir = normalize(float3(
          ndc.x * tanHalfFovY,
         -ndc.y * tanHalfFovY,   // flip: NDC.y > 0 is bottom → ray points -Y
@@ -107,7 +105,7 @@ RayDesc generatePinholeRay(float2 ndc, float tanHalfFovY) {
 // photographer-style controls, compute it in the caller:
 //     apertureRadius = focalLength / (2 * fStop);
 // — that keeps this function decoupled from f-number semantics.
-RayDesc generateThinLensRay(float2 ndc, float tanHalfFovY, float2 lensUV,
+public RayDesc generateThinLensRay(float2 ndc, float tanHalfFovY, float2 lensUV,
                             float focusDistance, float apertureRadius) {
     RayDesc pin = generatePinholeRay(ndc, tanHalfFovY);
 
@@ -137,7 +135,7 @@ RayDesc generateThinLensRay(float2 ndc, float tanHalfFovY, float2 lensUV,
 // passes, but I haven't validated it against Sharpless's canonical inverse.
 // Worth eyeballing against a reference Panini render once it's running — if
 // it bows wrong at wide FOV, swap in the quadratic-solve Sharpless inverse.
-RayDesc generatePaniniRay(float2 ndc, float cameraFovAngle, float paniniDistance,
+public RayDesc generatePaniniRay(float2 ndc, float cameraFovAngle, float paniniDistance,
                           float verticalCompression) {
     float halfFov       = cameraFovAngle * 0.5;
     float halfPaniniFov = atan2(sin(halfFov), cos(halfFov) + paniniDistance);
@@ -169,7 +167,7 @@ RayDesc generatePaniniRay(float2 ndc, float cameraFovAngle, float paniniDistance
 // To switch projections, replace the `theta = r * halfFov` line:
 //   equisolid     : theta = 2.0 * asin(r * sin(halfFov * 0.5));
 //   stereographic : theta = 2.0 * atan(r * tan(halfFov * 0.5));
-RayDesc generateFisheyeRay(float2 ndc, float cameraFovAngle) {
+public RayDesc generateFisheyeRay(float2 ndc, float cameraFovAngle) {
     float halfFov = min(cameraFovAngle, TWO_PI) * 0.5;
     float r       = length(ndc);
 
@@ -191,7 +189,7 @@ RayDesc generateFisheyeRay(float2 ndc, float cameraFovAngle) {
 }
 //RNG generation
 
-uint jenkinsHash(uint x) {
+public uint jenkinsHash(uint x) {
     x += x << 10;
     x ^= x >> 6;
     x += x << 3;
@@ -205,29 +203,29 @@ uint jenkinsHash(uint x) {
 // the local thread index was 0, giving identical seeds along every 8th
 // column → visible vertical streaks in the noise. `gtid` is no longer needed
 // for decorrelation; left in the signature for callers that still pass it.
-uint initRNG(uint2 pixel, uint2 gtid, uint frame) {
+public uint initRNG(uint2 pixel, uint2 gtid, uint frame) {
     uint seed = pixel.x * 1973u
               ^ pixel.y * 9277u
               ^ frame   * 26699u;
     return jenkinsHash(seed);
 }
 
-float uintToFloat(uint x) {
+public float uintToFloat(uint x) {
     return asfloat(0x3f800000 | (x >> 9)) - 1.0;
 }
 
-float rand(inout uint rngState) {
-    return uintToFloat(xorshift(rngState));
-}
-
-uint xorshift(inout uint state) {
+public uint xorshift(inout uint state) {
     state ^= state << 13;
     state ^= state >> 17;
     state ^= state << 5;
     return state;
 }
 
-float luminance(float3 c) {
+public float rand(inout uint rngState) {
+    return uintToFloat(xorshift(rngState));
+}
+
+public float luminance(float3 c) {
     return 0.2126 * c.r +  0.7152 * c.g +  0.0722 * c.b;
 }
 
@@ -235,7 +233,7 @@ float luminance(float3 c) {
 // Pixar / Frisvad revised: branchless, handles N.z < 0 without the original
 // 2003 numerical breakdown near -Z. Use to lift a tangent-space sample into
 // world space when you only have N (no vertex tangent / bitangent).
-void buildOrthonormalBasis(float3 n, out float3 t, out float3 b) {
+public void buildOrthonormalBasis(float3 n, out float3 t, out float3 b) {
     float s  = (n.z >= 0.0) ? 1.0 : -1.0;
     float a  = -1.0 / (s + n.z);
     float bx = n.x * n.y * a;
@@ -248,7 +246,7 @@ void buildOrthonormalBasis(float3 n, out float3 t, out float3 b) {
 // matches the diffuse lobe; specular gets full BRDF eval but is under-sampled
 // at high roughness (acceptable starting point; swap for split BRDF / GGX
 // VNDF sampling when noise on glossy surfaces becomes the dominant artifact).
-float3 sampleCosineHemisphere(float3 N, inout uint rngState, out float pdf) {
+public float3 sampleCosineHemisphere(float3 N, inout uint rngState, out float pdf) {
     float u1 = rand(rngState);
     float u2 = rand(rngState);
 
@@ -267,7 +265,7 @@ float3 sampleCosineHemisphere(float3 N, inout uint rngState, out float pdf) {
 
 // Clearcoat F0 is fixed by KHR_materials_clearcoat — the coat layer is always
 // IOR 1.5, so Schlick reduces to the standard dielectric 0.04.
-static const float CLEARCOAT_F0 = 0.04;
+public static const float CLEARCOAT_F0 = 0.04;
 
 // glTF metallic-roughness BRDF eval
 // Returns f_r(V, L) WITHOUT the cosine term — caller multiplies by NdotL.
@@ -275,7 +273,7 @@ static const float CLEARCOAT_F0 = 0.04;
 // it here lets both NEE (light-sampled) and the BSDF-sampled indirect leg of
 // the pathtracer reuse the same evaluation. This is the BASE BRDF only —
 // callers that want the clearcoat layer on top use evaluateFullBrdf below.
-float3 evaluatePbrBrdf(HitInfo h, float3 V, float3 L) {
+public float3 evaluatePbrBrdf(HitInfo h, float3 V, float3 L) {
     float3 N     = h.normal;
     float  NdotL = dot(N, L);
     float  NdotV = dot(N, V);
@@ -306,7 +304,7 @@ float3 evaluatePbrBrdf(HitInfo h, float3 V, float3 L) {
 // Returns the raw lobe BRDF — caller multiplies by NdotL.  No diffuse / no
 // transmission: the spec is reflection-only.  Uses `clearcoatNormal` so a
 // separate normal-mapped coat (orange peel) just plugs in when populated.
-float evaluateClearcoatBrdf(HitInfo h, float3 V, float3 L) {
+public float evaluateClearcoatBrdf(HitInfo h, float3 V, float3 L) {
     float3 N    = h.clearcoatNormal;
     float NdotL = dot(N, L);
     float NdotV = dot(N, V);
@@ -330,7 +328,7 @@ float evaluateClearcoatBrdf(HitInfo h, float3 V, float3 L) {
 // (squared), which is darker. Single-fresnel matches what UE / Filament /
 // most realtime PBRs do; swap to squared if you want stricter physical
 // correctness at the cost of energy.
-float3 evaluateFullBrdf(HitInfo h, float3 V, float3 L) {
+public float3 evaluateFullBrdf(HitInfo h, float3 V, float3 L) {
     float3 base = evaluatePbrBrdf(h, V, L);
     if (h.clearcoat <= 0.0) return base;
 
@@ -347,7 +345,7 @@ float3 evaluateFullBrdf(HitInfo h, float3 V, float3 L) {
 // `GeometrySmith` is the Schlick-GGX approximation that's cheaper but won't
 // match the sampling pdf exactly. Using the proper form here keeps the
 // BSDF-sample weight unbiased.
-float G1_GGX_Smith(float NdotX, float roughness) {
+public float G1_GGX_Smith(float NdotX, float roughness) {
     float a  = roughness * roughness;
     float a2 = a * a;
     float n2 = NdotX * NdotX;
@@ -359,7 +357,7 @@ float G1_GGX_Smith(float NdotX, float roughness) {
 // "wasted samples behind the horizon" that plain GGX H sampling produces.
 // `Vt` is the view direction in tangent space (N = +Z). Returns a sampled
 // half-vector Ht, also in tangent space.
-float3 sampleGGXVNDF(float3 Vt, float roughness, float u1, float u2) {
+public float3 sampleGGXVNDF(float3 Vt, float roughness, float u1, float u2) {
     float alpha = max(roughness * roughness, 1e-4);
 
     // Step 1: stretch to roughness=1 hemisphere.
@@ -407,18 +405,18 @@ float3 sampleGGXVNDF(float3 Vt, float roughness, float u1, float u2) {
 // `weight` already includes the cosine and 1/pdf — multiply straight into
 // throughput. `transmit` flags the refraction path; caller must offset the
 // next ray along the *opposite* face.
-struct BsdfSample {
-    float3 wi;
-    float  pdf;
-    float3 weight;
-    bool   valid;
-    bool   transmit;   // wi crosses the surface (refraction)
+public struct BsdfSample {
+    public float3 wi;
+    public float  pdf;
+    public float3 weight;
+    public bool   valid;
+    public bool   transmit;   // wi crosses the surface (refraction)
 };
 
 // Combined non-delta direction PDF given the lobe pick probabilities. Used
 // for the spec / diffuse / clearcoat branches; the delta transmit lobe has
 // zero contribution to non-delta directions and is excluded.
-float bsdfCombinedPdf(HitInfo h, float3 V, float3 wi,
+public float bsdfCombinedPdf(HitInfo h, float3 V, float3 wi,
                      float Pcc, float Pspec, float Pdiff) {
     float NdotV = max(dot(h.normal, V), 0.0);
     float NdotL = max(dot(h.normal, wi), 0.0);
@@ -446,7 +444,7 @@ float bsdfCombinedPdf(HitInfo h, float3 V, float3 wi,
     return Pcc * pdfCC + Pspec * pdfSpec + Pdiff * pdfDiff;
 }
 
-BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
+public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     BsdfSample s;
     s.wi       = float3(0.0);
     s.pdf      = 0.0;
@@ -571,5 +569,3 @@ BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     s.valid  = true;
     return s;
 }
-
-#endif // PT_UTILS_INCLUDED

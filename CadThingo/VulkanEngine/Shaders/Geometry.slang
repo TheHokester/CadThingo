@@ -1,4 +1,6 @@
-// Per-frame view+proj. Model matrix lives in the per-instance SSBO (PbrUtils.slang::InstanceData).
+import CommonTypes;   // PbrMaterial, InstanceData
+
+// Per-frame view+proj. Model matrix lives in the per-instance SSBO (CommonTypes::InstanceData).
 struct FrameUBO {
     float4x4 view;
     float4x4 proj;
@@ -27,8 +29,6 @@ struct GBufferOutput {
     float4 Material : SV_TARGET3;
     float4 Emissive : SV_TARGET4;
 }
-
-#include "PbrUtils.slang"
 
 // Set 0: per-frame UBO (view+proj). Bound once per frame.
 [[vk::binding(0,0)]] ConstantBuffer<FrameUBO> frame;

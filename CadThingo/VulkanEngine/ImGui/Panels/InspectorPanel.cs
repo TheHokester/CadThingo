@@ -226,6 +226,22 @@ public static unsafe class InspectorPanel
             {
                 Engine.renderer.MarkAccumulatorDirty();
             }
+
+            // KHR_materials_volume (Beer-Lambert absorption). Tint = color light
+            // becomes after Distance units inside the solid; white = clear.
+            // Needs watertight, two-sided glass — a single-quad pane has no
+            // interior, so push Distance to max (no absorption) for those.
+            if (ImGuiNET.ImGui.ColorEdit3("Attenuation tint", ref mat.AttenuationColor))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
+            }
+            // Log slider: short distance = strong absorption (small gem),
+            // huge distance ≈ no absorption (clear / thin glass).
+            if (ImGuiNET.ImGui.SliderFloat("Attenuation distance", ref mat.AttenuationDistance,
+                                           0.01f, 100f, "%.3f", ImGuiNET.ImGuiSliderFlags.Logarithmic))
+            {
+                Engine.renderer.MarkAccumulatorDirty();
+            }
             ImGuiNET.ImGui.TreePop();
         }
 

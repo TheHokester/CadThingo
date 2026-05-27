@@ -4,7 +4,7 @@
 // blending, depth-tested LESS_EQUAL against the geometry pass's depth buffer
 // (no depth write so multiple transparent layers can stack).
 
-#include "PbrUtils.slang"
+import PbrUtils;   // BRDF/light/IBL math + re-exported CommonTypes
 
 struct FrameUBO {
     float4x4 view;
@@ -27,18 +27,7 @@ struct FrameUBO {
     float  probeMipLevels;
 };
 
-// Layout mirrors ReflectionProbeSystem.ProbeGpuRecord (32B std430).
-struct ProbeRecord {
-    float4 positionRadius;
-    uint   cubeArraySlot;
-    uint   _pad0;
-    uint   _pad1;
-    uint   _pad2;
-};
-struct ProbeClusterRange {
-    uint offset;
-    uint count;
-};
+// ProbeRecord / ProbeClusterRange now come from CommonTypes (via import PbrUtils).
 
 struct DrawPC {
     float4x4 model;
@@ -48,9 +37,7 @@ struct DrawPC {
     uint     _pad2;
 };
 
-// Tile cull constants — must match Renderer_Resources.cs.
-static const uint TILE_SIZE_PX        = 16u;
-static const uint MAX_LIGHTS_PER_TILE = 64u;
+// TILE_SIZE_PX / MAX_LIGHTS_PER_TILE come from CommonTypes (via import PbrUtils).
 
 // Set 0 — own UBO + pointers to lighting buffers owned by other pipelines.
 [[vk::binding(0, 0)]] ConstantBuffer<FrameUBO>              frame;
@@ -307,62 +294,17 @@ float4 PSMain(VSOutput input) : SV_TARGET
         Lo += (kD * baseColor.rgb / baseColor.a * PI + specular) * radiance * NdotL;
     }
 
-    // Split-sum IBL — mirrors the deferred PbrShader.slang ambient block.
-    // Zero contribution until an environment is baked; the prior 0.03 floor
-    // is intentionally gone because transparents need physically-correct
+    // Split-sum IBL — shared evaluator in PbrUtils, same call the deferred pass
+    // makes. Zero contribution until an environment is baked; the prior 0.03
+    // floor is intentionally gone because transparents need physically-correct
     // reflection of the env once it lands.
-    float  NdotV_ibl  = max(dot(N, V), 0.0);
-    float3 F_ibl      = FresnelSchlickRoughness(NdotV_ibl, F0, roughness);
-    float3 kS_ibl     = F_ibl;
-    float3 kD_ibl     = (float3(1.0) - kS_ibl) * (1.0 - metallic);
-
-    float3 irradianceVal = irradianceCube.Sample(N).rgb;
-    float3 diffuseIBL    = irradianceVal * baseColor.rgb;
-
-    float  maxMip          = max(frame.prefilteredCubeMipLevels - 1.0, 0.0);
-    float2 envBRDF         = brdfLut.SampleLevel(float2(NdotV_ibl, roughness), 0).xy;
-
-    // Probe-blend specular — same cluster walk + lerp coverage as PbrShader.slang.
-    // Kept inline (vs. an #include) so each shader stays self-contained for the
-    // existing pipeline-per-file build path.
-    float3 specularInput = float3(0.0);
-    {
-        uint cx = min((uint)(input.Position.x) / TILE_SIZE_PX, frame.probeClusterDimsX - 1u);
-        uint cy = min((uint)(input.Position.y) / TILE_SIZE_PX, frame.probeClusterDimsY - 1u);
-        uint cz = 0u;   // 3D froxels arrive here later without altering shader-side math
-        uint clusterIdx = cx + cy * frame.probeClusterDimsX
-                       + cz * frame.probeClusterDimsX * frame.probeClusterDimsY;
-
-        ProbeClusterRange r = probeClusterRange[clusterIdx];
-
-        float maxMipProbe = max(frame.probeMipLevels - 1.0, 0.0);
-        float3 accum = float3(0.0);
-        float  totalW = 0.0;
-        for (uint p = 0u; p < r.count; p++) {
-            uint probeIdx = probeIndexList[r.offset + p];
-            ProbeRecord rec = probes[probeIdx];
-
-            float3 d   = WorldPos - rec.positionRadius.xyz;
-            float dist = length(d);
-            float rad  = rec.positionRadius.w;
-            if (rad <= 0.0 || dist >= rad) continue;
-
-            float w = 1.0 - smoothstep(rad * 0.5, rad, dist);
-            float3 sample = probeCubeArray.SampleLevel(
-                float4(R, (float)rec.cubeArraySlot),
-                roughness * maxMipProbe).rgb;
-            accum += sample * w;
-            totalW += w;
-        }
-
-        float3 globalIBL  = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
-        float  coverage   = saturate(totalW);
-        float3 probeBlend = (totalW > 1e-5) ? (accum / totalW) : float3(0.0);
-        specularInput = lerp(globalIBL, probeBlend, coverage);
-    }
-    float3 specularIBL     = specularInput * (F_ibl * envBRDF.x + envBRDF.y);
-
-    float3 ambient = (kD_ibl * diffuseIBL + specularIBL) * ao * frame.scaleIBLAmbient;
+    float3 ambient = evaluateIBL(
+        N, V, R, baseColor.rgb, metallic, roughness, ao, F0,
+        WorldPos, uint2(input.Position.xy),
+        irradianceCube, prefilteredCube, brdfLut, probeCubeArray,
+        probes, probeClusterRange, probeIndexList,
+        frame.prefilteredCubeMipLevels, frame.scaleIBLAmbient,
+        frame.probeClusterDimsX, frame.probeClusterDimsY, frame.probeMipLevels);
     float3 color   = ambient + Lo + emissiveTex;
 
     // Fresnel-modulated alpha: at grazing angles the surface becomes more reflective,

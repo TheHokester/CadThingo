@@ -2,7 +2,7 @@
 // view-independent — generated once at engine init and reused for every
 // environment. Axes: x = NdotV, y = roughness. Output: float2(scale, bias).
 
-#include "IblCommon.slang"
+import IblCommon;
 
 [[vk::binding(0, 0)]] [[vk::image_format("rg16f")]] RWTexture2D<float4> outLut;
 

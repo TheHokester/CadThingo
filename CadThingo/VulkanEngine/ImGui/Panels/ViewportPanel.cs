@@ -57,6 +57,7 @@ public static class ViewportPanel
     static void DrawFullscreen()
     {
         var vp = ImGuiNET.ImGui.GetMainViewport();
+        
         ImGuiNET.ImGui.SetNextWindowPos(vp.WorkPos);
         ImGuiNET.ImGui.SetNextWindowSize(vp.WorkSize);
 
@@ -90,6 +91,8 @@ public static class ViewportPanel
     static void DrawToolbar()
     {
         // Compact toolbar: fit mode + auto-resolution + fullscreen.
+        var pt = Engine.renderer.ptComputePipeline;
+        
         ImGuiNET.ImGui.AlignTextToFramePadding();
         ImGuiNET.ImGui.Text("Fit");
         ImGuiNET.ImGui.SameLine();
@@ -116,6 +119,11 @@ public static class ViewportPanel
             ImGuiNET.ImGui.TextDisabled($"{ext.Value.Width}x{ext.Value.Height}");
         }
 
+        if (EditorState.ViewportFullscreen && Engine.renderer.renderMode == Renderer.Renderer.RenderMode.RayCompute)
+        {
+            ImGuiNET.ImGui.SameLine();
+            ImGuiNET.ImGui.Text($"Samples accumulated: {pt.CurrentSampleCount}");
+        }
         ImGuiNET.ImGui.SameLine(ImGuiNET.ImGui.GetWindowWidth() - 110f);
         string fsLabel = EditorState.ViewportFullscreen ? "Exit fullscreen" : "Fullscreen";
         if (ImGuiNET.ImGui.Button(fsLabel))

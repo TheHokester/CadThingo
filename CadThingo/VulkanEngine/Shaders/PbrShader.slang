@@ -1,3 +1,5 @@
+import PbrUtils;   // BRDF/light/IBL math + re-exported CommonTypes (types, consts, vertex helpers)
+
 // Output from vertex shader / Input to fragment shader - Interpolated data
 struct LightingVSOutput {
     float4 Position : SV_POSITION; // Required clip space position for rasterization
@@ -28,25 +30,8 @@ struct LightingFrameUBO {
     float probeMipLevels;               // mip count of probe cubemap array (256² → 9)
 };
 
-// Layout mirrors ReflectionProbeSystem.ProbeGpuRecord (32B std430).
-struct ProbeRecord {
-    float4 positionRadius;
-    uint   cubeArraySlot;
-    uint   _pad0;
-    uint   _pad1;
-    uint   _pad2;
-};
-// Layout mirrors ProbeClusterGrid.ClusterRange (8B std430).
-struct ProbeClusterRange {
-    uint offset;
-    uint count;
-};
-
-#include "PbrUtils.slang"
-
-// Tile cull constants — must match Renderer_Resources.cs.
-static const uint TILE_SIZE_PX        = 16u;
-static const uint MAX_LIGHTS_PER_TILE = 64u;
+// ProbeRecord, ProbeClusterRange, TILE_SIZE_PX, MAX_LIGHTS_PER_TILE now come
+// from CommonTypes (via `import PbrUtils`).
 
 // Resource bindings - Connect CPU resources to GPU shader registers
 [[vk::binding(0, 0)]] ConstantBuffer<LightingFrameUBO>      ubo;
@@ -88,13 +73,7 @@ static const uint MAX_LIGHTS_PER_TILE = 64u;
 // Filled CPU-side in Renderer_Ray_Query.cs::RebuildTlas. Read in the shadow-ray
 // Proceed loop when the candidate is non-opaque (CPU sets ForceNoOpaqueBit on
 // MASK + BLEND TLAS instances; opaque geometry never enters the Proceed loop).
-struct ShadowEntityInfo {
-    uint indexOffset;     // first uint of this mesh's triangle list inside globalIndices
-    uint materialIndex;   // index into materials[]
-    uint flags;           // bit 0 = MASK, bit 2 = BLEND
-    uint _pad;
-};
-
+// ShadowEntityInfo layout lives in CommonTypes.
 [[vk::binding(0, 2)]] StructuredBuffer<ShadowEntityInfo> entityShadowInfo;
 [[vk::binding(1, 2)]] ByteAddressBuffer                  globalIndices;
 [[vk::binding(2, 2)]] ByteAddressBuffer                  globalVertices;
@@ -108,18 +87,8 @@ struct ShadowEntityInfo {
 [[vk::binding(2, 3)]] Texture2D                          textures[];
 [[vk::binding(3, 3)]] SamplerState                       samplers[];
 
-// Vertex stride / UV offset — must match the C# Vertex struct in MeshComponent.cs
-//   Position(12) + Normal(12) + TexCoord(8) + Tangent(16) = 48 bytes
-static const uint VERTEX_STRIDE    = 48u;
-static const uint VERTEX_UV_OFFSET = 24u;   // 12 (Position) + 12 (Normal)
-
-float2 fetchVertexUV(uint vertexIndex) {
-    return asfloat(globalVertices.Load2(vertexIndex * VERTEX_STRIDE + VERTEX_UV_OFFSET));
-}
-
-uint fetchTriangleIndex(uint indexOffset, uint primIdx, uint corner) {
-    return globalIndices.Load((indexOffset + primIdx * 3u + corner) * 4u);
-}
+// Vertex stride / fetch helpers now live in CommonTypes; they take the
+// ByteAddressBuffer as a parameter (globalVertices / globalIndices below).
 
 // Decides whether a candidate non-opaque hit should occlude the shadow ray.
 //   BLEND  → false (light passes through unattenuated).
@@ -136,12 +105,12 @@ bool shadowAlphaPasses(uint instCustomIdx, uint primIdx, float2 bary)
     
     if(mat.alphaCutoff == 0.0f) return true;
 
-    uint i0 = fetchTriangleIndex(info.indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(info.indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(info.indexOffset, primIdx, 2u);
-    float2 uv0 = fetchVertexUV(i0);
-    float2 uv1 = fetchVertexUV(i1);
-    float2 uv2 = fetchVertexUV(i2);
+    uint i0 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 2u);
+    float2 uv0 = fetchVertexUV(globalVertices, i0);
+    float2 uv1 = fetchVertexUV(globalVertices, i1);
+    float2 uv2 = fetchVertexUV(globalVertices, i2);
     float  w0  = 1.0 - bary.x - bary.y;
     float2 uv  = uv0 * w0 + uv1 * bary.x + uv2 * bary.y;
 
@@ -422,109 +391,25 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
             }
         }
 
-        // Calculate half vector (between view and light directions)
-        float3 H = normalize(V + L);
-
-        // === BRDF EVALUATION ===
-        float NdotL = max(dot(N, L), 0.0);  // Lambertian falloff
-        float NdotV = max(dot(N, V), 0.0);  // View angle
-        float NdotH = max(dot(N, H), 0.0);  // Half vector for specular
-        float HdotV = max(dot(H, V), 0.0);  // For Fresnel calculation
-
-        // Evaluate Cook-Torrance BRDF components
-        float D = DistributionGGX(NdotH, roughness);    // Normal distribution
-        float G = GeometrySmith(NdotV, NdotL, roughness); // Geometry function
-        float3 F = FresnelSchlick(HdotV, F0);           // Fresnel reflectance
-
-        // Specular BRDF
-        float3 numerator = D * G * F;
-        float denominator = 4.0 * NdotV * NdotL + 0.0001; // Prevent division by zero
-        float3 specular = numerator / denominator;
-
-        // === ENERGY CONSERVATION ===
-        float3 kS = F;                          // Specular contribution
-        float3 kD = float3(1.0, 1.0, 1.0) - kS; // Diffuse contribution
-        kD *= 1.0 - metallic;                   // Metals have no diffuse reflection
-
-        // === RADIANCE ACCUMULATION ===
-        Lo += (kD * baseColor.rgb / PI + specular) * radiance * NdotL;
+        // Cook-Torrance direct term (shared evaluator in PbrUtils). baseColor.rgb
+        // is the diffuse albedo; `radiance` already folds in colour · intensity ·
+        // attenuation · spot mask. Return value is pre-multiplied by NdotL.
+        Lo += cookTorranceDirect(N, V, L, radiance, baseColor.rgb, metallic, roughness, F0);
     }
 
-    // === IBL — SPLIT-SUM AMBIENT ===
-    // Diffuse term: irradiance map (Lambert-convolved env) modulated by baseColor.
-    // Specular term: prefiltered env (GGX importance-sampled per mip-roughness)
-    // multiplied by the split-sum BRDF LUT — that LUT pre-integrates the F0-
-    // independent part of the BRDF so the runtime cost is one cube sample + one
-    // 2D sample per pixel regardless of integration count.
-    // When no environment has been loaded the cubes are black and this whole
-    // contribution evaluates to 0 — the scene falls back to direct lighting only.
-    float  NdotV_ibl  = max(dot(N, V), 0.0);
-    float3 F_ibl      = FresnelSchlickRoughness(NdotV_ibl, F0, roughness);
-    float3 kS_ibl     = F_ibl;
-    float3 kD_ibl     = (float3(1.0) - kS_ibl) * (1.0 - metallic);
-
-    float3 irradianceVal = irradianceCube.Sample(N).rgb;
-    float3 diffuseIBL    = irradianceVal * baseColor.rgb;
-
-    float  maxMip          = max(ubo.prefilteredCubeMipLevels - 1.0, 0.0);
-    float2 envBRDF         = brdfLut.SampleLevel(float2(NdotV_ibl, roughness), 0).xy;
-
-    // Probe-blend specular: walk the cluster's probe list and accumulate
-    // distance-weighted samples from probeCubeArray. Fragments outside any
-    // probe's influence sphere fall back to the global IBL prefiltered cube
-    // — this is the empty-scene / no-probe-yet path and matches pre-Phase-7
-    // output exactly when no probes are registered.
-    float3 specularInput = float3(0.0);
-    {
-        uint cx = min((uint)(input.Position.x) / TILE_SIZE_PX, ubo.probeClusterDimsX - 1u);
-        uint cy = min((uint)(input.Position.y) / TILE_SIZE_PX, ubo.probeClusterDimsY - 1u);
-        // Z slice = 0 today; when 3D froxels land cz is computed from view-Z
-        // and the same cluster index math handles it without further edits.
-        uint cz = 0u;
-        uint clusterIdx = cx + cy * ubo.probeClusterDimsX
-                       + cz * ubo.probeClusterDimsX * ubo.probeClusterDimsY;
-
-        ProbeClusterRange r = probeClusterRange[clusterIdx];
-
-        float maxMipProbe = max(ubo.probeMipLevels - 1.0, 0.0);
-        float3 accum = float3(0.0);
-        float  totalW = 0.0;
-        for (uint p = 0u; p < r.count; p++) {
-            uint probeIdx = probeIndexList[r.offset + p];
-            ProbeRecord rec = probes[probeIdx];
-
-            float3 d   = WorldPos - rec.positionRadius.xyz;
-            float dist = length(d);
-            float rad  = rec.positionRadius.w;
-            if (rad <= 0.0 || dist >= rad) continue;
-
-            // Plateau-then-fade weight: full strength out to ~half the radius,
-            // then a smooth cubic fall-off to 0 at the boundary. Quadratic /
-            // linear falloffs hand off to the global IBL too early — by
-            // half-radius the coverage is already < 0.5 and the probe barely
-            // shows.
-            float w = 1.0 - smoothstep(rad * 0.5, rad, dist);
-
-            float3 sample = probeCubeArray.SampleLevel(
-                float4(R, (float)rec.cubeArraySlot),
-                roughness * maxMipProbe).rgb;
-            accum += sample * w;
-            totalW += w;
-        }
-
-        // Use totalW as a coverage factor that lerps from global IBL → probe blend.
-        // Without this, the probes' normalized accumulation contributes at full
-        // strength right up to the influence sphere boundary then snaps to IBL —
-        // visible as a hard edge. With it, totalW≈0 (sphere edge) leans on the
-        // global cube; totalW≥1 (well inside one or more probes) is pure probe.
-        float3 globalIBL = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
-        float coverage   = saturate(totalW);
-        float3 probeBlend = (totalW > 1e-5) ? (accum / totalW) : float3(0.0);
-        specularInput = lerp(globalIBL, probeBlend, coverage);
-    }
-    float3 specularIBL     = specularInput * (F_ibl * envBRDF.x + envBRDF.y);
-
-    float3 ambient = (kD_ibl * diffuseIBL + specularIBL) * ao * ubo.scaleIBLAmbient;
+    // === IBL — SPLIT-SUM AMBIENT (shared evaluator in PbrUtils) ===
+    // Diffuse irradiance + probe-blended prefiltered specular + BRDF LUT, with a
+    // global-IBL fallback baked into the coverage lerp. The deferred pass and the
+    // transparent pass call the same evaluateIBL with their own descriptor sets.
+    // When no environment is loaded the cubes are black and this returns 0 — the
+    // scene falls back to direct lighting only.
+    float3 ambient = evaluateIBL(
+        N, V, R, baseColor.rgb, metallic, roughness, ao, F0,
+        WorldPos, uint2(input.Position.xy),
+        irradianceCube, prefilteredCube, brdfLut, probeCubeArray,
+        probes, probeClusterRange, probeIndexList,
+        ubo.prefilteredCubeMipLevels, ubo.scaleIBLAmbient,
+        ubo.probeClusterDimsX, ubo.probeClusterDimsY, ubo.probeMipLevels);
 
     // Emissive radiance written by the geometry pass — added pre-tone-map so
     // exposure/gamma apply uniformly with the rest of the lighting.

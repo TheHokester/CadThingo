@@ -1,5 +1,4 @@
-﻿#include "PbrUtils.slang"
-#include "PTUtils.slang"
+﻿import PTUtils;   // pathtracer math; re-exports PbrUtils + CommonTypes
 
 //frame uniform
 struct PathFrameUBO {
@@ -30,13 +29,7 @@ struct PathFrameUBO {
 [[vk::binding(4, 0)]] RWTexture2D<float4> accumulator;
 [[vk::binding(5, 0)]] RWTexture2D<float4> outColor;
 
-//Set 1 scene
-struct ShadowEntityInfo {
-    uint indexOffset;
-    uint materialIndex;
-    uint flags;
-    uint _pad0;
-};
+//Set 1 scene — ShadowEntityInfo layout lives in CommonTypes.
 //primitives
 [[vk::binding(1, 1)]] ByteAddressBuffer                  globalVertices;
 [[vk::binding(2, 1)]] ByteAddressBuffer                  globalIndices;
@@ -70,22 +63,9 @@ enum CameraMode : uint{
 [[vk::constant_id(2)]] const uint MAX_BOUNCES      = 8u;     // hard cap; ubo.bounceCap clamps below
 [[vk::constant_id(3)]] const uint MODE             = 0u;     // 0 = PINHOLE; CameraMode enum values
 
-// Geometry fetch helpers (mirrors PbrShader.slang) 
-//Vertex layout Position(12) Normal(12) + TexCoord(8) + Tangent(16) = 48
-static const uint VERTEX_STRIDE = 48u;
-static const uint VERTEX_POS_OFFSET = 0u;
-static const uint VERTEX_NORMAL_OFFSET = 12u;
-static const uint VERTEX_UV_OFFSET = 24u;
-static const uint VERTEX_TANGENT_OFFSET = 32u;
-
-float3 fetchVertexPos (uint vi) {return asfloat(globalVertices.Load3(vi * VERTEX_STRIDE + VERTEX_POS_OFFSET));}
-float3 fetchVertexNormal (uint vi) {return asfloat(globalVertices.Load3(vi * VERTEX_STRIDE + VERTEX_NORMAL_OFFSET));}
-float2 fetchVertexUV (uint vi) {return asfloat(globalVertices.Load2(vi * VERTEX_STRIDE + VERTEX_UV_OFFSET));}
-float4 fetchVertexTangent (uint vi) {return asfloat(globalVertices.Load4(vi * VERTEX_STRIDE + VERTEX_TANGENT_OFFSET));}
-
-uint fetchTriangleIndex(uint indexOffset, uint primIdx, uint corner) {
-    return globalIndices.Load((indexOffset + primIdx * 3u + corner) * 4u);
-}
+// Vertex layout + fetch helpers (VERTEX_STRIDE, fetchVertexPos/Normal/UV/Tangent,
+// fetchTriangleIndex) live in CommonTypes and take the ByteAddressBuffer as a
+// parameter — call sites below pass globalVertices / globalIndices.
 
 RayDesc generatePrimaryRay(float2 ndc, inout uint rngState) {
     if (MODE == (uint)CameraMode.PINHOLE) {
@@ -107,12 +87,12 @@ RayDesc generatePrimaryRay(float2 ndc, inout uint rngState) {
 }
 
 float2 computeUV(uint indexOffset, uint primIdx, float2 bary) {
-    uint i0 = fetchTriangleIndex(indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(indexOffset, primIdx, 2u);
-    float2 uv0 = fetchVertexUV(i0);
-    float2 uv1 = fetchVertexUV(i1);
-    float2 uv2 = fetchVertexUV(i2);
+    uint i0 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 2u);
+    float2 uv0 = fetchVertexUV(globalVertices, i0);
+    float2 uv1 = fetchVertexUV(globalVertices, i1);
+    float2 uv2 = fetchVertexUV(globalVertices, i2);
     float  w0  = 1.0 - bary.x - bary.y;
     float2 uv  = uv0 * w0 + uv1 * bary.x + uv2 * bary.y;
     return uv;
@@ -183,30 +163,30 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
     h.matidx              = info.materialIndex;
 
     // Triangle vertex indices into globalVertices.
-    uint i0 = fetchTriangleIndex(info.indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(info.indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(info.indexOffset, primIdx, 2u);
+    uint i0 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 2u);
 
     // UV is needed for every material sample below, so do it first.
-    h.uv = fetchVertexUV(i0) * baryW.x
-         + fetchVertexUV(i1) * baryW.y
-         + fetchVertexUV(i2) * baryW.z;
+    h.uv = fetchVertexUV(globalVertices, i0) * baryW.x
+         + fetchVertexUV(globalVertices, i1) * baryW.y
+         + fetchVertexUV(globalVertices, i2) * baryW.z;
 
     // Object-space normals (smooth) + positions (for the flat / geometric N).
-    float3 nObj  = fetchVertexNormal(i0) * baryW.x
-                 + fetchVertexNormal(i1) * baryW.y
-                 + fetchVertexNormal(i2) * baryW.z;
+    float3 nObj  = fetchVertexNormal(globalVertices, i0) * baryW.x
+                 + fetchVertexNormal(globalVertices, i1) * baryW.y
+                 + fetchVertexNormal(globalVertices, i2) * baryW.z;
 
-    float3 p0    = fetchVertexPos(i0);
-    float3 p1    = fetchVertexPos(i1);
-    float3 p2    = fetchVertexPos(i2);
+    float3 p0    = fetchVertexPos(globalVertices, i0);
+    float3 p1    = fetchVertexPos(globalVertices, i1);
+    float3 p2    = fetchVertexPos(globalVertices, i2);
     float3 ngObj = normalize(cross(p1 - p0, p2 - p0));
 
     // glTF vertex tangent: xyz = tangent, w = bitangent sign (±1).  Sign is
     // constant across the triangle in practice; take from corner 0.
-    float4 t0   = fetchVertexTangent(i0);
-    float4 t1   = fetchVertexTangent(i1);
-    float4 t2   = fetchVertexTangent(i2);
+    float4 t0   = fetchVertexTangent(globalVertices, i0);
+    float4 t1   = fetchVertexTangent(globalVertices, i1);
+    float4 t2   = fetchVertexTangent(globalVertices, i2);
     float3 tObj = t0.xyz * baryW.x + t1.xyz * baryW.y + t2.xyz * baryW.z;
     h.bitangentSign = t0.w;
 
@@ -419,6 +399,19 @@ LightPick sampleLightRIS(inout uint rngState, float3 worldPos, float3 N) {
 }
 
 
+// KHR_materials_volume absorption coefficient (Beer-Lambert).
+//   σ_a = -ln(attenuationColor) / attenuationDistance
+// attenuationColor is the color light becomes after one attenuationDistance of
+// travel through the medium. The estimator below multiplies throughput by
+// exp(-σ_a · segmentLength) over each segment spent inside the volume.
+// White color (-ln 1 = 0) or the no-volume distance sentinel ⇒ σ_a = 0, so a
+// thin pane (tiny interior path) and untagged glass absorb nothing — only a
+// genuinely thick solid tints, which is the whole point.
+float3 mediumSigmaA(PbrMaterial m) {
+    if (m.attenuationDistance <= 0.0 || m.attenuationDistance >= 1e6) return float3(0.0);
+    return -log(max(m.attenuationColor, float3(1e-4))) / m.attenuationDistance;
+}
+
 //Entry point
 //8x8 tile keeps subgroup occupancy high on both nvidia and amd
 [shader("compute")]
@@ -445,6 +438,13 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
 
     float3 radiance   = float3(0.0);
     float3 throughput = float3(1.0);
+
+    // Beer-Lambert: absorption coefficient of the medium the current ray
+    // segment travels through. Vacuum (0) until a refraction event enters a
+    // volume; reset on exit. Carried across bounces so TIR inside a solid keeps
+    // absorbing. Assumes watertight, two-sided glass (every entry has a
+    // matching exit) — single-quad panes must be authored as no-volume.
+    float3 sigmaA = float3(0.0);
 
     // Fisheye corner cull (sentinel from generateFisheyeRay) — emit zero.
     if (ray.TMax < 0.0) {
@@ -478,6 +478,12 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
             radiance += envC;
             break;
         }
+
+        // Beer-Lambert absorption over the segment just traversed (previous
+        // vertex → this hit). No-op in vacuum. Applied before any contribution
+        // at this hit so emissive / NEE picked up here are already tinted by
+        // the medium the path came through.
+        if (any(sigmaA > 0.0)) throughput *= exp(-sigmaA * hit.hitT);
 
         // Always pick up emissive at the hit. With NEE this is technically
         // double-counted vs. the (not-yet-implemented) area-light sampling
@@ -538,6 +544,14 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
             float rr = clamp(luminance(throughput), 0.05, 0.95);
             if (rand(rngState) > rr) break;
             throughput /= rr;
+        }
+
+        // Update the participating medium on refraction. Entering (front face)
+        // adopts this material's absorption; exiting (back face) returns to
+        // vacuum. TIR keeps bs.transmit == false, so sigmaA is preserved and
+        // the trapped ray keeps absorbing as it bounces inside the solid.
+        if (bs.transmit) {
+            sigmaA = hit.frontFace ? mediumSigmaA(materials[hit.matidx]) : float3(0.0);
         }
 
         // Set up the next bounce. Refraction needs the origin on the *other*

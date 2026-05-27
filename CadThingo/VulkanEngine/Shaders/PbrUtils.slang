@@ -1,67 +1,24 @@
-#ifndef PBR_UTILS_INCLUDED
-#define PBR_UTILS_INCLUDED
+// PbrUtils — the BRDF + analytic-lighting + IBL math layer.
+//
+// `module PbrUtils;` with `__exported import CommonTypes;` so a consumer that
+// writes `import PbrUtils;` transitively sees PbrMaterial / PbrLight / PI / the
+// vertex helpers etc. without a second import line.
+//
+// Everything here is pure / re-entrant. Functions that need GPU resources take
+// them as parameters (see evaluateIBL) rather than reading globals, so the
+// module never pins a binding layout.
 
-static const float PI = 3.14159265359;
+module PbrUtils;
 
-struct PbrMaterial {
-    float4 baseColorFactor;        // Base color tint/multiplier
-    float3 emissiveFactor;         // HDR emissive (glTF factor × KHR_materials_emissive_strength)
-    float alphaCutoff;             // Packs into emissiveFactor's std430 trailing 4B
-    float metallicFactor;          // Metallic property multiplier
-    float roughnessFactor;         // Surface roughness multiplier
-    uint flags;                    // bit 0 = alphaMask, bit 1 = doubleSided, bit 2 = alphaBlend, ...
-    int baseColorTex;              // Texture binding index for base color (-1 = none)
-    int physicalDescriptorTex;     // Texture binding for metallic/roughness
-    int normalTex;                 // Texture binding for normal maps
-    int occlusionTex;              // Texture binding for ambient occlusion
-    int emissiveTex;               // Texture binding for emissive maps
-
-    // KHR_materials_transmission + KHR_materials_ior. Fields are present on
-    // every material upload but consumers can ignore them — opaque materials
-    // have transmissionFactor=0 / ior=1.5 (glTF defaults) and read the same.
-    float transmissionFactor;
-    float ior;
-
-    // KHR_materials_clearcoat. Same opt-in model: clearcoatFactor=0 means
-    // the coat lobe contributes nothing, so a BRDF that doesn't implement
-    // clearcoat yet simply leaves these fields unread.
-    float clearcoatFactor;
-    float clearcoatRoughnessFactor;
-    int transmissionTex;           // R channel multiplies transmissionFactor
-    int clearcoatTex;              // R channel multiplies clearcoatFactor
-    int clearcoatRoughnessTex;     // G channel multiplies clearcoatRoughnessFactor
-    int clearcoatNormalTex;        // tangent-space normal for the coat
-};
-struct InstanceData {
-    float4x4 model;
-    uint materialIndex;
-    uint _pad0, _pad1, _pad2;
-};
-
-// Per-light record packed by Renderer_Resources.UpdateLightingBuffers.
-// Conventions:
-//   positionRange.w  =  range (point/spot)     — directional uses -1 sentinel
-//   directionType.w  =  LightType encoded as float (0=Dir, 1=Point, 2=Spot)
-//   spotCones.z      =  CastShadows (0/1)
-struct PbrLight {
-    float4 positionRange;//   positionRange.w  =  range (point/spot)     — directional uses -1 sentinel
-    float4 colorIntensity;
-    float4 directionType;//   directionType.w  =  LightType encoded as float (0=Dir, 1=Point, 2=Spot)
-    float4 spotCones;//   spotCones.z      =  CastShadows (0/1)
-};
-
-// Light type tags — must match CadThingo.VulkanEngine.LightType.
-static const uint LIGHT_TYPE_DIRECTIONAL = 0u;
-static const uint LIGHT_TYPE_POINT       = 1u;
-static const uint LIGHT_TYPE_SPOT        = 2u;
+__exported import CommonTypes;
 
 //normal distribution function (D) - GGX/trowbridge-reitz
 //describes the statistical distribution of material microfacet normals
-float DistributionGGX(float NdotH, float roughness){
+public float DistributionGGX(float NdotH, float roughness){
     float a = roughness * roughness;//remapping for perceptual linearity
     float a2 = a * a;
     float NdotH2 = NdotH * NdotH;
-    
+
     float denom = (NdotH2 * (a2 - 1.0) + 1.0);
     denom = PI * denom * denom;
     return a2 / denom;
@@ -69,19 +26,19 @@ float DistributionGGX(float NdotH, float roughness){
 
 //Geometry function (G) - Smith's method
 //models self shadowing and masking between microfacets
-float GeometrySmith(float NdotV,float NdotL,float roughness){
+public float GeometrySmith(float NdotV,float NdotL,float roughness){
     float r = roughness + 1.0;
     float k = (r * r) / 8.0;
-    
+
     //geometry obstruction from view direction (masking)
     float ggx1 = NdotV / (NdotV * (1.0 - k) + k);
     //geometry obstruction from light direction (shadowing)
     float ggx2 = NdotL / (NdotL * (1.0 - k) + k);
-    
+
     return ggx1 * ggx2; //both obstructions are combined
 }
 //Fresnels Reflectance (F)
-float3 FresnelSchlick(float cosTheta, float3 F0){
+public float3 FresnelSchlick(float cosTheta, float3 F0){
 return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
@@ -90,7 +47,7 @@ return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 // variant pulls the limit down on rough surfaces so the kS term doesn't
 // overestimate the specular grab when integrating against an environment.
 // Source: Karis 2013 / Lazarov 2013.
-float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness){
+public float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness){
     return F0 + (max(float3(1.0 - roughness, 1.0 - roughness, 1.0 - roughness), F0) - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
@@ -106,15 +63,15 @@ float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness){
 // Returns false when the light contributes zero (intensity<=0, outside spot
 // cone). Range-based attenuation may produce a near-zero but still-positive
 // radiance; callers can skip with their own threshold if desired.
-struct LightSample {
-    float3 L;
-    float  distance;
-    float3 radiance;
-    bool   castShadows;
-    float  lightRadius;   // spotCones.w — only meaningful for soft shadows
+public struct LightSample {
+    public float3 L;
+    public float  distance;
+    public float3 radiance;
+    public bool   castShadows;
+    public float  lightRadius;   // spotCones.w — only meaningful for soft shadows
 };
 
-bool evaluateLight(PbrLight lt, float3 worldPos, out LightSample ls) {
+public bool evaluateLight(PbrLight lt, float3 worldPos, out LightSample ls) {
     ls = (LightSample)0;
     uint   type      = (uint)lt.directionType.w;
     float3 lColor    = lt.colorIntensity.rgb;
@@ -162,4 +119,112 @@ bool evaluateLight(PbrLight lt, float3 worldPos, out LightSample ls) {
     return true;
 }
 
-#endif // PBR_UTILS_INCLUDED
+// Single analytic-light Cook-Torrance term (physically-correct Lambert: /PI).
+// Returns the outgoing-radiance contribution ALREADY multiplied by NdotL —
+// accumulate the return value straight into Lo. `albedo` is the diffuse colour
+// (baseColor.rgb); pass an already-resolved `radiance` (colour·intensity·
+// attenuation·spot) and `F0` (lerp(0.04, baseColor, metallic)).
+//
+// This mirrors PbrShader.slang's in-loop BRDF. NOTE: Transparent.slang's loop
+// currently uses a `* PI` diffuse term (vs `/ PI` here) — see CLAUDE notes /
+// the refactor write-up — so it deliberately does NOT call this yet.
+public float3 cookTorranceDirect(float3 N, float3 V, float3 L, float3 radiance,
+                                 float3 albedo, float metallic, float roughness, float3 F0) {
+    float3 H = normalize(V + L);
+
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+    float HdotV = max(dot(H, V), 0.0);
+
+    float  D = DistributionGGX(NdotH, roughness);
+    float  G = GeometrySmith(NdotV, NdotL, roughness);
+    float3 F = FresnelSchlick(HdotV, F0);
+
+    float3 specular = (D * G * F) / (4.0 * NdotV * NdotL + 0.0001);
+
+    float3 kS = F;
+    float3 kD = (float3(1.0, 1.0, 1.0) - kS) * (1.0 - metallic);
+
+    return (kD * albedo / PI + specular) * radiance * NdotL;
+}
+
+// Split-sum IBL ambient + reflection-probe blend
+// Pulls the diffuse irradiance, the prefiltered specular (probe-blended, with a
+// global-IBL fallback via the coverage lerp), and the BRDF LUT into the final
+// ambient term. Resources are passed in so the deferred PBR pass and the
+// transparent pass share one definition while owning separate descriptor sets.
+//   pixelPos — integer pixel coords (SV_Position.xy cast to uint) for the
+//              cluster lookup; matches the tile grid used by light culling.
+public float3 evaluateIBL(
+    float3 N, float3 V, float3 R,
+    float3 baseColor, float metallic, float roughness, float ao, float3 F0,
+    float3 worldPos, uint2 pixelPos,
+    SamplerCube irradianceCube, SamplerCube prefilteredCube, Sampler2D brdfLut,
+    SamplerCubeArray probeCubeArray,
+    StructuredBuffer<ProbeRecord> probes,
+    StructuredBuffer<ProbeClusterRange> probeClusterRange,
+    StructuredBuffer<uint> probeIndexList,
+    float prefilteredCubeMipLevels, float scaleIBLAmbient,
+    uint probeClusterDimsX, uint probeClusterDimsY, float probeMipLevels)
+{
+    float  NdotV_ibl = max(dot(N, V), 0.0);
+    float3 F_ibl     = FresnelSchlickRoughness(NdotV_ibl, F0, roughness);
+    float3 kS_ibl    = F_ibl;
+    float3 kD_ibl    = (float3(1.0) - kS_ibl) * (1.0 - metallic);
+
+    float3 irradianceVal = irradianceCube.Sample(N).rgb;
+    float3 diffuseIBL    = irradianceVal * baseColor;
+
+    float  maxMip  = max(prefilteredCubeMipLevels - 1.0, 0.0);
+    float2 envBRDF = brdfLut.SampleLevel(float2(NdotV_ibl, roughness), 0).xy;
+
+    // Probe-blend specular: walk the cluster's probe list and accumulate
+    // distance-weighted samples from probeCubeArray. Fragments outside any
+    // probe's influence sphere fall back to the global IBL prefiltered cube.
+    float3 specularInput = float3(0.0);
+    {
+        uint cx = min(pixelPos.x / TILE_SIZE_PX, probeClusterDimsX - 1u);
+        uint cy = min(pixelPos.y / TILE_SIZE_PX, probeClusterDimsY - 1u);
+        // Z slice = 0 today; when 3D froxels land cz is computed from view-Z
+        // and the same cluster index math handles it without further edits.
+        uint cz = 0u;
+        uint clusterIdx = cx + cy * probeClusterDimsX
+                       + cz * probeClusterDimsX * probeClusterDimsY;
+
+        ProbeClusterRange r = probeClusterRange[clusterIdx];
+
+        float maxMipProbe = max(probeMipLevels - 1.0, 0.0);
+        float3 accum  = float3(0.0);
+        float  totalW = 0.0;
+        for (uint p = 0u; p < r.count; p++) {
+            uint probeIdx = probeIndexList[r.offset + p];
+            ProbeRecord rec = probes[probeIdx];
+
+            float3 d   = worldPos - rec.positionRadius.xyz;
+            float dist = length(d);
+            float rad  = rec.positionRadius.w;
+            if (rad <= 0.0 || dist >= rad) continue;
+
+            // Plateau-then-fade weight: full strength out to ~half the radius,
+            // then a smooth cubic fall-off to 0 at the boundary.
+            float w = 1.0 - smoothstep(rad * 0.5, rad, dist);
+
+            float3 s = probeCubeArray.SampleLevel(
+                float4(R, (float)rec.cubeArraySlot),
+                roughness * maxMipProbe).rgb;
+            accum  += s * w;
+            totalW += w;
+        }
+
+        // totalW as coverage: lerp global IBL → probe blend so the sphere edge
+        // (totalW≈0) leans on the global cube and the interior is pure probe.
+        float3 globalIBL  = prefilteredCube.SampleLevel(R, roughness * maxMip).rgb;
+        float  coverage   = saturate(totalW);
+        float3 probeBlend = (totalW > 1e-5) ? (accum / totalW) : float3(0.0);
+        specularInput = lerp(globalIBL, probeBlend, coverage);
+    }
+    float3 specularIBL = specularInput * (F_ibl * envBRDF.x + envBRDF.y);
+
+    return (kD_ibl * diffuseIBL + specularIBL) * ao * scaleIBLAmbient;
+}

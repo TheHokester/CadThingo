@@ -2,7 +2,7 @@
 // (one dispatch covers all 6 layers via the z dimension of the thread grid).
 // Output is the base mip of envCube; mip chain is generated CPU-side via blit.
 
-#include "IblCommon.slang"
+import IblCommon;
 
 [[vk::binding(0, 0)]] Sampler2D                                              equirect;
 [[vk::binding(1, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outCube;

@@ -102,6 +102,16 @@ public static class GltfMaterialResource
                                                           Format.R8G8B8A8Unorm, GltfDefaults.NormalIndex,
                                                           rm, renderer);
 
+        // KHR_materials_volume — absorption only (thickness / scattering ignored).
+        // FindChannel is null-safe: if the extension is absent (or the channel
+        // name doesn't match this SharpGLTF build) we fall back to white /
+        // sentinel distance, i.e. no absorption. White attenuationColor yields
+        // σ_a = 0 regardless of distance, so the default is always inert.
+        var volumeChannel = gltfMat.FindChannel("VolumeAttenuation");
+        Vector3 attenuationColor = volumeChannel?.Color.AsVector3() ?? Vector3.One;
+        float attenuationDistance = (float)SafeGetFactor(volumeChannel, "AttenuationDistance",
+                                                         PbrMaterialVolume.NoAbsorptionDistance);
+
         return new PbrMaterial
         {
             BaseColorFactor          = baseColorChannel?.Color ?? new Vector4(1, 1, 1, 1),
@@ -124,6 +134,8 @@ public static class GltfMaterialResource
             ClearcoatTex             = clearcoatTex,
             ClearcoatRoughnessTex    = clearcoatRoughnessTex,
             ClearcoatNormalTex       = clearcoatNormalTex,
+            AttenuationColor         = attenuationColor,
+            AttenuationDistance      = attenuationDistance,
         };
     }
 

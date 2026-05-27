@@ -12,7 +12,7 @@
 // downstream sees raw lit color, which is all the split-sum approximation
 // needs as input.
 
-#include "PbrUtils.slang"
+import CommonTypes;   // PbrMaterial, InstanceData
 
 struct CaptureUBO {
     float4x4 views[6];   // one per cube face, picked via SV_ViewID

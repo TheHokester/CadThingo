@@ -3,7 +3,7 @@
 // irradianceCube. Output face size is small (32²) so the sample-delta walk is
 // affordable even at 0.025rad spacing (~15k samples per output texel).
 
-#include "IblCommon.slang"
+import IblCommon;
 
 [[vk::binding(0, 0)]] SamplerCube                                            envCube;
 [[vk::binding(1, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outIrradiance;

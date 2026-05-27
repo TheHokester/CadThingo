@@ -634,6 +634,8 @@ public unsafe partial class Renderer
             ClearcoatTex             = GltfDefaults.OcclusionIndex,
             ClearcoatRoughnessTex    = GltfDefaults.OcclusionIndex,
             ClearcoatNormalTex       = GltfDefaults.NormalIndex,
+            AttenuationColor         = Vector3.One,
+            AttenuationDistance      = PbrMaterialVolume.NoAbsorptionDistance,
         };
 
         return (uint)matCount;
@@ -879,6 +881,19 @@ public struct PbrMaterial
     public int ClearcoatTex;             // R channel multiplies ClearcoatFactor
     public int ClearcoatRoughnessTex;    // G channel multiplies ClearcoatRoughnessFactor
     public int ClearcoatNormalTex;       // tangent-space normal for the coat layer
+
+    // KHR_materials_volume (Beer-Lambert absorption). White color or the
+    // no-absorption sentinel distance means glass behaves as before.
+    public Vector3 AttenuationColor;     // glTF default white (1,1,1) = no tint
+    public float   AttenuationDistance;  // distance to reach AttenuationColor
+}
+
+public static class PbrMaterialVolume
+{
+    // Sentinel for "no participating volume" — matches the shader guard
+    // (mediumSigmaA treats >= 1e6 as no absorption). glTF's real default is
+    // +infinity; a large finite value uploads cleanly and reads identically.
+    public const float NoAbsorptionDistance = 1e30f;
 }
 
 public enum AlphaMode : uint

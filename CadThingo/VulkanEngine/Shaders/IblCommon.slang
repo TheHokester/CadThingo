@@ -1,18 +1,19 @@
-#ifndef IBL_COMMON_INCLUDED
-#define IBL_COMMON_INCLUDED
+// IblCommon — shared utilities for the IBL bake compute shaders. Cube face math,
+// low-discrepancy sequences, GGX importance sampling. All routines are pure /
+// re-entrant and depend only on inputs — no descriptor reads happen here.
+//
+// `module IblCommon;` consumed via `import IblCommon;` by EquirectToCube,
+// IrradianceConvolve, PrefilterEnv, and BrdfLutGen. PI / TWO_PI / INV_PI now
+// come from CommonTypes (re-exported) instead of being redeclared here.
 
-// Shared utilities for the IBL bake compute shaders. Cube face math, low-
-// discrepancy sequences, GGX importance sampling. All routines are pure / re-
-// entrant and depend only on inputs — no descriptor reads happen here.
+module IblCommon;
 
-static const float PI     = 3.14159265359;
-static const float TWO_PI = 6.28318530718;
-static const float INV_PI = 0.31830988618;
+__exported import CommonTypes;
 
 // Standard Vulkan / OpenGL cubemap face conventions. `face` is the array
 // layer (0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z) and `uv01` is the in-face texel
 // center in [0,1]. Returned direction is normalized world-space.
-float3 cubeFaceDir(uint face, float2 uv01)
+public float3 cubeFaceDir(uint face, float2 uv01)
 {
     float2 uv = uv01 * 2.0 - 1.0;
     float a = uv.x;
@@ -32,7 +33,7 @@ float3 cubeFaceDir(uint face, float2 uv01)
 
 // Equirectangular UV from a unit direction. Wraps longitude through atan2 and
 // maps latitude through asin → both into [0,1].
-float2 equirectUV(float3 d)
+public float2 equirectUV(float3 d)
 {
     float lon = atan2(d.z, d.x);
     float lat = asin(clamp(d.y, -1.0, 1.0));
@@ -40,7 +41,7 @@ float2 equirectUV(float3 d)
 }
 
 // Van der Corput radical inverse — the second axis of the Hammersley sequence.
-float radicalInverseVdC(uint bits)
+public float radicalInverseVdC(uint bits)
 {
     bits = (bits << 16u) | (bits >> 16u);
     bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
@@ -50,14 +51,14 @@ float radicalInverseVdC(uint bits)
     return float(bits) * 2.3283064365386963e-10; // / 0x100000000
 }
 
-float2 Hammersley(uint i, uint N)
+public float2 Hammersley(uint i, uint N)
 {
     return float2(float(i) / float(N), radicalInverseVdC(i));
 }
 
 // GGX-importance-sampled half vector. Tangent → world via an arbitrary basis
 // around N. Used by both prefilter and BRDF LUT bake.
-float3 ImportanceSampleGGX(float2 Xi, float3 N, float roughness)
+public float3 ImportanceSampleGGX(float2 Xi, float3 N, float roughness)
 {
     float a   = roughness * roughness;
     float phi = TWO_PI * Xi.x;
@@ -76,15 +77,13 @@ float3 ImportanceSampleGGX(float2 Xi, float3 N, float roughness)
 // Smith geometry term, IBL form. The direct-lighting variant in PbrUtils uses
 // k = (roughness+1)²/8; the IBL split-sum derivation calls for k = α²/2 (see
 // Karis 2013 "Real Shading in UE4"). Don't reuse the direct-light G here.
-float G_SchlickGGX_IBL(float NdotV, float roughness)
+public float G_SchlickGGX_IBL(float NdotV, float roughness)
 {
     float k = (roughness * roughness) / 2.0;
     return NdotV / (NdotV * (1.0 - k) + k);
 }
 
-float G_Smith_IBL(float NdotV, float NdotL, float roughness)
+public float G_Smith_IBL(float NdotV, float NdotL, float roughness)
 {
     return G_SchlickGGX_IBL(NdotV, roughness) * G_SchlickGGX_IBL(NdotL, roughness);
 }
-
-#endif // IBL_COMMON_INCLUDED
