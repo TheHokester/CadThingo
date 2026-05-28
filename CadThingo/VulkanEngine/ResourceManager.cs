@@ -162,6 +162,29 @@ public unsafe class ResourceManager
     // safe because every mesh's index range is rebased into [0, VertexHighWater).
     public int VertexHighWater => vertexWriteOffset;
 
+    // CPU-side mesh geometry (object-space positions + local 0-based indices),
+    // keyed by the mesh's index-buffer offset (Mesh.offset, unique per live
+    // mesh). Retained at upload so the pathtracer can extract emissive triangles
+    // in world space — the global VB/IB are device-local and can't be read back.
+    // Released by FreeMesh.
+    private readonly Dictionary<int, (Vector3[] positions, uint[] indices)> _meshCpuGeometry = new();
+
+    /// <summary>Object-space positions + local (0-based) indices for a mesh,
+    /// keyed by <see cref="Mesh.offset"/>. Used to build emissive area lights.
+    /// Returns false for meshes not uploaded through <see cref="UploadMesh"/>.</summary>
+    public bool TryGetMeshGeometry(int meshOffset, out Vector3[] positions, out uint[] indices)
+    {
+        if (_meshCpuGeometry.TryGetValue(meshOffset, out var geo))
+        {
+            positions = geo.positions;
+            indices   = geo.indices;
+            return true;
+        }
+        positions = null!;
+        indices   = null!;
+        return false;
+    }
+
 
     private Vk vk;
     private Device device;
@@ -266,6 +289,15 @@ public unsafe class ResourceManager
             vertexOffset = vbOffset,
             vertexCount  = vertices.Length,
         };
+
+        // Retain object-space positions + local indices for emissive-light
+        // extraction. Keyed by ibOffset (== mesh.offset). Cloned so later mutation
+        // of the caller's arrays can't corrupt the cache. Overwrites any stale
+        // entry left at a reused free-list offset.
+        var positions = new Vector3[vertices.Length];
+        for (int i = 0; i < vertices.Length; i++) positions[i] = vertices[i].Position;
+        _meshCpuGeometry[ibOffset] = (positions, (uint[])indices.Clone());
+
         return mesh;
     }
 
@@ -334,6 +366,7 @@ public unsafe class ResourceManager
     {
         ReleaseRange(_vbFreeList, mesh.vertexOffset, mesh.vertexCount);
         ReleaseRange(_ibFreeList, mesh.offset,       mesh.count);
+        _meshCpuGeometry.Remove(mesh.offset);
     }
 
     /// <summary>Sum of free-list bytes for the global VB and IB. Editor stat.</summary>

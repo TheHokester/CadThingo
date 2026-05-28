@@ -18,6 +18,8 @@ struct PathFrameUBO {
     float aperture;
     float paniniDistance = 1.0f;
     float verticalCompression = 0.0f;
+    uint  emissiveTriCount;     // emissive area-light triangles in the alias table
+    float totalEmissivePower;   // Σ area·luminance(Le) — alias-table normaliser
 };
 
 //set 0 per-frame IO
@@ -28,6 +30,14 @@ struct PathFrameUBO {
 [[vk::binding(3, 0)]] StructuredBuffer<ShadowEntityInfo> entityInfo;//indexes into buffer stored in tlas
 [[vk::binding(4, 0)]] RWTexture2D<float4> accumulator;
 [[vk::binding(5, 0)]] RWTexture2D<float4> outColor;
+
+// Emissive area lights. One record per world-space emissive triangle, built on
+// the CPU in RebuildTlas. `emissiveAlias` is a Vose alias table over the same
+// indices, weighted by area·luminance(Le), for O(1) power-proportional picks.
+// EmissiveTri / AliasEntry layouts live in PTUtils (mirror EmissiveTriGpu /
+// AliasEntryGpu in Renderer_Ray_Query.cs).
+[[vk::binding(6, 0)]] StructuredBuffer<EmissiveTri> emissiveTris;
+[[vk::binding(7, 0)]] StructuredBuffer<AliasEntry>  emissiveAlias;
 
 //Set 1 scene — ShadowEntityInfo layout lives in CommonTypes.
 //primitives
@@ -412,6 +422,62 @@ float3 mediumSigmaA(PbrMaterial m) {
     return -log(max(m.attenuationColor, float3(1e-4))) / m.attenuationDistance;
 }
 
+// Emissive area-light sample (NEE)
+// Pick a triangle ∝ power via the alias table, then a uniform point on it.
+// The returned pdf is the full solid-angle density: selection × area-pdf ×
+// (dist² / cosθ_light). The triangle area cancels against the selection weight
+// (p_select = area·lum(Le)/totalPower), leaving the closed form below — which
+// is exactly what the BSDF-leg MIS recomputes from a hit, so the two strategies
+// agree. Double-sided (abs cosθ) to match the unconditional emissive pickup.
+struct EmissiveLightSample {
+    float3 L;          // direction: shading point → sampled point on emitter
+    float3 radiance;   // Le at the emitter (emissiveFactor; textures not sampled here)
+    float  dist;
+    float  pdf;        // solid-angle pdf, includes power-proportional selection
+    bool   valid;
+};
+
+EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
+    EmissiveLightSample es;
+    es.L = float3(0.0); es.radiance = float3(0.0); es.dist = 0.0; es.pdf = 0.0; es.valid = false;
+
+    uint n = frameUBO.emissiveTriCount;
+    if (n == 0u || frameUBO.totalEmissivePower <= 0.0) return es;
+
+    // Alias pick: bucket i, keep with prob, else jump to its alias.
+    uint i = min(n - 1u, uint(rand(rng) * float(n)));
+    AliasEntry a = emissiveAlias[i];
+    uint idx = (rand(rng) < a.prob) ? i : a.alias;
+
+    EmissiveTri t = emissiveTris[idx];
+    float3 p0 = t.p0Area.xyz;
+    float3 e1 = t.e1LeR.xyz;
+    float3 e2 = t.e2LeG.xyz;
+    float3 Le = float3(t.e1LeR.w, t.e2LeG.w, t.nLeB.w);
+    float3 nL = t.nLeB.xyz;
+
+    // Uniform point on the triangle (sqrt warp keeps it area-uniform).
+    float u1 = rand(rng);
+    float u2 = rand(rng);
+    float su = sqrt(u1);
+    float3 Q = p0 + e1 * (su * (1.0 - u2)) + e2 * (su * u2);
+
+    float3 toL  = Q - P;
+    float  dist = length(toL);
+    if (dist < 1e-4) return es;
+    float3 L = toL / dist;
+
+    float cosL = abs(dot(nL, L));
+    if (cosL < 1e-4) return es;
+
+    es.L        = L;
+    es.radiance = Le;
+    es.dist     = dist;
+    es.pdf      = luminance(Le) * dist * dist / (frameUBO.totalEmissivePower * cosL);
+    es.valid    = es.pdf > 0.0;
+    return es;
+}
+
 //Entry point
 //8x8 tile keeps subgroup occupancy high on both nvidia and amd
 [shader("compute")]
@@ -446,6 +512,14 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
     // matching exit) — single-quad panes must be authored as no-volume.
     float3 sigmaA = float3(0.0);
 
+    // MIS state carried from the previous bounce's BSDF sample. When this
+    // bounce lands on an emissive surface, its emission is weighted against the
+    // light-sampling strategy using `prevBsdfPdf`. `prevWasDelta` starts true so
+    // a directly-visible emitter (primary ray, no prior light-sampling chance)
+    // is taken at full weight.
+    float prevBsdfPdf  = 0.0;
+    bool  prevWasDelta = true;
+
     // Fisheye corner cull (sentinel from generateFisheyeRay) — emit zero.
     if (ray.TMax < 0.0) {
         if (frameUBO.resetAccum != 0u) accumulator[gid.xy] = float4(0.0, 0.0, 0.0, 1.0);
@@ -462,7 +536,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
     // subsequent sample. Clamping the per-bounce contribution by max channel
     // is the standard fix; biased downward at very low sample counts, but
     // by the time you've got a few hundred samples it converges back.
-    const float FIREFLY_CLAMP = 16.0;
+    const float FIREFLY_CLAMP = 256;
 
     uint cap = min(MAX_BOUNCES, frameUBO.bounceCap);
     for (uint b = 0u; b < cap; ++b) {
@@ -485,11 +559,24 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
         // the medium the path came through.
         if (any(sigmaA > 0.0)) throughput *= exp(-sigmaA * hit.hitT);
 
-        // Always pick up emissive at the hit. With NEE this is technically
-        // double-counted vs. the (not-yet-implemented) area-light sampling
-        // for emissive geometry — fine until emissive meshes are sampled as
-        // lights themselves.
-        float3 emC = throughput * hit.emissive;
+        // Pick up emission at the hit, MIS-weighted against the emissive-light
+        // NEE strategy (which also samples this surface). The weight uses the
+        // light-sampling pdf this emitter WOULD have had as seen from the
+        // previous vertex — computed from the material's emissiveFactor (not the
+        // textured hit.emissive) so it matches the alias-table weighting and
+        // stays exact for untextured emitters. Full weight when the previous
+        // bounce was specular/delta (NEE couldn't have sampled this direction)
+        // or on the primary ray.
+        float misEm = 1.0;
+        if (!prevWasDelta && frameUBO.emissiveTriCount > 0u && frameUBO.totalEmissivePower > 0.0) {
+            float lumLe = luminance(materials[hit.matidx].emissiveFactor);
+            float cosL  = abs(dot(hit.geometricNormal, ray.Direction));
+            if (lumLe > 0.0 && cosL > 1e-4) {
+                float pLight = lumLe * hit.hitT * hit.hitT / (frameUBO.totalEmissivePower * cosL);
+                misEm = powerHeuristic(prevBsdfPdf, pLight);
+            }
+        }
+        float3 emC = throughput * hit.emissive * misEm;
         float  me  = max(max(emC.r, emC.g), emC.b);
         if (me > FIREFLY_CLAMP) emC *= FIREFLY_CLAMP / me;
         radiance += emC;
@@ -523,6 +610,30 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
             }
         }
 
+        // NEE on emissive geometry (area lights), MIS-combined with the BSDF
+        // sampler. Power-heuristic weight against the pdf the BSDF would have
+        // used for this direction — the counterpart to the misEm weight on the
+        // emissive pickup above, so the two strategies don't double-count.
+        if (ENABLE_NEE && frameUBO.emissiveTriCount > 0u) {
+            EmissiveLightSample es = sampleEmissive(rngState, hit.worldPos);
+            if (es.valid) {
+                float NdotL = max(dot(hit.normal, es.L), 0.0);
+                if (NdotL > 0.0) {
+                    float3 shadowOrigin = hit.worldPos + hit.geometricNormal * 1e-3;
+                    float  tMax         = max(es.dist - 2e-3, 0.0);
+                    if (!isOccluded(shadowOrigin, es.L, tMax, rngState)) {
+                        float  pB   = bsdfPdfForDir(hit, V, es.L);
+                        float  w    = powerHeuristic(es.pdf, pB);
+                        float3 brdf = evaluateFullBrdf(hit, V, es.L);
+                        float3 emNee = throughput * brdf * es.radiance * NdotL * w / es.pdf;
+                        float  mn   = max(max(emNee.r, emNee.g), emNee.b);
+                        if (mn > FIREFLY_CLAMP) emNee *= FIREFLY_CLAMP / mn;
+                        radiance += emNee;
+                    }
+                }
+            }
+        }
+
         // BSDF sample for indirect. Split diffuse / GGX-VNDF sampler
         //    Fresnel-weighted lobe pick keeps glossy surfaces actually finding
         //    their highlights instead of relying on the diffuse lobe to ever
@@ -530,6 +641,12 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
         BsdfSample bs = sampleBsdf(hit, V, rngState);
         if (!bs.valid) break;
         throughput *= bs.weight;
+
+        // Carry this bounce's sampling pdf for the next hit's emissive MIS.
+        // Delta lobes (smooth refraction) flag so the next emitter hit is taken
+        // at full weight — NEE can't sample a singular direction.
+        prevBsdfPdf  = bs.pdf;
+        prevWasDelta = bs.isDelta;
 
         // Belt-and-braces: throughput should never go non-finite, but if a
         // numerical edge case in refract / pdf math produces NaN/Inf here we

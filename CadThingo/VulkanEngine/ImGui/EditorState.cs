@@ -49,6 +49,15 @@ public static unsafe class EditorState
     /// </summary>
     public static (uint w, uint h)? RequestedRenderExtent;
 
+    /// <summary>
+    /// Object-pick request posted by ViewportPanel on a left-click, in render-
+    /// target pixel coordinates (top-left origin). Consumed by
+    /// Renderer.ProcessPickRequest at the top of DrawFrame, which ray-queries
+    /// the TLAS and updates <see cref="SelectedEntity"/>. Null when no click is
+    /// pending.
+    /// </summary>
+    public static (uint x, uint y)? RequestedPick;
+
     // Scene Outliner state 
     /// <summary>
     /// When on, the Scene Outliner skips entities that carry neither a

@@ -315,12 +315,14 @@ public unsafe partial class Renderer
         // renderExtent — recreate them too so per-pixel work stays in sync.
         ptAccumulator?.Dispose();
         ptOutColor?.Dispose();
+        selectionMask?.Dispose();
 
         renderExtent = new Extent2D(width, height);
 
         CreateDepthResources();
         CreateGBufferResources();
         CreatePathTracingResources(renderExtent.Width, renderExtent.Height);
+        CreateSelectionResources(renderExtent.Width, renderExtent.Height);
 
         scene.renderGraph = new RenderGraph(vk!, device, physicalDevice);
         SetupDeferredRenderer(scene.renderGraph, renderExtent.Width, renderExtent.Height);
@@ -345,6 +347,11 @@ public unsafe partial class Renderer
         // MarkAccumulatorDirty internally so the next dispatch clears the
         // (also-fresh) accumulator instead of reading garbage memory.
         ptComputePipeline?.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
+
+        // Selection mask view is fresh — re-bind it on both the compute (storage
+        // image) and outline (sampled image) sides.
+        selectionMaskPipeline?.WriteMaskImageDescriptor(selectionMask.ImageView);
+        outlinePipeline?.WriteMaskDescriptor(selectionMask.ImageView);
     }
 
     /// <summary>
@@ -404,6 +411,12 @@ public unsafe partial class Renderer
             // we still need to clear it so the next frame doesn't re-enter.
             tlasDirty = false;
         }
+
+        // 0c-bis. Object pick. Consumes a click posted by ViewportPanel and runs
+        //     a one-ray compute dispatch against the (now up-to-date) TLAS,
+        //     setting EditorState.SelectedEntity. Out-of-band single-time submit,
+        //     so it sits here before the per-frame command buffer is recorded.
+        ProcessPickRequest();
 
         // 0d. Render-mode change: rebind tonemap's HDR input so its single
         //     shared descriptor set points at the right source. DeviceWaitIdle
@@ -470,6 +483,11 @@ public unsafe partial class Renderer
                 DrawDeferred(cmd, ctx);
                 break;
         }
+
+        // 6b. Selection outline. Both render modes leave FinalColor in
+        //     ShaderReadOnly here; this composites the outline overlay in place
+        //     (no-op when nothing's selected) and restores that layout.
+        RecordSelectionOutline(cmd);
 
         // 7. Blit FinalColor → swapchain image
         var swapImage = swapChainImages[imageIndex];
@@ -671,11 +689,13 @@ public unsafe partial class Renderer
         {
             var view = camera.GetViewMatrix();
             var pos  = camera.GetPosition();
-            if (view != _ptLastCameraView || pos != _ptLastCameraPos)
+            var fov  = camera.Fov;
+            if (view != _ptLastCameraView || pos != _ptLastCameraPos || fov != _ptLastCameraFov)
             {
                 MarkAccumulatorDirty();
                 _ptLastCameraView = view;
                 _ptLastCameraPos  = pos;
+                _ptLastCameraFov  = fov;
             }
         }
 
@@ -761,6 +781,99 @@ public unsafe partial class Renderer
     private void DrawRayTraced()
     {
 
+    }
+
+    /// <summary>
+    /// Consumes a pending viewport pick (posted by ViewportPanel as a render-
+    /// target pixel) and resolves it to an entity by casting one ray through the
+    /// TLAS in a compute dispatch. The hit instance's InstanceCustomIndex is the
+    /// scene entity index (see RebuildTlas), so the result maps straight to
+    /// <see cref="Scene.GetEntity"/>. Runs as a self-contained single-time
+    /// submit (QueueWaitIdle), so the host-visible result is ready immediately.
+    /// No-op unless ray queries are supported and a TLAS exists.
+    /// </summary>
+    private void ProcessPickRequest()
+    {
+        var req = ImGui.EditorState.RequestedPick;
+        if (!req.HasValue) return;
+        ImGui.EditorState.RequestedPick = null;
+
+        if (!RayShadowsSupported || khrAccelStruct == null || tlas.Handle == 0 || pickPipeline == null)
+            return;
+
+        uint px = req.Value.x;
+        uint py = req.Value.y;
+        if (px >= renderExtent.Width || py >= renderExtent.Height) return;
+
+        // Same Y-flipped projection the geometry / lighting / light-cull passes
+        // use, so the pick ray lines up with the rasterized image (and the PT
+        // image, which flips the same way).
+        Matrix4x4 view = camera.GetViewMatrix();
+        Matrix4x4 proj = camera.GetProjectionMatrix(
+            (float)renderExtent.Width / renderExtent.Height, 0.1f, 100.0f);
+        proj.M22 *= -1f;
+        if (!Matrix4x4.Invert(view * proj, out Matrix4x4 invVP)) return;
+
+        var cmd = BeginSingleTimeCommands();
+        pickPipeline.Record(cmd, invVP, camera.GetPosition(),
+            new Vector2(renderExtent.Width, renderExtent.Height), px, py);
+        EndSingleTimeCommands(cmd);   // QueueWaitIdle — result buffer is now valid
+
+        uint idx = pickPipeline.ReadResult();
+        ImGui.EditorState.SelectedEntity =
+            (idx == PickPipeline.PickNone || idx >= (uint)scene.EntityCount)
+                ? null
+                : scene.GetEntity((int)idx);
+    }
+
+    /// <summary>
+    /// Composites the selection outline into FinalColor. Runs after the active
+    /// render mode has produced FinalColor (left in ShaderReadOnly by both the
+    /// deferred and PT paths) and before the swapchain blit, so one insertion
+    /// point covers every mode. Ray-queries the TLAS into the coverage mask,
+    /// then draws an outer ring around the selected entity's silhouette. No-op
+    /// unless a mesh-bearing entity is selected and ray queries are available;
+    /// leaves FinalColor in ShaderReadOnly exactly as it found it.
+    /// </summary>
+    private void RecordSelectionOutline(CommandBuffer cmd)
+    {
+        if (ImGui.EditorState.SelectedEntity == null) return;
+        if (!RayShadowsSupported || khrAccelStruct == null || tlas.Handle == 0) return;
+        if (selectionMaskPipeline == null || outlinePipeline == null) return;
+
+        // Selected entity's flat-list index == its TLAS InstanceCustomIndex.
+        // -1 when the selection isn't in the scene list (shouldn't happen) — bail.
+        int idx = scene.IndexOf(ImGui.EditorState.SelectedEntity);
+        if (idx < 0) return;
+
+        Matrix4x4 view = camera.GetViewMatrix();
+        Matrix4x4 proj = camera.GetProjectionMatrix(
+            (float)renderExtent.Width / renderExtent.Height, 0.1f, 100.0f);
+        proj.M22 *= -1f;
+        if (!Matrix4x4.Invert(view * proj, out Matrix4x4 invVP)) return;
+
+        // Mask sits in ShaderReadOnly between frames. Flip to General before the
+        // compute write; this fragment-read→compute-write barrier also serializes
+        // the previous frame's outline read against this frame's overwrite.
+        TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
+
+        selectionMaskPipeline.Record(cmd, invVP, camera.GetPosition(), renderExtent, (uint)idx);
+
+        // compute write → outline fragment read
+        TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
+            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
+
+        var finalColor = scene.renderGraph.GetResource("FinalColor");
+        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
+
+        outlinePipeline.Record(cmd, renderExtent, finalColor.ImageView);
+
+        // Back to ShaderReadOnly — exactly where the swapchain blit (step 7) and
+        // the ImGui viewport sampler expect FinalColor to be.
+        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+            ImageLayout.ColorAttachmentOptimal, ImageLayout.ShaderReadOnlyOptimal);
     }
     
     
@@ -913,6 +1026,31 @@ public unsafe partial class Renderer
             ImageLayout.Undefined, ImageLayout.General);
         TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
             ImageLayout.Undefined, ImageLayout.General);
+        EndSingleTimeCommands(cmd);
+    }
+
+    /// <summary>
+    /// Allocates the R32F selection-coverage mask used by the outline overlay.
+    /// Storage (compute write) + sampled (outline fragment read). Left in
+    /// ShaderReadOnly between frames — RecordSelectionOutline flips it to General
+    /// and back each active frame, and that flip doubles as the cross-frame
+    /// write-after-read guard on the single shared image.
+    /// </summary>
+    private void CreateSelectionResources(uint width, uint height)
+    {
+        selectionMask = new ImageResource(vk, device, "selectionMask", Format.R32Sfloat,
+            new Extent2D(width, height),
+            ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
+            ImageLayout.Undefined, ImageLayout.General);
+        selectionMask.Allocate(physicalDevice);
+
+        // Settle in ShaderReadOnly so the per-frame block's opening
+        // ShaderReadOnly→General transition has a valid source layout.
+        var cmd = BeginSingleTimeCommands();
+        TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
+            ImageLayout.Undefined, ImageLayout.General);
+        TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
+            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
         EndSingleTimeCommands(cmd);
     }
 

@@ -62,6 +62,19 @@ public struct HitInfo {
 };
 
 
+// Emissive area-light records. One per world-space emissive triangle; layouts
+// mirror EmissiveTriGpu / AliasEntryGpu in Renderer_Ray_Query.cs. Bound as
+// StructuredBuffers in PTCompute (set 0, bindings 6/7). AliasEntry is a Vose
+// alias-table bucket for O(1) power-proportional triangle selection.
+public struct EmissiveTri {
+    public float4 p0Area;   // xyz = p0 (world),       w = triangle area
+    public float4 e1LeR;    // xyz = p1 - p0,          w = Le.r
+    public float4 e2LeG;    // xyz = p2 - p0,          w = Le.g
+    public float4 nLeB;     // xyz = geometric normal, w = Le.b
+};
+public struct AliasEntry { public float prob; public uint alias; };
+
+
 // Camera-space → world-space
 // Every raygen helper emits its ray in camera space (origin near 0, forward
 // = -Z).  Apply this once on the result to plant the ray at the actual
@@ -411,7 +424,17 @@ public struct BsdfSample {
     public float3 weight;
     public bool   valid;
     public bool   transmit;   // wi crosses the surface (refraction)
+    public bool   isDelta;    // singular lobe (smooth refraction) — MIS weight = 1
 };
+
+// Balance/power heuristic (β = 2). Combines two sampling strategies whose pdfs
+// for the SAME direction are `a` (the strategy we used) and `b` (the other one).
+// Returns the weight to apply to the `a`-strategy estimate.
+public float powerHeuristic(float a, float b) {
+    float a2 = a * a;
+    float denom = a2 + b * b;
+    return denom > 0.0 ? a2 / denom : 0.0;
+}
 
 // Combined non-delta direction PDF given the lobe pick probabilities. Used
 // for the spec / diffuse / clearcoat branches; the delta transmit lobe has
@@ -444,6 +467,49 @@ public float bsdfCombinedPdf(HitInfo h, float3 V, float3 wi,
     return Pcc * pdfCC + Pspec * pdfSpec + Pdiff * pdfDiff;
 }
 
+// Stochastic lobe-selection probabilities (clearcoat / base-spec / transmit /
+// diffuse), normalised to sum to 1. Factored out of sampleBsdf so NEE can
+// recompute the BSDF pdf for a light direction (MIS). Returns false when the
+// material has no sampleable lobe (Sum ≈ 0). `NdotV` is dot(shadingN, V).
+public bool bsdfLobeProbs(HitInfo h, float NdotV,
+    out float Pcc, out float Pspec, out float Ptrans, out float Pdiff) {
+    Pcc = 0.0; Pspec = 0.0; Ptrans = 0.0; Pdiff = 0.0;
+    float nv = max(NdotV, 0.0);
+
+    float3 F0  = lerp(float3(h.F0), h.baseColor.rgb, h.metallic);
+    float3 Fv  = FresnelSchlick(nv, F0);
+    float  Fl  = clamp(luminance(Fv), 0.05, 0.95);
+
+    float Fcc_v     = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - nv, 5.0);
+    float ccRaw     = h.clearcoat * Fcc_v;
+    float baseAtten = 1.0 - ccRaw;
+
+    float Pcc_raw   = ccRaw;
+    float Pspec_raw = Fl * baseAtten;
+    float Pt_raw    = (1.0 - Fl) * h.transmission * baseAtten;
+    float Pd_raw    = (1.0 - Fl) * (1.0 - h.transmission) * (1.0 - h.metallic) * baseAtten;
+    float Sum = Pcc_raw + Pspec_raw + Pt_raw + Pd_raw;
+    if (Sum <= 1e-6) return false;
+
+    Pcc    = Pcc_raw   / Sum;
+    Pspec  = Pspec_raw / Sum;
+    Ptrans = Pt_raw    / Sum;
+    Pdiff  = Pd_raw    / Sum;
+    return true;
+}
+
+// Solid-angle pdf the BSDF sampler would assign to direction `wi`. Used by NEE
+// to MIS-weight a light sample, and by the indirect leg to weight the emissive
+// pickup. Delta transmission contributes nothing to non-delta directions, so
+// it's excluded inside bsdfCombinedPdf.
+public float bsdfPdfForDir(HitInfo h, float3 V, float3 wi) {
+    float NdotV = dot(h.normal, V);
+    if (NdotV <= 0.0) return 0.0;
+    float Pcc, Pspec, Ptrans, Pdiff;
+    if (!bsdfLobeProbs(h, NdotV, Pcc, Pspec, Ptrans, Pdiff)) return 0.0;
+    return bsdfCombinedPdf(h, V, wi, Pcc, Pspec, Pdiff);
+}
+
 public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     BsdfSample s;
     s.wi       = float3(0.0);
@@ -451,6 +517,7 @@ public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     s.weight   = float3(0.0);
     s.valid    = false;
     s.transmit = false;
+    s.isDelta  = false;
 
     float3 N     = h.normal;
     float  NdotV = dot(N, V);
@@ -467,25 +534,17 @@ public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     // splits between the base lobes (spec / transmit / diffuse) just like
     // before. Metals push spec high; transmissive materials push transmit
     // high; clearcoated materials reserve some energy for the coat lobe.
+    // Fl (reflected share) + baseAtten are needed by the transmit-lobe weight
+    // below; the normalised lobe probabilities come from the shared helper
+    // (which recomputes Fl internally — cheap, and keeps NEE's pdf in sync).
     float3 F0  = lerp(float3(h.F0), h.baseColor.rgb, h.metallic);
     float3 Fv  = FresnelSchlick(NdotV, F0);
     float  Fl  = clamp(luminance(Fv), 0.05, 0.95);
+    float  Fcc_v     = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - NdotV, 5.0);
+    float  baseAtten = 1.0 - h.clearcoat * Fcc_v;
 
-    float Fcc_v     = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - NdotV, 5.0);
-    float ccRaw     = h.clearcoat * Fcc_v;
-    float baseAtten = 1.0 - ccRaw;
-
-    float Pcc_raw   = ccRaw;
-    float Pspec_raw = Fl * baseAtten;
-    float Pt_raw    = (1.0 - Fl) * h.transmission * baseAtten;
-    float Pd_raw    = (1.0 - Fl) * (1.0 - h.transmission) * (1.0 - h.metallic) * baseAtten;
-    float Sum = Pcc_raw + Pspec_raw + Pt_raw + Pd_raw;
-    if (Sum <= 1e-6) return s;
-
-    float Pcc     = Pcc_raw   / Sum;
-    float Pspec   = Pspec_raw / Sum;
-    float Ptrans  = Pt_raw    / Sum;
-    float Pdiff   = Pd_raw    / Sum;
+    float Pcc, Pspec, Ptrans, Pdiff;
+    if (!bsdfLobeProbs(h, NdotV, Pcc, Pspec, Ptrans, Pdiff)) return s;
 
     float u  = rand(rngState);
 
@@ -539,6 +598,7 @@ public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
         if (dot(wt, wt) < 1e-6) return s;
         s.wi       = normalize(wt);
         s.transmit = true;
+        s.isDelta  = true;   // singular direction — caller skips MIS for it
 
         // Delta weight. baseAtten scales the transmitted energy because light
         // first has to pass through the clearcoat layer. eta² is the standard

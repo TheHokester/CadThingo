@@ -139,6 +139,9 @@ public unsafe partial class Renderer
     internal TransparentPipeline  transparentPipeline;   // forward+ BLEND-mode pass between lighting and tonemap
     internal SkyboxPipeline       skyboxPipeline;        // background env-cube draw, between lighting and transparent
     internal PTComputePipeline    ptComputePipeline;
+    internal PickPipeline         pickPipeline;          // ray-query object picking (TLAS InstanceCustomIndex → entity)
+    internal SelectionMaskPipeline selectionMaskPipeline; // ray-query coverage mask of the selected entity
+    internal OutlinePipeline       outlinePipeline;       // composites the selection outline into FinalColor
 
     // Specialization-constant gate for soft (PCSS-style) ray-queried shadows.
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
@@ -196,12 +199,20 @@ public unsafe partial class Renderer
     private ImageResource ptAccumulator;
     private ImageResource ptOutColor;
 
+    // R32F coverage mask of the selected entity, written by the ray-query
+    // SelectionMaskPipeline and read by the OutlinePipeline. Renderer-owned,
+    // recreated on resize. Sits in ShaderReadOnly between frames.
+    private ImageResource selectionMask;
+
     // Previous-frame camera snapshot. DrawPathtraced compares against this and
     // flips accumulatorDirty when either differs, so any camera move restarts
     // progressive integration. Identity / zero defaults mean the first PT
     // frame after switching modes always restarts (which is what we want).
     private Matrix4x4 _ptLastCameraView = Matrix4x4.Identity;
     private Vector3   _ptLastCameraPos  = Vector3.Zero;
+    // FOV doesn't move the view matrix, so it needs its own snapshot — otherwise
+    // a FOV edit (camera panel or PT settings) wouldn't restart accumulation.
+    private float     _ptLastCameraFov  = 0f;
     
     
     
@@ -248,6 +259,7 @@ public unsafe partial class Renderer
         CreateGBufferResources();
         CreateGBufferSampler();
         CreatePathTracingResources(renderExtent.Width, renderExtent.Height);
+        CreateSelectionResources(renderExtent.Width, renderExtent.Height);
         // Lights SSBO lives on Renderer so every rendering path (deferred,
         // forward+, pathtracer) reads from the same buffer. Must exist before
         // any pipeline that wants to bind it.
@@ -314,7 +326,24 @@ public unsafe partial class Renderer
         // Same as the transparent / deferred pipelines: IBL images are Renderer-
         // owned and stable across rebakes, so set 3 only needs writing once.
         ptComputePipeline.WriteIblDescriptors();
-        
+
+        // Object picking — owns only a tiny result SSBO; the TLAS is bound below
+        // after InitRayQuery. No-op at runtime when ray queries aren't supported
+        // (ProcessPickRequest gates on RayShadowsSupported + a valid TLAS).
+        pickPipeline = new PickPipeline(this);
+        pickPipeline.Initialize();
+
+        // Selection outline (mode-agnostic, ray-query driven). Mask pipeline
+        // borrows the TLAS (bound below) + the renderer-owned mask image; the
+        // outline pass reads that mask and draws into FinalColor.
+        selectionMaskPipeline = new SelectionMaskPipeline(this);
+        selectionMaskPipeline.Initialize();
+        selectionMaskPipeline.WriteMaskImageDescriptor(selectionMask.ImageView);
+
+        outlinePipeline = new OutlinePipeline(this);
+        outlinePipeline.Initialize();
+        outlinePipeline.WriteMaskDescriptor(selectionMask.ImageView);
+
         // Tone-map / post pass — reads HDRColor produced by the lighting pass, writes
         // the LDR FinalColor that the swapchain blit sources. Initialized after
         // SetupDeferredRenderer so the HDRColor ImageView exists for the descriptor write.
@@ -357,11 +386,16 @@ public unsafe partial class Renderer
             PbrDeferredPipeline.WriteTlasDescriptor(tlas);
             transparentPipeline.WriteTlasDescriptor(tlas);
             ptComputePipeline.WriteTlasDescriptor(tlas);
+            pickPipeline.WriteTlasDescriptor(tlas);
+            selectionMaskPipeline.WriteTlasDescriptor(tlas);
             // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
             // path in the PBR lighting shadow rays. Has to happen after
             // InitRayQuery because the SSBO is allocated inside RebuildTlas.
             PbrDeferredPipeline.WriteShadowAlphaDescriptors();
             ptComputePipeline.WriteShadowInfoDescriptor();
+            // Emissive area-light buffers (built inside RebuildTlas, always
+            // allocated with ≥1 slot so the binding is valid even with no emitters).
+            ptComputePipeline.WriteEmissiveDescriptors();
         }
 
         initialized = true;
@@ -584,6 +618,7 @@ public unsafe partial class Renderer
         // owner because they aren't render-graph resources.
         ptAccumulator?.Dispose();
         ptOutColor?.Dispose();
+        selectionMask?.Dispose();
 
         // Lights SSBO — renderer-owned mirror of Scene's LightComponents.
         DestroyLightBuffers();
@@ -598,6 +633,9 @@ public unsafe partial class Renderer
         CleanupIblResources();
 
         // Pipelines (each pipeline disposes its own buffers, sets, layouts)
+        outlinePipeline      ?.Dispose();
+        selectionMaskPipeline?.Dispose();
+        pickPipeline       ?.Dispose();
         ptComputePipeline  ?.Dispose();
         skyboxPipeline     ?.Dispose();
         transparentPipeline?.Dispose();

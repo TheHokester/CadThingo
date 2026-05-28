@@ -22,6 +22,12 @@ public static unsafe class InspectorPanel
     static Quaternion _eulerLastQuat;
     static Vector3    _eulerCacheDeg;
 
+    // Per-material cache of the emissive (color, strength) split. EmissiveFactor
+    // is stored as color × strength, so the split isn't uniquely recoverable once
+    // strength hits 0 — we keep the last edited split and reuse it as long as it
+    // still reconstructs the stored factor (see DecomposeEmissive).
+    static readonly Dictionary<int, (Vector3 color, float strength)> _emissiveCache = new();
+
     public static void Draw()
     {
         if (!EditorState.ShowInspector) return;
@@ -161,11 +167,29 @@ public static unsafe class InspectorPanel
             Engine.renderer.MarkAccumulatorDirty();
         }
 
-        // Emissive is HDR — strength can exceed 1.0 (KHR_materials_emissive_strength).
-        if (ImGuiNET.ImGui.ColorEdit3("Emissive", ref mat.EmissiveFactor,
-                ImGuiColorEditFlags.Float | ImGuiColorEditFlags.HDR))
+        // Emissive is one HDR vector (color × strength). Editing the raw HDR
+        // swatch couples hue and brightness awkwardly, so split it: a normalized
+        // color + a strength multiplier (KHR_materials_emissive_strength). The
+        // decomposition is cached per material so the hue survives strength == 0
+        // (where color × 0 = black would otherwise be unrecoverable).
         {
-            Engine.renderer.MarkAccumulatorDirty();
+            var (emColor, emStrength) = DecomposeEmissive(idx, mat.EmissiveFactor);
+            bool emChanged = false;
+            emChanged |= ImGuiNET.ImGui.ColorEdit3("Emissive color", ref emColor, ImGuiColorEditFlags.Float);
+            emChanged |= ImGuiNET.ImGui.DragFloat("Emissive strength", ref emStrength, 0.05f, 0f, 1000f, "%.2f");
+            if (emChanged)
+            {
+                emStrength = MathF.Max(0f, emStrength);
+                emColor    = Vector3.Clamp(emColor, Vector3.Zero, Vector3.One);
+                _emissiveCache[idx] = (emColor, emStrength);
+                mat.EmissiveFactor  = emColor * emStrength;
+                Engine.renderer.MarkAccumulatorDirty();
+                // PT area lights (emissiveTriBuffer + alias table + totalEmissivePower)
+                // are baked in RebuildTlas, NOT the per-frame material SSBO — force a
+                // rebuild so the new Le actually drives NEE, and so a triangle that
+                // crosses the zero/non-zero boundary joins or leaves the emitter set.
+                Engine.renderer.MarkTlasDirty();
+            }
         }
 
         if (ImGuiNET.ImGui.SliderFloat("Metallic", ref mat.MetallicFactor, 0f, 1f))
@@ -189,6 +213,9 @@ public static unsafe class InspectorPanel
         {
             mat.Flags = SetBit(mat.Flags, 0x1u, alphaMask);
             Engine.renderer.MarkAccumulatorDirty();
+            // MASK feeds the TLAS instance's ForceNoOpaque flag (RebuildTlas:
+            // matFlags & 5) — rebuild so ray queries alpha-test this instance.
+            Engine.renderer.MarkTlasDirty();
         }
         ImGuiNET.ImGui.SameLine();
         if (ImGuiNET.ImGui.Checkbox("Double sided", ref doubleSided))
@@ -201,6 +228,8 @@ public static unsafe class InspectorPanel
         {
             mat.Flags = SetBit(mat.Flags, 0x4u, alphaBlend);
             Engine.renderer.MarkAccumulatorDirty();
+            // BLEND also feeds ForceNoOpaque (RebuildTlas: matFlags & 5).
+            Engine.renderer.MarkTlasDirty();
         }
 
         if (alphaMask)
@@ -219,6 +248,9 @@ public static unsafe class InspectorPanel
             if (ImGuiNET.ImGui.SliderFloat("Transmission", ref mat.TransmissionFactor, 0f, 1f))
             {
                 Engine.renderer.MarkAccumulatorDirty();
+                // transmission > 0 flips the instance to ForceNoOpaque (RebuildTlas)
+                // so the ray query can refract / pass through — rebuild on change.
+                Engine.renderer.MarkTlasDirty();
             }
             // 1.0 = vacuum / no refraction, 2.4 covers everything up to diamond.
             // Glass sits at 1.5, water 1.33, plastic 1.46–1.55.
@@ -275,6 +307,27 @@ public static unsafe class InspectorPanel
 
     static uint SetBit(uint flags, uint bit, bool on) => on ? (flags | bit) : (flags & ~bit);
     static string FmtTex(int idx) => idx < 0 ? "—" : idx.ToString();
+
+    /// <summary>
+    /// Splits the stored HDR emissive vector into a normalized color + strength
+    /// multiplier. Prefers the cached split when it still reconstructs the
+    /// current factor (so dragging strength to 0 doesn't lose the chosen hue);
+    /// otherwise re-derives from the factor with strength = max channel — covers
+    /// glTF loads and any external edit. Defaults to white at zero strength so
+    /// cranking the slider from 0 produces visible light.
+    /// </summary>
+    static (Vector3 color, float strength) DecomposeEmissive(int idx, Vector3 factor)
+    {
+        if (_emissiveCache.TryGetValue(idx, out var cached) &&
+            Vector3.DistanceSquared(cached.color * cached.strength, factor) < 1e-8f)
+            return cached;
+
+        float strength = MathF.Max(factor.X, MathF.Max(factor.Y, factor.Z));
+        Vector3 color  = strength > 1e-6f ? factor / strength : Vector3.One;
+        var split = (color, strength);
+        _emissiveCache[idx] = split;
+        return split;
+    }
 
     static void DrawLight(LightComponent l)
     {

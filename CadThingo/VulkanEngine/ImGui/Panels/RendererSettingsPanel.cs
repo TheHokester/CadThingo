@@ -127,12 +127,14 @@ public static class RendererSettingsPanel
             renderer.MarkAccumulatorDirty();
         }
 
-        // FOV is used by every projection mode — vertical FOV in degrees, the
-        // pipeline derives radians + tanHalfFov for the UBO.
-        float fov = pt.FovDeg;
-        if (ImGuiNET.ImGui.SliderFloat("FOV (deg)", ref fov, 10f, 170f, "%.1f"))
+        // FOV is the camera's vertical FOV (degrees), shared with the raster
+        // modes so switching renderers doesn't change the framing. The PT
+        // pipeline derives radians + tanHalfFov from it for every projection
+        // mode. Range matches the camera's own clamp.
+        float fov = renderer.Camera.Fov;
+        if (ImGuiNET.ImGui.SliderFloat("FOV (deg)", ref fov, 1f, 120f, "%.1f"))
         {
-            pt.FovDeg = fov;
+            renderer.Camera.Fov = fov;
             renderer.MarkAccumulatorDirty();
         }
 

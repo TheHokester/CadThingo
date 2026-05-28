@@ -488,7 +488,8 @@ public unsafe partial class Renderer
             // Probe prefilter sets reuse iblCubeSampler — one CombinedImageSampler
             // each. MaxProbes (16) × MipLevels (9) = 144. Cheap to oversize.
             new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 32 + 200 },
-            new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 4 },
+            // PBR (1) + Transparent (1) + PT (MAX_FRAMES) + Pick (1) + headroom.
+            new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 8 },
             // IBL bake passes need StorageImage descriptors — one per dispatch.
             // Worst case is the prefilter chain (1 set × prefilteredCubeMipLevels
             // mips) + equirect→cube + irradiance + BRDF LUT ≈ 11 sets. Reflection

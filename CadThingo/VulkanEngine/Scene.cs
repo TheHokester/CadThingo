@@ -167,6 +167,16 @@ public class Scene
     public unsafe Entity* GetEntity(int index) => (Entity*)_entityList[index];
 
     /// <summary>
+    /// Position of <paramref name="entity"/> in the flat entity list, or -1 if
+    /// absent. This index is exactly the InstanceCustomIndex the TLAS build
+    /// writes per instance (RebuildTlas walks the same list), so it's how a
+    /// selected entity is mapped to its GPU-side identity (e.g. the selection
+    /// outline mask).
+    /// </summary>
+    public unsafe int IndexOf(Entity* entity) =>
+        entity == null ? -1 : _entityList.IndexOf((nint)entity);
+
+    /// <summary>
     /// Removes a single entity from the scene's flat list and hierarchy mirror.
     /// TransformComponent.Parent is left intact so a later AddEntity rebuilds
     /// the same parent-child edge. The entity's native memory is NOT freed —

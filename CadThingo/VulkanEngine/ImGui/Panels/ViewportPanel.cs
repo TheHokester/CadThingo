@@ -166,6 +166,25 @@ public static class ViewportPanel
         // Image-specific hover so RMB-drag on the toolbar / menubar doesn't
         // start camera rotation — only clicks landing on the scene image do.
         EditorState.ViewportHovered = ImGuiNET.ImGui.IsItemHovered();
+
+        // Left-click picks the entity under the cursor. Map the click from the
+        // (possibly fit-scaled) on-screen image rect into render-target pixels;
+        // the renderer ray-queries the TLAS for that pixel next frame. RMB is
+        // camera look, so only LMB triggers a pick.
+        if (EditorState.ViewportHovered &&
+            ImGuiNET.ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+        {
+            var rectMin  = ImGuiNET.ImGui.GetItemRectMin();
+            var rectSize = ImGuiNET.ImGui.GetItemRectSize();
+            if (rectSize.X > 0 && rectSize.Y > 0)
+            {
+                var mouse = ImGuiNET.ImGui.GetMousePos();
+                float u = Math.Clamp((mouse.X - rectMin.X) / rectSize.X, 0f, 0.999999f);
+                float v = Math.Clamp((mouse.Y - rectMin.Y) / rectSize.Y, 0f, 0.999999f);
+                EditorState.RequestedPick =
+                    ((uint)(u * renderExt.Width), (uint)(v * renderExt.Height));
+            }
+        }
     }
 
     static void MaybeRequestResize(uint w, uint h)

@@ -43,6 +43,8 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         public float     aperture;
         public float     paniniDistance;
         public float     verticalCompression;
+        public uint      emissiveTriCount;    // emissive area-light triangles in the alias table
+        public float     totalEmissivePower;  // Σ area·luminance(Le) — alias-table normaliser
     }
 
     public enum CameraMode : uint
@@ -82,7 +84,6 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     public float      FocusDistance       { get; set; } = 5.0f;
     public float      PaniniDistance      { get; set; } = 1.0f;
     public float      VerticalCompression { get; set; } = 0.0f;
-    public float      FovDeg              { get; set; } = 60.0f;
     public float      IblIntensity        { get; set; } = 1.0f;
 
     private UboBuffer[] _frameUbos = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
@@ -108,15 +109,18 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         DescriptorSetLayouts            = new DescriptorSetLayout[4];
         OwnedDescriptorSetLayoutIndices = new[] { SetFrame, SetGeom, SetIbl };
 
-        // Set 0: UBO + lights + TLAS + shadow info + accumulator + outColor.
-        var set0 = stackalloc DescriptorSetLayoutBinding[6];
+        // Set 0: UBO + lights + TLAS + shadow info + accumulator + outColor
+        //        + emissive triangles + emissive alias table.
+        var set0 = stackalloc DescriptorSetLayoutBinding[8];
         set0[0] = new() { Binding = 0, DescriptorType = DescriptorType.UniformBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
         set0[1] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
         set0[2] = new() { Binding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
         set0[3] = new() { Binding = 3, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
         set0[4] = new() { Binding = 4, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
         set0[5] = new() { Binding = 5, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        CreateLayout(set0, 6, out DescriptorSetLayouts[SetFrame]);
+        set0[6] = new() { Binding = 6, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
+        set0[7] = new() { Binding = 7, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
+        CreateLayout(set0, 8, out DescriptorSetLayouts[SetFrame]);
 
         // Set 1: globalVertices + globalIndices. Shader uses bindings 1 and 2
         // (binding 0 is intentionally unused — match the shader exactly).
@@ -401,6 +405,27 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         }
     }
 
+    /// <summary>Set 0 bindings 6/7: emissive-triangle SSBO + alias table.
+    /// Borrowed from Renderer (built in RebuildTlas). Re-call whenever the
+    /// emissive buffers reallocate. Buffers are always allocated (≥1 slot) once
+    /// RebuildTlas has run, so this is safe to call after InitRayQuery.</summary>
+    public void WriteEmissiveDescriptors()
+    {
+        var triBuf   = Renderer.EmissiveTriBuffer;
+        var aliasBuf = Renderer.EmissiveAliasBuffer;
+        if (triBuf.Handle == 0 || aliasBuf.Handle == 0) return;
+
+        DescriptorBufferInfo triInfo   = new() { Buffer = triBuf,   Offset = 0, Range = Renderer.EmissiveTriBufferSize };
+        DescriptorBufferInfo aliasInfo = new() { Buffer = aliasBuf, Offset = 0, Range = Renderer.EmissiveAliasBufferSize };
+        var writes = stackalloc WriteDescriptorSet[2];
+        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 6, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &triInfo };
+            writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 7, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &aliasInfo };
+            Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
+        }
+    }
+
     /// <summary>Set 0 bindings 4/5: accumulator + outColor storage images.
     /// Both VkImages must be in ImageLayout.General before Record runs. Call
     /// after the renderer creates the images and again on render-extent
@@ -483,7 +508,12 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         Matrix4x4.Invert(view, out var invView);
         Matrix4x4.Invert(proj, out var invProj);
 
-        float fovRad     = FovDeg * (float)(Math.PI / 180.0);
+        // FOV comes from the camera — the single source of truth shared with the
+        // raster paths (GetProjectionMatrix), so switching into PT doesn't change
+        // the framing. Every projection mode (pinhole / thin-lens / panini /
+        // fisheye) derives its angle from this vertical FOV.
+        float fovDeg     = camera != null ? camera.Fov : 60.0f;
+        float fovRad     = fovDeg * (float)(Math.PI / 180.0);
         float tanHalfFov = MathF.Tan(fovRad * 0.5f);
 
         PathFrameUBO ubo = new()
@@ -504,6 +534,8 @@ public sealed unsafe class PTComputePipeline : PipelineBase
             aperture                 = Aperture,
             paniniDistance           = PaniniDistance,
             verticalCompression      = VerticalCompression,
+            emissiveTriCount         = Renderer.EmissiveTriangleCount,
+            totalEmissivePower       = Renderer.TotalEmissivePower,
         };
 
         void* data = _frameUbos[frameIndex].mapped;

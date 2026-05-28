@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
@@ -14,6 +15,28 @@ public struct ShadowEntityInfo
     public uint MaterialIndex;   // index into the materials SSBO
     public uint Flags;           // copy of PbrMaterial.Flags — bit 0 = MASK, bit 2 = BLEND
     public uint _pad0;
+}
+
+// One world-space emissive triangle, treated as an area light by the
+// pathtracer's NEE + MIS. Layout matches PTCompute.slang::EmissiveTri (64B,
+// std430). Positions/normal are world-space (baked from the entity transform at
+// TLAS-rebuild time); Le is the material emissive radiance.
+[StructLayout(LayoutKind.Sequential)]
+public struct EmissiveTriGpu
+{
+    public Vector4 P0Area;   // xyz = p0 (world),       w = triangle area (world)
+    public Vector4 E1LeR;    // xyz = p1 - p0,          w = Le.r
+    public Vector4 E2LeG;    // xyz = p2 - p0,          w = Le.g
+    public Vector4 NLeB;     // xyz = geometric normal, w = Le.b
+}
+
+// Vose alias-table entry for O(1) power-proportional triangle selection.
+// Matches PTCompute.slang::AliasEntry (8B).
+[StructLayout(LayoutKind.Sequential)]
+public struct AliasEntryGpu
+{
+    public float Prob;       // probability of keeping bucket i (else jump to Alias)
+    public uint  Alias;      // fallback triangle index
 }
 
 public unsafe partial class Renderer
@@ -87,6 +110,31 @@ public unsafe partial class Renderer
     /// the underlying VkBuffer — the renderer reads this after RebuildTlas and
     /// re-writes the PBR pipeline's shadow-alpha descriptor when true.</summary>
     private bool shadowInfoBufferResized;
+
+    // Emissive area-light buffers, rebuilt alongside the TLAS (world-space data
+    // depends on entity transforms). Host-visible so RebuildTlas writes them
+    // inline. Always allocated with capacity >= 1 so the PT descriptor stays
+    // valid even in scenes with no emissive geometry (emissiveTriCount == 0
+    // makes the shader skip them).
+    private Buffer   emissiveTriBuffer;
+    private SubAlloc emissiveTriAlloc;
+    private void*    emissiveTriMapped;
+    private Buffer   emissiveAliasBuffer;
+    private SubAlloc emissiveAliasAlloc;
+    private void*    emissiveAliasMapped;
+    private uint     emissiveCapacity;       // slots allocated (shared by both buffers), not bytes
+    private uint     emissiveTriCount;       // live emissive triangles this build
+    private float    totalEmissivePower;     // Σ area·luminance(Le) — the alias-table normaliser
+    private bool     emissiveBuffersResized; // true when EnsureEmissiveCapacity reallocated
+
+    /// <summary>Emissive-triangle SSBO + its size. PT pipeline binds these on
+    /// set 0 (bindings 6/7). Zero handle until the first RebuildTlas.</summary>
+    public Buffer EmissiveTriBuffer    => emissiveTriBuffer;
+    public ulong  EmissiveTriBufferSize   => (ulong)emissiveCapacity * (ulong)sizeof(EmissiveTriGpu);
+    public Buffer EmissiveAliasBuffer  => emissiveAliasBuffer;
+    public ulong  EmissiveAliasBufferSize => (ulong)emissiveCapacity * (ulong)sizeof(AliasEntryGpu);
+    public uint   EmissiveTriangleCount => emissiveTriCount;
+    public float  TotalEmissivePower    => totalEmissivePower;
 
     private bool tlasDirty = true;
 
@@ -250,6 +298,128 @@ public unsafe partial class Renderer
         return true;
     }
 
+    /// <summary>
+    /// Grows the emissive-triangle + alias-table buffers to hold at least
+    /// <paramref name="requiredTris"/> entries (floored at 1 so the descriptor
+    /// is always valid). Both buffers share one capacity. Returns true iff a
+    /// reallocation happened — caller must re-write the PT descriptor then.
+    /// </summary>
+    private bool EnsureEmissiveCapacity(uint requiredTris)
+    {
+        uint required = Math.Max(1u, requiredTris);
+        if (emissiveCapacity >= required && emissiveTriBuffer.Handle != 0)
+            return false;
+
+        if (emissiveTriAlloc.IsValid)   { DestroyBuffer(emissiveTriBuffer,   emissiveTriAlloc);   emissiveTriMapped   = null; }
+        if (emissiveAliasAlloc.IsValid) { DestroyBuffer(emissiveAliasBuffer, emissiveAliasAlloc); emissiveAliasMapped = null; }
+
+        uint capacity = 8;
+        while (capacity < required) capacity <<= 1;
+
+        CreateBuffer((ulong)capacity * (ulong)sizeof(EmissiveTriGpu),
+            BufferUsageFlags.StorageBufferBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out emissiveTriBuffer, out emissiveTriAlloc);
+        CreateBuffer((ulong)capacity * (ulong)sizeof(AliasEntryGpu),
+            BufferUsageFlags.StorageBufferBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out emissiveAliasBuffer, out emissiveAliasAlloc);
+
+        emissiveTriMapped   = memAllocator.GetMapped(emissiveTriAlloc);
+        emissiveAliasMapped = memAllocator.GetMapped(emissiveAliasAlloc);
+        emissiveCapacity    = capacity;
+        return true;
+    }
+
+    private static float Luminance(Vector3 c) => 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;
+
+    /// <summary>
+    /// Appends every emissive triangle of <paramref name="mesh"/> (transformed
+    /// to world space by <paramref name="world"/>) to <paramref name="tris"/>,
+    /// accumulating per-triangle power (area·luminance(Le)) into
+    /// <paramref name="weights"/> and the running total. Degenerate or zero-power
+    /// triangles are skipped. No-op if the mesh has no retained CPU geometry.
+    /// </summary>
+    private void CollectEmissiveTriangles(Mesh* mesh, in System.Numerics.Matrix4x4 world,
+        Vector3 emissive, List<EmissiveTriGpu> tris, List<float> weights, ref float totalPower)
+    {
+        if (!Engine.ResourceManager.TryGetMeshGeometry(mesh->offset, out var pos, out var idx))
+            return;
+
+        float lum = Luminance(emissive);
+        if (lum <= 0.0f) return;
+
+        for (int t = 0; t + 2 < idx.Length; t += 3)
+        {
+            Vector3 p0 = Vector3.Transform(pos[idx[t]],     world);
+            Vector3 p1 = Vector3.Transform(pos[idx[t + 1]], world);
+            Vector3 p2 = Vector3.Transform(pos[idx[t + 2]], world);
+
+            Vector3 e1 = p1 - p0;
+            Vector3 e2 = p2 - p0;
+            Vector3 cr = Vector3.Cross(e1, e2);
+            float   len = cr.Length();
+            float   area = 0.5f * len;
+            if (area < 1e-9f) continue;             // degenerate
+
+            float power = area * lum;
+            if (power <= 0.0f) continue;
+
+            Vector3 n = cr / len;
+            tris.Add(new EmissiveTriGpu
+            {
+                P0Area = new Vector4(p0, area),
+                E1LeR  = new Vector4(e1, emissive.X),
+                E2LeG  = new Vector4(e2, emissive.Y),
+                NLeB   = new Vector4(n,  emissive.Z),
+            });
+            weights.Add(power);
+            totalPower += power;
+        }
+    }
+
+    /// <summary>
+    /// Uploads the collected emissive triangles and builds a Vose alias table
+    /// over their power weights, so the shader can pick a triangle ∝ power in
+    /// O(1). Handles the empty case (allocates a 1-slot dummy, count 0). Sets
+    /// emissiveTriCount / totalEmissivePower / emissiveBuffersResized.
+    /// </summary>
+    private void BuildEmissiveBuffers(List<EmissiveTriGpu> tris, List<float> weights, float totalPower)
+    {
+        int n = tris.Count;
+        emissiveBuffersResized = EnsureEmissiveCapacity((uint)n);
+        emissiveTriCount   = (uint)n;
+        totalEmissivePower = totalPower;
+
+        if (n == 0) return;   // dummy buffers already valid; shader skips on count 0
+
+        // Upload triangle records.
+        var triDst = (EmissiveTriGpu*)emissiveTriMapped;
+        for (int i = 0; i < n; i++) triDst[i] = tris[i];
+
+        // Vose's alias method. scaled[i] = w_i * n / Σw  (mean 1).
+        var scaled = new double[n];
+        for (int i = 0; i < n; i++) scaled[i] = weights[i] * n / totalPower;
+
+        var small = new Stack<int>();
+        var large = new Stack<int>();
+        for (int i = 0; i < n; i++) (scaled[i] < 1.0 ? small : large).Push(i);
+
+        var aliasDst = (AliasEntryGpu*)emissiveAliasMapped;
+        while (small.Count > 0 && large.Count > 0)
+        {
+            int l = small.Pop();
+            int g = large.Pop();
+            aliasDst[l] = new AliasEntryGpu { Prob = (float)scaled[l], Alias = (uint)g };
+            scaled[g] = (scaled[g] + scaled[l]) - 1.0;
+            (scaled[g] < 1.0 ? small : large).Push(g);
+        }
+        // Leftovers settle at prob 1 (self-alias). Floating-point drift can leave
+        // a few in either stack.
+        while (large.Count > 0) { int g = large.Pop(); aliasDst[g] = new AliasEntryGpu { Prob = 1.0f, Alias = (uint)g }; }
+        while (small.Count > 0) { int s = small.Pop(); aliasDst[s] = new AliasEntryGpu { Prob = 1.0f, Alias = (uint)s }; }
+    }
+
 
     //
     //  Building blocks
@@ -353,6 +523,14 @@ public unsafe partial class Renderer
         var sDst   = (ShadowEntityInfo*)shadowInfoMapped;
         uint count = 0;
 
+        // Emissive area lights — collected during the same walk (we already have
+        // each entity's world transform + material here). World-space, so this is
+        // rebuilt every TLAS rebuild. Non-emissive scenes pay only the per-entity
+        // luminance check in CollectEmissiveTriangles.
+        var emTris    = new List<EmissiveTriGpu>();
+        var emWeights = new List<float>();
+        float emPower = 0f;
+
         // 2. Walk entities. Pack one record per (transform + mesh) pair. Entity
         //    only has GetComponent<T> (singular) — multi-mesh entities aren't a
         //    thing yet, so one record per entity is correct.
@@ -396,6 +574,12 @@ public unsafe partial class Renderer
                 var mat = scene.GetMaterial(matIdx);
                 matFlags        = mat.Flags;
                 matTransmission = mat.TransmissionFactor;
+
+                // Gather this entity's emissive triangles as area lights, baking
+                // the world transform so sampled points + areas are world-space.
+                if (mat.EmissiveFactor != Vector3.Zero)
+                    CollectEmissiveTriangles(meshComp.mesh, *transform.GetWorldMatrix(),
+                                             mat.EmissiveFactor, emTris, emWeights, ref emPower);
             }
 
             var instFlags = GeometryInstanceFlagsKHR.TriangleFacingCullDisableBitKhr;
@@ -429,7 +613,12 @@ public unsafe partial class Renderer
                 AccelerationStructureReference         = blas.DeviceAddress,
             };
         }
-        //if 
+        // Build the emissive area-light buffers + alias table. Done before the
+        // empty-scene early-out so the PT descriptor always points at a valid
+        // (possibly 1-slot dummy) buffer.
+        BuildEmissiveBuffers(emTris, emWeights, emPower);
+
+        //if
         if (count == 0 && PreviousCount == 0)
         {
             tlasDirty = false;
@@ -612,6 +801,8 @@ public unsafe partial class Renderer
             PbrDeferredPipeline?.WriteTlasDescriptor(tlas);
             transparentPipeline?.WriteTlasDescriptor(tlas);
             ptComputePipeline?.WriteTlasDescriptor(tlas);
+            pickPipeline?.WriteTlasDescriptor(tlas);
+            selectionMaskPipeline?.WriteTlasDescriptor(tlas);
         }
 
         if (shadowInfoBufferResized)
@@ -619,6 +810,15 @@ public unsafe partial class Renderer
             PbrDeferredPipeline?.WriteShadowAlphaDescriptors();
             ptComputePipeline?.WriteShadowInfoDescriptor();
             shadowInfoBufferResized = false;
+        }
+
+        // Emissive buffers reallocate only when the triangle count outgrows
+        // capacity; content otherwise updates in place (host-coherent), so a
+        // re-write is only needed on resize.
+        if (emissiveBuffersResized)
+        {
+            ptComputePipeline?.WriteEmissiveDescriptors();
+            emissiveBuffersResized = false;
         }
     }
 
@@ -629,10 +829,14 @@ public unsafe partial class Renderer
         // Host-visible mappings live for the lifetime of the parent block (the
         // allocator owns the map/unmap). Just null the pointers — Free below
         // releases the suballocation; the block stays mapped until allocator dispose.
-        tlasInstanceMapped = null;
-        shadowInfoMapped   = null;
+        tlasInstanceMapped  = null;
+        shadowInfoMapped    = null;
+        emissiveTriMapped   = null;
+        emissiveAliasMapped = null;
 
-        if (shadowInfoBuffer.Handle != 0) DestroyBuffer(shadowInfoBuffer, shadowInfoAlloc);
+        if (shadowInfoBuffer.Handle    != 0) DestroyBuffer(shadowInfoBuffer,    shadowInfoAlloc);
+        if (emissiveTriBuffer.Handle   != 0) DestroyBuffer(emissiveTriBuffer,   emissiveTriAlloc);
+        if (emissiveAliasBuffer.Handle != 0) DestroyBuffer(emissiveAliasBuffer, emissiveAliasAlloc);
 
         if (tlas.Handle != 0)
         {
