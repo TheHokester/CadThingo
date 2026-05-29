@@ -18,9 +18,11 @@ public struct ShadowEntityInfo
 }
 
 // One world-space emissive triangle, treated as an area light by the
-// pathtracer's NEE + MIS. Layout matches PTCompute.slang::EmissiveTri (64B,
+// pathtracer's NEE + MIS. Layout matches PTUtils.slang::EmissiveTri (80B,
 // std430). Positions/normal are world-space (baked from the entity transform at
-// TLAS-rebuild time); Le is the material emissive radiance.
+// TLAS-rebuild time); Le is the material emissive factor. IndexOffset/PrimIndex
+// point back into the global index buffer so the shader can refetch the UVs and
+// modulate Le by the emissive texture at the sampled point.
 [StructLayout(LayoutKind.Sequential)]
 public struct EmissiveTriGpu
 {
@@ -28,6 +30,10 @@ public struct EmissiveTriGpu
     public Vector4 E1LeR;    // xyz = p1 - p0,          w = Le.r
     public Vector4 E2LeG;    // xyz = p2 - p0,          w = Le.g
     public Vector4 NLeB;     // xyz = geometric normal, w = Le.b
+    public int IndexOffset;  // element offset into globalIndices (= Mesh.offset)
+    public int PrimIndex;    // triangle index within the mesh
+    public int EmissiveTex;  // bindless emissive-texture index (-1 = none)
+    public int _pad;
 }
 
 // Vose alias-table entry for O(1) power-proportional triangle selection.
@@ -341,13 +347,17 @@ public unsafe partial class Renderer
     /// triangles are skipped. No-op if the mesh has no retained CPU geometry.
     /// </summary>
     private void CollectEmissiveTriangles(Mesh* mesh, in System.Numerics.Matrix4x4 world,
-        Vector3 emissive, List<EmissiveTriGpu> tris, List<float> weights, ref float totalPower)
+        Vector3 emissive, int emissiveTex, List<EmissiveTriGpu> tris, List<float> weights, ref float totalPower)
     {
         if (!Engine.ResourceManager.TryGetMeshGeometry(mesh->offset, out var pos, out var idx))
             return;
 
         float lum = Luminance(emissive);
         if (lum <= 0.0f) return;
+
+        // Element offset of this mesh's triangle list inside the global index
+        // buffer — the shader pairs it with the primitive index to refetch UVs.
+        int indexOffset = mesh->offset;
 
         for (int t = 0; t + 2 < idx.Length; t += 3)
         {
@@ -372,6 +382,12 @@ public unsafe partial class Renderer
                 E1LeR  = new Vector4(e1, emissive.X),
                 E2LeG  = new Vector4(e2, emissive.Y),
                 NLeB   = new Vector4(n,  emissive.Z),
+                // primIdx comes from the loop counter, NOT tris.Count — skipped
+                // degenerate triangles must not shift the index-buffer mapping.
+                IndexOffset = indexOffset,
+                PrimIndex   = t / 3,
+                EmissiveTex = emissiveTex,
+                _pad        = 0,
             });
             weights.Add(power);
             totalPower += power;
@@ -579,7 +595,7 @@ public unsafe partial class Renderer
                 // the world transform so sampled points + areas are world-space.
                 if (mat.EmissiveFactor != Vector3.Zero)
                     CollectEmissiveTriangles(meshComp.mesh, *transform.GetWorldMatrix(),
-                                             mat.EmissiveFactor, emTris, emWeights, ref emPower);
+                                             mat.EmissiveFactor, mat.EmissiveTex, emTris, emWeights, ref emPower);
             }
 
             var instFlags = GeometryInstanceFlagsKHR.TriangleFacingCullDisableBitKhr;

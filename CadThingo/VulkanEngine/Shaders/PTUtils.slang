@@ -68,9 +68,14 @@ public struct HitInfo {
 // alias-table bucket for O(1) power-proportional triangle selection.
 public struct EmissiveTri {
     public float4 p0Area;   // xyz = p0 (world),       w = triangle area
-    public float4 e1LeR;    // xyz = p1 - p0,          w = Le.r
+    public float4 e1LeR;    // xyz = p1 - p0,          w = Le.r (emissiveFactor.r)
     public float4 e2LeG;    // xyz = p2 - p0,          w = Le.g
     public float4 nLeB;     // xyz = geometric normal, w = Le.b
+    // x = index-buffer element offset, y = primitive (triangle) index — both
+    // into globalIndices so the NEE sampler can refetch the UVs and modulate Le
+    // by the emissive texture. z = bindless emissive-texture index (-1 = none),
+    // w = pad.
+    public int4 meta;
 };
 public struct AliasEntry { public float prob; public uint alias; };
 
@@ -211,31 +216,42 @@ public uint jenkinsHash(uint x) {
     return x;
 }
 
-// Mix both pixel coordinates and the frame into the seed via independent
-// prime multipliers, then jenkins-hash. The previous formula collapsed when
-// the local thread index was 0, giving identical seeds along every 8th
-// column → visible vertical streaks in the noise. `gtid` is no longer needed
-// for decorrelation; left in the signature for callers that still pass it.
+// PCG hash (RXS-M-XS, 32-bit): full avalanche from a single uint. Adjacent
+// seeds decorrelate completely — the thing xorshift32 failed at (nearby
+// pixels/frames seeded similar states → visible vertical streaks in the noise).
+public uint pcgHash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// Seed the per-pixel stream. Nested pcgHash folds pixel.x, pixel.y and the
+// frame index into a well-separated starting state for every pixel and frame.
+// `gtid` is unused (the hash decorrelates on its own); kept in the signature
+// for callers that still pass it.
 public uint initRNG(uint2 pixel, uint2 gtid, uint frame) {
-    uint seed = pixel.x * 1973u
-              ^ pixel.y * 9277u
-              ^ frame   * 26699u;
-    return jenkinsHash(seed);
+    return pcgHash(pixel.x + pcgHash(pixel.y + pcgHash(frame)));
 }
 
 public float uintToFloat(uint x) {
     return asfloat(0x3f800000 | (x >> 9)) - 1.0;
 }
 
-public uint xorshift(inout uint state) {
-    state ^= state << 13;
-    state ^= state >> 17;
-    state ^= state << 5;
-    return state;
+// One PCG step: advance the LCG state, permute, map to [0,1). Drop-in for the
+// old xorshift `rand` — same inout-state contract, far better per-draw quality.
+public float rand(inout uint rngState) {
+    rngState  = rngState * 747796405u + 2891336453u;
+    uint word = ((rngState >> ((rngState >> 28u) + 4u)) ^ rngState) * 277803737u;
+    word      = (word >> 22u) ^ word;
+    return uintToFloat(word);
 }
 
-public float rand(inout uint rngState) {
-    return uintToFloat(xorshift(rngState));
+// Tent filter warp: maps a uniform [0,1) sample to [-1,1) with a triangular PDF
+// peaked at 0. Two of these form a 2D tent reconstruction filter of radius 1px
+// — softer than the box (uniform) jitter, cleaner edges, negligible extra blur.
+public float tentWarp(float u) {
+    u *= 2.0;
+    return (u < 1.0) ? (sqrt(u) - 1.0) : (1.0 - sqrt(2.0 - u));
 }
 
 public float luminance(float3 c) {

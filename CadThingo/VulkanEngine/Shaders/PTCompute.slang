@@ -373,11 +373,17 @@ LightPick sampleLightRIS(inout uint rngState, float3 worldPos, float3 N) {
 
     if (frameUBO.lightCount == 0u) return best;
 
+    // With a single light every candidate collapses to it, so M>1 just repeats
+    // the same evaluateLight for an identical result — clamp to 1. Multi-light
+    // scenes keep the full M: extra candidates improve target-proportional
+    // coverage (lower variance), so we don't shrink M down to lightCount there.
+    uint M = (frameUBO.lightCount == 1u) ? 1u : RIS_LIGHT_SAMPLE_COUNT;
+
     float wSum         = 0.0;
     float bestPTarget  = 0.0;
     LightSample bestLs = (LightSample)0;
 
-    for (uint i = 0u; i < RIS_LIGHT_SAMPLE_COUNT; ++i) {
+    for (uint i = 0u; i < M; ++i) {
         uint idx = min(frameUBO.lightCount - 1u,
                        uint(rand(rngState) * float(frameUBO.lightCount)));
         PbrLight cand = lights[idx];
@@ -403,7 +409,7 @@ LightPick sampleLightRIS(inout uint rngState, float3 worldPos, float3 N) {
     if (bestPTarget <= 0.0 || wSum <= 0.0) return best;
 
     best.sample = bestLs;
-    best.weight = wSum / (float(RIS_LIGHT_SAMPLE_COUNT) * bestPTarget);
+    best.weight = wSum / (float(M) * bestPTarget);
     best.valid  = true;
     return best;
 }
@@ -453,14 +459,19 @@ EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
     float3 p0 = t.p0Area.xyz;
     float3 e1 = t.e1LeR.xyz;
     float3 e2 = t.e2LeG.xyz;
-    float3 Le = float3(t.e1LeR.w, t.e2LeG.w, t.nLeB.w);
+    float3 Le = float3(t.e1LeR.w, t.e2LeG.w, t.nLeB.w);   // emissiveFactor
     float3 nL = t.nLeB.xyz;
 
-    // Uniform point on the triangle (sqrt warp keeps it area-uniform).
+    // Uniform point on the triangle (sqrt warp keeps it area-uniform). b1/b2
+    // are the barycentric weights on edges e1/e2 (vertices 1/2); vertex 0 gets
+    // 1 - b1 - b2. Kept around so the emissive-texture UV below interpolates at
+    // the exact sampled point.
     float u1 = rand(rng);
     float u2 = rand(rng);
     float su = sqrt(u1);
-    float3 Q = p0 + e1 * (su * (1.0 - u2)) + e2 * (su * u2);
+    float b1 = su * (1.0 - u2);
+    float b2 = su * u2;
+    float3 Q = p0 + e1 * b1 + e2 * b2;
 
     float3 toL  = Q - P;
     float  dist = length(toL);
@@ -470,8 +481,27 @@ EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
     float cosL = abs(dot(nL, L));
     if (cosL < 1e-4) return es;
 
+    // Texture the emitted radiance to match the BSDF-leg pickup (hit.emissive =
+    // emissiveFactor × emissiveTex). Refetch the triangle's UVs from the global
+    // buffers and sample the emissive map at the chosen point. Only the RADIANCE
+    // is textured — the selection pdf below stays factor-based so it matches the
+    // alias-table weighting and the BSDF-leg MIS pLight, keeping the estimator
+    // unbiased.
+    float3 radiance = Le;
+    if (t.meta.z >= 0) {
+        uint io  = (uint)t.meta.x;
+        uint pi  = (uint)t.meta.y;
+        uint vi0 = fetchTriangleIndex(globalIndices, io, pi, 0u);
+        uint vi1 = fetchTriangleIndex(globalIndices, io, pi, 1u);
+        uint vi2 = fetchTriangleIndex(globalIndices, io, pi, 2u);
+        float2 uv = fetchVertexUV(globalVertices, vi0) * (1.0 - b1 - b2)
+                  + fetchVertexUV(globalVertices, vi1) * b1
+                  + fetchVertexUV(globalVertices, vi2) * b2;
+        radiance *= textures[NonUniformResourceIndex(t.meta.z)].SampleLevel(samplers[0], uv, 0.0).rgb;
+    }
+
     es.L        = L;
-    es.radiance = Le;
+    es.radiance = radiance;
     es.dist     = dist;
     es.pdf      = luminance(Le) * dist * dist / (frameUBO.totalEmissivePower * cosL);
     es.valid    = es.pdf > 0.0;
@@ -486,13 +516,14 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
     // pixel reject + RNG seed
     uint rngState = initRNG(gid.xy, dim.xy, frameUBO.frameIndex);
 
-    // Sub-pixel jitter inside [0,1)² each sample — converges to a box-filter
-    // AA over the accumulator. Without this every sample fires through the
-    // pixel center and aliasing is baked in no matter how many samples land.
-    // Box is the simplest filter; swap to tent / gaussian (e.g. Mitchell)
-    // here if you want softer edges at the cost of slightly blurrier output.
-    float2 jitter = float2(rand(rngState), rand(rngState));
-    float2 px     = float2(gid.xy) + jitter;
+    // Sub-pixel jitter each sample — without it every sample fires through the
+    // pixel center and aliasing is baked in no matter how many land. tentWarp
+    // gives a triangular offset in [-1,1)² around the pixel center: a radius-1px
+    // tent reconstruction filter, softer edges than a plain box (uniform) jitter
+    // with negligible extra blur. Swap to a gaussian / Mitchell kernel here for
+    // even softer falloff at the cost of more blur.
+    float2 jitter = float2(tentWarp(rand(rngState)), tentWarp(rand(rngState)));
+    float2 px     = float2(gid.xy) + 0.5f + jitter;
     float2 ndc    = (px / frameUBO.screenSize) * 2.0f - 1.0f;
     ndc.x        *= frameUBO.screenSize.x / frameUBO.screenSize.y;
 

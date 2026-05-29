@@ -24,7 +24,7 @@ public unsafe partial class Renderer
     /// </summary>
     internal Vk? vk = Globals.vk;
     public bool initialized = false;
-    
+
     private bool enableValidationLayers = true;
     private readonly string[] ValidationLayers =
     [
