@@ -25,7 +25,7 @@ public unsafe partial class Renderer
     internal Vk? vk = Globals.vk;
     public bool initialized = false;
 
-    private bool enableValidationLayers = true;
+    private bool enableValidationLayers = false;
     private readonly string[] ValidationLayers =
     [
         "VK_LAYER_KHRONOS_validation"
@@ -393,6 +393,11 @@ public unsafe partial class Renderer
             // InitRayQuery because the SSBO is allocated inside RebuildTlas.
             PbrDeferredPipeline.WriteShadowAlphaDescriptors();
             ptComputePipeline.WriteShadowInfoDescriptor();
+            // Pick + selection resolve the hit entity through the same flat
+            // ShadowEntityInfo table (per-cluster instances → entity via
+            // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex).
+            pickPipeline.WriteEntityInfoDescriptor();
+            selectionMaskPipeline.WriteEntityInfoDescriptor();
             // Emissive area-light buffers (built inside RebuildTlas, always
             // allocated with ≥1 slot so the binding is valid even with no emitters).
             ptComputePipeline.WriteEmissiveDescriptors();

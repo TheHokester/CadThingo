@@ -62,15 +62,19 @@ public sealed unsafe class PickPipeline : ComputePipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Binding 0: TLAS. Binding 1: result SSBO (single uint).
-        var bindings = stackalloc DescriptorSetLayoutBinding[2];
+        // Binding 0: TLAS. Binding 1: result SSBO (single uint). Binding 2:
+        // entityInfo SSBO — the hit resolves to an entity via
+        // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex now that
+        // instances are per-cluster (custom index is no longer the entity).
+        var bindings = stackalloc DescriptorSetLayoutBinding[3];
         bindings[0] = new() { Binding = 0, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
         bindings[1] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
+        bindings[2] = new() { Binding = 2, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
 
         DescriptorSetLayoutCreateInfo info = new()
         {
             SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 2,
+            BindingCount = 3,
             PBindings    = bindings,
         };
         if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
@@ -115,6 +119,25 @@ public sealed unsafe class PickPipeline : ComputePipeline
             SType           = StructureType.WriteDescriptorSet,
             DstSet          = DescriptorSets[0][0],
             DstBinding      = 1,
+            DescriptorType  = DescriptorType.StorageBuffer,
+            DescriptorCount = 1,
+            PBufferInfo     = &info,
+        };
+        Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
+    }
+
+    /// <summary>Binding 2: the renderer-owned ShadowEntityInfo SSBO. Call after
+    /// InitRayQuery and whenever the buffer reallocates (resize).</summary>
+    public void WriteEntityInfoDescriptor()
+    {
+        var buf = Renderer.ShadowInfoBuffer;
+        if (buf.Handle == 0) return;
+        DescriptorBufferInfo info = new() { Buffer = buf, Offset = 0, Range = Renderer.ShadowInfoBufferSize };
+        var write = new WriteDescriptorSet
+        {
+            SType           = StructureType.WriteDescriptorSet,
+            DstSet          = DescriptorSets[0][0],
+            DstBinding      = 2,
             DescriptorType  = DescriptorType.StorageBuffer,
             DescriptorCount = 1,
             PBufferInfo     = &info,

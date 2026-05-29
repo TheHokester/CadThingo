@@ -73,6 +73,15 @@ enum CameraMode : uint{
 [[vk::constant_id(2)]] const uint MAX_BOUNCES      = 8u;     // hard cap; ubo.bounceCap clamps below
 [[vk::constant_id(3)]] const uint MODE             = 0u;     // 0 = PINHOLE; CameraMode enum values
 
+// Material LOD. On bounces >= this, traceRay skips the normal / metallic-
+// roughness / clearcoat / transmission texture fetches and falls back to the
+// material factors. Those fetches are the bulk of per-hit memory traffic (the
+// dominant long-scoreboard stall), and indirect bounces carry little high-
+// frequency material detail, so the quality cost is ~invisible. baseColor +
+// emissive are always sampled (albedo tint + light contribution matter). Set to
+// MAX_BOUNCES to disable; lower toward 1 to trade more quality for speed.
+static const uint MATERIAL_LOD_BOUNCE = 2u;
+
 // Vertex layout + fetch helpers (VERTEX_STRIDE, fetchVertexPos/Normal/UV/Tangent,
 // fetchTriangleIndex) live in CommonTypes and take the ByteAddressBuffer as a
 // parameter — call sites below pass globalVertices / globalIndices.
@@ -123,10 +132,11 @@ float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 baryc
 // HitInfo with `hit == false` and the rest zero-initialized.
 // `rngState` is plumbed in for the BLEND stochastic-transparency coin flip
 // in the Proceed loop — pure-opaque scenes leave it untouched.
-HitInfo traceRay(RayDesc ray, inout uint rngState) {
+HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     HitInfo h        = (HitInfo)0;
-    h.ray            = ray;
     h.hit            = false;
+    // On deep bounces, skip the detail-texture fetches (see MATERIAL_LOD_BOUNCE).
+    bool lowDetail = bounce >= MATERIAL_LOD_BOUNCE;
 
     RayQuery<RAY_FLAG_NONE> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
@@ -138,8 +148,9 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
     // do the actual refract-vs-reflect decision based on Fresnel + IOR.
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
-            uint candInst        = q.CandidateInstanceID();
-            ShadowEntityInfo cei = entityInfo[candInst];
+            // Flat per-geometry record: instance custom index is the cluster's
+            // geometry-block base, geometry index selects the primitive within it.
+            ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
             PbrMaterial      cmat = materials[cei.materialIndex];
             float alpha = computeAlpha(cmat, cei.indexOffset,
                                        q.CandidatePrimitiveIndex(),
@@ -161,7 +172,6 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
 
     // Hit was committed.  Resolve geometry first, material second.
     h.hit      = true;
-    h.instID   = q.CommittedInstanceID();
     h.hitT     = q.CommittedRayT();
     h.worldPos = ray.Origin + ray.Direction * h.hitT;
 
@@ -169,7 +179,10 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
     float2 bary    = q.CommittedTriangleBarycentrics();
     float3 baryW   = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
-    ShadowEntityInfo info = entityInfo[h.instID];
+    // Flat per-geometry record index (cluster block base + geometry within it).
+    // Local — only needed to fetch material/geometry below, not after traceRay.
+    uint recordIndex      = q.CommittedInstanceID() + q.CommittedGeometryIndex();
+    ShadowEntityInfo info = entityInfo[recordIndex];
     h.matidx              = info.materialIndex;
 
     // Triangle vertex indices into globalVertices.
@@ -177,10 +190,11 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
     uint i1 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 1u);
     uint i2 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 2u);
 
-    // UV is needed for every material sample below, so do it first.
-    h.uv = fetchVertexUV(globalVertices, i0) * baryW.x
-         + fetchVertexUV(globalVertices, i1) * baryW.y
-         + fetchVertexUV(globalVertices, i2) * baryW.z;
+    // UV is needed for every material sample below, so do it first. Local — the
+    // bounce loop never reads it (sampleEmissive recomputes its own UV).
+    float2 uv = fetchVertexUV(globalVertices, i0) * baryW.x
+              + fetchVertexUV(globalVertices, i1) * baryW.y
+              + fetchVertexUV(globalVertices, i2) * baryW.z;
 
     // Object-space normals (smooth) + positions (for the flat / geometric N).
     float3 nObj  = fetchVertexNormal(globalVertices, i0) * baryW.x
@@ -198,7 +212,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
     float4 t1   = fetchVertexTangent(globalVertices, i1);
     float4 t2   = fetchVertexTangent(globalVertices, i2);
     float3 tObj = t0.xyz * baryW.x + t1.xyz * baryW.y + t2.xyz * baryW.z;
-    h.bitangentSign = t0.w;
+    float bitangentSign = t0.w;
 
     // Object → world via the TLAS instance transform.  Upper-3x3 is enough
     // for directions; assumes uniform / near-uniform scale.  For genuinely
@@ -209,7 +223,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
 
     h.normal          = normalize(mul(obj2worldR, nObj));
     h.geometricNormal = normalize(mul(obj2worldR, ngObj));
-    h.tangent         = normalize(mul(obj2worldR, tObj));
+    float3 tangent    = normalize(mul(obj2worldR, tObj));
 
     // Front-face test against the GEOMETRIC normal (shading normal can lie
     // due to interpolation / normal maps).  Flip both so downstream BSDF code
@@ -226,40 +240,38 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
 
     h.baseColor = mat.baseColorFactor;
     if (mat.baseColorTex >= 0)
-        h.baseColor *= textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, h.uv);
+        h.baseColor *= textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, uv);
 
     h.metallic  = mat.metallicFactor;
     h.roughness = mat.roughnessFactor;
-    if (mat.physicalDescriptorTex >= 0) {
-        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, h.uv).bg;
+    if (mat.physicalDescriptorTex >= 0 && !lowDetail) {
+        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, uv).bg;
         h.metallic  *= mr.x;
         h.roughness *= mr.y;
     }
 
     h.emissive = mat.emissiveFactor;
     if (mat.emissiveTex >= 0)
-        h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, h.uv).rgb;
+        h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, uv).rgb;
 
     // Normal-map perturbation.  Done AFTER the front-face flip so the TBN
-    // frame matches the (possibly-flipped) shading normal.
-    if (mat.normalTex >= 0) {
-        float3 nm = textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, h.uv).xyz * 2.0 - 1.0;
-        float3 T  = normalize(h.tangent);
-        float3 B  = cross(h.normal, T) * h.bitangentSign;
+    // frame matches the (possibly-flipped) shading normal. Skipped on deep
+    // bounces — indirect lighting barely registers the perturbation.
+    if (mat.normalTex >= 0 && !lowDetail) {
+        float3 nm = textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, uv).xyz * 2.0 - 1.0;
+        float3 T  = normalize(tangent);
+        float3 B  = cross(h.normal, T) * bitangentSign;
         h.normal  = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
     }
 
-    // Classification + transmission / IOR from KHR_materials_transmission
-    //    + KHR_materials_ior. transmissionTex .r multiplies the factor; full
-    //    glass = factor 1, opaque PBR = factor 0 (the default).
-    h.alphaMode    = (int)(mat.flags & 0x5u);   // bit 0 = MASK, bit 2 = BLEND
+    // Transmission / IOR from KHR_materials_transmission + KHR_materials_ior.
+    // transmissionTex .r multiplies the factor; full glass = factor 1, opaque
+    // PBR = factor 0 (the default).
     h.transmission = mat.transmissionFactor;
-    if (mat.transmissionTex >= 0) {
-        h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].Sample(s, h.uv).r;
+    if (mat.transmissionTex >= 0 && !lowDetail) {
+        h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].Sample(s, uv).r;
     }
     h.ior     = mat.ior;
-    h.isGlass = h.transmission > 0.001;
-    h.isLiquid = false;
 
     // F0 from Schlick's IOR formula: ((η - 1) / (η + 1))². Reproduces the
     // historical 0.04 dielectric default at IOR=1.5 (glass) and gives correct
@@ -272,12 +284,12 @@ HitInfo traceRay(RayDesc ray, inout uint rngState) {
     // spec, so its F0 is the canonical 0.04 (constant in the eval below).
     // glTF: clearcoatTexture uses R channel, clearcoatRoughnessTexture uses G.
     h.clearcoat = mat.clearcoatFactor;
-    if (mat.clearcoatTex >= 0) {
-        h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].Sample(s, h.uv).r;
+    if (mat.clearcoatTex >= 0 && !lowDetail) {
+        h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].Sample(s, uv).r;
     }
     h.clearcoatRoughness = mat.clearcoatRoughnessFactor;
-    if (mat.clearcoatRoughnessTex >= 0) {
-        h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].Sample(s, h.uv).g;
+    if (mat.clearcoatRoughnessTex >= 0 && !lowDetail) {
+        h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].Sample(s, uv).g;
     }
     // Clamp roughness to a small floor — GGX D(roughness=0) is 0 everywhere
     // except the mirror direction where it's 0/0 = NaN, so a literal zero
@@ -313,8 +325,9 @@ bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngState) {
     q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, r);
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
-            uint candInst        = q.CandidateInstanceID();
-            ShadowEntityInfo cei = entityInfo[candInst];
+            // Flat per-geometry record: instance custom index is the cluster's
+            // geometry-block base, geometry index selects the primitive within it.
+            ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
             PbrMaterial      cmat = materials[cei.materialIndex];
             float alpha = computeAlpha(cmat, cei.indexOffset,
                                        q.CandidatePrimitiveIndex(),
@@ -571,7 +584,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
 
     uint cap = min(MAX_BOUNCES, frameUBO.bounceCap);
     for (uint b = 0u; b < cap; ++b) {
-        HitInfo hit = traceRay(ray, rngState);
+        HitInfo hit = traceRay(ray, rngState, b);
 
         // Miss: sample environment (full-res envCube, not the 128²
         //    GGX-prefiltered chain) and terminate.
@@ -614,52 +627,69 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
 
         float3 V = -ray.Direction;   // toward camera/incoming ray's origin
 
-        // NEE: pick a light, shadow-test, add f * Le * cosθ * W.
-        if (ENABLE_NEE && frameUBO.lightCount > 0u) {
-            LightPick pick = sampleLightRIS(rngState, hit.worldPos, hit.normal);
-            if (pick.valid) {
-                float NdotL = max(dot(hit.normal, pick.sample.L), 0.0);
-                if (NdotL > 0.0) {
-                    // Offset along the GEOMETRIC normal — shading normal can
-                    // disagree with the surface and seed self-intersections.
-                    float3 shadowOrigin = hit.worldPos + hit.geometricNormal * 1e-3;
-                    float  tMax         = max(pick.sample.distance - 2e-3, 0.0);
-                    bool   shadowed     = pick.sample.castShadows &&
-                                          isOccluded(shadowOrigin, pick.sample.L, tMax, rngState);
-                    if (!shadowed) {
-                        // evaluateFullBrdf includes the clearcoat lobe + base
-                        // attenuation; for materials without clearcoat (factor=0)
-                        // it collapses to the standard PBR BRDF.
-                        float3 brdf = evaluateFullBrdf(hit, V, pick.sample.L);
-                        float3 neeC = throughput * brdf * pick.sample.radiance
-                                                 * NdotL * pick.weight;
-                        float  mn   = max(max(neeC.r, neeC.g), neeC.b);
-                        if (mn > FIREFLY_CLAMP) neeC *= FIREFLY_CLAMP / mn;
-                        radiance += neeC;
-                    }
-                }
-            }
-        }
+        // NEE — analytic lights + emissive geometry folded into a SINGLE shadow
+        // ray. Each bounce stochastically picks a light category and fires one
+        // occlusion ray; dividing by the category-selection probability keeps the
+        // estimator unbiased. Halves NEE traversal vs sampling both categories
+        // every bounce. The selection prob (pAnalytic) only enters as the 1/p
+        // estimator factor — the power-heuristic MIS weights are unchanged (they
+        // just partition the integrand), so the BSDF-leg misEm pickup above stays
+        // exact. When only one category exists its prob is 1 → no variance change;
+        // when both exist, 50/50 trades some direct-light variance for the ray.
+        if (ENABLE_NEE) {
+            bool haveAnalytic = frameUBO.lightCount > 0u;
+            bool haveEmissive = frameUBO.emissiveTriCount > 0u;
+            if (haveAnalytic || haveEmissive) {
+                float pAnalytic = (haveAnalytic && haveEmissive) ? 0.5
+                                : (haveAnalytic ? 1.0 : 0.0);
 
-        // NEE on emissive geometry (area lights), MIS-combined with the BSDF
-        // sampler. Power-heuristic weight against the pdf the BSDF would have
-        // used for this direction — the counterpart to the misEm weight on the
-        // emissive pickup above, so the two strategies don't double-count.
-        if (ENABLE_NEE && frameUBO.emissiveTriCount > 0u) {
-            EmissiveLightSample es = sampleEmissive(rngState, hit.worldPos);
-            if (es.valid) {
-                float NdotL = max(dot(hit.normal, es.L), 0.0);
-                if (NdotL > 0.0) {
-                    float3 shadowOrigin = hit.worldPos + hit.geometricNormal * 1e-3;
-                    float  tMax         = max(es.dist - 2e-3, 0.0);
-                    if (!isOccluded(shadowOrigin, es.L, tMax, rngState)) {
-                        float  pB   = bsdfPdfForDir(hit, V, es.L);
-                        float  w    = powerHeuristic(es.pdf, pB);
-                        float3 brdf = evaluateFullBrdf(hit, V, es.L);
-                        float3 emNee = throughput * brdf * es.radiance * NdotL * w / es.pdf;
-                        float  mn   = max(max(emNee.r, emNee.g), emNee.b);
-                        if (mn > FIREFLY_CLAMP) emNee *= FIREFLY_CLAMP / mn;
-                        radiance += emNee;
+                if (rand(rngState) < pAnalytic) {
+                    // Analytic-light RIS. No BSDF MIS — the BSDF sampler can't hit
+                    // these lights, so there's no double-count to weight against.
+                    LightPick pick = sampleLightRIS(rngState, hit.worldPos, hit.normal);
+                    if (pick.valid) {
+                        float NdotL = max(dot(hit.normal, pick.sample.L), 0.0);
+                        if (NdotL > 0.0) {
+                            // Offset along the GEOMETRIC normal — shading normal can
+                            // disagree with the surface and seed self-intersections.
+                            float3 shadowOrigin = hit.worldPos + hit.geometricNormal * 1e-3;
+                            float  tMax         = max(pick.sample.distance - 2e-3, 0.0);
+                            bool   shadowed     = pick.sample.castShadows &&
+                                                  isOccluded(shadowOrigin, pick.sample.L, tMax, rngState);
+                            if (!shadowed) {
+                                // evaluateFullBrdf includes the clearcoat lobe + base
+                                // attenuation; without clearcoat (factor=0) it collapses
+                                // to the standard PBR BRDF.
+                                float3 brdf = evaluateFullBrdf(hit, V, pick.sample.L);
+                                float3 neeC = throughput * brdf * pick.sample.radiance
+                                                         * NdotL * pick.weight / pAnalytic;
+                                float  mn   = max(max(neeC.r, neeC.g), neeC.b);
+                                if (mn > FIREFLY_CLAMP) neeC *= FIREFLY_CLAMP / mn;
+                                radiance += neeC;
+                            }
+                        }
+                    }
+                } else {
+                    // Emissive geometry (area lights), MIS-combined with the BSDF
+                    // sampler — the counterpart to the misEm pickup above, so the
+                    // two strategies don't double-count.
+                    EmissiveLightSample es = sampleEmissive(rngState, hit.worldPos);
+                    if (es.valid) {
+                        float NdotL = max(dot(hit.normal, es.L), 0.0);
+                        if (NdotL > 0.0) {
+                            float3 shadowOrigin = hit.worldPos + hit.geometricNormal * 1e-3;
+                            float  tMax         = max(es.dist - 2e-3, 0.0);
+                            if (!isOccluded(shadowOrigin, es.L, tMax, rngState)) {
+                                float  pB    = bsdfPdfForDir(hit, V, es.L);
+                                float  w     = powerHeuristic(es.pdf, pB);
+                                float3 brdf  = evaluateFullBrdf(hit, V, es.L);
+                                float3 emNee = throughput * brdf * es.radiance * NdotL * w
+                                                         / (es.pdf * (1.0 - pAnalytic));
+                                float  mn    = max(max(emNee.r, emNee.g), emNee.b);
+                                if (mn > FIREFLY_CLAMP) emNee *= FIREFLY_CLAMP / mn;
+                                radiance += emNee;
+                            }
+                        }
                     }
                 }
             }

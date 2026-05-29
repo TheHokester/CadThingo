@@ -6,10 +6,12 @@
 // opaque or not, so glass / foliage are pickable too — and writes the hit
 // instance's custom index to pickResult[0].
 //
-// That custom index is the scene entity index: RebuildTlas in
-// Renderer_Ray_Query.cs sets InstanceCustomIndex = i for each instance, so the
-// CPU side maps the result straight to scene.GetEntity(i). On a miss, writes
-// PICK_NONE (0xFFFFFFFF).
+// Instances are per spatial cluster now, so InstanceCustomIndex is the cluster's
+// geometry-block base, not the entity. The hit's entity index comes from
+// entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex (RebuildTlas fills
+// that flat table); the CPU maps the result to scene.GetEntity(i). Miss PICK_NONE.
+
+import CommonTypes;   // ShadowEntityInfo
 
 struct PickParams {
     float4x4 invViewProj;   // un-projects NDC -> world (Y-flipped proj, matches raster)
@@ -22,6 +24,7 @@ struct PickParams {
 
 [[vk::binding(0, 0)]] RaytracingAccelerationStructure tlas;
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint>        pickResult;
+[[vk::binding(2, 0)]] StructuredBuffer<ShadowEntityInfo> entityInfo;
 
 static const uint PICK_NONE = 0xFFFFFFFFu;
 
@@ -54,6 +57,6 @@ void main() {
     }
 
     pickResult[0] = (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
-                  ? q.CommittedInstanceID()
+                  ? entityInfo[q.CommittedInstanceID() + q.CommittedGeometryIndex()].entityIndex
                   : PICK_NONE;
 }

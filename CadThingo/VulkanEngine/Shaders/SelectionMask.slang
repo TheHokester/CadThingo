@@ -5,9 +5,11 @@
 // deferred, forward+ and pathtraced render modes — which is what lets the
 // outline overlay work everywhere.
 //
-// The committed InstanceCustomIndex is the scene entity index (RebuildTlas sets
-// InstanceCustomIndex = i); the CPU passes the selected entity's index in
-// params.selectedIndex.
+// Instances are per spatial cluster now, so the hit's entity index comes from
+// entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex; the CPU passes
+// the selected entity's index in params.selectedIndex.
+
+import CommonTypes;   // ShadowEntityInfo
 
 struct MaskParams {
     float4x4 invViewProj;   // un-projects NDC -> world (matches the raster image)
@@ -21,6 +23,7 @@ struct MaskParams {
 
 [[vk::binding(0, 0)]] RaytracingAccelerationStructure tlas;
 [[vk::binding(1, 0)]] RWTexture2D<float>             mask;
+[[vk::binding(2, 0)]] StructuredBuffer<ShadowEntityInfo> entityInfo;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -46,7 +49,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
             q.CommitNonOpaqueTriangleHit();
     }
 
-    float hit = (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT &&
-                 q.CommittedInstanceID() == params.selectedIndex) ? 1.0 : 0.0;
-    mask[px] = hit;
+    bool hitSelected = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT &&
+                       entityInfo[q.CommittedInstanceID() + q.CommittedGeometryIndex()].entityIndex == params.selectedIndex;
+    mask[px] = hitSelected ? 1.0 : 0.0;
 }

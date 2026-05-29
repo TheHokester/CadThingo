@@ -33,32 +33,29 @@ public static const uint  MIN_BOUNCES      = 1;
 // Per-hit shading info returned by traceRay().  Lives in registers across the
 // bounce loop — size affects occupancy more than direct perf.  Fields slotted
 // so float3 + float pairs pack into 16B vectors.
+// Only fields read AFTER traceRay returns (in the bounce loop + BSDF eval) live
+// here — this struct stays resident across the whole loop, so every field is
+// persistent register pressure. Values needed only while traceRay runs (uv,
+// tangent, bitangentSign, the record index, the input ray) are locals there, not
+// fields, to keep occupancy up. Slotted so float3 + float pack into 16B vectors.
 public struct HitInfo {
-    public RayDesc ray;              // 32B - input ray (handy for outgoing dir = -ray.Direction)
     public float3 worldPos;           // 12B - world-space hit position
     public float metallic;            //  4B - packs with worldPos
     public float4 baseColor;          // 16B - factor * texture; .a kept for alpha-blend math
     public float3 normal;             // 12B - SHADING normal (after normal-map perturbation)
     public float roughness;           //  4B - packs with normal
     public float3 geometricNormal;    // 12B - geometry-only; use for ray offset + front/back test
-    public float hitT;                //  4B - committed ray distance; worldPos = ray.Origin + dir*hitT
-    public float3 tangent;            // 12B - world-space T axis of the TBN frame
-    public float bitangentSign;       //  4B - glTF tangent.w; B = cross(N, T) * bitangentSign
+    public float hitT;                //  4B - committed ray distance
     public float3 emissive;           // 12B - factor * texture
     public float ior;                 //  4B - index of refraction (~1.5 default)
     public float3 clearcoatNormal;    // 12B - normal for the coat lobe (usually = shading N)
     public float clearcoat;           //  4B - KHR_materials_clearcoat factor × tex.r
     public float F0;                  //  4B - dielectric F0; derived from IOR
     public float clearcoatRoughness;  //  4B - clearcoat lobe roughness (factor × tex.g)
-    public float2 uv;                 //  8B - interpolated UV at the hit
     public float transmission;        //  4B - glass / transparency factor [0..1]
-    public int alphaMode;             //  4B - 0=opaque, 1=mask, 4=blend (mat.flags bits)
-    public uint instID;               //  4B - committed instance — debug
-    public uint matidx;               //  4B - material index
+    public uint matidx;               //  4B - material index (emissive MIS reads emissiveFactor)
     public bool hit;                  //  4B - false ⇒ ray missed the scene
     public bool frontFace;            //  4B - dot(geometricNormal, ray.Direction) < 0
-    public bool isGlass;              //  4B
-    public bool isLiquid;             //  4B
 };
 
 

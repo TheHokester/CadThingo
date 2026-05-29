@@ -14,7 +14,7 @@ public struct ShadowEntityInfo
     public uint IndexOffset;     // uint elements into GlobalIndexBuffer for this mesh's first triangle
     public uint MaterialIndex;   // index into the materials SSBO
     public uint Flags;           // copy of PbrMaterial.Flags — bit 0 = MASK, bit 2 = BLEND
-    public uint _pad0;
+    public uint EntityIndex;     // scene entity index — pick/selection resolve through this
 }
 
 // One world-space emissive triangle, treated as an area light by the
@@ -61,10 +61,30 @@ public unsafe partial class Renderer
     // properly aligned." Default 1 keeps math safe before LoadRayQueryExtensions runs.
     private uint asScratchAlignment = 1;
 
-    // BLAS cache keyed by the underlying Mesh* (Mesh lives in NativeMemory and never
-    // moves, so the raw pointer makes a stable key). nint instead of Mesh* because
-    // Dictionary keys can't be pointers.
-    private readonly Dictionary<nint, BlasEntry> blasCache = new();
+    // Cluster BLASes. One world-space BLAS per spatial cluster of primitives,
+    // rebuilt wholesale every RebuildTlas (the geometry is baked to world space
+    // via per-geometry transforms, so a moved transform invalidates the BLAS).
+    // Replaces the old per-mesh BLAS cache: merging co-located primitives into a
+    // shared BLAS is what kills the instance-AABB overlap that made the TLAS
+    // un-prunable (wall + window in the same volume were separate BLASes for example).
+    private readonly List<BlasEntry> clusterBlases = new();
+
+    // Max primitives per cluster. int.MaxValue == one merged BLAS over the whole
+    // scene: a single SAH BVH spans all triangles, so instance-AABB overlap goes
+    // to zero and the builder partitions overlapping geometry at the triangle
+    // level (which is the only thing that actually helps when primitives have
+    // real extent — whole-prim clustering just preserves the overlap). Lower this
+    // to split into multiple BLASes only if one-BLAS build time on a massive scene
+    // becomes a problem; the right split then is SAH-by-AABB, not centroid-median.
+    private const int CLUSTER_MAX_PRIMS = int.MaxValue;
+
+    // Per-geometry world transforms consumed by the cluster BLAS builds. One
+    // TransformMatrixKHR per primitive, keyed by the same flat geometry slot that
+    // keys shadowInfo. Host-visible + device address; the AS build reads it.
+    private Buffer    clusterTransformBuffer;
+    private SubAlloc  clusterTransformAlloc;
+    private void*     clusterTransformMapped;
+    private uint      clusterTransformCapacity;   // slots (TransformMatrixKHR), not bytes
 
     private struct BlasEntry
     {
@@ -72,6 +92,21 @@ public unsafe partial class Renderer
         public Buffer        Storage;          // usage = AccelerationStructureStorageBitKhr | ShaderDeviceAddressBit
         public SubAlloc      StorageAlloc;
         public ulong         DeviceAddress;    // from GetAccelerationStructureDeviceAddress (NOT GetBufferDeviceAddress)
+    }
+
+    // Primitive gathered for clustering: one per renderable entity. World matrix
+    // is baked into the BLAS via per-geometry transform; Centroid (world-space
+    // mesh sphere center) drives the spatial median split.
+    private struct ClusterPrim
+    {
+        public int        EntityIndex;
+        public Matrix4x4  World;
+        public uint       IndexOffset;    // mesh->offset (elements into globalIndices)
+        public uint       TriCount;       // mesh->count / 3
+        public uint       MaterialIndex;
+        public uint       Flags;          // PbrMaterial.Flags
+        public bool       NonOpaque;      // MASK / BLEND / transmissive → no per-geometry OpaqueBit
+        public Vector3    Centroid;
     }
 
     // Single scene-wide TLAS. Rebuild on entity-set / transform changes; flag
@@ -441,147 +476,224 @@ public unsafe partial class Renderer
     //  Building blocks
     //
 
-    private BlasEntry BuildBlas(Mesh* mesh)
+    // Recursive spatial median split over primitive centroids. Emits leaf ranges
+    // [lo,hi) into outClusters, each with <= CLUSTER_MAX_PRIMS primitives.
+    // Co-located primitives (similar centroids) land in the same leaf → one BLAS,
+    // where SAH packs the overlapping geometry into a tight hierarchy; spatially
+    // separated primitives split into different leaves so the TLAS can prune.
+    private static void ClusterPrims(List<ClusterPrim> prims, int[] idx, int lo, int hi,
+        List<(int lo, int hi)> outClusters)
     {
-        // so RebuildTlas can read .DeviceAddress.
-
-        ulong vertexAddress = GetBufferDeviceAddress(Engine.ResourceManager.GlobalVertexBuffer);
-        ulong indexAddress = GetBufferDeviceAddress(Engine.ResourceManager.GlobalIndexBuffer) + (ulong)(4 * mesh->offset);
-
-        var geo = new AccelerationStructureGeometryKHR()
+        int count = hi - lo;
+        if (count <= CLUSTER_MAX_PRIMS)
         {
-            SType = StructureType.AccelerationStructureGeometryKhr,
-            GeometryType = GeometryTypeKHR.TrianglesKhr,
-            Flags = GeometryFlagsKHR.OpaqueBitKhr,
+            outClusters.Add((lo, hi));
+            return;
+        }
 
-        };
-        //triangle needs SType set or else triangles will default to garbage values
-        geo.Geometry.Triangles.SType = StructureType.AccelerationStructureGeometryTrianglesDataKhr;
-        geo.Geometry.Triangles.VertexFormat = Format.R32G32B32Sfloat;
-        geo.Geometry.Triangles.VertexStride = (ulong)sizeof(Vertex);
-        geo.Geometry.Triangles.VertexData.DeviceAddress = vertexAddress;
-
-        // MaxVertex must be >= the highest vertex INDEX referenced by this mesh's
-        // index range. Indices are rebased into [0, VertexHighWater) at upload time,
-        // so the global high-water mark is a conservative upper bound that's always
-        // valid (just a bit wasteful — revisit when meshes need a per-mesh range).
-        geo.Geometry.Triangles.MaxVertex = (uint)Engine.ResourceManager.VertexHighWater;
-        geo.Geometry.Triangles.IndexType = IndexType.Uint32;
-        geo.Geometry.Triangles.IndexData.DeviceAddress = indexAddress;
-
-        var rangeInfo = new AccelerationStructureBuildRangeInfoKHR {
-              PrimitiveCount = (uint)(mesh->count / 3),
-              PrimitiveOffset = 0, FirstVertex = 0, TransformOffset = 0,
-          };
-        var buildInfo = new AccelerationStructureBuildGeometryInfoKHR {
-              SType = StructureType.AccelerationStructureBuildGeometryInfoKhr,
-              Type = AccelerationStructureTypeKHR.BottomLevelKhr,
-              Mode = BuildAccelerationStructureModeKHR.BuildKhr,
-              Flags = BuildAccelerationStructureFlagsKHR.PreferFastTraceBitKhr,
-              GeometryCount = 1,
-              PGeometries = &geo,
-          };
-        //   - Query sizes:
-        uint primitiveCount = (uint)(mesh->count / 3);
-        var sizes = new AccelerationStructureBuildSizesInfoKHR { SType = StructureType.AccelerationStructureBuildSizesInfoKhr };
-        khrAccelStruct!.GetAccelerationStructureBuildSizes(
-            device, AccelerationStructureBuildTypeKHR.DeviceKhr,
-            &buildInfo, &primitiveCount, &sizes);
-         
-        //   - Allocate storage (CreateBufferWithDeviceAddress, AccelerationStructureStorageBitKhr | ShaderDeviceAddressBit)
-        CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize,
-            BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
-            MemoryPropertyFlags.DeviceLocalBit, out var storage, out var storageAlloc);
-        
-        // Grow scratch buffer (allocates if first call). Without this, the line
-        // below that reads GetBufferDeviceAddress(asScratchBuffer) returns 0 and
-        // the build crashes — the original `if` only updated the size variable.
-        EnsureScratchCapacity(sizes.BuildScratchSize);
-        var createInfo = new AccelerationStructureCreateInfoKHR {
-              SType = StructureType.AccelerationStructureCreateInfoKhr,
-              Buffer = storage,
-              Size = sizes.AccelerationStructureSize,
-              Type = AccelerationStructureTypeKHR.BottomLevelKhr,
-          };
-        khrAccelStruct.CreateAccelerationStructure(device, &createInfo, null, out var handle);
-        buildInfo.DstAccelerationStructure = handle;
-        buildInfo.ScratchData.DeviceAddress = GetBufferDeviceAddress(asScratchBuffer);
-        
-        //   - Single-time-command:
-        var cmd = BeginSingleTimeCommands();
-        var pRange = &rangeInfo;
-        khrAccelStruct.CmdBuildAccelerationStructures(cmd, 1, &buildInfo, &pRange);
-        EndSingleTimeCommands(cmd);
-        var addrInfo = new AccelerationStructureDeviceAddressInfoKHR {
-        SType = StructureType.AccelerationStructureDeviceAddressInfoKhr,
-        AccelerationStructure = handle,
-        };
-        ulong devAddr = khrAccelStruct.GetAccelerationStructureDeviceAddress(device, &addrInfo);
-        blasCache[(nint)mesh] = new BlasEntry
+        // Centroid bounds over this range → split along the longest axis.
+        Vector3 mn = new(float.MaxValue), mx = new(float.MinValue);
+        for (int i = lo; i < hi; i++)
         {
-            Handle = handle,
-            Storage = storage,
-            StorageAlloc = storageAlloc,
-            DeviceAddress = devAddr,
+            Vector3 c = prims[idx[i]].Centroid;
+            mn = Vector3.Min(mn, c);
+            mx = Vector3.Max(mx, c);
+        }
+        Vector3 ext = mx - mn;
+        int axis = (ext.X >= ext.Y && ext.X >= ext.Z) ? 0 : (ext.Y >= ext.Z ? 1 : 2);
+
+        Comparison<int> cmp = axis switch
+        {
+            0 => (a, b) => prims[a].Centroid.X.CompareTo(prims[b].Centroid.X),
+            1 => (a, b) => prims[a].Centroid.Y.CompareTo(prims[b].Centroid.Y),
+            _ => (a, b) => prims[a].Centroid.Z.CompareTo(prims[b].Centroid.Z),
         };
-        return blasCache[(nint)mesh];
+        Array.Sort(idx, lo, count, Comparer<int>.Create(cmp));
+
+        // Median split by count. Coincident centroids (the wall/window case) still
+        // halve, so the recursion always terminates and cluster size stays bounded.
+        int mid = lo + count / 2;
+        ClusterPrims(prims, idx, lo, mid, outClusters);
+        ClusterPrims(prims, idx, mid, hi, outClusters);
+    }
+
+    /// <summary>
+    /// Grows the per-geometry transform buffer (one TransformMatrixKHR per
+    /// primitive). Build input + device address; host-visible so RebuildTlas
+    /// writes it inline before the BLAS builds read it.
+    /// </summary>
+    private void EnsureClusterTransformCapacity(uint requiredSlots)
+    {
+        uint required = Math.Max(1u, requiredSlots);
+        if (clusterTransformCapacity >= required && clusterTransformBuffer.Handle != 0)
+            return;
+
+        if (clusterTransformAlloc.IsValid)
+        {
+            DestroyBuffer(clusterTransformBuffer, clusterTransformAlloc);
+            clusterTransformMapped = null;
+        }
+
+        uint capacity = 8;
+        while (capacity < required) capacity <<= 1;
+
+        CreateBufferWithDeviceAddress((ulong)capacity * (ulong)sizeof(TransformMatrixKHR),
+            BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out clusterTransformBuffer, out clusterTransformAlloc);
+
+        clusterTransformMapped   = memAllocator.GetMapped(clusterTransformAlloc);
+        clusterTransformCapacity = capacity;
+    }
+
+    /// <summary>Destroys all cluster BLAS handles + storage. Caller must have
+    /// drained the device (RebuildTlas runs under the editor's DeviceWaitIdle, or
+    /// at init before any frame).</summary>
+    private void DestroyClusterBlases()
+    {
+        if (khrAccelStruct == null) return;
+        foreach (var b in clusterBlases)
+        {
+            khrAccelStruct.DestroyAccelerationStructure(device, b.Handle, null);
+            DestroyBuffer(b.Storage, b.StorageAlloc);
+        }
+        clusterBlases.Clear();
+    }
+
+    // Builds one world-space BLAS for primitives idx[lo..hi). One geometry per
+    // primitive — so CommittedGeometryIndex() maps straight to the flat shadowInfo
+    // slot (baseSlot + g) — each baked to world space by its per-geometry transform
+    // at the same slot in clusterTransformBuffer. Reuses the object-space global
+    // VB/IB (no vertex duplication); the builder applies the transform.
+    private BlasEntry BuildClusterBlas(List<ClusterPrim> prims, int[] idx, int lo, int hi, uint baseSlot)
+    {
+        int geomCount = hi - lo;
+
+        ulong vbAddr    = GetBufferDeviceAddress(Engine.ResourceManager.GlobalVertexBuffer);
+        ulong ibBase    = GetBufferDeviceAddress(Engine.ResourceManager.GlobalIndexBuffer);
+        ulong xfBase    = GetBufferDeviceAddress(clusterTransformBuffer);
+        uint  maxVertex = (uint)Engine.ResourceManager.VertexHighWater;
+        uint  xfStride  = (uint)sizeof(TransformMatrixKHR);   // 48 — a multiple of 16 (transformOffset rule)
+
+        var geos     = new AccelerationStructureGeometryKHR[geomCount];
+        var ranges   = new AccelerationStructureBuildRangeInfoKHR[geomCount];
+        var maxPrims = new uint[geomCount];
+
+        for (int g = 0; g < geomCount; g++)
+        {
+            ClusterPrim p = prims[idx[lo + g]];
+
+            var geo = new AccelerationStructureGeometryKHR
+            {
+                SType        = StructureType.AccelerationStructureGeometryKhr,
+                GeometryType = GeometryTypeKHR.TrianglesKhr,
+                // Per-geometry opacity: an opaque prim keeps the fast traversal
+                // path even inside a BLAS that also holds an alpha-tested / glass
+                // prim (replaces the old blanket instance-level ForceNoOpaque).
+                Flags        = p.NonOpaque ? 0 : GeometryFlagsKHR.OpaqueBitKhr,
+            };
+            geo.Geometry.Triangles.SType        = StructureType.AccelerationStructureGeometryTrianglesDataKhr;
+            geo.Geometry.Triangles.VertexFormat = Format.R32G32B32Sfloat;
+            geo.Geometry.Triangles.VertexStride = (ulong)sizeof(Vertex);
+            geo.Geometry.Triangles.VertexData.DeviceAddress = vbAddr;
+            geo.Geometry.Triangles.MaxVertex    = maxVertex;
+            geo.Geometry.Triangles.IndexType    = IndexType.Uint32;
+            geo.Geometry.Triangles.IndexData.DeviceAddress = ibBase + (ulong)(4 * p.IndexOffset);
+            // Per-geometry world transform: the build bakes object-space verts to
+            // world space, so the BLAS needs no instance transform (identity).
+            geo.Geometry.Triangles.TransformData.DeviceAddress = xfBase;
+            geos[g] = geo;
+
+            ranges[g] = new AccelerationStructureBuildRangeInfoKHR
+            {
+                PrimitiveCount  = p.TriCount,
+                PrimitiveOffset = 0,
+                FirstVertex     = 0,
+                TransformOffset = (baseSlot + (uint)g) * xfStride,
+            };
+            maxPrims[g] = p.TriCount;
+        }
+
+        fixed (AccelerationStructureGeometryKHR* pGeos = geos)
+        fixed (uint* pMaxPrims = maxPrims)
+        {
+            var buildInfo = new AccelerationStructureBuildGeometryInfoKHR
+            {
+                SType         = StructureType.AccelerationStructureBuildGeometryInfoKhr,
+                Type          = AccelerationStructureTypeKHR.BottomLevelKhr,
+                Mode          = BuildAccelerationStructureModeKHR.BuildKhr,
+                Flags         = BuildAccelerationStructureFlagsKHR.PreferFastTraceBitKhr,
+                GeometryCount = (uint)geomCount,
+                PGeometries   = pGeos,
+            };
+
+            var sizes = new AccelerationStructureBuildSizesInfoKHR { SType = StructureType.AccelerationStructureBuildSizesInfoKhr };
+            khrAccelStruct!.GetAccelerationStructureBuildSizes(
+                device, AccelerationStructureBuildTypeKHR.DeviceKhr,
+                &buildInfo, pMaxPrims, &sizes);
+
+            CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize,
+                BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
+                MemoryPropertyFlags.DeviceLocalBit, out var storage, out var storageAlloc);
+
+            EnsureScratchCapacity(sizes.BuildScratchSize);
+
+            var createInfo = new AccelerationStructureCreateInfoKHR
+            {
+                SType  = StructureType.AccelerationStructureCreateInfoKhr,
+                Buffer = storage,
+                Size   = sizes.AccelerationStructureSize,
+                Type   = AccelerationStructureTypeKHR.BottomLevelKhr,
+            };
+            khrAccelStruct.CreateAccelerationStructure(device, &createInfo, null, out var handle);
+            buildInfo.DstAccelerationStructure  = handle;
+            buildInfo.ScratchData.DeviceAddress = GetBufferDeviceAddress(asScratchBuffer);
+
+            fixed (AccelerationStructureBuildRangeInfoKHR* pRanges = ranges)
+            {
+                var pr  = pRanges;
+                var cmd = BeginSingleTimeCommands();
+                khrAccelStruct.CmdBuildAccelerationStructures(cmd, 1, &buildInfo, &pr);
+                EndSingleTimeCommands(cmd);
+            }
+
+            var addrInfo = new AccelerationStructureDeviceAddressInfoKHR
+            {
+                SType = StructureType.AccelerationStructureDeviceAddressInfoKhr,
+                AccelerationStructure = handle,
+            };
+            ulong devAddr = khrAccelStruct.GetAccelerationStructureDeviceAddress(device, &addrInfo);
+
+            return new BlasEntry { Handle = handle, Storage = storage, StorageAlloc = storageAlloc, DeviceAddress = devAddr };
+        }
     }
     //tlas previous entry count(ensures that if all are removed old tlas isnt used)
     private static uint PreviousCount = 0;
     private void RebuildTlas()
     {
-        // 1. Make sure the persistently-mapped instance buffer can hold a
-        //    worst-case fill (one record per entity). Mirror that capacity into
-        //    the ShadowEntityInfo SSBO so InstanceCustomIndex stays a direct index.
-        EnsureInstanceCapacity((uint)scene.EntityCount);
-        shadowInfoBufferResized = EnsureShadowInfoCapacity((uint)scene.EntityCount);
-        var dst    = (AccelerationStructureInstanceKHR*)tlasInstanceMapped;
-        var sDst   = (ShadowEntityInfo*)shadowInfoMapped;
-        uint count = 0;
+        // World-space cluster BLASes depend on the current transforms, so free
+        // last build's set before regathering.
+        DestroyClusterBlases();
 
-        // Emissive area lights — collected during the same walk (we already have
-        // each entity's world transform + material here). World-space, so this is
-        // rebuilt every TLAS rebuild. Non-emissive scenes pay only the per-entity
-        // luminance check in CollectEmissiveTriangles.
+        // 1. Gather renderable primitives (one per active entity with a mesh) and,
+        //    in the same walk, collect emissive area-light triangles (we already
+        //    have each entity's world transform + material here).
+        var prims     = new List<ClusterPrim>();
         var emTris    = new List<EmissiveTriGpu>();
         var emWeights = new List<float>();
         float emPower = 0f;
 
-        // 2. Walk entities. Pack one record per (transform + mesh) pair. Entity
-        //    only has GetComponent<T> (singular) — multi-mesh entities aren't a
-        //    thing yet, so one record per entity is correct.
-        //
-        //    TLAS instances are compacted (`count` grows only for renderables),
-        //    but ShadowEntityInfo MUST be keyed by entity index `i` because the
-        //    shadow ray reads it via CandidateInstanceID() which returns the
-        //    InstanceCustomIndex we set below (= `i`). Writing it by `count`
-        //    instead silently misaligns the lookup whenever a non-renderable
-        //    entity (light-only, transform-only, etc.) sits earlier in the list —
-        //    so we default-init the i-th slot up front and overwrite when valid.
         for (int i = 0; i < scene.EntityCount; i++)
         {
-            sDst[i] = default;
-
             Entity* e = scene.GetEntity(i);
-            
-            if(!e->IsActive) continue;
-            
             if (e == null) continue;
+            if (!e->IsActive) continue;
             var transform = e->GetComponent<TransformComponent>();
             var meshComp  = e->GetComponent<MeshComponent>();
             if (transform == null || meshComp == null || meshComp.mesh == null) continue;
 
-            // Cache lookup; build on miss. BuildBlas writes the cache itself, so
-            // a subsequent call for the same mesh would rebuild + leak — this
-            // guard keeps it one-shot per mesh.
-            if (!blasCache.TryGetValue((nint)meshComp.mesh, out var blas))
-                blas = BuildBlas(meshComp.mesh);
+            Matrix4x4 world = *transform.GetWorldMatrix();
 
-            // Lookup the entity's material so we can flag non-opaque instances
-            // (MASK + BLEND + KHR_materials_transmission) as ForceNoOpaque —
-            // that's what gives the ray query a chance to alpha-test / fresnel-
-            // test in the Proceed loop on the GPU. Materials are scene-owned so
-            // this is a cheap host lookup, no GPU readback.
             uint  matFlags        = 0u;
             float matTransmission = 0f;
             int   matIdx          = meshComp.materialIndex;
@@ -591,60 +703,105 @@ public unsafe partial class Renderer
                 matFlags        = mat.Flags;
                 matTransmission = mat.TransmissionFactor;
 
-                // Gather this entity's emissive triangles as area lights, baking
-                // the world transform so sampled points + areas are world-space.
+                // Emissive triangles as area lights, baked to world space.
                 if (mat.EmissiveFactor != Vector3.Zero)
-                    CollectEmissiveTriangles(meshComp.mesh, *transform.GetWorldMatrix(),
+                    CollectEmissiveTriangles(meshComp.mesh, world,
                                              mat.EmissiveFactor, mat.EmissiveTex, emTris, emWeights, ref emPower);
             }
 
-            var instFlags = GeometryInstanceFlagsKHR.TriangleFacingCullDisableBitKhr;
-            // Mask=0x1, Blend=0x4 → either alpha mode flips the instance to
-            // non-opaque so the Proceed loop can stochastic-test alpha.
-            // Transmission > 0 likewise — the PT shadow ray + traceRay both
-            // need to see the candidate so transmissive surfaces can let the
-            // ray pass through (or refract on a hit-commit).
-            if ((matFlags & 5u) != 0u || matTransmission > 0f)
-                instFlags |= GeometryInstanceFlagsKHR.ForceNoOpaqueBitKhr;
+            // World-space centroid from the mesh bounding-sphere center drives the
+            // spatial split; co-located prims (wall/window) share a cluster.
+            Vector4 sphere   = meshComp.mesh->sphereLocal;
+            Vector3 centroid = Vector3.Transform(new Vector3(sphere.X, sphere.Y, sphere.Z), world);
 
-            sDst[i] = new ShadowEntityInfo
+            prims.Add(new ClusterPrim
             {
+                EntityIndex   = i,
+                World         = world,
                 IndexOffset   = (uint)meshComp.mesh->offset,
+                TriCount      = (uint)(meshComp.mesh->count / 3),
                 MaterialIndex = matIdx >= 0 ? (uint)matIdx : 0u,
                 Flags         = matFlags,
-            };
+                // MASK (0x1) / BLEND (0x4) / transmission > 0 → non-opaque, so the
+                // Proceed loop gets a chance to alpha- / fresnel-test the candidate.
+                NonOpaque     = (matFlags & 5u) != 0u || matTransmission > 0f,
+                Centroid      = centroid,
+            });
+        }
 
-            dst[count++] = new AccelerationStructureInstanceKHR
+        // Build the emissive area-light buffers + alias table. Before the empty
+        // early-out so the PT descriptor always points at a valid buffer.
+        BuildEmissiveBuffers(emTris, emWeights, emPower);
+
+        int n = prims.Count;
+
+        // 2. Spatial median-split clustering — scene-graph-agnostic, so it holds
+        //    for flat scenes and deep hierarchies alike.
+        var clusters = new List<(int lo, int hi)>();
+        int[] idx = new int[n];
+        for (int k = 0; k < n; k++) idx[k] = k;
+        if (n > 0) ClusterPrims(prims, idx, 0, n, clusters);
+
+        // 3. Capacities: one TLAS instance per cluster; one shadowInfo + transform
+        //    slot per primitive, laid out flat and cluster-contiguous.
+        EnsureInstanceCapacity((uint)Math.Max(1, clusters.Count));
+        shadowInfoBufferResized = EnsureShadowInfoCapacity((uint)Math.Max(1, n));
+        EnsureClusterTransformCapacity((uint)Math.Max(1, n));
+
+        var dst  = (AccelerationStructureInstanceKHR*)tlasInstanceMapped;
+        var sDst = (ShadowEntityInfo*)shadowInfoMapped;
+        var xDst = (TransformMatrixKHR*)clusterTransformMapped;
+
+        // 4. Per cluster: write its prims' transforms + shadowInfo into a
+        //    contiguous flat block, build the cluster BLAS over them, and emit one
+        //    identity instance whose InstanceCustomIndex is the block base. The
+        //    shaders resolve a hit via entityInfo[InstanceCustomIndex + GeometryIndex].
+        uint instCount = 0;
+        uint gslot     = 0;
+        foreach (var (lo, hi) in clusters)
+        {
+            uint baseSlot = gslot;
+            for (int k = lo; k < hi; k++)
             {
-                // World matrix, not local — must match the per-instance ModelMatrix
-                // the geometry pass uploads (Renderer_Compute.cs:235 and the gbuffer
-                // shader). With only local here, child entities in the scenegraph
-                // get their BLAS placed at the wrong world position and rays from
-                // the correct world-space gbuffer surface miss them entirely.
-                Transform                              = ToTransformMatrixKHR(*transform.GetWorldMatrix()),
-                InstanceCustomIndex                    = (uint)i,
+                ClusterPrim p = prims[idx[k]];
+                xDst[gslot] = ToTransformMatrixKHR(p.World);
+                sDst[gslot] = new ShadowEntityInfo
+                {
+                    IndexOffset   = p.IndexOffset,
+                    MaterialIndex = p.MaterialIndex,
+                    Flags         = p.Flags,
+                    EntityIndex   = (uint)p.EntityIndex,
+                };
+                gslot++;
+            }
+
+            BlasEntry blas = BuildClusterBlas(prims, idx, lo, hi, baseSlot);
+            clusterBlases.Add(blas);
+
+            dst[instCount++] = new AccelerationStructureInstanceKHR
+            {
+                // Identity: the cluster BLAS is already world-space.
+                Transform                              = ToTransformMatrixKHR(Matrix4x4.Identity),
+                InstanceCustomIndex                    = baseSlot,   // 24-bit flat geometry-block base
                 Mask                                   = 0xFF,
                 InstanceShaderBindingTableRecordOffset = 0,
-                Flags                                  = instFlags,
+                // No force-opaque flags — per-geometry OpaqueBit governs, so opaque
+                // prims keep the fast path inside a mixed cluster.
+                Flags                                  = GeometryInstanceFlagsKHR.TriangleFacingCullDisableBitKhr,
                 AccelerationStructureReference         = blas.DeviceAddress,
             };
         }
-        // Build the emissive area-light buffers + alias table. Done before the
-        // empty-scene early-out so the PT descriptor always points at a valid
-        // (possibly 1-slot dummy) buffer.
-        BuildEmissiveBuffers(emTris, emWeights, emPower);
 
-        //if
-        if (count == 0 && PreviousCount == 0)
+        if (instCount == 0 && PreviousCount == 0)
         {
             tlasDirty = false;
             return;
         }
-        PreviousCount = count;
-        
-        
+        PreviousCount = instCount;
+
+
         // 3. Geometry — instance data lives at tlasInstanceBuffer's device address.
-        uint instanceCount = count;
+        uint instanceCount = instCount;
         var geo = new AccelerationStructureGeometryKHR
         {
             SType        = StructureType.AccelerationStructureGeometryKhr,
@@ -746,37 +903,21 @@ public unsafe partial class Renderer
         vk!.GetPhysicalDeviceProperties2(physicalDevice, &props2);
         asScratchAlignment = Math.Max(1, asProps.MinAccelerationStructureScratchOffsetAlignment);
 
-        // Build BLAS for every mesh referenced by an entity. Cache lookup means
-        // duplicate meshes only build once.
-        for (int i = 0; i < scene.EntityCount; i++)
-        {
-            Entity* e = scene.GetEntity(i);
-            if (e == null) continue;
-            var meshComp = e->GetComponent<MeshComponent>();
-            if (meshComp == null || meshComp.mesh == null) continue;
-            if (blasCache.ContainsKey((nint)meshComp.mesh)) continue;
-            BuildBlas(meshComp.mesh);
-        }
-        
+        // RebuildTlas now clusters primitives and builds the world-space cluster
+        // BLASes itself — no per-mesh BLAS prepass.
         RebuildTlas();
     }
 
     /// <summary>
-    /// Destroys cached BLAS entries for every mesh pointer in
-    /// <paramref name="meshPtrs"/>. Pairs with file destroy in the editor.
-    /// Caller is responsible for DeviceWaitIdle before calling (typically via
-    /// the editor's destroy path, which also frees mesh/texture resources).
+    /// Pairs with file destroy in the editor. Cluster BLASes are world-space and
+    /// rebuilt wholesale on the next RebuildTlas, so there is nothing mesh-keyed
+    /// to free here — just mark the AS stale so the freed geometry is dropped on
+    /// the next rebuild (which the editor triggers via OnSceneEntitiesChanged).
     /// </summary>
     public void DestroyBlasFor(IEnumerable<nint> meshPtrs)
     {
-        if (khrAccelStruct == null) return;
-        foreach (var ptr in meshPtrs)
-        {
-            if (!blasCache.TryGetValue(ptr, out var entry)) continue;
-            khrAccelStruct.DestroyAccelerationStructure(device, entry.Handle, null);
-            DestroyBuffer(entry.Storage, entry.StorageAlloc);
-            blasCache.Remove(ptr);
-        }
+        _ = meshPtrs;
+        MarkTlasDirty();
     }
 
     /// <summary>
@@ -797,17 +938,8 @@ public unsafe partial class Renderer
 
         vk!.DeviceWaitIdle(device);
 
-        // Build BLAS for any meshes that joined the scene since last build.
-        for (int i = 0; i < scene.EntityCount; i++)
-        {
-            Entity* e = scene.GetEntity(i);
-            if (e == null) continue;
-            var meshComp = e->GetComponent<MeshComponent>();
-            if (meshComp == null || meshComp.mesh == null) continue;
-            if (blasCache.ContainsKey((nint)meshComp.mesh)) continue;
-            BuildBlas(meshComp.mesh);
-        }
-
+        // RebuildTlas reclusters from scratch and rebuilds the world-space cluster
+        // BLASes, so newly-joined meshes are picked up automatically.
         RebuildTlas();
 
         // TLAS handle changes on every rebuild — re-bind it on every consumer
@@ -825,6 +957,8 @@ public unsafe partial class Renderer
         {
             PbrDeferredPipeline?.WriteShadowAlphaDescriptors();
             ptComputePipeline?.WriteShadowInfoDescriptor();
+            pickPipeline?.WriteEntityInfoDescriptor();
+            selectionMaskPipeline?.WriteEntityInfoDescriptor();
             shadowInfoBufferResized = false;
         }
 
@@ -845,14 +979,16 @@ public unsafe partial class Renderer
         // Host-visible mappings live for the lifetime of the parent block (the
         // allocator owns the map/unmap). Just null the pointers — Free below
         // releases the suballocation; the block stays mapped until allocator dispose.
-        tlasInstanceMapped  = null;
-        shadowInfoMapped    = null;
-        emissiveTriMapped   = null;
-        emissiveAliasMapped = null;
+        tlasInstanceMapped     = null;
+        shadowInfoMapped       = null;
+        emissiveTriMapped      = null;
+        emissiveAliasMapped    = null;
+        clusterTransformMapped = null;
 
         if (shadowInfoBuffer.Handle    != 0) DestroyBuffer(shadowInfoBuffer,    shadowInfoAlloc);
         if (emissiveTriBuffer.Handle   != 0) DestroyBuffer(emissiveTriBuffer,   emissiveTriAlloc);
         if (emissiveAliasBuffer.Handle != 0) DestroyBuffer(emissiveAliasBuffer, emissiveAliasAlloc);
+        if (clusterTransformBuffer.Handle != 0) DestroyBuffer(clusterTransformBuffer, clusterTransformAlloc);
 
         if (tlas.Handle != 0)
         {
@@ -863,12 +999,7 @@ public unsafe partial class Renderer
         if (tlasInstanceBuffer.Handle != 0) DestroyBuffer(tlasInstanceBuffer, tlasInstanceAlloc);
         if (asScratchBuffer.Handle != 0)    DestroyBuffer(asScratchBuffer,    asScratchAlloc);
 
-        foreach (var entry in blasCache.Values)
-        {
-            khrAccelStruct.DestroyAccelerationStructure(device, entry.Handle, null);
-            DestroyBuffer(entry.Storage, entry.StorageAlloc);
-        }
-        blasCache.Clear();
+        DestroyClusterBlases();
 
         khrAccelStruct.Dispose();
         khrAccelStruct = null;

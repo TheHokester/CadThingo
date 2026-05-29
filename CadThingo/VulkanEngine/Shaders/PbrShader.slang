@@ -95,9 +95,11 @@ struct LightingFrameUBO {
 //   MASK   → alpha-tests sampled baseColor.a against material.alphaCutoff.
 //   other  → defensive: returns true so a stray non-opaque-tagged opaque
 //            instance still casts a shadow.
-bool shadowAlphaPasses(uint instCustomIdx, uint primIdx, float2 bary)
-{ 
-    ShadowEntityInfo info = entityShadowInfo[instCustomIdx];
+bool shadowAlphaPasses(uint recordIndex, uint primIdx, float2 bary)
+{
+    // recordIndex is the flat per-geometry slot: the candidate instance's custom
+    // index (cluster geometry-block base) + the candidate geometry index.
+    ShadowEntityInfo info = entityShadowInfo[recordIndex];
     if ((info.flags & 4u) != 0u) return false;   // BLEND → no shadow
     if ((info.flags & 1u) == 0u) return true;    // not MASK → commit (defensive)
 
@@ -156,7 +158,7 @@ bool isOccluded(float3 origin, float3 dir, float tMax)
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
         {
             if (shadowAlphaPasses(
-                    q.CandidateInstanceID(),
+                    q.CandidateInstanceID() + q.CandidateGeometryIndex(),
                     q.CandidatePrimitiveIndex(),
                     q.CandidateTriangleBarycentrics()))
             {
@@ -186,7 +188,7 @@ float blockerSearch(float3 origin, float3 dir, float tMax)
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
         {
             if (shadowAlphaPasses(
-                    q.CandidateInstanceID(),
+                    q.CandidateInstanceID() + q.CandidateGeometryIndex(),
                     q.CandidatePrimitiveIndex(),
                     q.CandidateTriangleBarycentrics()))
             {

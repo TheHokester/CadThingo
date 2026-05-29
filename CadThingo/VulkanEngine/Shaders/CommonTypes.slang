@@ -97,14 +97,16 @@ public struct ProbeClusterRange {
     public uint count;
 };
 
-// Shadow / TLAS instance lookup
-// ShadowEntityInfo[i] = info for the entity whose TLAS InstanceCustomIndex == i.
-// Filled CPU-side in Renderer_Ray_Query.cs::RebuildTlas.
+// Shadow / TLAS geometry lookup
+// One record per (cluster instance, geometry) pair. A TLAS instance's
+// InstanceCustomIndex is the base offset of its cluster's geometry block, so
+// the flat record index is `InstanceCustomIndex + GeometryIndex`. Filled
+// CPU-side in Renderer_Ray_Query.cs::RebuildTlas.
 public struct ShadowEntityInfo {
-    public uint indexOffset;     // first uint of this mesh's triangle list inside globalIndices
+    public uint indexOffset;     // first uint of this primitive's triangle list inside globalIndices
     public uint materialIndex;   // index into materials[]
     public uint flags;           // bit 0 = MASK, bit 2 = BLEND
-    public uint _pad;
+    public uint entityIndex;     // scene entity index — pick/selection resolve through this
 };
 
 // Tile-cull constants — must match Renderer_Resources.cs.
