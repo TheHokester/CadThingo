@@ -522,8 +522,19 @@ public unsafe class ResourceManager
                 StageFlags = ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
             }
         };
-        
-            
+
+        // Make the shared bindless set bindable from the RT-pipeline path tracer's
+        // hit/miss/raygen stages too — but only when ray tracing pipelines are
+        // actually supported, since declaring RT stage bits on a device without
+        // the extension is invalid.
+        if (_renderer.RayTracePipelineSupported)
+        {
+            var rt = ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.MissBitKhr |
+                     ShaderStageFlags.ClosestHitBitKhr | ShaderStageFlags.AnyHitBitKhr;
+            for (int i = 0; i < bindings.Length; i++) bindings[i].StageFlags |= rt;
+        }
+
+
 
         DescriptorSetLayoutBindingFlagsCreateInfo flagsCreateInfo = new()
             { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };

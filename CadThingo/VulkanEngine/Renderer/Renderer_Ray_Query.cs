@@ -15,6 +15,12 @@ public struct ShadowEntityInfo
     public uint MaterialIndex;   // index into the materials SSBO
     public uint Flags;           // copy of PbrMaterial.Flags — bit 0 = MASK, bit 2 = BLEND
     public uint EntityIndex;     // scene entity index — pick/selection resolve through this
+    // Per-geometry world transform (column-vector 3x4 rows). The cluster BLAS is
+    // world-space with an identity instance transform, so the shader applies this
+    // to rotate fetched object-space normals into world space.
+    public Vector4 Xform0;
+    public Vector4 Xform1;
+    public Vector4 Xform2;
 }
 
 // One world-space emissive triangle, treated as an area light by the
@@ -765,12 +771,19 @@ public unsafe partial class Renderer
             {
                 ClusterPrim p = prims[idx[k]];
                 xDst[gslot] = ToTransformMatrixKHR(p.World);
+                // Column-vector 3x4 rows of the world matrix (same transpose
+                // ToTransformMatrixKHR does) so the shader can rotate object-space
+                // normals into world space — the identity instance transform can't.
+                Matrix4x4 w = p.World;
                 sDst[gslot] = new ShadowEntityInfo
                 {
                     IndexOffset   = p.IndexOffset,
                     MaterialIndex = p.MaterialIndex,
                     Flags         = p.Flags,
                     EntityIndex   = (uint)p.EntityIndex,
+                    Xform0        = new Vector4(w.M11, w.M21, w.M31, w.M41),
+                    Xform1        = new Vector4(w.M12, w.M22, w.M32, w.M42),
+                    Xform2        = new Vector4(w.M13, w.M23, w.M33, w.M43),
                 };
                 gslot++;
             }
@@ -949,6 +962,7 @@ public unsafe partial class Renderer
             PbrDeferredPipeline?.WriteTlasDescriptor(tlas);
             transparentPipeline?.WriteTlasDescriptor(tlas);
             ptComputePipeline?.WriteTlasDescriptor(tlas);
+            rtPipeline?.WriteTlasDescriptor(tlas);
             pickPipeline?.WriteTlasDescriptor(tlas);
             selectionMaskPipeline?.WriteTlasDescriptor(tlas);
         }
@@ -957,6 +971,7 @@ public unsafe partial class Renderer
         {
             PbrDeferredPipeline?.WriteShadowAlphaDescriptors();
             ptComputePipeline?.WriteShadowInfoDescriptor();
+            rtPipeline?.WriteShadowInfoDescriptor();
             pickPipeline?.WriteEntityInfoDescriptor();
             selectionMaskPipeline?.WriteEntityInfoDescriptor();
             shadowInfoBufferResized = false;
@@ -968,6 +983,7 @@ public unsafe partial class Renderer
         if (emissiveBuffersResized)
         {
             ptComputePipeline?.WriteEmissiveDescriptors();
+            rtPipeline?.WriteEmissiveDescriptors();
             emissiveBuffersResized = false;
         }
     }

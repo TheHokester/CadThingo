@@ -107,6 +107,21 @@ public struct ShadowEntityInfo {
     public uint materialIndex;   // index into materials[]
     public uint flags;           // bit 0 = MASK, bit 2 = BLEND
     public uint entityIndex;     // scene entity index — pick/selection resolve through this
+    // Per-geometry world transform (column-vector 3x4, same packing as the BLAS
+    // build transform). The cluster BLAS bakes positions to world space with an
+    // IDENTITY instance transform, so CommittedObjectToWorld3x4 can't rotate the
+    // fetched object-space normals — apply this 3x3 instead. Rows i = (m_i0,m_i1,
+    // m_i2, t_i); only .xyz (the linear part) is used for directions.
+    public float4 xform0;
+    public float4 xform1;
+    public float4 xform2;
+}
+
+// 3x3 linear part of the per-geometry world transform, for rotating fetched
+// object-space normals/tangents into world space (uniform-scale assumption,
+// matching the old ObjectToWorld path).
+public float3x3 entityNormalMatrix(ShadowEntityInfo info) {
+    return float3x3(info.xform0.xyz, info.xform1.xyz, info.xform2.xyz);
 };
 
 // Tile-cull constants — must match Renderer_Resources.cs.

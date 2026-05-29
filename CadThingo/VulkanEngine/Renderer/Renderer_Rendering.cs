@@ -335,7 +335,9 @@ public unsafe partial class Renderer
         // pathtracer. Both ImageViews are fresh post-rebuild — pick the right
         // one or PT-mode resize ends up reading from the empty HDRColor and
         // the screen goes black until the next mode flip rebinds it.
-        ImageView hdrInput = renderMode == RenderMode.RayCompute
+        // Both pathtracer modes (compute + RT pipeline) write ptOutColor.
+        bool ptMode = renderMode == RenderMode.RayCompute || renderMode == RenderMode.RayTrace;
+        ImageView hdrInput = ptMode
             ? ptOutColor.ImageView
             : scene.renderGraph.GetResource("HDRColor").ImageView;
         tonemapPipeline.WriteHdrInputDescriptor(hdrInput, gBufferSampler);
@@ -347,6 +349,7 @@ public unsafe partial class Renderer
         // MarkAccumulatorDirty internally so the next dispatch clears the
         // (also-fresh) accumulator instead of reading garbage memory.
         ptComputePipeline?.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
+        rtPipeline?.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
 
         // Selection mask view is fresh — re-bind it on both the compute (storage
         // image) and outline (sampled image) sides.
@@ -426,7 +429,7 @@ public unsafe partial class Renderer
         if (renderMode != _lastRenderMode)
         {
             vk!.DeviceWaitIdle(device);
-            ImageView source = renderMode == RenderMode.RayCompute
+            ImageView source = (renderMode == RenderMode.RayCompute || renderMode == RenderMode.RayTrace)
                 ? ptOutColor.ImageView
                 : scene.renderGraph.GetResource("HDRColor").ImageView;
             tonemapPipeline.WriteHdrInputDescriptor(source, gBufferSampler);
@@ -475,9 +478,10 @@ public unsafe partial class Renderer
                 DrawPathtraced(cmd, ctx);
                 break;
             case RenderMode.RayTrace:
-                // RT pipeline path not implemented — fall through to deferred so the
-                // viewport stays alive.
-                DrawDeferred(cmd, ctx);
+                // Opt-in RT-pipeline path tracer; falls back to deferred if the
+                // device didn't expose the feature (rtPipeline == null).
+                if (rtPipeline != null) DrawRayTraced(cmd, ctx);
+                else                    DrawDeferred(cmd, ctx);
                 break;
             default:
                 DrawDeferred(cmd, ctx);
@@ -776,11 +780,92 @@ public unsafe partial class Renderer
     }
 
     /// <summary>
-    /// placeholder for future RTPipeline implementation<br/>
+    /// RT-pipeline path tracer. Mirrors DrawPathtraced but dispatches via
+    /// CmdTraceRays into the SAME ptAccumulator + ptOutColor images, then blits
+    /// through the tonemap into FinalColor. Only reached when rtPipeline != null
+    /// (RayTracePipelineSupported).
     /// </summary>
-    private void DrawRayTraced()
+    private void DrawRayTraced(CommandBuffer cmd, FrameContext frameContext)
     {
+        var rt = rtPipeline!;
 
+        // Camera motion → restart accumulation (shared snapshot with the compute path).
+        if (camera != null)
+        {
+            var view = camera.GetViewMatrix();
+            var pos  = camera.GetPosition();
+            var fov  = camera.Fov;
+            if (view != _ptLastCameraView || pos != _ptLastCameraPos || fov != _ptLastCameraFov)
+            {
+                MarkAccumulatorDirty();
+                _ptLastCameraView = view;
+                _ptLastCameraPos  = pos;
+                _ptLastCameraFov  = fov;
+            }
+        }
+
+        uint lightCount = UpdateLights(currentFrame, scene);
+        UpdateMaterials(currentFrame, scene);
+
+        if (accumulatorDirty)
+        {
+            rt.MarkAccumulatorDirty();
+            accumulatorDirty = false;
+        }
+
+        rt.UpdatePerFrame(currentFrame, camera, lightCount, renderExtent);
+
+        //  Pre-dispatch barrier — same as the compute path but the writer stage
+        //  is the ray-tracing stage rather than compute. Both images stay in
+        //  General; tonemap reads ptOutColor in ShaderReadOnly between trace and
+        //  end-of-frame, re-stamped to General before the next trace.
+        var preBarriers = stackalloc ImageMemoryBarrier[2];
+        preBarriers[0] = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.General,
+            NewLayout = ImageLayout.General,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = ptAccumulator.Image,
+            SrcAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
+            DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
+            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
+        };
+        preBarriers[1] = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.General,
+            NewLayout = ImageLayout.General,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = ptOutColor.Image,
+            SrcAccessMask = AccessFlags.ShaderReadBit,
+            DstAccessMask = AccessFlags.ShaderWriteBit,
+            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
+        };
+        vk!.CmdPipelineBarrier(cmd,
+            PipelineStageFlags.RayTracingShaderBitKhr | PipelineStageFlags.FragmentShaderBit,
+            PipelineStageFlags.RayTracingShaderBitKhr,
+            0, 0, null, 0, null, 2, preBarriers);
+
+        rt.Record(cmd, frameContext);
+
+        // Tonemap into FinalColor (HDR input rebound to ptOutColor on the mode flip).
+        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
+            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
+
+        var finalColor = scene.renderGraph.GetResource("FinalColor");
+        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
+
+        tonemapPipeline.Record(cmd, frameContext, finalColor.ImageView);
+
+        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+            ImageLayout.ColorAttachmentOptimal, ImageLayout.ShaderReadOnlyOptimal);
+
+        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
+            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
     }
 
     /// <summary>

@@ -37,6 +37,11 @@ public unsafe partial class Renderer
     
     private KhrSurface? khrSurface;
     private SurfaceKHR surface;
+
+    // Read-only handle accessor — pipelines that load their own device-extension
+    // dispatch tables (e.g. RtPipeline → KhrRayTracingPipeline) need the instance
+    // for vk.TryGetDeviceExtension. Generic, not tied to any one extension.
+    internal Instance GetVkInstance() => instance;
     
     internal PhysicalDevice physicalDevice;
     // List (not array) so AddSupportedOptionalExtensions can actually mutate it.
@@ -89,6 +94,7 @@ public unsafe partial class Renderer
     private bool robustness2Enabled = false;
     private bool accelerationStructureEnabled = false;
     private bool rayQueryEnabled = false;
+    private bool rayTracePipelineEnabled = false;
     // Vulkan 1.1 multiview. Required for the reflection-probe capture pass that
     // renders all 6 faces of a cubemap in one draw via gl_ViewIndex.
     internal bool multiviewEnabled = false;
@@ -99,6 +105,13 @@ public unsafe partial class Renderer
     /// to a non-shadowed code path when false.
     /// </summary>
     public bool RayShadowsSupported => rayQueryEnabled && accelerationStructureEnabled;
+
+    /// <summary>
+    /// True iff KHR_ray_tracing_pipeline is enabled alongside KHR_acceleration_structure.
+    /// Gates the (additive, opt-in) RT-pipeline path tracer; the inline-ray-query compute
+    /// path tracer stays available regardless. Falls back to compute when false.
+    /// </summary>
+    public bool RayTracePipelineSupported => rayTracePipelineEnabled && accelerationStructureEnabled;
 
     
     //swapchain fields
@@ -139,6 +152,7 @@ public unsafe partial class Renderer
     internal TransparentPipeline  transparentPipeline;   // forward+ BLEND-mode pass between lighting and tonemap
     internal SkyboxPipeline       skyboxPipeline;        // background env-cube draw, between lighting and transparent
     internal PTComputePipeline    ptComputePipeline;
+    internal RTPipeline?          rtPipeline;            // opt-in RT-pipeline path tracer (null when unsupported)
     internal PickPipeline         pickPipeline;          // ray-query object picking (TLAS InstanceCustomIndex → entity)
     internal SelectionMaskPipeline selectionMaskPipeline; // ray-query coverage mask of the selected entity
     internal OutlinePipeline       outlinePipeline;       // composites the selection outline into FinalColor
@@ -327,6 +341,20 @@ public unsafe partial class Renderer
         // owned and stable across rebakes, so set 3 only needs writing once.
         ptComputePipeline.WriteIblDescriptors();
 
+        // Opt-in RT-pipeline path tracer (RenderMode.RayTrace). Shares the same
+        // accumulator/outColor images + scene buffers as the compute path; only
+        // built when the device exposes the feature. TLAS/shadow/emissive sets
+        // are bound below after InitRayQuery, mirroring the compute pipeline.
+        if (RayTracePipelineSupported)
+        {
+            rtPipeline = new RTPipeline(this);
+            rtPipeline.Initialize();
+            rtPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
+            rtPipeline.WriteGeometryDescriptors();
+            rtPipeline.WriteLightsDescriptor();
+            rtPipeline.WriteIblDescriptors();
+        }
+
         // Object picking — owns only a tiny result SSBO; the TLAS is bound below
         // after InitRayQuery. No-op at runtime when ray queries aren't supported
         // (ProcessPickRequest gates on RayShadowsSupported + a valid TLAS).
@@ -386,6 +414,7 @@ public unsafe partial class Renderer
             PbrDeferredPipeline.WriteTlasDescriptor(tlas);
             transparentPipeline.WriteTlasDescriptor(tlas);
             ptComputePipeline.WriteTlasDescriptor(tlas);
+            rtPipeline?.WriteTlasDescriptor(tlas);
             pickPipeline.WriteTlasDescriptor(tlas);
             selectionMaskPipeline.WriteTlasDescriptor(tlas);
             // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
@@ -393,6 +422,7 @@ public unsafe partial class Renderer
             // InitRayQuery because the SSBO is allocated inside RebuildTlas.
             PbrDeferredPipeline.WriteShadowAlphaDescriptors();
             ptComputePipeline.WriteShadowInfoDescriptor();
+            rtPipeline?.WriteShadowInfoDescriptor();
             // Pick + selection resolve the hit entity through the same flat
             // ShadowEntityInfo table (per-cluster instances → entity via
             // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex).
@@ -401,6 +431,7 @@ public unsafe partial class Renderer
             // Emissive area-light buffers (built inside RebuildTlas, always
             // allocated with ≥1 slot so the binding is valid even with no emitters).
             ptComputePipeline.WriteEmissiveDescriptors();
+            rtPipeline?.WriteEmissiveDescriptors();
         }
 
         initialized = true;
@@ -641,6 +672,7 @@ public unsafe partial class Renderer
         outlinePipeline      ?.Dispose();
         selectionMaskPipeline?.Dispose();
         pickPipeline       ?.Dispose();
+        rtPipeline         ?.Dispose();
         ptComputePipeline  ?.Dispose();
         skyboxPipeline     ?.Dispose();
         transparentPipeline?.Dispose();
@@ -989,6 +1021,10 @@ public unsafe partial class Renderer
         {
             SType = StructureType.PhysicalDeviceRayQueryFeaturesKhr
         };
+        var rayTracingPipelineFeaturesSupported = new PhysicalDeviceRayTracingPipelineFeaturesKHR
+        {
+            SType = StructureType.PhysicalDeviceRayTracingPipelineFeaturesKhr
+        };
 
         coreSupported.PNext             = &vulkan11Supported;
         vulkan11Supported.PNext         = &vulkan12Supported;
@@ -996,7 +1032,8 @@ public unsafe partial class Renderer
         vulkan13Supported.PNext         = &robust2Supported;
         robust2Supported.PNext          = &accelerationStructureFeaturesSupported;
         accelerationStructureFeaturesSupported.PNext = &rayQueryFeaturesSupported;
-        rayQueryFeaturesSupported.PNext = null;
+        rayQueryFeaturesSupported.PNext = &rayTracingPipelineFeaturesSupported;
+        rayTracingPipelineFeaturesSupported.PNext = null;
 
         vk!.GetPhysicalDeviceFeatures2(physicalDevice, &coreSupported);
 
@@ -1122,7 +1159,18 @@ public unsafe partial class Renderer
         {
             rayQueryEnable.RayQuery = true;
         }
-        
+
+        //prepare ray-tracing-pipeline features if extension is enabled and supported.
+        //Additive: only gates the opt-in RT-pipeline path tracer; the compute path
+        //tracer is unaffected whether or not this ends up enabled.
+        var hasRayTracingPipeline = hasExtension(KhrRayTracingPipeline.ExtensionName);
+        PhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineEnable = new(){SType = StructureType.PhysicalDeviceRayTracingPipelineFeaturesKhr};
+        if (hasRayTracingPipeline && rayTracingPipelineFeaturesSupported.RayTracingPipeline)
+        {
+            rayTracingPipelineEnable.RayTracingPipeline = true;
+            
+        }
+
         //chain all features together: 1.1 -> 1.2 -> 1.3 -> optional ext structs
         features.PNext = &vulkan11Features;
         vulkan11Features.PNext = &vulkan12Features;
@@ -1147,15 +1195,24 @@ public unsafe partial class Renderer
             tailNext = (void**)&rayQueryEnable.PNext;
         }
 
+        if (hasRayTracingPipeline && rayTracingPipelineEnable.RayTracingPipeline)
+        {
+            *tailNext = &rayTracingPipelineEnable;
+            tailNext = (void**)&rayTracingPipelineEnable.PNext;
+        }
+
         //record which features ended up enabled
         descriptorIndexEnabled = descriptorIndexingEnabled && (vulkan12Features.DescriptorBindingPartiallyBound && vulkan12Features.DescriptorBindingUpdateUnusedWhilePending);
         robustness2Enabled = hasRobust2 && (robust2Enable.RobustBufferAccess2 || robust2Enable.RobustImageAccess2 || robust2Enable.NullDescriptor);
         accelerationStructureEnabled = hasAccelerationStructure && accelerationstructureEnable.AccelerationStructure;
         rayQueryEnabled = hasRayQuery && rayQueryEnable.RayQuery;
+        rayTracePipelineEnabled = hasRayTracingPipeline && rayTracingPipelineEnable.RayTracingPipeline;
         multiviewEnabled = vulkan11Features.Multiview;
 
         Console.WriteLine($"----> RayShadowsSupported: {RayShadowsSupported} " +
                           $"(rayQuery={rayQueryEnabled}, accelStruct={accelerationStructureEnabled})");
+        Console.WriteLine($"----> RayTracePipelineSupported: {RayTracePipelineSupported} " +
+                          $"(rayTracingPipeline={rayTracePipelineEnabled})");
 
         bool printFeatures = false;
         if (printFeatures)

@@ -214,12 +214,12 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     float3 tObj = t0.xyz * baryW.x + t1.xyz * baryW.y + t2.xyz * baryW.z;
     float bitangentSign = t0.w;
 
-    // Object → world via the TLAS instance transform.  Upper-3x3 is enough
-    // for directions; assumes uniform / near-uniform scale.  For genuinely
-    // non-uniform scales you'd want the inverse-transpose of the 3x3 for the
-    // normal — add when you actually see skew.
-    float3x4 obj2world  = q.CommittedObjectToWorld3x4();
-    float3x3 obj2worldR = (float3x3)obj2world;
+    // Object → world. The cluster BLAS bakes positions to world space with an
+    // IDENTITY instance transform, so CommittedObjectToWorld3x4 would NOT rotate
+    // these object-space normals — use the per-geometry world transform carried
+    // in the ShadowEntityInfo record instead. Upper-3x3 only; assumes uniform /
+    // near-uniform scale (inverse-transpose would be needed for genuine skew).
+    float3x3 obj2worldR = entityNormalMatrix(info);
 
     h.normal          = normalize(mul(obj2worldR, nObj));
     h.geometricNormal = normalize(mul(obj2worldR, ngObj));
