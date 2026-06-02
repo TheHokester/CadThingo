@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
@@ -11,126 +11,6 @@ namespace CadThingo.VulkanEngine.Renderer;
 
 public unsafe partial class Renderer
 {
-    private void CreateSwapChain()
-    {
-        //query swapchain support
-        SwapChainSupportDetails swapChainSupport = QuerySwapChainSupport(physicalDevice);
-        
-        //choose swapsurface format
-        SurfaceFormatKHR surfaceFormat = ChooseSwapSurfaceFormat(swapChainSupport.Formats);
-        PresentModeKHR presentMode = ChooseSwapPresentMode(swapChainSupport.PresentModes);
-        Extent2D extent = ChooseSwapExtent(swapChainSupport.Capabilities);
-        
-        
-        
-        //choose image count
-        uint imageCount = swapChainSupport.Capabilities.MinImageCount + 1;
-        if (swapChainSupport.Capabilities.MaxImageCount > 0 && imageCount > swapChainSupport.Capabilities.MaxImageCount)
-        {
-            imageCount = swapChainSupport.Capabilities.MaxImageCount;
-        }
-        
-        //create swapchain info
-        SwapchainCreateInfoKHR createInfo = new()
-        {
-            SType = StructureType.SwapchainCreateInfoKhr,
-            Surface = surface,
-            MinImageCount = imageCount,
-            ImageFormat = surfaceFormat.Format,
-            ImageColorSpace = surfaceFormat.ColorSpace,
-            ImageExtent = extent,
-            ImageArrayLayers = 1,
-            ImageUsage = ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferDstBit,
-            PreTransform = swapChainSupport.Capabilities.CurrentTransform,
-            CompositeAlpha = CompositeAlphaFlagsKHR.OpaqueBitKhr,
-            PresentMode = presentMode,
-            Clipped = true,
-            OldSwapchain = default
-        };
-        //set sharing mode
-        uint?[] queueFamilyIndiciesLoc =
-        {
-            queueFamilyIndices.graphicsFamily,
-            queueFamilyIndices.presentFamily
-        };
-        
-        if (queueFamilyIndices.graphicsFamily != queueFamilyIndices.presentFamily)
-        {
-            createInfo.ImageSharingMode = SharingMode.Concurrent;
-            createInfo.QueueFamilyIndexCount = (uint)queueFamilyIndiciesLoc.Length;
-            fixed (uint?* pQueueFamilyIndicesLoc = &queueFamilyIndiciesLoc[0])
-                createInfo.PQueueFamilyIndices = (uint*)pQueueFamilyIndicesLoc;
-        }
-        else
-        {
-            createInfo.ImageSharingMode = SharingMode.Exclusive;
-            createInfo.QueueFamilyIndexCount = 0;
-            createInfo.PQueueFamilyIndices = null;
-        }
-        
-        //create swapchain
-        if (!vk!.TryGetDeviceExtension(instance, device, out swapChainKhr))
-        {
-            throw new Exception("Failed to load swapchain extension");
-        }
-
-        if (swapChainKhr.CreateSwapchain(device, &createInfo, null, out swapChain) != Result.Success)
-        {
-            throw new Exception("Failed to create swapchain");
-        }
-        
-        //Get swapchain images
-        swapChainKhr.GetSwapchainImages(device, swapChain, &imageCount, null);
-        swapChainImages = new Image[imageCount];
-        fixed (Image* imagesPtr = swapChainImages)
-        {
-            swapChainKhr.GetSwapchainImages(device, swapChain, &imageCount, imagesPtr);
-        }
-        
-        //swapchain images start with no layout
-        var imageLayouts = new ImageLayout[imageCount];
-        for (var i = 0; i < imageCount; i++) imageLayouts[i] = ImageLayout.Undefined;
-        swapChainImageLayouts = imageLayouts;
-        
-        //format and extent
-        swapChainImageFormat = surfaceFormat.Format;
-        swapChainExtent = extent;
-    }
-
-    private void CreateImageViews()
-    {
-        swapChainImageViews = new ImageView[swapChainImages.Length];
-
-        ImageViewCreateInfo viewInfo = new()
-        {
-            SType = StructureType.ImageViewCreateInfo,
-            ViewType = ImageViewType.Type2D,
-            Format = swapChainImageFormat,
-            Components = new ComponentMapping()
-            {
-                R = ComponentSwizzle.Identity,
-                G = ComponentSwizzle.Identity,
-                B = ComponentSwizzle.Identity,
-                A = ComponentSwizzle.Identity
-            },
-            SubresourceRange = new ImageSubresourceRange()
-            {
-                AspectMask = ImageAspectFlags.ColorBit,
-                BaseMipLevel = 0,
-                LevelCount = 1,
-                BaseArrayLayer = 0,
-                LayerCount = 1
-            }
-        };
-        //create imageview for each image
-        for (var i = 0; i < swapChainImages.Length; i ++)
-        {
-            viewInfo.Image = swapChainImages[i];
-            vk!.CreateImageView(device, &viewInfo, null, out swapChainImageViews[i]);
-        }
-        
-    }
-
     private void SetupDynamicRendering()
     {
         //create color attachment
@@ -176,74 +56,6 @@ public unsafe partial class Renderer
         }
     }
     
-    private void CreateCommandBuffers()
-    {
-        commandBuffers = new CommandBuffer[swapChainImages!.Length];
-        CommandBufferAllocateInfo allocateInfo = new()
-        {
-            SType = StructureType.CommandBufferAllocateInfo,
-            CommandPool = commandPool,
-            Level = CommandBufferLevel.Primary,
-            CommandBufferCount = 1
-        };
-        
-
-        for (int i = 0; i < commandBuffers.Length; i++)
-        {
-            if (vk!.AllocateCommandBuffers(device, &allocateInfo, out commandBuffers[i]) != Result.Success)
-            {
-                throw new Exception("Failed to allocate command buffers");
-            } 
-        }
-    }
-
-    private void CreateSyncObjects()
-    {
-        imageAvailableSemaphores = new Semaphore[MAX_CONCURRENT_FRAMES];
-        renderFinishedSemaphores = new Semaphore[MAX_CONCURRENT_FRAMES];
-        inFlightFences = new Fence[MAX_CONCURRENT_FRAMES];
-        
-        SemaphoreCreateInfo semaphoreCreateInfo = new()
-        {
-            SType = StructureType.SemaphoreCreateInfo,
-        };
-        FenceCreateInfo fenceCreateInfo = new()
-        {
-            SType = StructureType.FenceCreateInfo,
-            Flags = FenceCreateFlags.SignaledBit
-        };
-
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            if (vk!.CreateSemaphore(device, &semaphoreCreateInfo, null, out imageAvailableSemaphores[i]) != Result.Success ||
-                vk!.CreateSemaphore(device, &semaphoreCreateInfo, null, out renderFinishedSemaphores[i]) != Result.Success ||
-                vk!.CreateFence(device, &fenceCreateInfo, null, out inFlightFences[i]) != Result.Success)
-            {
-                throw new Exception("Failed to create synchronization objects for a frame");
-            }
-        }
-    }
-
-
-    // Tears down only the swap chain itself + its image views. Size-dependent
-    // attachments (depth, g-buffers, FinalColor) are owned elsewhere and torn
-    // down by RecreateSwapChain / Cleanup.
-    private void CleanupSwapChain()
-    {
-        if (swapChainImageViews != null)
-        {
-            foreach (var iv in swapChainImageViews)
-                if (iv.Handle != 0) vk!.DestroyImageView(device, iv, null);
-            swapChainImageViews = Array.Empty<ImageView>();
-        }
-
-        if (swapChain.Handle != 0)
-        {
-            swapChainKhr.DestroySwapchain(device, swapChain, null);
-            swapChain = default;
-        }
-    }
-
     // Rebuilds everything tied to the surface extent: swap chain, attachment
     // images, render graph (which captures width/height in its pass closures),
     // and the lighting pass's g-buffer descriptor writes.
@@ -262,9 +74,7 @@ public unsafe partial class Renderer
         }
         vk!.DeviceWaitIdle(device);
 
-        CleanupSwapChain();
-        CreateSwapChain();
-        CreateImageViews();
+        swapchain.Recreate();
 
         // Window resized — bring renderExtent back to swapchain size by default.
         // ViewportPanel will then drive it back down to panel size next frame if
@@ -282,31 +92,13 @@ public unsafe partial class Renderer
     /// </summary>
     private void RebuildRenderTargets(uint width, uint height)
     {
-        // Order matters: render graph holds references to depth + g-buffer
-        // ImageResources, so dispose it first. The ImageResource Dispose guard
-        // makes the explicit calls below idempotent.
+        // Order matters: the render graph holds references to depth + g-buffer
+        // ImageResources, so dispose it before reallocating the targets. RenderTargets
+        // reallocates the size-dependent attachments (keeping the g-buffer sampler).
         scene.renderGraph.Dispose();
-        depthImageResource.Dispose();
-        gBufferPosition.Dispose();
-        gBufferNormal.Dispose();
-        gBufferAlbedo.Dispose();
-        gBufferMaterial.Dispose();
-        gBufferEmissive.Dispose();
+        renderTargets.ReallocateSizeDependent(new Extent2D(width, height));
 
-        // Pathtracer storage images live outside the graph but share the
-        // renderExtent — recreate them too so per-pixel work stays in sync.
-        ptAccumulator?.Dispose();
-        ptOutColor?.Dispose();
-        selectionMask?.Dispose();
-
-        renderExtent = new Extent2D(width, height);
-
-        CreateDepthResources();
-        CreateGBufferResources();
-        CreatePathTracingResources(renderExtent.Width, renderExtent.Height);
-        CreateSelectionResources(renderExtent.Width, renderExtent.Height);
-
-        scene.renderGraph = new RenderGraph.RenderGraph(vk!, device, physicalDevice);
+        scene.renderGraph = new RenderGraph(vk!, device, physicalDevice);
         SetupDeferredRenderer(scene.renderGraph, renderExtent.Width, renderExtent.Height);
 
         // G-buffer ImageViews are fresh — re-bind them on the lighting pass set.
@@ -429,9 +221,7 @@ public unsafe partial class Renderer
         vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
 
         // 2. Acquire swapchain image
-        uint imageIndex = 0;
-        var acquireResult = swapChainKhr.AcquireNextImage(device, swapChain, ulong.MaxValue,
-            imageAvailableSemaphores[currentFrame], default, &imageIndex);
+        var acquireResult = swapchain.AcquireNextImage(imageAvailableSemaphores[currentFrame], out uint imageIndex);
         if (acquireResult == Result.ErrorOutOfDateKhr) { RecreateSwapChain(); return; }
 
         // 3. Reset fence — we're about to submit work that will signal it
@@ -579,23 +369,10 @@ public unsafe partial class Renderer
             throw new Exception("Queue submit failed");
 
         // 10. Present — wait on renderFinished
-        fixed (SwapchainKHR* pSwap = &swapChain)
-        {
-            var presentSig = renderFinishedSemaphores[currentFrame];
-            var presentInfo = new PresentInfoKHR
-            {
-                SType = StructureType.PresentInfoKhr,
-                WaitSemaphoreCount = 1,
-                PWaitSemaphores    = &presentSig,
-                SwapchainCount     = 1,
-                PSwapchains        = pSwap,
-                PImageIndices      = &imageIndex,
-            };
-            swapChainKhr.QueuePresent(presentQueue, &presentInfo);
-        }
+        swapchain.Present(presentQueue, renderFinishedSemaphores[currentFrame], imageIndex);
 
-        currentFrame = (currentFrame + 1) % MAX_CONCURRENT_FRAMES;
-        frameCounter++;
+        // Advance to the next frame-in-flight slot + bump the monotonic counter.
+        frameRing.Advance();
     }
     /// <summary>
     /// Refactor of existing rendering code in DrawFrame(), the logic unique to DrawFrame()
@@ -951,7 +728,7 @@ public unsafe partial class Renderer
     /// <param name="graph"></param>
     /// <param name="width"></param>
     /// <param name="height"></param>
-    private void SetupDeferredRenderer(RenderGraph.RenderGraph graph, uint width, uint height)
+    private void SetupDeferredRenderer(RenderGraph graph, uint width, uint height)
     {
         //configure posiiton buffer for world-space vertex positions
         //High precision format preserves positional accuracy for lighting calculations
@@ -1066,62 +843,6 @@ public unsafe partial class Renderer
     }
 
 
-    private void CreatePathTracingResources(uint width, uint height)
-    {
-        // ptOutColor needs TransferSrcBit so DrawPathtraced can blit it into
-        // FinalColor (the viewport's source) at the end of the dispatch.
-        ptAccumulator = new ImageResource(vk, device, "accumulator", Format.R32G32B32A32Sfloat,
-            new Extent2D(width, height),
-            ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
-            ImageLayout.Undefined, ImageLayout.General);
-
-        ptOutColor = new ImageResource(vk, device, "outColor", Format.R32G32B32A32Sfloat,
-            new Extent2D(width, height),
-            ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit | ImageUsageFlags.TransferSrcBit,
-            ImageLayout.Undefined, ImageLayout.General);
-
-        // Render graph normally calls Allocate inside Compile — these images live
-        // outside the graph, so allocate explicitly.
-        ptAccumulator.Allocate(physicalDevice);
-        ptOutColor.Allocate(physicalDevice);
-
-        // One-shot Undefined → General transition so the very first dispatch can
-        // do imageStore without a per-frame "first use" branch. Subsequent
-        // dispatches keep both images in General between frames.
-        var cmd = BeginSingleTimeCommands();
-        TransitionImageLayout(cmd, ptAccumulator.Image, ptAccumulator._format,
-            ImageLayout.Undefined, ImageLayout.General);
-        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
-            ImageLayout.Undefined, ImageLayout.General);
-        EndSingleTimeCommands(cmd);
-    }
-
-    /// <summary>
-    /// Allocates the R32F selection-coverage mask used by the outline overlay.
-    /// Storage (compute write) + sampled (outline fragment read). Left in
-    /// ShaderReadOnly between frames — RecordSelectionOutline flips it to General
-    /// and back each active frame, and that flip doubles as the cross-frame
-    /// write-after-read guard on the single shared image.
-    /// </summary>
-    private void CreateSelectionResources(uint width, uint height)
-    {
-        selectionMask = new ImageResource(vk, device, "selectionMask", Format.R32Sfloat,
-            new Extent2D(width, height),
-            ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
-            ImageLayout.Undefined, ImageLayout.General);
-        selectionMask.Allocate(physicalDevice);
-
-        // Settle in ShaderReadOnly so the per-frame block's opening
-        // ShaderReadOnly→General transition has a valid source layout.
-        var cmd = BeginSingleTimeCommands();
-        TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
-            ImageLayout.Undefined, ImageLayout.General);
-        TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
-            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
-        EndSingleTimeCommands(cmd);
-    }
-
-    
 
 
     

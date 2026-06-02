@@ -1,6 +1,5 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
-using CadThingo.VulkanEngine.GLTF;
 using ImGuiNET;
 using Silk.NET.Vulkan;
 
@@ -47,46 +46,6 @@ namespace CadThingo.VulkanEngine.Renderer;
  */
 public unsafe partial class Renderer
 {
-    private void CreateDepthResources()
-    {
-        // Depth buffer matches the render target extent — sampled / depth-tested
-        // by the deferred passes which all run at renderExtent.
-        var width = renderExtent.Width;
-        var height = renderExtent.Height;
-
-        depthImageResource = new ImageResource(vk, device, "Depth", Format.D32Sfloat, new Extent2D(width, height),
-            ImageUsageFlags.DepthStencilAttachmentBit | ImageUsageFlags.InputAttachmentBit,
-            ImageLayout.Undefined, ImageLayout.DepthStencilAttachmentOptimal);
-    }
-
-    private void CreateGBufferResources()
-    {
-        // G-buffers + lighting all run at the render extent (== panel size in
-        // editor mode), not necessarily the swapchain size.
-        var width = renderExtent.Width;
-        var height = renderExtent.Height;
-        // SampledBit required: the lighting pass samples these via CombinedImageSampler descriptors.
-        const ImageUsageFlags gBufferUsage =
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit | ImageUsageFlags.SampledBit;
-        gBufferPosition = new ImageResource(vk, device, "GBuffer_Position", Format.R32G32B32A32Sfloat,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        gBufferNormal = new ImageResource(vk, device, "GBuffer_Normal", Format.R32G32B32A32Sfloat,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        gBufferAlbedo = new ImageResource(vk, device, "GBuffer_Albedo", Format.R8G8B8A8Unorm,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        gBufferMaterial = new ImageResource(vk, device, "GBuffer_Material", Format.R8G8B8A8Unorm,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        // Emissive G-buffer: HDR range. Geometry pass writes emissiveSampler.rgb;
-        // lighting pass adds it to the final color before tone-mapping.
-        gBufferEmissive = new ImageResource(vk, device, "GBuffer_Emissive", Format.R16G16B16A16Sfloat,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-    }
-
     // Device-service helpers moved to GraphicsDevice (L1). Forwarders keep the
     // former Renderer.* / Engine.renderer.* call sites (pipelines, ImageResource,
     // Texture, ResourceManager) compiling unchanged.
@@ -105,33 +64,6 @@ public unsafe partial class Renderer
 
     public void DestroyBuffer(Buffer buffer, SubAlloc alloc) => gfx.DestroyBuffer(buffer, alloc);
 
-    private void CreateGBufferSampler()
-    {
-        SamplerCreateInfo samplerInfo = new()
-        {
-            SType = StructureType.SamplerCreateInfo,
-            MagFilter = Filter.Nearest,
-            MinFilter = Filter.Nearest,
-            AddressModeU = SamplerAddressMode.ClampToEdge,
-            AddressModeV = SamplerAddressMode.ClampToEdge,
-            AddressModeW = SamplerAddressMode.ClampToEdge,
-            AnisotropyEnable = true,
-            MaxAnisotropy = 16,
-            BorderColor = BorderColor.FloatOpaqueBlack,
-            UnnormalizedCoordinates = false,
-            CompareEnable = false,
-            CompareOp = CompareOp.Always,
-            MipmapMode = SamplerMipmapMode.Nearest,
-            MinLod = 0.0f,
-            MaxLod = 1.0f,
-            MipLodBias = 0.0f,
-        };
-        if(vk!.CreateSampler(device, &samplerInfo, null, out gBufferSampler) != Result.Success)
-        {
-            throw new Exception("Failed to create gBuffer sampler");
-        }
-            
-    }
     internal void CreateMappedUniformBuffer(int sizeBytes, ref UboBuffer ubo)
         => gfx.CreateMappedUniformBuffer(sizeBytes, ref ubo);
 
@@ -215,137 +147,26 @@ public unsafe partial class Renderer
         BufferUsageFlags extraUsage = 0)
         => gfx.CreateMappedStorageBuffer(sizeBytes, ref ubo, extraUsage);
 
-    // Lights SSBO
-    // Lives on Renderer (not PbrDeferredPipeline) so the pathtracer can read
-    // it without depending on the deferred lighting pipeline existing. The
-    // scene owns the LightComponents; this is just the per-frame GPU mirror.
-
-    internal UboBuffer[] lightStorageBuffers = new UboBuffer[MAX_CONCURRENT_FRAMES];
-    private readonly List<LightComponent> _lightScratch = new();
+    // Lights SSBO — owned by GpuScene (L2). These forwarders keep the former
+    // Renderer.GetLightStorageBuffer / Renderer.LightCount call sites (LightCull,
+    // PBR-deferred, Transparent, PT, RT pipelines) compiling unchanged.
 
     /// <summary>Buffer holding packed PbrLightGpu records for the given frame
     /// slot. Bound by every pipeline that needs scene lighting. Stable for the
     /// renderer's lifetime.</summary>
-    public Buffer GetLightStorageBuffer(uint frame) => lightStorageBuffers[frame].buffer;
+    public Buffer GetLightStorageBuffer(uint frame) => gpuScene.GetLightStorageBuffer(frame);
 
     /// <summary>Number of valid lights packed by the most recent UpdateLights.</summary>
-    public uint LightCount { get; private set; }
+    public uint LightCount => gpuScene.LightCount;
 
-    private void CreateLightBuffers()
-    {
-        for (int i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            CreateMappedStorageBuffer(
-                (ulong)(MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
-                ref lightStorageBuffers[i]);
-        }
-    }
+    // Scene → GPU packing moved to GpuScene.Extract (L2). These forwarders keep the
+    // per-frame DrawX call sites + PbrDeferredPipeline.Record compiling unchanged.
 
-    private void DestroyLightBuffers()
-    {
-        for (int i = 0; i < lightStorageBuffers.Length; i++)
-        {
-            if (lightStorageBuffers[i].buffer.Handle != 0)
-                DestroyBuffer(lightStorageBuffers[i].buffer, lightStorageBuffers[i].alloc);
-        }
-    }
+    /// <summary>Forwards to <see cref="GpuScene.UpdateMaterials"/>. See there.</summary>
+    public uint UpdateMaterials(uint frameIndex, Scene scene) => gpuScene.UpdateMaterials(frameIndex, scene);
 
-    /// <summary>
-    /// Copy every scene material into the per-frame material SSBO, plus a
-    /// fallback entry at slot [MaterialCount] for legacy / procedural geometry
-    /// without an assigned material index. Every rendering path (deferred,
-    /// forward+, pathtracer) calls this once per frame so live edits in the
-    /// inspector show up on the next frame regardless of which renderer is
-    /// active. Returns the material count actually written (excluding the
-    /// fallback).
-    /// </summary>
-    public uint UpdateMaterials(uint frameIndex, Scene scene)
-    {
-        int matCount = scene.MaterialCount;
-        if (matCount + 1 > (int)MAX_MATERIALS)
-            throw new InvalidOperationException(
-                $"Scene material count ({matCount}) exceeds MAX_MATERIALS ({MAX_MATERIALS}).");
-
-        PbrMaterial* matPtr = (PbrMaterial*)Engine.ResourceManager.GetMaterialMapped(frameIndex);
-        for (int mi = 0; mi < matCount; mi++) matPtr[mi] = scene.Materials[mi];
-
-        matPtr[matCount] = new PbrMaterial
-        {
-            BaseColorFactor          = new Vector4(1, 1, 1, 1),
-            EmissiveFactor           = Vector3.Zero,
-            AlphaCutoff              = 0f,
-            MetallicFactor           = 0.3f,
-            RoughnessFactor          = 0.7f,
-            Flags                    = 0,
-            BaseColorTex             = GltfDefaults.BaseColorIndex,
-            PhysicalDescriptorTex    = GltfDefaults.MetallicRoughnessIndex,
-            NormalTex                = GltfDefaults.NormalIndex,
-            OcclusionTex             = GltfDefaults.OcclusionIndex,
-            EmissiveTex              = GltfDefaults.EmissiveIndex,
-            TransmissionFactor       = 0f,
-            Ior                      = 1.5f,
-            ClearcoatFactor          = 0f,
-            ClearcoatRoughnessFactor = 0f,
-            TransmissionTex          = GltfDefaults.OcclusionIndex,
-            ClearcoatTex             = GltfDefaults.OcclusionIndex,
-            ClearcoatRoughnessTex    = GltfDefaults.OcclusionIndex,
-            ClearcoatNormalTex       = GltfDefaults.NormalIndex,
-            AttenuationColor         = Vector3.One,
-            AttenuationDistance      = PbrMaterialVolume.NoAbsorptionDistance,
-        };
-
-        return (uint)matCount;
-    }
-
-    /// <summary>Walks scene lights into the per-frame light SSBO. Returns the
-    /// packed light count, also cached in <see cref="LightCount"/>. Every
-    /// rendering path (deferred, forward+, pathtracer) calls this once per frame
-    /// before recording its draws.</summary>
-    public uint UpdateLights(uint frameIndex, Scene scene)
-    {
-        scene.EnumerateLights(_lightScratch);
-
-        PbrLightGpu* lightPtr = (PbrLightGpu*)lightStorageBuffers[frameIndex].mapped;
-        uint count = 0;
-        foreach (var light in _lightScratch)
-        {
-            if (count >= MAX_LIGHTS) break;
-
-            // World-space position from the owner transform if present.
-            Vector3 worldPos = Vector3.Zero;
-            if (light.Owner != null)
-            {
-                var t = light.Owner->GetComponent<TransformComponent>();
-                if (t != null)
-                {
-                    var w = *t.GetWorldMatrix();
-                    worldPos = new Vector3(w.M41, w.M42, w.M43);
-                }
-            }
-
-            // Normalize direction — guard against zero-vector default.
-            Vector3 dir = light.Direction.LengthSquared() > 1e-8f
-                ? Vector3.Normalize(light.Direction)
-                : new Vector3(0, -1, 0);
-
-            // Range: -1 sentinel marks directional lights so the shader can branch
-            // on attenuation without inspecting Type for the most common test.
-            float range = light.Type == LightType.Directional ? -1f : light.Range;
-
-            lightPtr[count] = new PbrLightGpu
-            {
-                positionRange  = new Vector4(worldPos, range),
-                colorIntensity = new Vector4(light.Color, light.Intensity),
-                directionType  = new Vector4(dir, (float)(uint)light.Type),
-                spotCones      = new Vector4(light.InnerConeCos, light.OuterConeCos,
-                    light.CastShadows ? 1f : 0f, light.Radius),
-            };
-            count++;
-        }
-
-        LightCount = count;
-        return count;
-    }
+    /// <summary>Forwards to <see cref="GpuScene.UpdateLights"/>. See there.</summary>
+    public uint UpdateLights(uint frameIndex, Scene scene) => gpuScene.UpdateLights(frameIndex, scene);
 
    
 
@@ -387,59 +208,10 @@ public unsafe partial class Renderer
         }
         vk!.UpdateDescriptorSets(device, (uint)sets.Length, writes, 0, null);
     }
-
-    private Extent2D ChooseSwapExtent(SurfaceCapabilitiesKHR capabilities)
-    {
-        if (capabilities.CurrentExtent.Width != uint.MaxValue)
-            return capabilities.CurrentExtent;
-        else
-        {
-            var framebufferSize = Engine.window!.FramebufferSize;
-            Extent2D actualExtent = new()
-            {
-                Width = (uint)framebufferSize.X,
-                Height = (uint)framebufferSize.Y
-            };
-            actualExtent.Width = Math.Clamp(actualExtent.Width, capabilities.MinImageExtent.Width, capabilities.MaxImageExtent.Width);
-            actualExtent.Height = Math.Clamp(actualExtent.Height, capabilities.MinImageExtent.Height, capabilities.MaxImageExtent.Height);
-            
-            return actualExtent;
-        }
-    }
-
-    private PresentModeKHR ChooseSwapPresentMode(PresentModeKHR[] presentModes)
-    {
-        foreach (var availablePresentMode in presentModes)
-        {
-            if(availablePresentMode == PresentModeKHR.MailboxKhr)
-                return availablePresentMode;
-        }
-        
-        return PresentModeKHR.FifoKhr;
-    }
-
-    private SurfaceFormatKHR ChooseSwapSurfaceFormat(SurfaceFormatKHR[] formats)
-    {
-        foreach (var availableFormat in formats)
-        {
-            if(availableFormat.Format == Format.B8G8R8A8Srgb && availableFormat.ColorSpace == ColorSpaceKHR.PaceSrgbNonlinearKhr)
-                return availableFormat;
-        }
-        
-        return formats[0];
-    }
 }
 
 // Mirrors PbrUtils.slang::PbrLight under std430 (16B alignment, no padding needed —
 // the struct is exactly 4 × float4 = 64B).
-[StructLayout(LayoutKind.Sequential)]
-public struct PbrLightGpu
-{
-    public Vector4 positionRange;   // xyz = world pos, w = range (point/spot; ignored for directional)
-    public Vector4 colorIntensity;  // rgb = linear color, a = intensity
-    public Vector4 directionType;   // xyz = direction (dir/spot, world-space), w = LightType as float
-    public Vector4 spotCones;       // x = innerCos, y = outerCos, z = castShadows (0/1), w = lightRadius
-}
 
 // Per-instance row in the geometry pipeline's instance SSBO. Shader sees this as
 // PbrUtils.slang::InstanceData (std430 layout, stride 80B). Padding keeps the C#
@@ -455,16 +227,6 @@ public struct InstanceDataGPU
 // Cull-pass input record. CPU writes one per scene entity into RenderableInputBuffers
 // each frame; the compute shader reads it and emits an indirect draw + InstanceData
 // when the bounding sphere passes the frustum test. Std430 alignment, total 96B.
-[StructLayout(LayoutKind.Sequential)]
-public struct RenderableInputGpu
-{
-    public Matrix4x4 model;        // 64B
-    public Vector4 sphereLocal;    // 16B  (xyz center, w radius — local space)
-    public uint indexCount;        //  4B  ┐
-    public uint firstIndex;        //  4B  │  pulled straight from Mesh
-    public uint materialIndex;     //  4B  │
-    public uint _pad;              //  4B  ┘  std430 16B alignment
-}
 
 // CPU-side transparent draw record. Forward+ transparent pass walks a sorted
 // list of these (back-to-front by view-space Z) and issues one push-constant +
@@ -510,39 +272,6 @@ unsafe struct UboBuffer
 // data — transmission, IOR, clearcoat. All scalar / 4B-aligned so std430
 // packs them with zero padding. Fields the shaders don't yet consume sit
 // here as data only; uploaded every frame regardless. Total: 96B.
-[StructLayout(LayoutKind.Sequential)]
-public struct PbrMaterial
-{
-    public Vector4 BaseColorFactor;
-    public Vector3 EmissiveFactor;
-    public float AlphaCutoff;
-    public float MetallicFactor;
-    public float RoughnessFactor;
-    public uint Flags;//bit 0 alphaMask, bit 1 doubleSided, bit 2 alphaBlend, ...
-    public int BaseColorTex;
-    public int PhysicalDescriptorTex;
-    public int NormalTex;
-    public int OcclusionTex;
-    public int EmissiveTex;
-
-    // KHR_materials_transmission + KHR_materials_ior
-    public float TransmissionFactor;     // 0 = opaque, 1 = full transmission
-    public float Ior;                    // index of refraction; glTF default 1.5
-
-    // KHR_materials_clearcoat
-    public float ClearcoatFactor;        // 0 = no coat, 1 = full coat
-    public float ClearcoatRoughnessFactor;
-
-    public int TransmissionTex;          // R channel multiplies TransmissionFactor
-    public int ClearcoatTex;             // R channel multiplies ClearcoatFactor
-    public int ClearcoatRoughnessTex;    // G channel multiplies ClearcoatRoughnessFactor
-    public int ClearcoatNormalTex;       // tangent-space normal for the coat layer
-
-    // KHR_materials_volume (Beer-Lambert absorption). White color or the
-    // no-absorption sentinel distance means glass behaves as before.
-    public Vector3 AttenuationColor;     // glTF default white (1,1,1) = no tint
-    public float   AttenuationDistance;  // distance to reach AttenuationColor
-}
 
 public static class PbrMaterialVolume
 {

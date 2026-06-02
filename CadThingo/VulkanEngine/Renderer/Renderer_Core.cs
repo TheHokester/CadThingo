@@ -100,24 +100,35 @@ public unsafe partial class Renderer
     public bool SerSupported => gfx.SerSupported;
 
 
-    //swapchain fields
+    //frames-in-flight count. Referenced pervasively as Renderer.MAX_CONCURRENT_FRAMES;
+    //FrameRing takes it as a ctor arg (L1.4) rather than depending back on Renderer.
     internal const uint MAX_CONCURRENT_FRAMES = 2;
-    
-    private KhrSwapchain swapChainKhr;
-    private SwapchainKHR swapChain;
-    private Image[] swapChainImages;
-    internal Format swapChainImageFormat;
-    internal Extent2D swapChainExtent;
+
+    // Presentation resources (L1.3). Renderer keeps the former field names as
+    // delegating accessors so the frame body / ImGui / command-buffer sizing read
+    // them unchanged.
+    internal Swapchain swapchain = null!;
+    internal Format    swapChainImageFormat => swapchain.ImageFormat;
+    internal Extent2D  swapChainExtent      => swapchain.Extent;
+    internal Image[]   swapChainImages      => swapchain.Images;
+    internal ImageView[] swapChainImageViews => swapchain.ImageViews;
+
+    // Render targets (L1.5): depth + g-buffers + sampler + PT/selection images, sized
+    // to the render extent. Renderer keeps the former field names as delegating
+    // accessors so pipelines / the frame body read them unchanged.
+    internal RenderTargets renderTargets = null!;
+
+    // GpuScene : the scene→GPU mirror + the single Extract path. Owns
+    // the light SSBO and hosts the light/material extractors today; renderable /
+    // AS buffers + the scene descriptor set fold in over the later L2 steps.
+    internal GpuScene gpuScene = null!;
 
     // Render target extent — the size at which the deferred chain (gbuffers,
     // HDRColor, FinalColor) and the lighting tile grid are sized. Distinct from
     // swapChainExtent because the editor's viewport panel can be smaller than
-    // the OS window. Initialized to swapChainExtent and tracks it until the
-    // viewport panel posts a different requested size via EditorState.
-    internal Extent2D renderExtent;
+    // the OS window. Owned by RenderTargets; viewport panel drives resize.
+    internal Extent2D renderExtent => renderTargets.RenderExtent;
     public Extent2D RenderExtent => renderExtent;
-    internal ImageView[] swapChainImageViews;
-    private ImageLayout[] swapChainImageLayouts;
 
     // UI overlay drawn after the FinalColor blit, before the present transition.
     // Lifetime/instantiation owned externally; null when UI is disabled.
@@ -158,50 +169,40 @@ public unsafe partial class Renderer
     // pipeline rebuild.
     public TonemapOperator tonemapOperator = TonemapOperator.Filmic;
     
-    //Command buffers (the pool lives on GraphicsDevice)
-    CommandBuffer[] commandBuffers;
-    
+    // Per-frame command buffers + sync ring (L1.4). FrameRing owns the state and the
+    // acquire/submit/present cadence; Renderer keeps the former field names as
+    // delegating accessors so the frame body reads them unchanged. currentFrame /
+    // frameCounter advance via frameRing.Advance() at end-of-frame.
+    internal FrameRing frameRing = null!;
+    internal CommandBuffer[] commandBuffers           => frameRing.CommandBuffers;
+    internal Semaphore[]     imageAvailableSemaphores => frameRing.ImageAvailableSemaphores;
+    internal Semaphore[]     renderFinishedSemaphores => frameRing.RenderFinishedSemaphores;
+    internal Fence[]         inFlightFences           => frameRing.InFlightFences;
+    internal uint            currentFrame             => frameRing.CurrentFrame;
+    internal ulong           frameCounter             => frameRing.FrameCounter;
+
     //Camera
     Camera camera;
     public Camera Camera => camera;
 
-    //Sync objects
-    Semaphore[] imageAvailableSemaphores;
-    Semaphore[] renderFinishedSemaphores;
-    Fence[] inFlightFences;
-    uint currentFrame;
-    // Monotonic frame counter — incremented once per DrawFrame. Distinct from
-    // currentFrame which cycles 0..MAX_CONCURRENT_FRAMES-1. Used by the probe
-    // scheduler for EveryNFrames bookkeeping and capture timing.
-    internal ulong frameCounter;
-    
-    //upload timeline semaphore
-    Semaphore uploadsTimeline;
-    //tracks last timeline value that was submitted
-    volatile uint lastTimelineValue;
-    
-    //Depth buffer + Images — shared across passes via the render graph and the
-    //PBR pipeline's g-buffer sampler set. Internal so PbrDeferredPipeline.WriteGBufferDescriptors
-    //can rebind ImageViews after swapchain recreate.
-    ImageResource depthImageResource;
-    internal ImageResource gBufferPosition;
-    internal ImageResource gBufferNormal;
-    internal ImageResource gBufferAlbedo;
-    internal ImageResource gBufferMaterial;
-    internal ImageResource gBufferEmissive;
+    //Depth buffer + Images — owned by RenderTargets (L1.5). Delegating accessors keep
+    //the former field names so the render graph / PbrDeferredPipeline.WriteGBufferDescriptors
+    //and the frame body read them unchanged.
+    internal ImageResource depthImageResource => renderTargets.Depth;
+    internal ImageResource gBufferPosition    => renderTargets.GBufferPosition;
+    internal ImageResource gBufferNormal      => renderTargets.GBufferNormal;
+    internal ImageResource gBufferAlbedo      => renderTargets.GBufferAlbedo;
+    internal ImageResource gBufferMaterial    => renderTargets.GBufferMaterial;
+    internal ImageResource gBufferEmissive    => renderTargets.GBufferEmissive;
+    internal Sampler       gBufferSampler     => renderTargets.GBufferSampler;
+    private  ImageResource ptAccumulator      => renderTargets.PtAccumulator;
+    private  ImageResource ptOutColor         => renderTargets.PtOutColor;
+    private  ImageResource selectionMask      => renderTargets.SelectionMask;
 
-    internal Sampler gBufferSampler;
-    
-    //ImageResources for Path tracing
+    //Path-tracing accumulation state (the images live on RenderTargets; this is the
+    //CPU-side dirty/restart bookkeeping that drives progressive integration).
     bool accumulatorDirty = false;
     public void MarkAccumulatorDirty() => accumulatorDirty = true;
-    private ImageResource ptAccumulator;
-    private ImageResource ptOutColor;
-
-    // R32F coverage mask of the selected entity, written by the ray-query
-    // SelectionMaskPipeline and read by the OutlinePipeline. Renderer-owned,
-    // recreated on resize. Sits in ShaderReadOnly between frames.
-    private ImageResource selectionMask;
 
     // Previous-frame camera snapshot. DrawPathtraced compares against this and
     // flips accumulatorDirty when either differs, so any camera move restarts
@@ -223,27 +224,27 @@ public unsafe partial class Renderer
         gfx = new GraphicsDevice(window!, enableValidationLayers);
         gfx.Initialize();
 
-        CreateSwapChain();
+        swapchain = new Swapchain(gfx, window!);
+        swapchain.Create();
         // Initial render extent tracks swapchain extent. ViewportPanel can later
         // shrink it via EditorState.RequestedRenderExtent → ResizeRenderTargets.
-        renderExtent = swapChainExtent;
-        CreateImageViews();
+        renderTargets = new RenderTargets(gfx);
+        renderTargets.SetExtent(swapChainExtent);
+        swapchain.CreateImageViews();
         SetupDynamicRendering();
 
         CreateDescriptorPool();
         Engine.ResourceManager.Initialize(this);
 
-        // ImageResource objects only — actual VkImage + ImageView allocation happens
-        // inside graph.Compile() called from SetupDeferredRenderer below.
-        CreateDepthResources();
-        CreateGBufferResources();
-        CreateGBufferSampler();
-        CreatePathTracingResources(renderExtent.Width, renderExtent.Height);
-        CreateSelectionResources(renderExtent.Width, renderExtent.Height);
-        // Lights SSBO lives on Renderer so every rendering path (deferred,
-        // forward+, pathtracer) reads from the same buffer. Must exist before
-        // any pipeline that wants to bind it.
-        CreateLightBuffers();
+        // Depth + g-buffers are ImageResource objects only — the render graph allocates
+        // their VkImages inside Compile() (SetupDeferredRenderer below). The PT /
+        // selection images are allocated + laid out here.
+        renderTargets.AllocateAll();
+        // GpuScene owns the light SSBO (and, as L2 progresses, the rest of the
+        // scene→GPU mirror). Built on gfx; must exist before any pipeline that
+        // binds the lights buffer, and before the first per-frame Extract.
+        gpuScene = new GpuScene(gfx);
+        gpuScene.CreateLightBuffers();
 
         // IBL images allocated up-front, cleared to black. The PBR lighting set
         // binds them unconditionally; the compute bake passes fill the content
@@ -363,10 +364,10 @@ public unsafe partial class Renderer
         skyboxPipeline = new SkyboxPipeline(this);
         skyboxPipeline.Initialize();
 
-        //Create command buffers
-        CreateCommandBuffers();
-        //Create sync objects
-        CreateSyncObjects();
+        // Per-frame command buffers + sync ring.
+        frameRing = new FrameRing(gfx, MAX_CONCURRENT_FRAMES);
+        frameRing.CreateCommandBuffers(swapChainImages.Length);
+        frameRing.CreateSyncObjects();
 
         CreateTestEntity();
 
@@ -566,9 +567,12 @@ public unsafe partial class Renderer
         DrawFrame();
     }
 
-    // Full teardown in reverse-creation order. Safe to call once after Initialize.
-    // Globals.vk is a process-wide singleton — never Dispose it here. The window
-    // is owned by Engine and disposed by Engine.Shutdown.
+    // Centralized teardown (L1.6). Each lifetime-scoped owner (FrameRing, RenderTargets,
+    // Swapchain, GraphicsDevice) frees only what it owns; the orchestrator owns the
+    // *order*. The one hard rule: GraphicsDevice.Dispose() runs strictly last — it frees
+    // every VkDeviceMemory block + the device itself, so everything that allocated
+    // through it must already be gone. Globals.vk is a process-wide singleton — never
+    // disposed here. The window is owned by Engine and disposed by Engine.Shutdown.
     public void Cleanup()
     {
         if (!initialized) return;
@@ -576,17 +580,9 @@ public unsafe partial class Renderer
         // Drain GPU work so nothing references resources we're about to destroy.
         vk!.DeviceWaitIdle(device);
 
-        //  Frame sync
-        for (var i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            if (renderFinishedSemaphores[i].Handle != 0)
-                vk.DestroySemaphore(device, renderFinishedSemaphores[i], null);
-            if (imageAvailableSemaphores[i].Handle != 0)
-                vk.DestroySemaphore(device, imageAvailableSemaphores[i], null);
-            if (inFlightFences[i].Handle != 0)
-                vk.DestroyFence(device, inFlightFences[i], null);
-        }
-        
+        //  Frame sync + per-frame command buffers
+        frameRing.Dispose();
+
         if (testEntity != null)
         {
             Entity.Destroy(testEntity);
@@ -605,28 +601,14 @@ public unsafe partial class Renderer
         imGuiUtils?.Dispose();
         
         
-        // Render graph + size-dependent attachments
-        // RenderGraph.Dispose disposes resources it owns; ImageResource.Dispose
-        // is idempotent so the explicit calls below are safe redundant cleanup.
+        // Render graph (holds references to depth + g-buffers) then the render targets.
+        // RenderGraph.Dispose disposes resources it owns; ImageResource.Dispose is
+        // idempotent so RenderTargets.Dispose re-freeing them is a safe no-op.
         scene?.renderGraph?.Dispose();
-        depthImageResource?.Dispose();
-        gBufferPosition?.Dispose();
-        gBufferNormal?.Dispose();
-        gBufferAlbedo?.Dispose();
-        gBufferMaterial?.Dispose();
-        gBufferEmissive?.Dispose();
+        renderTargets.Dispose();
 
-        // Pathtracer storage images — same size class as the g-buffers, separate
-        // owner because they aren't render-graph resources.
-        ptAccumulator?.Dispose();
-        ptOutColor?.Dispose();
-        selectionMask?.Dispose();
-
-        // Lights SSBO — renderer-owned mirror of Scene's LightComponents.
-        DestroyLightBuffers();
-
-        // G-buffer sampler
-        if (gBufferSampler.Handle != 0) vk.DestroySampler(device, gBufferSampler, null);
+        // GpuScene buffers (light SSBO today) — the GPU mirror of Scene's render data.
+        gpuScene.Dispose();
 
         // Reflection probes
         reflectionProbeSystem?.Dispose();
@@ -649,7 +631,7 @@ public unsafe partial class Renderer
         geometryPipeline   ?.Dispose();
 
         // Swap chain + image views
-        CleanupSwapChain();
+        swapchain.Dispose();
 
         // RHI context — strictly last. GraphicsDevice.Dispose() destroys the
         // descriptor pool, command pool, frees every VkDeviceMemory block, then

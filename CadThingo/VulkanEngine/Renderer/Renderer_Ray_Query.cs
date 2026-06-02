@@ -8,20 +8,6 @@ namespace CadThingo.VulkanEngine.Renderer;
 // Per-entity record consumed by the PBR lighting shader's shadow-ray alpha-test
 // path. One slot per TLAS instance, keyed by AccelerationStructureInstanceKHR.
 // InstanceCustomIndex. Layout matches PbrShader.slang::ShadowEntityInfo.
-[StructLayout(LayoutKind.Sequential)]
-public struct ShadowEntityInfo
-{
-    public uint IndexOffset;     // uint elements into GlobalIndexBuffer for this mesh's first triangle
-    public uint MaterialIndex;   // index into the materials SSBO
-    public uint Flags;           // copy of PbrMaterial.Flags — bit 0 = MASK, bit 2 = BLEND
-    public uint EntityIndex;     // scene entity index — pick/selection resolve through this
-    // Per-geometry world transform (column-vector 3x4 rows). The cluster BLAS is
-    // world-space with an identity instance transform, so the shader applies this
-    // to rotate fetched object-space normals into world space.
-    public Vector4 Xform0;
-    public Vector4 Xform1;
-    public Vector4 Xform2;
-}
 
 // One world-space emissive triangle, treated as an area light by the
 // pathtracer's NEE + MIS. Layout matches PTUtils.slang::EmissiveTri (80B,
@@ -29,18 +15,6 @@ public struct ShadowEntityInfo
 // TLAS-rebuild time); Le is the material emissive factor. IndexOffset/PrimIndex
 // point back into the global index buffer so the shader can refetch the UVs and
 // modulate Le by the emissive texture at the sampled point.
-[StructLayout(LayoutKind.Sequential)]
-public struct EmissiveTriGpu
-{
-    public Vector4 P0Area;   // xyz = p0 (world),       w = triangle area (world)
-    public Vector4 E1LeR;    // xyz = p1 - p0,          w = Le.r
-    public Vector4 E2LeG;    // xyz = p2 - p0,          w = Le.g
-    public Vector4 NLeB;     // xyz = geometric normal, w = Le.b
-    public int IndexOffset;  // element offset into globalIndices (= Mesh.offset)
-    public int PrimIndex;    // triangle index within the mesh
-    public int EmissiveTex;  // bindless emissive-texture index (-1 = none)
-    public int _pad;
-}
 
 // Vose alias-table entry for O(1) power-proportional triangle selection.
 // Matches PTCompute.slang::AliasEntry (8B).
