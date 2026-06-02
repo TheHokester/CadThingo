@@ -236,24 +236,43 @@ void missMain(inout RayPayload pay) {
     pay.hit.hit = false;   // raygen samples the env using its tracked ray direction
 }
 
-[shader("closesthit")]
-void closestHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes attr) {
+// Object-space point → world via the full per-geometry 3x4 (rows carry the
+// translation in .w). Used to derive the hit position in the SER path, where
+// RayTCurrent isn't available in raygen.
+float3 xformPoint(ShadowEntityInfo info, float3 p) {
+    return float3(dot(info.xform0.xyz, p) + info.xform0.w,
+                  dot(info.xform1.xyz, p) + info.xform1.w,
+                  dot(info.xform2.xyz, p) + info.xform2.w);
+}
+
+// Shared hit-shading prep: fetches geometry + material at the hit and returns a
+// fully-populated HitInfo. Used by the closest-hit shader (non-SER path) and,
+// under USE_SER, inline in raygen after a HitObject query — the Slang 2026.1
+// HitObject.Invoke lowering is broken, and GetRayTCurrent isn't available in
+// raygen, so the SER path queries the hit identity and shades inline here. The
+// world hit position is computed from the world-transformed triangle (not
+// ray·t), so it's identical in both paths and stage-independent.
+HitInfo fillHit(ShadowEntityInfo info, uint primIdx, float2 bary,
+                float3 rayOrigin, float3 rayDir, bool lowDetail) {
     HitInfo h = (HitInfo)0;
-    h.hit  = true;
-    h.hitT = RayTCurrent();
-    float3 rayDir = WorldRayDirection();
-    h.worldPos = WorldRayOrigin() + rayDir * h.hitT;
-
-    uint   primIdx = PrimitiveIndex();
-    float2 bary    = attr.barycentrics;
-    float3 baryW   = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
-
-    ShadowEntityInfo info = entityInfo[InstanceID() + GeometryIndex()];
+    h.hit    = true;
     h.matidx = info.materialIndex;
 
+    float3 baryW = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
     uint i0 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 0u);
     uint i1 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 1u);
     uint i2 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 2u);
+
+    float3 op0 = fetchVertexPos(globalVertices, i0);
+    float3 op1 = fetchVertexPos(globalVertices, i1);
+    float3 op2 = fetchVertexPos(globalVertices, i2);
+
+    // World hit position from the transformed triangle; hitT along the unit ray.
+    float3 wp0 = xformPoint(info, op0);
+    float3 wp1 = xformPoint(info, op1);
+    float3 wp2 = xformPoint(info, op2);
+    h.worldPos = wp0 * baryW.x + wp1 * baryW.y + wp2 * baryW.z;
+    h.hitT     = length(h.worldPos - rayOrigin);
 
     float2 uv = fetchVertexUV(globalVertices, i0) * baryW.x
               + fetchVertexUV(globalVertices, i1) * baryW.y
@@ -262,11 +281,7 @@ void closestHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes 
     float3 nObj = fetchVertexNormal(globalVertices, i0) * baryW.x
                 + fetchVertexNormal(globalVertices, i1) * baryW.y
                 + fetchVertexNormal(globalVertices, i2) * baryW.z;
-
-    float3 p0 = fetchVertexPos(globalVertices, i0);
-    float3 p1 = fetchVertexPos(globalVertices, i1);
-    float3 p2 = fetchVertexPos(globalVertices, i2);
-    float3 ngObj = normalize(cross(p1 - p0, p2 - p0));
+    float3 ngObj = normalize(cross(op1 - op0, op2 - op0));
 
     float4 t0 = fetchVertexTangent(globalVertices, i0);
     float4 t1 = fetchVertexTangent(globalVertices, i1);
@@ -274,8 +289,8 @@ void closestHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes 
     float3 tObj = t0.xyz * baryW.x + t1.xyz * baryW.y + t2.xyz * baryW.z;
     float  bitangentSign = t0.w;
 
-    // Per-geometry world transform (cluster BLAS is world-space + identity
-    // instance transform, so ObjectToWorld can't rotate object-space normals).
+    // Object → world for directions: 3x3 of the per-geometry transform (identity
+    // instance transform can't do it — the cluster BLAS baked positions).
     float3x3 obj2worldR = entityNormalMatrix(info);
     h.normal          = normalize(mul(obj2worldR, nObj));
     h.geometricNormal = normalize(mul(obj2worldR, ngObj));
@@ -284,7 +299,6 @@ void closestHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes 
     h.frontFace = dot(h.geometricNormal, rayDir) < 0.0;
     if (!h.frontFace) { h.normal = -h.normal; h.geometricNormal = -h.geometricNormal; }
 
-    bool lowDetail = pay.bounce >= MATERIAL_LOD_BOUNCE;
     PbrMaterial mat = materials[h.matidx];
     SamplerState s  = samplers[0];
 
@@ -329,7 +343,15 @@ void closestHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes 
     h.roughness          = max(h.roughness,          0.045);
     h.clearcoatNormal    = h.normal;
 
-    pay.hit = h;
+    return h;
+}
+
+[shader("closesthit")]
+void closestHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes attr) {
+    ShadowEntityInfo info = entityInfo[InstanceID() + GeometryIndex()];
+    pay.hit = fillHit(info, PrimitiveIndex(), attr.barycentrics,
+                      WorldRayOrigin(), WorldRayDirection(),
+                      pay.bounce >= MATERIAL_LOD_BOUNCE);
 }
 
 [shader("raygeneration")]
@@ -360,7 +382,33 @@ void rayGenMain() {
         pay.bounce  = b;
         pay.rng     = rngState;
         pay.hit.hit = false;
+#ifdef USE_SER
+        // Shader Execution Reordering: record the hit (runs traversal + any-hit),
+        // regroup warps by the hit so the shading lanes that follow are coherent,
+        // then query the hit identity and shade INLINE via fillHit. This is the
+        // getter-based SER pattern (HitObject.Invoke is broken in Slang 2026.1 and
+        // GetRayTCurrent isn't available in raygen). The reorder collapses the
+        // path-/material-divergence that strands ~2/3 of each warp's lanes.
+        // NV-only (Ada-class); the non-SER TraceRay variant is compiled otherwise.
+        HitObject ho = HitObject.TraceRay(tlas, RAY_FLAG_NONE, 0xFF, 0u, 0u, 0u, ray, pay);
+        // Material-coherence hint: bucket the reorder by material in addition to
+        // hit, so warps regroup by what they're about to fetch. 8 bits = 256
+        // buckets, plenty for typical scenes. Miss → bucket 0 (harmless).
+        uint matHint = ho.IsHit()
+            ? entityInfo[ho.GetInstanceID() + ho.GetGeometryIndex()].materialIndex
+            : 0u;
+        ReorderThread(ho, matHint, 8u);
+        if (ho.IsHit()) {
+            ShadowEntityInfo info = entityInfo[ho.GetInstanceID() + ho.GetGeometryIndex()];
+            float2 bary = ho.GetAttributes<BuiltInTriangleIntersectionAttributes>().barycentrics;
+            pay.hit = fillHit(info, ho.GetPrimitiveIndex(), bary,
+                              ray.Origin, ray.Direction, b >= MATERIAL_LOD_BOUNCE);
+        } else {
+            pay.hit.hit = false;
+        }
+#else
         TraceRay(tlas, RAY_FLAG_NONE, 0xFF, 0u, 0u, 0u, ray, pay);
+#endif
         rngState = pay.rng;            // any-hit advanced it (BLEND)
         HitInfo hit = pay.hit;
 

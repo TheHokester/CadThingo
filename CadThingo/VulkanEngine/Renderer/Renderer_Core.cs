@@ -95,6 +95,7 @@ public unsafe partial class Renderer
     private bool accelerationStructureEnabled = false;
     private bool rayQueryEnabled = false;
     private bool rayTracePipelineEnabled = false;
+    private bool serEnabled = false;   // VK_NV_ray_tracing_invocation_reorder
     // Vulkan 1.1 multiview. Required for the reflection-probe capture pass that
     // renders all 6 faces of a cubemap in one draw via gl_ViewIndex.
     internal bool multiviewEnabled = false;
@@ -112,6 +113,13 @@ public unsafe partial class Renderer
     /// path tracer stays available regardless. Falls back to compute when false.
     /// </summary>
     public bool RayTracePipelineSupported => rayTracePipelineEnabled && accelerationStructureEnabled;
+
+    /// <summary>
+    /// True iff VK_NV_ray_tracing_invocation_reorder (SER) is enabled on top of the
+    /// RT pipeline. When true the RT path tracer loads the SER raygen variant
+    /// (HitObject + ReorderThread); otherwise the plain TraceRay variant.
+    /// </summary>
+    public bool SerSupported => serEnabled && RayTracePipelineSupported;
 
     
     //swapchain fields
@@ -929,6 +937,7 @@ public unsafe partial class Renderer
         KhrDeferredHostOperations.ExtensionName,           // required by acceleration_structure
         KhrAccelerationStructure.ExtensionName,
         KhrRayTracingPipeline.ExtensionName,
+        "VK_NV_ray_tracing_invocation_reorder",            // SER (Ada-class); opt-in, no Silk wrapper
         KhrRayQueryExtensionName,                          // pure SPIR-V cap, no Silk wrapper
         "VK_KHR_depth_stencil_resolve",
         "VK_EXT_descriptor_indexing",
@@ -1025,6 +1034,10 @@ public unsafe partial class Renderer
         {
             SType = StructureType.PhysicalDeviceRayTracingPipelineFeaturesKhr
         };
+        var serFeaturesSupported = new PhysicalDeviceRayTracingInvocationReorderFeaturesNV
+        {
+            SType = StructureType.PhysicalDeviceRayTracingInvocationReorderFeaturesNV
+        };
 
         coreSupported.PNext             = &vulkan11Supported;
         vulkan11Supported.PNext         = &vulkan12Supported;
@@ -1033,7 +1046,8 @@ public unsafe partial class Renderer
         robust2Supported.PNext          = &accelerationStructureFeaturesSupported;
         accelerationStructureFeaturesSupported.PNext = &rayQueryFeaturesSupported;
         rayQueryFeaturesSupported.PNext = &rayTracingPipelineFeaturesSupported;
-        rayTracingPipelineFeaturesSupported.PNext = null;
+        rayTracingPipelineFeaturesSupported.PNext = &serFeaturesSupported;
+        serFeaturesSupported.PNext = null;
 
         vk!.GetPhysicalDeviceFeatures2(physicalDevice, &coreSupported);
 
@@ -1168,7 +1182,16 @@ public unsafe partial class Renderer
         if (hasRayTracingPipeline && rayTracingPipelineFeaturesSupported.RayTracingPipeline)
         {
             rayTracingPipelineEnable.RayTracingPipeline = true;
-            
+
+        }
+
+        //prepare SER (VK_NV_ray_tracing_invocation_reorder) — built on the RT
+        //pipeline; gates the HitObject/ReorderThread raygen variant. Additive.
+        var hasSer = hasExtension("VK_NV_ray_tracing_invocation_reorder");
+        PhysicalDeviceRayTracingInvocationReorderFeaturesNV serEnable = new(){SType = StructureType.PhysicalDeviceRayTracingInvocationReorderFeaturesNV};
+        if (hasSer && serFeaturesSupported.RayTracingInvocationReorder)
+        {
+            serEnable.RayTracingInvocationReorder = true;
         }
 
         //chain all features together: 1.1 -> 1.2 -> 1.3 -> optional ext structs
@@ -1201,18 +1224,26 @@ public unsafe partial class Renderer
             tailNext = (void**)&rayTracingPipelineEnable.PNext;
         }
 
+        if (hasSer && serEnable.RayTracingInvocationReorder)
+        {
+            *tailNext = &serEnable;
+            tailNext = (void**)&serEnable.PNext;
+        }
+
         //record which features ended up enabled
         descriptorIndexEnabled = descriptorIndexingEnabled && (vulkan12Features.DescriptorBindingPartiallyBound && vulkan12Features.DescriptorBindingUpdateUnusedWhilePending);
         robustness2Enabled = hasRobust2 && (robust2Enable.RobustBufferAccess2 || robust2Enable.RobustImageAccess2 || robust2Enable.NullDescriptor);
         accelerationStructureEnabled = hasAccelerationStructure && accelerationstructureEnable.AccelerationStructure;
         rayQueryEnabled = hasRayQuery && rayQueryEnable.RayQuery;
         rayTracePipelineEnabled = hasRayTracingPipeline && rayTracingPipelineEnable.RayTracingPipeline;
+        serEnabled = hasSer && serEnable.RayTracingInvocationReorder;
         multiviewEnabled = vulkan11Features.Multiview;
 
         Console.WriteLine($"----> RayShadowsSupported: {RayShadowsSupported} " +
                           $"(rayQuery={rayQueryEnabled}, accelStruct={accelerationStructureEnabled})");
         Console.WriteLine($"----> RayTracePipelineSupported: {RayTracePipelineSupported} " +
                           $"(rayTracingPipeline={rayTracePipelineEnabled})");
+        Console.WriteLine($"----> SerSupported: {SerSupported} (invocationReorder={serEnabled})");
 
         bool printFeatures = false;
         if (printFeatures)

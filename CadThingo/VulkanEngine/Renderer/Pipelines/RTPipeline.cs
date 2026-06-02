@@ -60,8 +60,13 @@ public sealed unsafe class RTPipeline : RtPipeline
         ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.MissBitKhr |
         ShaderStageFlags.ClosestHitBitKhr | ShaderStageFlags.AnyHitBitKhr;
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PathTraceRT.spv";
+    // SER variant (HitObject + ReorderThread raygen) when the device exposes
+    // VK_NV_ray_tracing_invocation_reorder; otherwise the plain TraceRay variant.
+    // Both .spv expose the same entry points, so the pipeline build is identical.
+    protected override string ShaderPath =>
+        Renderer.SerSupported
+            ? @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PathTraceRT_SER.spv"
+            : @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PathTraceRT.spv";
 
     // SBT: one buffer holding [raygen][miss][hit] regions, each padded to the
     // device's shaderGroupBaseAlignment; CmdTraceRays reads the strided regions.

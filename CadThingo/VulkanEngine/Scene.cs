@@ -1,6 +1,7 @@
 ﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer;
+using CadThingo.VulkanEngine.Renderer.RenderGraph;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine;

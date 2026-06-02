@@ -17,3 +17,4 @@ D:\VulkanSDK\Bin\slangc.exe PickCompute.slang -target spirv -capability spvRayQu
 D:\VulkanSDK\Bin\slangc.exe SelectionMask.slang -target spirv -capability spvRayQueryKHR -o ../../Assets/Shaders/SelectionMask.spv
 D:\VulkanSDK\Bin\slangc.exe Outline.slang -target spirv -o ../../Assets/Shaders/Outline.spv
 D:\VulkanSDK\Bin\slangc.exe PathTraceRT.slang -target spirv -capability spvRayTracingKHR -o ../../Assets/Shaders/PathTraceRT.spv
+D:\VulkanSDK\Bin\slangc.exe PathTraceRT.slang -DUSE_SER=1 -target spirv -capability spvRayTracingKHR -o ../../Assets/Shaders/PathTraceRT_SER.spv
