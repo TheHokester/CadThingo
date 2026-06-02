@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using Silk.NET.Vulkan;
@@ -67,7 +67,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
     public override void Dispose()
     {
-        foreach (var b in LightingUniformBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in LightingUniformBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 
@@ -314,7 +314,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         fixed (DescriptorSetLayoutBinding* pSet1 = set1Bindings)
         fixed (DescriptorSetLayoutBinding* pSet2 = set2Bindings)
         {
-            if (Renderer.descriptorIndexEnabled)
+            if (Gfx.DescriptorIndexingEnabled)
             {
                 var updateFlags = DescriptorBindingFlags.UpdateAfterBindBit |
                                   DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
@@ -345,7 +345,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
                 BindingCount = (uint)set0Bindings.Length,
                 PBindings = pSet0,
             };
-            if (Renderer.descriptorIndexEnabled)
+            if (Gfx.DescriptorIndexingEnabled)
             {
                 set0LayoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
                 set0LayoutInfo.PNext = &set0FlagsInfo;
@@ -359,7 +359,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
                 BindingCount = (uint)set1Bindings.Length,
                 PBindings = pSet1,
             };
-            if (Renderer.descriptorIndexEnabled)
+            if (Gfx.DescriptorIndexingEnabled)
             {
                 set1LayoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
                 set1LayoutInfo.PNext = &set1FlagsInfo;
@@ -392,7 +392,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     {
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            Renderer.CreateMappedUniformBuffer(sizeof(LightingFrameUBO), ref LightingUniformBuffers[i]);
+            Gfx.CreateMappedUniformBuffer(sizeof(LightingFrameUBO), ref LightingUniformBuffers[i]);
         }
     }
 
@@ -406,7 +406,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         DescriptorSetAllocateInfo lightingAlloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = lightingLayouts,
         };
@@ -424,7 +424,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         DescriptorSetAllocateInfo gBufAlloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &gBufLayout,
         };
@@ -442,7 +442,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         DescriptorSetAllocateInfo shadowAlloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &shadowLayout,
         };

@@ -68,7 +68,7 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
         DescriptorSetAllocateInfo alloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &layout,
         };

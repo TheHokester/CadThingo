@@ -56,7 +56,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
     public override void Dispose()
     {
         _resultMapped = null;
-        if (_resultBuffer.Handle != 0) Renderer.DestroyBuffer(_resultBuffer, _resultAlloc);
+        if (_resultBuffer.Handle != 0) Gfx.DestroyBuffer(_resultBuffer, _resultAlloc);
         base.Dispose();
     }
 
@@ -85,11 +85,11 @@ public sealed unsafe class PickPipeline : ComputePipeline
 
     protected override void CreateResources()
     {
-        Renderer.CreateBuffer(sizeof(uint),
+        Gfx.CreateBuffer(sizeof(uint),
             BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out _resultBuffer, out _resultAlloc);
-        _resultMapped = Renderer.memAllocator.GetMapped(_resultAlloc);
+        _resultMapped = Gfx.Allocator.GetMapped(_resultAlloc);
     }
 
     protected override void CreateDescriptorSets()
@@ -98,7 +98,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
         DescriptorSetAllocateInfo alloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &layout,
         };

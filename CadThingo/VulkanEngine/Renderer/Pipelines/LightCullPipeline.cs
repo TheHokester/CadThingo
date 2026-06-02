@@ -51,8 +51,8 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
     public override void Dispose()
     {
-        foreach (var b in TileLightCountBuffers)   Renderer.DestroyBuffer(b.buffer, b.alloc);
-        foreach (var b in TileLightIndicesBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in TileLightCountBuffers)   Gfx.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in TileLightIndicesBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 
@@ -89,10 +89,10 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         // Per frame: TileLightCount = MAX × 4B, TileLightIndices = MAX × MAX_LIGHTS_PER_TILE × 4B.
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            Renderer.CreateMappedStorageBuffer(
+            Gfx.CreateMappedStorageBuffer(
                 (ulong)(Renderer.MAX_TILE_COUNT * sizeof(uint)),
                 ref TileLightCountBuffers[i]);
-            Renderer.CreateMappedStorageBuffer(
+            Gfx.CreateMappedStorageBuffer(
                 (ulong)(Renderer.MAX_TILE_COUNT * Renderer.MAX_LIGHTS_PER_TILE * sizeof(uint)),
                 ref TileLightIndicesBuffers[i]);
         }
@@ -106,7 +106,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         DescriptorSetAllocateInfo alloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = layouts,
         };

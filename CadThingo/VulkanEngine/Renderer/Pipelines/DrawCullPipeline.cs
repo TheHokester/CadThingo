@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
@@ -67,9 +67,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
 
     public override void Dispose()
     {
-        foreach (var b in RenderableInputBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
-        foreach (var b in IndirectCmdBuffers)     Renderer.DestroyBuffer(b.buffer, b.alloc);
-        foreach (var b in IndirectCountBuffers)   Renderer.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in RenderableInputBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in IndirectCmdBuffers)     Gfx.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in IndirectCountBuffers)   Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 
@@ -106,20 +106,20 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     {
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            Renderer.CreateMappedStorageBuffer(
+            Gfx.CreateMappedStorageBuffer(
                 (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(RenderableInputGpu)),
                 ref RenderableInputBuffers[i]);
 
             // Indirect-command buffer also needs IndirectBuffer usage so the
             // vkCmdDraw...IndirectCount call can read it without validation errors.
-            Renderer.CreateMappedStorageBuffer(
+            Gfx.CreateMappedStorageBuffer(
                 (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(DrawIndexedIndirectCommandGpu)),
                 ref IndirectCmdBuffers[i],
                 BufferUsageFlags.IndirectBufferBit);
 
             // Count buffer is one uint. Needs IndirectBuffer for the count read and
             // TransferDst so vkCmdFillBuffer can reset it to 0 every frame.
-            Renderer.CreateMappedStorageBuffer(
+            Gfx.CreateMappedStorageBuffer(
                 sizeof(uint),
                 ref IndirectCountBuffers[i],
                 BufferUsageFlags.IndirectBufferBit | BufferUsageFlags.TransferDstBit);
@@ -134,7 +134,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         DescriptorSetAllocateInfo alloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = layouts,
         };

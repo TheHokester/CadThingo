@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
 using Silk.NET.Vulkan;
@@ -36,7 +36,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
 
     public override void Dispose()
     {
-        foreach (var ubo in GeometryUniformBuffers) Renderer.DestroyBuffer(ubo.buffer, ubo.alloc);
+        foreach (var ubo in GeometryUniformBuffers) Gfx.DestroyBuffer(ubo.buffer, ubo.alloc);
         base.Dispose();
     }
 
@@ -132,7 +132,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     {
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            Renderer.CreateMappedUniformBuffer(sizeof(GeometryUBO), ref GeometryUniformBuffers[i]);
+            Gfx.CreateMappedUniformBuffer(sizeof(GeometryUBO), ref GeometryUniformBuffers[i]);
         }
     }
 
@@ -147,7 +147,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         DescriptorSetAllocateInfo allocateInfo = new()
         {
             SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = Renderer.descriptorPool,
+            DescriptorPool = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts = layouts
         };
@@ -213,7 +213,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         var flag = DescriptorBindingFlags.UpdateAfterBindBit |
                    DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
 
-        if (Renderer.descriptorIndexEnabled)
+        if (Gfx.DescriptorIndexingEnabled)
         {
             flagsCreateInfo.BindingCount = 1;
             flagsCreateInfo.PBindingFlags = &flag;
@@ -225,7 +225,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
             BindingCount = 1,
             PBindings = &binding,
         };
-        if (Renderer.descriptorIndexEnabled)
+        if (Gfx.DescriptorIndexingEnabled)
         {
             layoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
             layoutInfo.PNext = &flagsCreateInfo;

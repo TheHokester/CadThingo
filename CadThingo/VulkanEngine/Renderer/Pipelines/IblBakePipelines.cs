@@ -96,7 +96,7 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
         DescriptorSetAllocateInfo info = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &layout,
         };
@@ -109,7 +109,7 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
     public void FreeDescriptorSet(DescriptorSet set)
     {
         if (set.Handle == 0) return;
-        Vk.FreeDescriptorSets(Device, Renderer.descriptorPool, 1, &set);
+        Vk.FreeDescriptorSets(Device, Gfx.DescriptorPool, 1, &set);
     }
 
     /// <summary>

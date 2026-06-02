@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using Silk.NET.Vulkan;
@@ -77,7 +77,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
 
     public override void Dispose()
     {
-        foreach (var b in FrameUniformBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in FrameUniformBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
     internal readonly ref struct Attachments(ImageView hdrColor, ImageView depth)
@@ -254,7 +254,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
     {
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            Renderer.CreateMappedUniformBuffer(sizeof(TransparentFrameUBO), ref FrameUniformBuffers[i]);
+            Gfx.CreateMappedUniformBuffer(sizeof(TransparentFrameUBO), ref FrameUniformBuffers[i]);
         }
     }
 
@@ -266,7 +266,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         var allocInfo = new DescriptorSetAllocateInfo
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = layouts,
         };

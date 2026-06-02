@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
@@ -22,32 +22,44 @@ public unsafe partial class Renderer
     /// <summary>
     /// Renderer fields
     /// </summary>
-    internal Vk? vk = Globals.vk;
+    // The Vulkan RHI context — instance, device, queues, allocator, descriptor /
+    // command pools, capability flags, and the device-service helpers. Owned for the
+    // app's lifetime; constructed first in Initialize() and disposed strictly last in
+    // Cleanup(). Renderer exposes the same-named delegating accessors below so the rest
+    // of the Renderer partials and every pipeline / ImageResource / ResourceManager
+    // call site keep reaching device services unchanged while the deeper L1/L2/L3
+    // repoints land (L1 of the renderer refactor).
+    internal GraphicsDevice gfx = null!;
+
     public bool initialized = false;
 
+    // Config input for the GraphicsDevice (instance validation layers). Lives here so
+    // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
     private bool enableValidationLayers = false;
-    private readonly string[] ValidationLayers =
-    [
-        "VK_LAYER_KHRONOS_validation"
-    ];
-    private ExtDebugUtils? debugUtils;
-    private DebugUtilsMessengerEXT debugMessenger;
     private IWindow? window;
-    private Instance instance;
-    
-    private KhrSurface? khrSurface;
-    private SurfaceKHR surface;
+
+    // ---- Delegating accessors onto GraphicsDevice (transitional) -----------
+    internal Vk?               vk             => gfx?.Vk;
+    internal Device            device         => gfx.Device;
+    internal PhysicalDevice    physicalDevice => gfx.PhysicalDevice;
+    internal GpuMemoryAllocator memAllocator  => gfx.Allocator;
+    internal DescriptorPool    descriptorPool => gfx.DescriptorPool;
+    internal CommandPool       commandPool    => gfx.CommandPool;
+    internal Queue             graphicsQueue  => gfx.GraphicsQueue;
+    internal Queue             presentQueue   => gfx.PresentQueue;
+    internal Queue             computeQueue   => gfx.ComputeQueue;
+    internal Queue             transferQueue  => gfx.TransferQueue;
+    private  Instance          instance       => gfx.Instance;
+    private  SurfaceKHR        surface        => gfx.Surface;
+    private  QueueFamilyIndices queueFamilyIndices => gfx.QueueFamilyIndices;
+
+    internal bool descriptorIndexEnabled => gfx.DescriptorIndexingEnabled;
+    internal bool multiviewEnabled       => gfx.MultiviewEnabled;
 
     // Read-only handle accessor — pipelines that load their own device-extension
     // dispatch tables (e.g. RtPipeline → KhrRayTracingPipeline) need the instance
     // for vk.TryGetDeviceExtension. Generic, not tied to any one extension.
-    internal Instance GetVkInstance() => instance;
-    
-    internal PhysicalDevice physicalDevice;
-    // List (not array) so AddSupportedOptionalExtensions can actually mutate it.
-    // Required swapchain seeds the list; optional extensions append after device pick.
-    private readonly List<string> deviceExtensions = new() { KhrSwapchain.ExtensionName };
-    internal Device device;
+    internal Instance GetVkInstance() => gfx.GetVkInstance();
 
     public enum RenderMode : uint
     {
@@ -65,63 +77,29 @@ public unsafe partial class Renderer
     private RenderMode _lastRenderMode = RenderMode.Deferred;
     
     
-    // Suballocates VkDeviceMemory blocks so we don't burn one slot of
-    // maxMemoryAllocationCount per resource. Owned for the lifetime of the
-    // renderer; constructed right after CreateLogicalDevice, disposed last in
-    // Cleanup so every other resource can free through it.
-    internal GpuMemoryAllocator memAllocator = null!;
-
     // Runtime reflection probes — GPU resources + CPU registry. Allocated after
     // the IBL cubemaps because it reuses the same prefilter pipeline. Phase 2
     // stops at resource allocation; capture / shader integration come later.
     internal ReflectionProbeSystem reflectionProbeSystem = null!;
 
-    // Silk.NET 2.23 ships no KhrRayQuery wrapper (ray-query has zero host functions —
-    // it's a pure SPIR-V capability), so we hardcode the extension string ourselves.
-    private const string KhrRayQueryExtensionName = "VK_KHR_ray_query";
-    
     //world scene
     private Scene scene;
     public Scene Scene => scene;
     private Entity* testEntity;
     
-    private QueueFamilyIndices queueFamilyIndices;
-    internal Queue graphicsQueue;
-    private Queue presentQueue;
-    private Queue computeQueue;
-    private Queue transferQueue;
-    internal bool descriptorIndexEnabled = false;
-    private bool robustness2Enabled = false;
-    private bool accelerationStructureEnabled = false;
-    private bool rayQueryEnabled = false;
-    private bool rayTracePipelineEnabled = false;
-    private bool serEnabled = false;   // VK_NV_ray_tracing_invocation_reorder
-    // Vulkan 1.1 multiview. Required for the reflection-probe capture pass that
-    // renders all 6 faces of a cubemap in one draw via gl_ViewIndex.
-    internal bool multiviewEnabled = false;
+    /// <summary>True iff both KHR_acceleration_structure and KHR_ray_query are enabled.
+    /// Gates the ray-traced shadow path. Forwards to <see cref="GraphicsDevice"/>.</summary>
+    public bool RayShadowsSupported => gfx.RayShadowsSupported;
 
-    /// <summary>
-    /// True iff both KHR_acceleration_structure and KHR_ray_query are enabled with their
-    /// device features active. Gates the ray-traced shadow path; callers should fall back
-    /// to a non-shadowed code path when false.
-    /// </summary>
-    public bool RayShadowsSupported => rayQueryEnabled && accelerationStructureEnabled;
+    /// <summary>True iff KHR_ray_tracing_pipeline is enabled alongside
+    /// KHR_acceleration_structure. Gates the opt-in RT-pipeline path tracer.</summary>
+    public bool RayTracePipelineSupported => gfx.RayTracePipelineSupported;
 
-    /// <summary>
-    /// True iff KHR_ray_tracing_pipeline is enabled alongside KHR_acceleration_structure.
-    /// Gates the (additive, opt-in) RT-pipeline path tracer; the inline-ray-query compute
-    /// path tracer stays available regardless. Falls back to compute when false.
-    /// </summary>
-    public bool RayTracePipelineSupported => rayTracePipelineEnabled && accelerationStructureEnabled;
+    /// <summary>True iff VK_NV_ray_tracing_invocation_reorder (SER) is enabled on top of
+    /// the RT pipeline. Selects the HitObject/ReorderThread raygen variant.</summary>
+    public bool SerSupported => gfx.SerSupported;
 
-    /// <summary>
-    /// True iff VK_NV_ray_tracing_invocation_reorder (SER) is enabled on top of the
-    /// RT pipeline. When true the RT path tracer loads the SER raygen variant
-    /// (HitObject + ReorderThread); otherwise the plain TraceRay variant.
-    /// </summary>
-    public bool SerSupported => serEnabled && RayTracePipelineSupported;
 
-    
     //swapchain fields
     internal const uint MAX_CONCURRENT_FRAMES = 2;
     
@@ -180,8 +158,7 @@ public unsafe partial class Renderer
     // pipeline rebuild.
     public TonemapOperator tonemapOperator = TonemapOperator.Filmic;
     
-    //Command pool and buffers
-    CommandPool commandPool;
+    //Command buffers (the pool lives on GraphicsDevice)
     CommandBuffer[] commandBuffers;
     
     //Camera
@@ -238,32 +215,14 @@ public unsafe partial class Renderer
     
     
     
-    internal DescriptorPool descriptorPool;
-     
-    
-    private static unsafe uint DebugCallBack(
-        DebugUtilsMessageSeverityFlagsEXT severity,
-        DebugUtilsMessageTypeFlagsEXT types,
-        DebugUtilsMessengerCallbackDataEXT* data,
-        void* userData)
-    {
-        var message = SilkMarshal.PtrToString((nint)data->PMessage);
-        Console.WriteLine($"[VALIDATION LAYER:] {message}");
-        return Vk.False;
-        
-    }
-    
-    
-    
     public void Initialize()
     {
-        CreateInstance();
-        SetupDebugMessenger(enableValidationLayers);
-        CreateSurface();
-        PickPhysicalDevice();
-        CreateLogicalDevice();
-        // Must exist before ANY buffer/image allocation downstream.
-        memAllocator = new GpuMemoryAllocator(vk!, device, physicalDevice);
+        // Bring up the Vulkan RHI context (instance → debug → surface → physical →
+        // logical device → memory allocator → command pool). Everything below
+        // allocates through it.
+        gfx = new GraphicsDevice(window!, enableValidationLayers);
+        gfx.Initialize();
+
         CreateSwapChain();
         // Initial render extent tracks swapchain extent. ViewportPanel can later
         // shrink it via EditorState.RequestedRenderExtent → ResizeRenderTargets.
@@ -274,7 +233,6 @@ public unsafe partial class Renderer
         CreateDescriptorPool();
         Engine.ResourceManager.Initialize(this);
 
-        CreateCommandPool();
         // ImageResource objects only — actual VkImage + ImageView allocation happens
         // inside graph.Compile() called from SetupDeferredRenderer below.
         CreateDepthResources();
@@ -690,629 +648,15 @@ public unsafe partial class Renderer
         drawCullPipeline   ?.Dispose();
         geometryPipeline   ?.Dispose();
 
-        // Descriptor pool (frees the descriptor sets owned by the pipelines)
-        if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
-
-        // Command pool (frees buffers)
-        if (commandPool.Handle != 0) vk.DestroyCommandPool(device, commandPool, null);
-
         // Swap chain + image views
         CleanupSwapChain();
 
-        // Memory allocator (frees every VkDeviceMemory block) 
-        // Must run after every other Vk*Destroy above — those don't free memory,
-        // they only release the buffer/image handle. The allocator is what owns
-        // the underlying allocations.
-        memAllocator?.Dispose();
-
-        // Device, debug, surface, instance
-        vk.DestroyDevice(device, null);
-        if (enableValidationLayers && debugUtils != null)
-            debugUtils.DestroyDebugUtilsMessenger(instance, debugMessenger, null);
-        khrSurface?.DestroySurface(instance, surface, null);
-        vk.DestroyInstance(instance, null);
+        // RHI context — strictly last. GraphicsDevice.Dispose() destroys the
+        // descriptor pool, command pool, frees every VkDeviceMemory block, then
+        // tears down device → debug → surface → instance in order. Every resource
+        // freed above allocated through it, so it has to outlive them all.
+        gfx.Dispose();
 
         initialized = false;
     }
-    
-    private void CreateInstance()
-    {
-        
-        
-        var appNamePtr = SilkMarshal.StringToPtr("App");
-        var engineNamePtr = SilkMarshal.StringToPtr("Engine");
-
-        var appInfo = new ApplicationInfo()
-        {
-            SType = StructureType.ApplicationInfo,
-            PApplicationName = (byte*)appNamePtr,
-            ApplicationVersion = new Version32(1, 0, 0),
-            ApiVersion = Vk.Version13,
-            EngineVersion = new Version32(1, 0, 0),
-            PEngineName = (byte*)engineNamePtr
-        };
-
-
-        var createInfo = new InstanceCreateInfo()
-        {
-            SType = StructureType.InstanceCreateInfo,
-            PApplicationInfo = &appInfo,
-        };
-        var extensions = GetRequiredExtensions();
-        createInfo.EnabledExtensionCount = (uint)extensions.Length;
-        createInfo.PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(extensions);
-        
-        //enable validation layers if requested
-        ValidationFeaturesEXT validationFeatures = new(){SType = StructureType.ValidationFeaturesExt}; 
-        ValidationFeatureEnableEXT[] enabledValidationFeatures = [
-        ];
-        
-        if (enableValidationLayers)
-        {
-            if (!CheckValidationLayerSupport())
-            {
-                throw new Exception("Validation layers requested, but not available!");
-            }
-            
-            createInfo.EnabledLayerCount = (uint)ValidationLayers.Length;
-            byte** layerNames = (byte**)SilkMarshal.StringArrayToPtr(ValidationLayers);
-            createInfo.PpEnabledLayerNames = layerNames;
-            
-            //Keep validation output quiet by default (no DebugPrint feature)
-            fixed(ValidationFeatureEnableEXT* featurePtr = enabledValidationFeatures)
-            {
-                validationFeatures.EnabledValidationFeatureCount = (uint)enabledValidationFeatures.Length;
-                validationFeatures.PEnabledValidationFeatures = featurePtr;
-            }
-            
-            createInfo.PNext = &validationFeatures;
-        }
-        
-        //create instance 
-        if (vk!.CreateInstance(&createInfo, null, out instance) != Result.Success)
-        {
-            throw new Exception("Failed to create Vulkan instance");
-        }
-        SilkMarshal.Free(appNamePtr);
-        SilkMarshal.Free(engineNamePtr);
-        SilkMarshal.Free((nint)createInfo.PpEnabledExtensionNames);
-        if(enableValidationLayers)
-            SilkMarshal.Free((nint)createInfo.PpEnabledLayerNames);
-    }
-
-    private void SetupDebugMessenger(bool enableValidation)
-    {
-        if (!enableValidation) return;
-
-        if (!vk!.TryGetInstanceExtension(instance, out debugUtils)) return;
-        //create messenger here
-        var createInfo = new DebugUtilsMessengerCreateInfoEXT()
-        {
-            SType = StructureType.DebugUtilsMessengerCreateInfoExt,
-            MessageSeverity = DebugUtilsMessageSeverityFlagsEXT.VerboseBitExt |
-                              DebugUtilsMessageSeverityFlagsEXT.WarningBitExt |
-                              DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt |
-                              DebugUtilsMessageSeverityFlagsEXT.InfoBitExt,
-            MessageType = DebugUtilsMessageTypeFlagsEXT.GeneralBitExt |
-                          DebugUtilsMessageTypeFlagsEXT.ValidationBitExt |
-                          DebugUtilsMessageTypeFlagsEXT.PerformanceBitExt,
-            PfnUserCallback = (PfnDebugUtilsMessengerCallbackEXT)DebugCallBack
-        };
-
-        if (debugUtils!.CreateDebugUtilsMessenger(instance, &createInfo, null, out debugMessenger) != Result.Success)
-        {
-            throw new Exception("Failed to create debug messenger");
-        }
-    }
-    
-    private void CreateSurface()
-    {
-        if(!vk!.TryGetInstanceExtension<KhrSurface>(instance, out khrSurface))
-            throw new Exception("KHR Surface ext not found");
-        surface = window!.VkSurface!.Create<AllocationCallbacks>(instance.ToHandle(), null).ToSurface();
-    }
-
-    private void PickPhysicalDevice()
-    {
-        uint deviceCount = 0;
-        vk!.EnumeratePhysicalDevices(instance, &deviceCount, null);
-
-        if (deviceCount == 0)
-            throw new Exception("No Vulkan devices found");
-
-        var devices = stackalloc PhysicalDevice[(int)deviceCount];
-        vk!.EnumeratePhysicalDevices(instance, &deviceCount, devices); 
-        
-        //prioritise discrete GPUs, over integrated GPUs 
-        //first collect all suitable devices with their suitability scores
-        Dictionary<PhysicalDevice, int> deviceSuitability = new();
-        
-        
-        for (var i = 0; i < deviceCount; i++)
-        {
-            var device = devices[i];
-            var deviceProperites = vk!.GetPhysicalDeviceProperties(device);
-            Console.WriteLine("Checking Device: " + SilkMarshal.PtrToString((nint)deviceProperites.DeviceName) + " (Type: " + deviceProperites.DeviceType + " )");
-            
-            //check for vulkan 1.3 support
-            bool supportsVulkan1_3 = deviceProperites.ApiVersion >= Vk.Version13;
-            if (!supportsVulkan1_3)
-            {
-                Console.WriteLine("----> Device does not support Vulkan 1.3");
-                continue;
-            }
-            
-            //Check queue families
-            QueueFamilyIndices indices = FindQueueFamilies(device);
-            bool supportsGraphics = indices.IsComplete();
-            if (!supportsGraphics)
-            {
-                Console.WriteLine("----> Device Missing required queue families");
-                continue;
-            }
-            
-            //check device extensions
-            bool supportsAllRequiredExtensions = CheckDeviceExtensionSupport(device);
-            if (!supportsAllRequiredExtensions)
-            {
-                Console.WriteLine("----> Device Missing required extensions");
-                continue;
-            }
-            
-            //Check swapchain support
-            SwapChainSupportDetails swapChainSupport = QuerySwapChainSupport(device);
-            bool swapChainAdequate = swapChainSupport.Formats.Length != 0 && swapChainSupport.PresentModes.Length != 0;
-            if (!swapChainAdequate)
-            {
-                Console.WriteLine("----> Inadequate swapchain support");
-                continue;
-            }
-            
-            
-            //Check for required features
-            var features13 = new PhysicalDeviceVulkan13Features()
-            {
-                SType = StructureType.PhysicalDeviceVulkan13Features,
-            }; 
-            var features2 = new PhysicalDeviceFeatures2(StructureType.PhysicalDeviceFeatures2, &features13);
-            vk!.GetPhysicalDeviceFeatures2(device, &features2);
-            if (!features13.DynamicRendering)
-            {
-                Console.WriteLine("----> Device does not support dynamic rendering");
-                continue;
-            }
-            
-            
-            //Calculate suitability score
-            int score = 0;
-            if (deviceProperites.DeviceType == PhysicalDeviceType.DiscreteGpu)
-            {
-                score += 1000;
-                Console.WriteLine("----> Discrete GPU + 1000 points");
-            } else if (deviceProperites.DeviceType == PhysicalDeviceType.IntegratedGpu)
-            {
-                score += 100;
-                Console.WriteLine("----> Integrated GPU + 100 points");
-            }
-            //Add points for memory size (more VRAM = more points)
-            vk!.GetPhysicalDeviceMemoryProperties(device, out var memProps);
-            for(var m = 0; m < memProps.MemoryHeapCount; m++)
-                if ((memProps.MemoryHeaps[m].Flags & MemoryHeapFlags.DeviceLocalBit) != 0)
-                {
-                    score += (int)memProps.MemoryHeaps[m].Size / (1024 * 1024 * 1024);
-                    Console.WriteLine("----> Device has " + (int)memProps.MemoryHeaps[m].Size / (1024 * 1024 * 1024) + "GB VRAM");
-                    break;
-                }
-            
-            Console.WriteLine("----> Device Suitability Score: " + score);
-            deviceSuitability.Add(device, score);
-
-        } 
-        if (!deviceSuitability.Count.Equals(0))
-        {
-            //select the device with the highest score
-           physicalDevice = deviceSuitability.OrderByDescending(x => x.Value).First().Key;
-           vk!.GetPhysicalDeviceProperties(physicalDevice, out var deviceProperties);
-           Console.WriteLine("Selected Device: " + *deviceProperties.DeviceName + 
-                             " (Type: " + deviceProperties.DeviceType + " Score: " + deviceSuitability.First().Value + ")");
-        }
-        //Store queue family indices for selected device
-        queueFamilyIndices = FindQueueFamilies(physicalDevice);
-        
-        //add supported optional extensions
-        AddSupportedOptionalExtensions();
-
-        return;
-    }
-
-
-    // Optional device extensions tried at device-create time. Each entry is the *real*
-    // VK extension string (lowercase, no _EXTENSION_NAME macro suffix). Anything Silk.NET
-    // wraps as a class exposes ExtensionName; ray-query has no wrapper so we use the const.
-    private readonly string[] optionalDeviceExtensions =
-    {
-        KhrDynamicRendering.ExtensionName,
-        KhrGetPhysicalDeviceProperties2.ExtensionName,
-        KhrDynamicRenderingLocalRead.ExtensionName,
-        KhrDeferredHostOperations.ExtensionName,           // required by acceleration_structure
-        KhrAccelerationStructure.ExtensionName,
-        KhrRayTracingPipeline.ExtensionName,
-        "VK_NV_ray_tracing_invocation_reorder",            // SER (Ada-class); opt-in, no Silk wrapper
-        KhrRayQueryExtensionName,                          // pure SPIR-V cap, no Silk wrapper
-        "VK_KHR_depth_stencil_resolve",
-        "VK_EXT_descriptor_indexing",
-        "VK_EXT_robustness2",
-        "VK_EXT_shader_tile_image",
-    };
-    
-    private void AddSupportedOptionalExtensions()
-    {
-        // Two-call pattern: first call returns the count, second populates the array.
-        uint extensionCount = 0;
-        vk!.EnumerateDeviceExtensionProperties(physicalDevice, (byte*)null, &extensionCount, null);
-        var available = new ExtensionProperties[extensionCount];
-        fixed (ExtensionProperties* pAvailable = available)
-            vk!.EnumerateDeviceExtensionProperties(physicalDevice, (byte*)null, &extensionCount, pAvailable);
-
-        var avail = new HashSet<string>();
-        foreach (var ext in available)
-            avail.Add(SilkMarshal.PtrToString((nint)ext.ExtensionName));
-
-        foreach (var ext in optionalDeviceExtensions)
-        {
-            if (avail.Contains(ext))
-            {
-                deviceExtensions.Add(ext);
-                Console.WriteLine("----> Added optional extension: " + ext);
-            }
-            else
-            {
-                Console.WriteLine("----> Optional extension not supported: " + ext);
-            }
-        }
-    }
-    
-    private void CreateLogicalDevice()
-    {
-        //create queue create info for each queue family
-        List<DeviceQueueCreateInfo> queueCreateInfos = new();
-        HashSet<uint> uniqueQueueFamilies = new HashSet<uint>()
-        {
-            queueFamilyIndices.graphicsFamily.Value,
-            queueFamilyIndices.presentFamily.Value,
-            queueFamilyIndices.computeFamily.Value,
-            queueFamilyIndices.transferFamily.Value
-        };
-        
-        float queuePriority = 1.0f;
-        foreach (var qf in uniqueQueueFamilies)
-        {
-            DeviceQueueCreateInfo queueCreateInfo = new()
-            {
-                SType = StructureType.DeviceQueueCreateInfo,
-                QueueFamilyIndex = qf,
-                PQueuePriorities = &queuePriority,
-                QueueCount = 1
-            };
-            queueCreateInfos.Add(queueCreateInfo);
-        }
-        
-        //Query supported features. We use the 1.2 / 1.3 omnibus structs in place of
-        //the individual Timeline / MemoryModel / BufferAddress / 8BitStorage /
-        //DescriptorIndexing feature structs because Vulkan forbids mixing them with
-        //the 1.2 features struct in the same pNext chain (VUID-VkDeviceCreateInfo-
-        //pNext-02830) and the omnibus already exposes every individual field we need.
-        var coreSupported = new PhysicalDeviceFeatures2
-        {
-            SType = StructureType.PhysicalDeviceFeatures2
-        };
-        var vulkan11Supported = new PhysicalDeviceVulkan11Features
-        {
-            SType = StructureType.PhysicalDeviceVulkan11Features
-        };
-        var vulkan12Supported = new PhysicalDeviceVulkan12Features
-        {
-            SType = StructureType.PhysicalDeviceVulkan12Features
-        };
-        var vulkan13Supported = new PhysicalDeviceVulkan13Features
-        {
-            SType = StructureType.PhysicalDeviceVulkan13Features
-        };
-        var robust2Supported = new PhysicalDeviceRobustness2FeaturesEXT
-        {
-            SType = StructureType.PhysicalDeviceRobustness2FeaturesExt
-        };
-        var accelerationStructureFeaturesSupported = new PhysicalDeviceAccelerationStructureFeaturesKHR
-        {
-            SType = StructureType.PhysicalDeviceAccelerationStructureFeaturesKhr
-        };
-        var rayQueryFeaturesSupported = new PhysicalDeviceRayQueryFeaturesKHR
-        {
-            SType = StructureType.PhysicalDeviceRayQueryFeaturesKhr
-        };
-        var rayTracingPipelineFeaturesSupported = new PhysicalDeviceRayTracingPipelineFeaturesKHR
-        {
-            SType = StructureType.PhysicalDeviceRayTracingPipelineFeaturesKhr
-        };
-        var serFeaturesSupported = new PhysicalDeviceRayTracingInvocationReorderFeaturesNV
-        {
-            SType = StructureType.PhysicalDeviceRayTracingInvocationReorderFeaturesNV
-        };
-
-        coreSupported.PNext             = &vulkan11Supported;
-        vulkan11Supported.PNext         = &vulkan12Supported;
-        vulkan12Supported.PNext         = &vulkan13Supported;
-        vulkan13Supported.PNext         = &robust2Supported;
-        robust2Supported.PNext          = &accelerationStructureFeaturesSupported;
-        accelerationStructureFeaturesSupported.PNext = &rayQueryFeaturesSupported;
-        rayQueryFeaturesSupported.PNext = &rayTracingPipelineFeaturesSupported;
-        rayTracingPipelineFeaturesSupported.PNext = &serFeaturesSupported;
-        serFeaturesSupported.PNext = null;
-
-        vk!.GetPhysicalDeviceFeatures2(physicalDevice, &coreSupported);
-
-        bool supported = (
-            coreSupported.Features.SamplerAnisotropy &&
-            coreSupported.Features.MultiDrawIndirect &&
-            coreSupported.Features.DrawIndirectFirstInstance &&
-            coreSupported.Features.ImageCubeArray &&
-            vulkan11Supported.ShaderDrawParameters &&
-            vulkan11Supported.Multiview &&
-            vulkan12Supported.TimelineSemaphore &&
-            vulkan12Supported.VulkanMemoryModel &&
-            vulkan12Supported.BufferDeviceAddress &&
-            vulkan12Supported.DrawIndirectCount &&
-            vulkan13Supported.DynamicRendering &&
-            vulkan13Supported.Synchronization2);
-        if(!supported) throw new Exception("Device does not support required features");
-
-
-        //enable required features (verified to be supported)
-        vk!.GetPhysicalDeviceFeatures2(physicalDevice, out var features);
-        features.SType = StructureType.PhysicalDeviceFeatures2;
-        features.Features.SamplerAnisotropy = true;
-        features.Features.DepthBiasClamp = coreSupported.Features.DepthBiasClamp ? true : false;
-        // Required by the GPU-driven cull pass: indirect draws emit one
-        // VkDrawIndexedIndirectCommand per visible mesh, all consumed by a single
-        // vkCmdDrawIndexedIndirectCount.
-        features.Features.MultiDrawIndirect = true;
-        // The cull shader writes a non-zero firstInstance into each indirect command
-        // so the geometry VS can resolve SV_InstanceID -> instances[slot]. Without
-        // this feature the spec requires firstInstance=0 and drivers silently clamp
-        // it, making every primitive read instances[0].
-        features.Features.DrawIndirectFirstInstance = true;
-        // Cube-array views (VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) — required by the
-        // ReflectionProbeSystem to sample all probes from a single descriptor.
-        features.Features.ImageCubeArray = true;
-        //rayQuery shader uses indexing into a large sampled-image array.
-        if (coreSupported.Features.ShaderSampledImageArrayDynamicIndexing)
-            features.Features.ShaderSampledImageArrayDynamicIndexing = true;
-
-        //vulkan 1.1
-        PhysicalDeviceVulkan11Features vulkan11Features = new(){SType = StructureType.PhysicalDeviceVulkan11Features};
-        vulkan11Features.ShaderDrawParameters = true;
-        // Multiview — gl_ViewIndex in vertex shaders so cubemap-face capture can
-        // render all 6 layers in one draw call. Required for reflection probes.
-        vulkan11Features.Multiview = true;
-
-        //vulkan 1.2 — rolls in Timeline, MemoryModel, BufferDeviceAddress, 8-bit storage,
-        //DescriptorIndexing, and DrawIndirectCount (used by vkCmdDrawIndexedIndirectCount).
-        PhysicalDeviceVulkan12Features vulkan12Features = new(){SType = StructureType.PhysicalDeviceVulkan12Features};
-        vulkan12Features.TimelineSemaphore                = true;
-        vulkan12Features.VulkanMemoryModel                = true;
-        vulkan12Features.VulkanMemoryModelDeviceScope     = vulkan12Supported.VulkanMemoryModelDeviceScope;
-        vulkan12Features.BufferDeviceAddress              = true;
-        vulkan12Features.StorageBuffer8BitAccess          = vulkan12Supported.StorageBuffer8BitAccess;
-        vulkan12Features.DrawIndirectCount                = true;
-
-        //Descriptor-indexing fields live on the 1.2 features struct. The DescriptorIndexing
-        //master toggle is required when VK_EXT_descriptor_indexing is in the enabled
-        //extension list (VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-02833).
-        var descriptorIndexingEnabled = false;
-        if (vulkan12Supported.ShaderSampledImageArrayNonUniformIndexing)
-        {
-            vulkan12Features.ShaderSampledImageArrayNonUniformIndexing = true;
-            descriptorIndexingEnabled = true;
-        }
-        if (vulkan12Supported.RuntimeDescriptorArray)
-            vulkan12Features.RuntimeDescriptorArray = true;
-        if (descriptorIndexingEnabled)
-        {
-            if (vulkan12Supported.DescriptorBindingPartiallyBound)
-                vulkan12Features.DescriptorBindingPartiallyBound = true;
-            if (vulkan12Supported.DescriptorBindingUpdateUnusedWhilePending)
-                vulkan12Features.DescriptorBindingUpdateUnusedWhilePending = true;
-        }
-        if (vulkan12Supported.DescriptorBindingSampledImageUpdateAfterBind)
-            vulkan12Features.DescriptorBindingSampledImageUpdateAfterBind = true;
-        if (vulkan12Supported.DescriptorBindingUniformBufferUpdateAfterBind)
-            vulkan12Features.DescriptorBindingUniformBufferUpdateAfterBind = true;
-        if (vulkan12Supported.DescriptorBindingUpdateUnusedWhilePending)
-            vulkan12Features.DescriptorBindingUpdateUnusedWhilePending = true;
-        // The descriptor-indexing master toggle gates the whole feature family and
-        // is required when the legacy VK_EXT_descriptor_indexing extension is enabled.
-        if (descriptorIndexingEnabled)
-            vulkan12Features.DescriptorIndexing = true;
-
-        //vulkan 1.3
-        PhysicalDeviceVulkan13Features vulkan13Features = new(){SType = StructureType.PhysicalDeviceVulkan13Features};
-        vulkan13Features.DynamicRendering = true;
-        vulkan13Features.Synchronization2 = true;
-        
-        //helper to verify that an extension is enabled
-        bool hasExtension(string name)
-        {
-            return deviceExtensions.Contains(name);
-        }
-        
-        //prepare robustness2 featureset if the extension is enabled
-        var hasRobust2 = hasExtension("VK_EXT_robustness2");
-        PhysicalDeviceRobustness2FeaturesEXT robust2Enable = new() {SType = StructureType.PhysicalDeviceRobustness2FeaturesExt};
-        if (hasRobust2)
-        {
-            if (robust2Supported.RobustBufferAccess2)
-                robust2Enable.RobustBufferAccess2 = true;
-            if (robust2Supported.RobustImageAccess2)
-                robust2Enable.RobustImageAccess2 = true;
-            if(robust2Supported.NullDescriptor)
-                robust2Enable.NullDescriptor = true;
-        }
-        
-        //prepare acceleration structure features if extension is enabled and supported
-        var hasAccelerationStructure = hasExtension(KhrAccelerationStructure.ExtensionName);
-        PhysicalDeviceAccelerationStructureFeaturesKHR accelerationstructureEnable = new(){SType = StructureType.PhysicalDeviceAccelerationStructureFeaturesKhr};
-        if (hasAccelerationStructure)
-        {
-            accelerationstructureEnable.AccelerationStructure = true;
-        }
-        
-        //prepare rayQuery features if extension is enabled and supported
-        var hasRayQuery = hasExtension(KhrRayQueryExtensionName);
-        PhysicalDeviceRayQueryFeaturesKHR rayQueryEnable = new(){SType = StructureType.PhysicalDeviceRayQueryFeaturesKhr};
-        if (hasRayQuery)
-        {
-            rayQueryEnable.RayQuery = true;
-        }
-
-        //prepare ray-tracing-pipeline features if extension is enabled and supported.
-        //Additive: only gates the opt-in RT-pipeline path tracer; the compute path
-        //tracer is unaffected whether or not this ends up enabled.
-        var hasRayTracingPipeline = hasExtension(KhrRayTracingPipeline.ExtensionName);
-        PhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineEnable = new(){SType = StructureType.PhysicalDeviceRayTracingPipelineFeaturesKhr};
-        if (hasRayTracingPipeline && rayTracingPipelineFeaturesSupported.RayTracingPipeline)
-        {
-            rayTracingPipelineEnable.RayTracingPipeline = true;
-
-        }
-
-        //prepare SER (VK_NV_ray_tracing_invocation_reorder) — built on the RT
-        //pipeline; gates the HitObject/ReorderThread raygen variant. Additive.
-        var hasSer = hasExtension("VK_NV_ray_tracing_invocation_reorder");
-        PhysicalDeviceRayTracingInvocationReorderFeaturesNV serEnable = new(){SType = StructureType.PhysicalDeviceRayTracingInvocationReorderFeaturesNV};
-        if (hasSer && serFeaturesSupported.RayTracingInvocationReorder)
-        {
-            serEnable.RayTracingInvocationReorder = true;
-        }
-
-        //chain all features together: 1.1 -> 1.2 -> 1.3 -> optional ext structs
-        features.PNext = &vulkan11Features;
-        vulkan11Features.PNext = &vulkan12Features;
-        vulkan12Features.PNext = &vulkan13Features;
-        void** tailNext = (void**)&vulkan13Features.PNext;
-
-        if (hasRobust2)
-        {
-            *tailNext = &robust2Enable;
-            tailNext = (void**)&robust2Enable.PNext;
-        }
-
-        if (hasAccelerationStructure)
-        {
-            *tailNext = &accelerationstructureEnable;
-            tailNext = (void**)&accelerationstructureEnable.PNext;
-        }
-
-        if (hasRayQuery)
-        {
-            *tailNext = &rayQueryEnable;
-            tailNext = (void**)&rayQueryEnable.PNext;
-        }
-
-        if (hasRayTracingPipeline && rayTracingPipelineEnable.RayTracingPipeline)
-        {
-            *tailNext = &rayTracingPipelineEnable;
-            tailNext = (void**)&rayTracingPipelineEnable.PNext;
-        }
-
-        if (hasSer && serEnable.RayTracingInvocationReorder)
-        {
-            *tailNext = &serEnable;
-            tailNext = (void**)&serEnable.PNext;
-        }
-
-        //record which features ended up enabled
-        descriptorIndexEnabled = descriptorIndexingEnabled && (vulkan12Features.DescriptorBindingPartiallyBound && vulkan12Features.DescriptorBindingUpdateUnusedWhilePending);
-        robustness2Enabled = hasRobust2 && (robust2Enable.RobustBufferAccess2 || robust2Enable.RobustImageAccess2 || robust2Enable.NullDescriptor);
-        accelerationStructureEnabled = hasAccelerationStructure && accelerationstructureEnable.AccelerationStructure;
-        rayQueryEnabled = hasRayQuery && rayQueryEnable.RayQuery;
-        rayTracePipelineEnabled = hasRayTracingPipeline && rayTracingPipelineEnable.RayTracingPipeline;
-        serEnabled = hasSer && serEnable.RayTracingInvocationReorder;
-        multiviewEnabled = vulkan11Features.Multiview;
-
-        Console.WriteLine($"----> RayShadowsSupported: {RayShadowsSupported} " +
-                          $"(rayQuery={rayQueryEnabled}, accelStruct={accelerationStructureEnabled})");
-        Console.WriteLine($"----> RayTracePipelineSupported: {RayTracePipelineSupported} " +
-                          $"(rayTracingPipeline={rayTracePipelineEnabled})");
-        Console.WriteLine($"----> SerSupported: {SerSupported} (invocationReorder={serEnabled})");
-
-        bool printFeatures = false;
-        if (printFeatures)
-        {
-            Console.WriteLine("----> Device Features:");
-            Console.WriteLine("----> Sampler Anisotropy: " + features.Features.SamplerAnisotropy);
-            Console.WriteLine("----> Depth Bias Clamp: " + features.Features.DepthBiasClamp);
-            Console.WriteLine("----> MultiDrawIndirect: " + features.Features.MultiDrawIndirect);
-            Console.WriteLine("----> Vulkan 1.1 Features: " + vulkan11Features.ShaderDrawParameters);
-            Console.WriteLine("----> Vulkan 1.2 Features: timeline=" + vulkan12Features.TimelineSemaphore +
-                              " memoryModel=" + vulkan12Features.VulkanMemoryModel +
-                              " bufferDeviceAddress=" + vulkan12Features.BufferDeviceAddress +
-                              " drawIndirectCount=" + vulkan12Features.DrawIndirectCount +
-                              " descriptorIndexing=" + vulkan12Features.DescriptorIndexing);
-            Console.WriteLine("----> Vulkan 1.3 Features: " + vulkan13Features.DynamicRendering + " " + vulkan13Features.Synchronization2);
-            Console.WriteLine("----> Robustness 2 Features: " + robust2Enable.RobustBufferAccess2 + "\n " + robust2Enable.RobustImageAccess2 + "\n "
-                              + robust2Enable.NullDescriptor);
-            Console.WriteLine("----> Acceleration Structure Features: " + accelerationstructureEnable.AccelerationStructure);
-            Console.WriteLine("----> Ray Query Features: " + rayQueryEnable.RayQuery);
-        }
-        
-        
-        
-        
-        //Create logical device
-        //only configure extensions here
-        //validation enabled on instance layers
-        fixed (DeviceQueueCreateInfo* queueInfoPtr = &queueCreateInfos.ToArray()[0])
-        {
-            DeviceCreateInfo deviceCreateInfo = new()
-            {
-                SType = StructureType.DeviceCreateInfo,
-                PNext = &features,
-                QueueCreateInfoCount = (uint)queueCreateInfos.Count,
-                PQueueCreateInfos = queueInfoPtr,
-                EnabledExtensionCount = (uint)deviceExtensions.Count,
-                PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(deviceExtensions.ToArray()),
-                PEnabledFeatures = null //using pNext for features
-            };
-            if (vk!.CreateDevice(physicalDevice, &deviceCreateInfo, null, out device) != Result.Success)
-            {
-                throw new Exception("Failed to create logical device");   
-            }
-            //create queues
-            vk!.GetDeviceQueue(device, queueFamilyIndices.graphicsFamily.Value, 0, out graphicsQueue);
-            vk!.GetDeviceQueue(device, queueFamilyIndices.presentFamily.Value, 0, out presentQueue);
-            vk!.GetDeviceQueue(device, queueFamilyIndices.computeFamily.Value, 0, out computeQueue);
-            vk!.GetDeviceQueue(device, queueFamilyIndices.transferFamily.Value, 0, out transferQueue);
-        }
-        
-        //
-    }
-    
-    private bool CheckValidationLayerSupport()
-    {
-        uint layerCount = 0;
-        vk!.EnumerateInstanceLayerProperties(&layerCount, null);
-
-        var layers = stackalloc LayerProperties[(int)layerCount];
-        vk!.EnumerateInstanceLayerProperties(&layerCount, layers);
-
-        for (int i = 0; i < layerCount; i++)
-        {
-            var name = SilkMarshal.PtrToString((nint)layers[i].LayerName);
-            if(name.Equals("VK_LAYER_KHRONOS_validation"))
-                return true;
-        }
-        return false;
-    }
-    
-    
 }

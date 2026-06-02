@@ -41,7 +41,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
 
     public override void Dispose()
     {
-        foreach (var b in FrameUniformBuffers) Renderer.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in FrameUniformBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 
@@ -153,7 +153,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
     protected override void CreateResources()
     {
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Renderer.CreateMappedUniformBuffer(sizeof(SkyboxUBO), ref FrameUniformBuffers[i]);
+            Gfx.CreateMappedUniformBuffer(sizeof(SkyboxUBO), ref FrameUniformBuffers[i]);
     }
 
     protected override void CreateDescriptorSets()
@@ -164,7 +164,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         DescriptorSetAllocateInfo allocInfo = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = layouts,
         };

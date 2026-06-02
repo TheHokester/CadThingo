@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
 using ImGuiNET;
@@ -87,93 +87,23 @@ public unsafe partial class Renderer
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
     }
 
-    public CommandBuffer BeginSingleTimeCommands()
-    {
-        CommandBufferAllocateInfo allocInfo = new()
-        {
-            SType = StructureType.CommandBufferAllocateInfo,
-            CommandPool = commandPool,
-            Level = CommandBufferLevel.Primary,
-            CommandBufferCount = 1,
-        };
-        vk!.AllocateCommandBuffers(device, &allocInfo, out CommandBuffer cmd);
-        CommandBufferBeginInfo beginInfo = new()
-        {
-            SType = StructureType.CommandBufferBeginInfo,
-            Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
-        };
-        vk!.BeginCommandBuffer(cmd, &beginInfo);
-        return cmd;
-    }
+    // Device-service helpers moved to GraphicsDevice (L1). Forwarders keep the
+    // former Renderer.* / Engine.renderer.* call sites (pipelines, ImageResource,
+    // Texture, ResourceManager) compiling unchanged.
+    public CommandBuffer BeginSingleTimeCommands() => gfx.BeginSingleTimeCommands();
 
-    public void EndSingleTimeCommands(CommandBuffer cmd)
-    {
-        vk!.EndCommandBuffer(cmd);
-        SubmitInfo submit = new()
-        {
-            SType = StructureType.SubmitInfo,
-            CommandBufferCount = 1,
-            PCommandBuffers = &cmd,
-        };
-        vk!.QueueSubmit(graphicsQueue, 1, &submit, default);
-        vk!.QueueWaitIdle(graphicsQueue);
-        vk!.FreeCommandBuffers(device, commandPool, 1, &cmd);
-    }
+    public void EndSingleTimeCommands(CommandBuffer cmd) => gfx.EndSingleTimeCommands(cmd);
 
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
         out Buffer buffer, out SubAlloc alloc)
-    {
-        BufferCreateInfo bufferInfo = new()
-        {
-            SType = StructureType.BufferCreateInfo,
-            Size = size,
-            Usage = usage,
-            SharingMode = SharingMode.Exclusive,
-        };
-        if (vk!.CreateBuffer(device, &bufferInfo, null, out buffer) != Result.Success)
-            throw new Exception("Failed to create buffer");
+        => gfx.CreateBuffer(size, usage, memProps, out buffer, out alloc);
 
-        // DeviceAddress flag is already baked into every buffer-bucket block by
-        // the allocator — no per-call PNext chain needed. Caller still has to set
-        // ShaderDeviceAddressBit in `usage` for the buffer itself, which they do.
-        alloc = memAllocator.AllocateForBuffer(buffer, memProps);
-    }
-
-    public void CopyBuffer(Buffer src, Buffer dst, ulong size)
-    {
-        var cmd = BeginSingleTimeCommands();
-        BufferCopy region = new()
-        {
-            SrcOffset = 0,
-            DstOffset = 0,
-            Size = size,
-        };
-        vk!.CmdCopyBuffer(cmd, src, dst, 1, &region);
-        EndSingleTimeCommands(cmd);
-    }
+    public void CopyBuffer(Buffer src, Buffer dst, ulong size) => gfx.CopyBuffer(src, dst, size);
 
     public void UploadBufferData(Buffer dst, long dstOffset, void* srcData, ulong size)
-    {
-        CreateBuffer(size, BufferUsageFlags.TransferSrcBit,
-            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out var staging, out var stagingAlloc);
+        => gfx.UploadBufferData(dst, dstOffset, srcData, size);
 
-        void* mapped = memAllocator.GetMapped(stagingAlloc);
-        System.Buffer.MemoryCopy(srcData, mapped, (long)size, (long)size);
-
-        var cmd = BeginSingleTimeCommands();
-        BufferCopy region = new() { SrcOffset = 0, DstOffset = (ulong)dstOffset, Size = size };
-        vk!.CmdCopyBuffer(cmd, staging, dst, 1, &region);
-        EndSingleTimeCommands(cmd);
-
-        DestroyBuffer(staging, stagingAlloc);
-    }
-
-    public void DestroyBuffer(Buffer buffer, SubAlloc alloc)
-    {
-        if (buffer.Handle != 0) vk!.DestroyBuffer(device, buffer, null);
-        memAllocator.Free(alloc);
-    }
+    public void DestroyBuffer(Buffer buffer, SubAlloc alloc) => gfx.DestroyBuffer(buffer, alloc);
 
     private void CreateGBufferSampler()
     {
@@ -203,265 +133,14 @@ public unsafe partial class Renderer
             
     }
     internal void CreateMappedUniformBuffer(int sizeBytes, ref UboBuffer ubo)
-    {
-        BufferCreateInfo bufferInfo = new()
-        {
-            SType = StructureType.BufferCreateInfo,
-            Size = (ulong)sizeBytes,
-            Usage = BufferUsageFlags.UniformBufferBit,
-            SharingMode = SharingMode.Exclusive,
-        };
-        vk!.CreateBuffer(device, &bufferInfo, null, out ubo.buffer);
-        ubo.alloc  = memAllocator.AllocateForBuffer(ubo.buffer,
-            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
-        ubo.mapped = memAllocator.GetMapped(ubo.alloc);
-    }
-    
-    public void TransitionImageLayout( CommandBuffer cmd, Image image, Format format,  ImageLayout oldLayout,
+        => gfx.CreateMappedUniformBuffer(sizeBytes, ref ubo);
+
+    public void TransitionImageLayout(CommandBuffer cmd, Image image, Format format, ImageLayout oldLayout,
         ImageLayout newLayout, uint mipLevels = 1)
-    {
-        bool isDepth = format == Format.D32Sfloat || format == Format.D32SfloatS8Uint || format == Format.D24UnormS8Uint;
-        ImageMemoryBarrier barrier = new()
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = oldLayout,
-            NewLayout = newLayout,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = image,
-            SubresourceRange =
-                new ImageSubresourceRange(isDepth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit, 0, mipLevels,
-                    0, 1)
-        };
-        
-        //Initialize pipeline stage tracking for synchronization timing
-        //these stages define when operations must complete and when new operations can begin
-        PipelineStageFlags sourceStage;
-        PipelineStageFlags destinationStage;
-        
-        //configure sync for undefined -> transfer layout transition
-        //common when preparing images
-        if (oldLayout == ImageLayout.Undefined && newLayout == ImageLayout.TransferDstOptimal)
-        {
-            barrier.SrcAccessMask = 0;
-            barrier.DstAccessMask = AccessFlags.TransferWriteBit;
-             
-            sourceStage = PipelineStageFlags.TopOfPipeBit;
-            destinationStage = PipelineStageFlags.TransferBit;
+        => gfx.TransitionImageLayout(cmd, image, format, oldLayout, newLayout, mipLevels);
 
-        } 
-        //configure sync for transfer -> shader read layout transition
-        //pattern prepares uploaded images for shader sampling
-        else if (oldLayout == ImageLayout.TransferDstOptimal && newLayout == ImageLayout.ShaderReadOnlyOptimal)
-        {
-            barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
-            barrier.DstAccessMask = AccessFlags.ShaderReadBit;
-
-            sourceStage = PipelineStageFlags.TransferBit;
-            destinationStage = PipelineStageFlags.FragmentShaderBit;
-        }
-        // Swapchain image post-blit → ImGui overlay pass.
-        // Blit (transfer write) must finish before color-attachment writes from the UI pipeline.
-        else if (oldLayout == ImageLayout.TransferDstOptimal && newLayout == ImageLayout.ColorAttachmentOptimal)
-        {
-            barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
-            barrier.DstAccessMask = AccessFlags.ColorAttachmentWriteBit;
-
-            sourceStage = PipelineStageFlags.TransferBit;
-            destinationStage = PipelineStageFlags.ColorAttachmentOutputBit;
-        }
-        // ImGui overlay → present. Color writes must finish before the presentation engine reads.
-        // PresentSrcKhr has no access mask (acquire/release sync handled by semaphores).
-        else if (oldLayout == ImageLayout.ColorAttachmentOptimal && newLayout == ImageLayout.PresentSrcKhr)
-        {
-            barrier.SrcAccessMask = AccessFlags.ColorAttachmentWriteBit;
-            barrier.DstAccessMask = 0;
-
-            sourceStage = PipelineStageFlags.ColorAttachmentOutputBit;
-            destinationStage = PipelineStageFlags.BottomOfPipeBit;
-        }
-        // FinalColor: settled in ShaderReadOnlyOptimal by the render-graph final-layout barrier,
-        // briefly TransferSrcOptimal for the swapchain blit, then back. Prior shader reads must
-        // finish before the blit, and the blit's transfer reads must finish before the next
-        // ImGui sample.
-        else if (oldLayout == ImageLayout.ShaderReadOnlyOptimal && newLayout == ImageLayout.TransferSrcOptimal)
-        {
-            barrier.SrcAccessMask = AccessFlags.ShaderReadBit;
-            barrier.DstAccessMask = AccessFlags.TransferReadBit;
-
-            sourceStage = PipelineStageFlags.FragmentShaderBit;
-            destinationStage = PipelineStageFlags.TransferBit;
-        }
-        else if (oldLayout == ImageLayout.TransferSrcOptimal && newLayout == ImageLayout.ShaderReadOnlyOptimal)
-        {
-            barrier.SrcAccessMask = AccessFlags.TransferReadBit;
-            barrier.DstAccessMask = AccessFlags.ShaderReadBit;
-
-            sourceStage = PipelineStageFlags.TransferBit;
-            destinationStage = PipelineStageFlags.FragmentShaderBit;
-        }
-        // Pathtracer storage-image transitions
-        // Fresh storage image — one-shot init in CreatePathTracingResources.
-        // No prior work to wait on; the next user is a compute shader.
-        else if (oldLayout == ImageLayout.Undefined && newLayout == ImageLayout.General)
-        {
-            barrier.SrcAccessMask = 0;
-            barrier.DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit;
-
-            sourceStage      = PipelineStageFlags.TopOfPipeBit;
-            destinationStage = PipelineStageFlags.ComputeShaderBit;
-        }
-        // PT dispatch finished writing ptOutColor; tonemap is about to sample it
-        // as a CombinedImageSampler.  Compute-write → fragment-read.
-        else if (oldLayout == ImageLayout.General && newLayout == ImageLayout.ShaderReadOnlyOptimal)
-        {
-            barrier.SrcAccessMask = AccessFlags.ShaderWriteBit;
-            barrier.DstAccessMask = AccessFlags.ShaderReadBit;
-
-            sourceStage      = PipelineStageFlags.ComputeShaderBit;
-            destinationStage = PipelineStageFlags.FragmentShaderBit;
-        }
-        // ptOutColor back to General for the next frame's dispatch.  The reader
-        // was tonemap's fragment shader; the next user is the compute dispatch.
-        else if (oldLayout == ImageLayout.ShaderReadOnlyOptimal && newLayout == ImageLayout.General)
-        {
-            barrier.SrcAccessMask = AccessFlags.ShaderReadBit;
-            barrier.DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit;
-
-            sourceStage      = PipelineStageFlags.FragmentShaderBit;
-            destinationStage = PipelineStageFlags.ComputeShaderBit;
-        }
-        // FinalColor was sitting in ShaderReadOnly (viewport sample / last frame's
-        // graph end-state); tonemap is about to write it as a color attachment.
-        else if (oldLayout == ImageLayout.ShaderReadOnlyOptimal && newLayout == ImageLayout.ColorAttachmentOptimal)
-        {
-            barrier.SrcAccessMask = AccessFlags.ShaderReadBit;
-            barrier.DstAccessMask = AccessFlags.ColorAttachmentWriteBit;
-
-            sourceStage      = PipelineStageFlags.FragmentShaderBit;
-            destinationStage = PipelineStageFlags.ColorAttachmentOutputBit;
-        }
-        // Tonemap finished writing FinalColor; next consumers are the swapchain
-        // blit (transfer read) and the ImGui viewport sampler (fragment read).
-        // Cover both downstream stages so neither needs an extra barrier.
-        else if (oldLayout == ImageLayout.ColorAttachmentOptimal && newLayout == ImageLayout.ShaderReadOnlyOptimal)
-        {
-            barrier.SrcAccessMask = AccessFlags.ColorAttachmentWriteBit;
-            barrier.DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.TransferReadBit;
-
-            sourceStage      = PipelineStageFlags.ColorAttachmentOutputBit;
-            destinationStage = PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.TransferBit;
-        }
-        else
-        {
-            throw new Exception($"Unsupported layout transition: {oldLayout} -> {newLayout}");
-        }
-        
-        vk.CmdPipelineBarrier(cmd,
-            sourceStage,
-            destinationStage,
-            0,
-            0, null, 
-            0, null,
-            1, &barrier);
-    }
-
-    internal void GenerateMipMaps(CommandBuffer cmds, Image image, Format format, uint width, uint height,uint mipLevels)
-    {
-        ImageMemoryBarrier barrier = new()
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            Image = image,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            SubresourceRange = new()
-            {
-                AspectMask = ImageAspectFlags.ColorBit,
-                LevelCount = 1,
-                LayerCount = 1
-            }
-        };
-        var mipWidth = width;
-        var mipHeight = height;
-        
-        
-        for(uint i =1; i < mipLevels; i++)
-        {
-            barrier.SubresourceRange.BaseMipLevel = i - 1;
-            barrier.OldLayout = ImageLayout.TransferDstOptimal;
-            barrier.NewLayout = ImageLayout.TransferSrcOptimal;
-            barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
-            barrier.DstAccessMask = AccessFlags.TransferReadBit;
-            
-            vk!.CmdPipelineBarrier(cmds, PipelineStageFlags.TransferBit,
-                PipelineStageFlags.TransferBit, 0, 
-                0, null,
-                0, null,
-                1, &barrier);
-
-            ImageBlit blit = new()
-            {
-                SrcOffsets =
-                {
-                    Element0 = new Offset3D(0, 0, 0),
-                    Element1 = new Offset3D((int)mipWidth, (int)mipHeight, 1)
-                },
-                SrcSubresource =
-                {
-                    AspectMask = ImageAspectFlags.ColorBit,
-                    MipLevel = i - 1,
-                    BaseArrayLayer = 0,
-                    LayerCount = 1
-                },
-                DstOffsets =
-                {
-                    Element0 = new Offset3D(0, 0, 0),
-                    Element1 = new Offset3D((int)mipWidth > 1 ? (int)mipWidth / 2 : 1,
-                        (int)mipHeight > 1 ? (int)mipHeight / 2 : 1, 1)
-                },
-                DstSubresource =
-                {
-                    AspectMask = ImageAspectFlags.ColorBit,
-                    MipLevel = i,
-                    BaseArrayLayer = 0,
-                    LayerCount = 1
-                }
-            };
-            
-            vk!.CmdBlitImage(cmds, 
-                image, ImageLayout.TransferSrcOptimal,
-                image, ImageLayout.TransferDstOptimal,
-                1, &blit,
-                Filter.Linear);
-            
-            barrier.OldLayout = ImageLayout.TransferSrcOptimal;
-            barrier.NewLayout = ImageLayout.ShaderReadOnlyOptimal;
-            barrier.SrcAccessMask = AccessFlags.TransferReadBit;
-            barrier.DstAccessMask = AccessFlags.ShaderReadBit;
-            
-            vk!.CmdPipelineBarrier(cmds, PipelineStageFlags.TransferBit,
-                PipelineStageFlags.FragmentShaderBit, 0,
-                 0, null,
-                 0, null,
-                 1, &barrier);
-            
-            if(mipWidth > 1) mipWidth /= 2;
-            if(mipHeight > 1) mipHeight /= 2;
-        }
-        
-        barrier.SubresourceRange.BaseMipLevel = mipLevels - 1;
-        barrier.OldLayout = ImageLayout.TransferDstOptimal;
-        barrier.NewLayout = ImageLayout.ShaderReadOnlyOptimal;
-        barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
-        barrier.DstAccessMask = AccessFlags.ShaderReadBit;
-        
-        vk!.CmdPipelineBarrier(cmds, PipelineStageFlags.TransferBit,
-            PipelineStageFlags.FragmentShaderBit, 0,
-             0, null,
-             0, null,
-             1, &barrier);
-        
-    }
+    internal void GenerateMipMaps(CommandBuffer cmds, Image image, Format format, uint width, uint height, uint mipLevels)
+        => gfx.GenerateMipMaps(cmds, image, format, width, height, mipLevels);
     
 
     private void CreateDescriptorPool()
@@ -497,21 +176,9 @@ public unsafe partial class Renderer
             // (9) = 144. Round up.
             new() { Type = DescriptorType.StorageImage,             DescriptorCount = 24 + 200 },
         };
-        fixed (DescriptorPoolSize* poolSizesPtr = poolSizes)
-        {
-            DescriptorPoolCreateInfo poolInfo = new()
-            {
-                SType = StructureType.DescriptorPoolCreateInfo,
-                MaxSets = 48 + 200,
-                PoolSizeCount = (uint)poolSizes.Length,
-                PPoolSizes = poolSizesPtr,
-                Flags = DescriptorPoolCreateFlags.UpdateAfterBindBit | DescriptorPoolCreateFlags.FreeDescriptorSetBit,
-            };
-            if (vk!.CreateDescriptorPool(device, &poolInfo, null, out descriptorPool) != Result.Success)
-            {
-                throw new Exception("Failed to create descriptor pool");
-            }
-        }
+        // Sizing is an app-level budget (above); GraphicsDevice owns the pool handle.
+        gfx.CreateDescriptorPool(poolSizes, maxSets: 48 + 200,
+            DescriptorPoolCreateFlags.UpdateAfterBindBit | DescriptorPoolCreateFlags.FreeDescriptorSetBit);
     }
    
 
@@ -546,19 +213,7 @@ public unsafe partial class Renderer
     // count source on top of plain storage usage.
     internal void CreateMappedStorageBuffer(ulong sizeBytes, ref UboBuffer ubo,
         BufferUsageFlags extraUsage = 0)
-    {
-        BufferCreateInfo bufferInfo = new()
-        {
-            SType = StructureType.BufferCreateInfo,
-            Size = sizeBytes,
-            Usage = BufferUsageFlags.StorageBufferBit | extraUsage,
-            SharingMode = SharingMode.Exclusive,
-        };
-        vk!.CreateBuffer(device, &bufferInfo, null, out ubo.buffer);
-        ubo.alloc  = memAllocator.AllocateForBuffer(ubo.buffer,
-            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
-        ubo.mapped = memAllocator.GetMapped(ubo.alloc);
-    }
+        => gfx.CreateMappedStorageBuffer(sizeBytes, ref ubo, extraUsage);
 
     // Lights SSBO
     // Lives on Renderer (not PbrDeferredPipeline) so the pathtracer can read

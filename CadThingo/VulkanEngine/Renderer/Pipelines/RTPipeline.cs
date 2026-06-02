@@ -64,7 +64,7 @@ public sealed unsafe class RTPipeline : RtPipeline
     // VK_NV_ray_tracing_invocation_reorder; otherwise the plain TraceRay variant.
     // Both .spv expose the same entry points, so the pipeline build is identical.
     protected override string ShaderPath =>
-        Renderer.SerSupported
+        Gfx.SerSupported
             ? @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PathTraceRT_SER.spv"
             : @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PathTraceRT.spv";
 
@@ -145,7 +145,7 @@ public sealed unsafe class RTPipeline : RtPipeline
             throw new Exception("RTPipeline: VK_KHR_ray_tracing_pipeline dispatch table not loaded");
 
         byte[] code   = File.ReadAllBytes(ShaderPath);
-        var    module = Renderer.CreateShaderModule(code);
+        var    module = Gfx.CreateShaderModule(code);
 
         // Entry-point names preserved by slangc for the multi-entry-point module
         // (confirmed in phase 1: rayGenMain / missMain / closestHitMain / anyHitMain).
@@ -238,12 +238,12 @@ public sealed unsafe class RTPipeline : RtPipeline
 
         ulong sbtSize = _raygenRegion.Size + _missRegion.Size + _hitRegion.Size;
 
-        Renderer.CreateBuffer(sbtSize,
+        Gfx.CreateBuffer(sbtSize,
             BufferUsageFlags.ShaderBindingTableBitKhr | BufferUsageFlags.ShaderDeviceAddressBit | BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out _sbtBuffer, out _sbtAlloc);
 
-        byte* sbt     = (byte*)Renderer.memAllocator.GetMapped(_sbtAlloc);
+        byte* sbt     = (byte*)Gfx.Allocator.GetMapped(_sbtAlloc);
         var   handles = new byte[groupCount * handleSize];
         fixed (byte* pHandles = handles)
         {
@@ -269,7 +269,7 @@ public sealed unsafe class RTPipeline : RtPipeline
     protected override void CreateResources()
     {
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Renderer.CreateMappedUniformBuffer(sizeof(PathFrameUBO), ref _frameUbos[i]);
+            Gfx.CreateMappedUniformBuffer(sizeof(PathFrameUBO), ref _frameUbos[i]);
     }
 
 
@@ -282,7 +282,7 @@ public sealed unsafe class RTPipeline : RtPipeline
         DescriptorSetAllocateInfo alloc0 = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = set0Layouts,
         };
@@ -295,7 +295,7 @@ public sealed unsafe class RTPipeline : RtPipeline
         DescriptorSetAllocateInfo alloc1 = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &geomLayout,
         };
@@ -310,7 +310,7 @@ public sealed unsafe class RTPipeline : RtPipeline
         DescriptorSetAllocateInfo alloc3 = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &iblLayout,
         };
@@ -505,8 +505,8 @@ public sealed unsafe class RTPipeline : RtPipeline
 
     public override void Dispose()
     {
-        if (_sbtBuffer.Handle != 0) Renderer.DestroyBuffer(_sbtBuffer, _sbtAlloc);
-        foreach (var b in _frameUbos) Renderer.DestroyBuffer(b.buffer, b.alloc);
+        if (_sbtBuffer.Handle != 0) Gfx.DestroyBuffer(_sbtBuffer, _sbtAlloc);
+        foreach (var b in _frameUbos) Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 }

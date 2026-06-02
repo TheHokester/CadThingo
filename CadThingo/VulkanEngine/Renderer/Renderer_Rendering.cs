@@ -176,24 +176,6 @@ public unsafe partial class Renderer
         }
     }
     
-    private void CreateCommandPool()
-    {
-        //Create command pool info
-        CommandPoolCreateInfo poolCreateInfo = new()
-        {
-            SType = StructureType.CommandPoolCreateInfo,
-            Flags = CommandPoolCreateFlags.ResetCommandBufferBit,
-            QueueFamilyIndex = queueFamilyIndices.graphicsFamily!.Value
-        };
-
-        if (vk!.CreateCommandPool(device, &poolCreateInfo, null, out commandPool) != Result.Success)
-        {
-            throw new Exception("Failed to create command pool");
-        }
-        
-        
-    }
-
     private void CreateCommandBuffers()
     {
         commandBuffers = new CommandBuffer[swapChainImages!.Length];

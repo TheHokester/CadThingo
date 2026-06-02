@@ -22,16 +22,20 @@ namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 
 public abstract unsafe class PipelineBase : IDisposable
 {
-    // Single reference back to the renderer — pipelines call into things like
-    // Renderer.CreateMappedStorageBuffer / CreateShaderModule / FindDepthFormat
-    // directly. The fields and methods on Renderer that pipelines need are
-    // 'internal' for same-assembly access.
+    // Reference back to the renderer — concrete pipelines still reach renderer-owned
+    // technique/scene data through it (IBL views, light SSBOs, g-buffers, the probe
+    // system, per-frame scene packing). That residual coupling is what L2/L3 remove.
     protected readonly Renderer Renderer;
 
-    // Convenience accessors so subclass bodies stay short — these just forward
-    // to the renderer's vk / device.
-    protected Vk     Vk     => Renderer.vk!;
-    protected Device Device => Renderer.device;
+    // The device-services surface (L1). Pure RHI calls — Vk / Device / PhysicalDevice
+    // / shader-module + buffer creation / single-time commands — go through this, not
+    // the Renderer god object. Resolved off the renderer because GraphicsDevice exists
+    // by the time any pipeline is constructed (Renderer.Initialize builds it first).
+    protected GraphicsDevice Gfx => Renderer.gfx;
+
+    // Convenience accessors so subclass bodies stay short — forward to the device.
+    protected Vk     Vk     => Gfx.Vk;
+    protected Device Device => Gfx.Device;
 
     protected Pipeline       PipelineHandle;
     protected PipelineLayout PipelineLayoutHandle;
@@ -238,7 +242,7 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
     protected sealed override void CreatePipeline()
     {
         byte[] code   = File.ReadAllBytes(ShaderPath);
-        var    module = Renderer.CreateShaderModule(code);
+        var    module = Gfx.CreateShaderModule(code);
 
         var stageDefs = ShaderStages;
         var stages    = stackalloc PipelineShaderStageCreateInfo[stageDefs.Length];
@@ -423,7 +427,7 @@ public abstract unsafe class ComputePipeline : PipelineBase
     protected sealed override void CreatePipeline()
     {
         byte[] code   = File.ReadAllBytes(ShaderPath);
-        var    module = Renderer.CreateShaderModule(code);
+        var    module = Gfx.CreateShaderModule(code);
         var    entry  = SilkMarshal.StringToPtr(EntryPoint);
 
         var stage = new PipelineShaderStageCreateInfo
@@ -481,7 +485,7 @@ public abstract unsafe class RtPipeline : PipelineBase
     // just leaves KhrRtPipeline null and the properties zero.
     private void LoadDispatchAndProperties()
     {
-        if (!Vk.TryGetDeviceExtension(Renderer.GetVkInstance(), Device, out KhrRtPipeline))
+        if (!Vk.TryGetDeviceExtension(Gfx.GetVkInstance(), Device, out KhrRtPipeline))
         {
             Console.Error.WriteLine("[RtPipeline] KhrRayTracingPipeline dispatch table failed to load");
             KhrRtPipeline = null;
@@ -497,7 +501,7 @@ public abstract unsafe class RtPipeline : PipelineBase
             SType = StructureType.PhysicalDeviceProperties2,
             PNext = &rtProps,
         };
-        Vk.GetPhysicalDeviceProperties2(Renderer.physicalDevice, &props2);
+        Vk.GetPhysicalDeviceProperties2(Gfx.PhysicalDevice, &props2);
 
         ShaderGroupHandleSize      = rtProps.ShaderGroupHandleSize;
         ShaderGroupBaseAlignment   = rtProps.ShaderGroupBaseAlignment;

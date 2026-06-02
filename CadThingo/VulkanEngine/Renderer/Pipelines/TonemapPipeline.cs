@@ -1,4 +1,4 @@
-﻿using System.Runtime.InteropServices;
+using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
@@ -167,7 +167,7 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
         DescriptorSetAllocateInfo allocInfo = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &layout,
         };

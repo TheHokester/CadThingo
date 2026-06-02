@@ -159,7 +159,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     protected override void CreatePipeline()
     {
         byte[] code     = File.ReadAllBytes(ShaderPath);
-        var    module   = Renderer.CreateShaderModule(code);
+        var    module   = Gfx.CreateShaderModule(code);
         var    entryPtr = SilkMarshal.StringToPtr("main");
 
         // 4 spec entries packed into a 16B blob:
@@ -225,7 +225,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     protected override void CreateResources()
     {
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Renderer.CreateMappedUniformBuffer(sizeof(PathFrameUBO), ref _frameUbos[i]);
+            Gfx.CreateMappedUniformBuffer(sizeof(PathFrameUBO), ref _frameUbos[i]);
     }
 
 
@@ -241,7 +241,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         DescriptorSetAllocateInfo alloc0 = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = set0Layouts,
         };
@@ -255,7 +255,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         DescriptorSetAllocateInfo alloc1 = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &geomLayout,
         };
@@ -272,7 +272,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
         DescriptorSetAllocateInfo alloc3 = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = 1,
             PSetLayouts        = &iblLayout,
         };
@@ -585,7 +585,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
             if (_modePipelines[i].Handle != 0)
                 Vk.DestroyPipeline(Device, _modePipelines[i], null);
         }
-        foreach (var b in _frameUbos) Renderer.DestroyBuffer(b.buffer, b.alloc);
+        foreach (var b in _frameUbos) Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 }

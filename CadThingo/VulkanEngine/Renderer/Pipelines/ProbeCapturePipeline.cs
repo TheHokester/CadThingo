@@ -123,7 +123,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
     protected override void CreateResources()
     {
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Renderer.CreateMappedUniformBuffer(sizeof(CaptureUbo), ref _ubos[i]);
+            Gfx.CreateMappedUniformBuffer(sizeof(CaptureUbo), ref _ubos[i]);
     }
 
     protected override void CreateDescriptorSets()
@@ -134,7 +134,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
         DescriptorSetAllocateInfo alloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Renderer.descriptorPool,
+            DescriptorPool     = Gfx.DescriptorPool,
             DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = layouts,
         };
@@ -174,7 +174,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
     public override void Dispose()
     {
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Renderer.DestroyBuffer(_ubos[i].buffer, _ubos[i].alloc);
+            Gfx.DestroyBuffer(_ubos[i].buffer, _ubos[i].alloc);
         base.Dispose();
     }
 
