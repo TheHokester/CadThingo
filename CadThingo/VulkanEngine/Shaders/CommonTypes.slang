@@ -106,7 +106,7 @@ public struct ShadowEntityInfo {
     public uint indexOffset;     // first uint of this primitive's triangle list inside globalIndices
     public uint materialIndex;   // index into materials[]
     public uint flags;           // bit 0 = MASK, bit 2 = BLEND
-    public uint entityIndex;     // scene entity index — pick/selection resolve through this
+    public uint entityIndex;     // RenderableHandle slot — pick/selection resolve through this (CPU: GpuScene)
     // Per-geometry world transform (column-vector 3x4, same packing as the BLAS
     // build transform). The cluster BLAS bakes positions to world space with an
     // IDENTITY instance transform, so CommittedObjectToWorld3x4 can't rotate the

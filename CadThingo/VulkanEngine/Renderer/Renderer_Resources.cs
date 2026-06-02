@@ -224,9 +224,10 @@ public struct InstanceDataGPU
     public uint _pad0, _pad1, _pad2;
 }
 
-// Cull-pass input record. CPU writes one per scene entity into RenderableInputBuffers
-// each frame; the compute shader reads it and emits an indirect draw + InstanceData
-// when the bounding sphere passes the frustum test. Std430 alignment, total 96B.
+// Cull-pass input record. GpuScene.ExtractRenderables packs one per OPAQUE/MASK
+// renderable into its cull-input SSBO each frame; the compute shader reads it and
+// emits an indirect draw + InstanceData when the bounding sphere passes the frustum
+// test. Std430 alignment, total 96B.
 
 // CPU-side transparent draw record. Forward+ transparent pass walks a sorted
 // list of these (back-to-front by view-space Z) and issues one push-constant +

@@ -245,6 +245,8 @@ public unsafe partial class Renderer
         // binds the lights buffer, and before the first per-frame Extract.
         gpuScene = new GpuScene(gfx);
         gpuScene.CreateLightBuffers();
+        // Cull-input SSBO — must exist before DrawCullPipeline binds it (binding 0).
+        gpuScene.CreateRenderableBuffers();
 
         // IBL images allocated up-front, cleared to black. The PBR lighting set
         // binds them unconditionally; the compute bake passes fill the content

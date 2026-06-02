@@ -702,7 +702,11 @@ public unsafe partial class Renderer
 
             prims.Add(new ClusterPrim
             {
-                EntityIndex   = i,
+                // Stable RenderableHandle slot — not the flat list index `i` — so a
+                // later reorder/removal can't alias identity (L2 step 6). Register is
+                // idempotent: SyncRenderables already allocated this entity's slot at
+                // the top of RebuildTlas, so this just reads it back.
+                EntityIndex   = (int)gpuScene.Register(e).Index,
                 World         = world,
                 IndexOffset   = (uint)meshComp.mesh->offset,
                 TriCount      = (uint)(meshComp.mesh->count / 3),

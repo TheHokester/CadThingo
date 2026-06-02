@@ -5,9 +5,9 @@
 // deferred, forward+ and pathtraced render modes — which is what lets the
 // outline overlay work everywhere.
 //
-// Instances are per spatial cluster now, so the hit's entity index comes from
-// entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex; the CPU passes
-// the selected entity's index in params.selectedIndex.
+// Instances are per spatial cluster now, so the hit's identity comes from
+// entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex — a RenderableHandle
+// slot; the CPU passes the selected entity's slot in params.selectedIndex.
 
 import CommonTypes;   // ShadowEntityInfo
 
@@ -15,7 +15,7 @@ struct MaskParams {
     float4x4 invViewProj;   // un-projects NDC -> world (matches the raster image)
     float4   camPos;        // xyz = ray origin (eye)
     float2   screenSize;    // render-target pixels
-    uint     selectedIndex; // scene entity index to mask
+    uint     selectedIndex; // RenderableHandle slot of the entity to mask
     uint     _pad;
 };
 

@@ -413,9 +413,14 @@ public unsafe partial class Renderer
         // or if the capture shader wasn't compiled into ProbeCapture.spv.
         reflectionProbeSystem.RecordCapture(cmd, currentFrame, frameCounter, scene);
 
+        // 5b. Scene extraction (L2 step 4) — the single ECS walk that packs the
+        // cull-input SSBO + classifies BLEND candidates. Must precede the cull pass.
+        gpuScene.ExtractRenderables(currentFrame, scene);
+
         // 5b. GPU cull pass — runs before the geometry pass and produces the
         // indirect command + post-cull instance buffers the geometry pass consumes.
-        drawCullPipeline.Record(cmd, currentFrame, camera, scene);
+        // Reads GpuScene.Renderables; pure frustum cull now (no scene walk).
+        drawCullPipeline.Record(cmd, currentFrame, camera);
 
         // 5c. Tiled light-cull — bins lights into per-tile slot lists for the
         // lighting fragment shader. Buffer barrier inside makes the writes
@@ -630,11 +635,12 @@ public unsafe partial class Renderer
     /// <summary>
     /// Consumes a pending viewport pick (posted by ViewportPanel as a render-
     /// target pixel) and resolves it to an entity by casting one ray through the
-    /// TLAS in a compute dispatch. The hit instance's InstanceCustomIndex is the
-    /// scene entity index (see RebuildTlas), so the result maps straight to
-    /// <see cref="Scene.GetEntity"/>. Runs as a self-contained single-time
-    /// submit (QueueWaitIdle), so the host-visible result is ready immediately.
-    /// No-op unless ray queries are supported and a TLAS exists.
+    /// TLAS in a compute dispatch. The pick pass returns the hit's
+    /// ShadowEntityInfo.EntityIndex — a stable RenderableHandle slot (see
+    /// RebuildTlas) — which <see cref="GpuScene.ResolveSlot"/> maps back to the
+    /// entity. Runs as a self-contained single-time submit (QueueWaitIdle), so the
+    /// host-visible result is ready immediately. No-op unless ray queries are
+    /// supported and a TLAS exists.
     /// </summary>
     private void ProcessPickRequest()
     {
@@ -665,9 +671,7 @@ public unsafe partial class Renderer
 
         uint idx = pickPipeline.ReadResult();
         ImGui.EditorState.SelectedEntity =
-            (idx == PickPipeline.PickNone || idx >= (uint)scene.EntityCount)
-                ? null
-                : scene.GetEntity((int)idx);
+            idx == PickPipeline.PickNone ? null : gpuScene.ResolveSlot(idx);
     }
 
     /// <summary>
@@ -685,10 +689,12 @@ public unsafe partial class Renderer
         if (!RayShadowsSupported || khrAccelStruct == null || tlas.Handle == 0) return;
         if (selectionMaskPipeline == null || outlinePipeline == null) return;
 
-        // Selected entity's flat-list index == its TLAS InstanceCustomIndex.
-        // -1 when the selection isn't in the scene list (shouldn't happen) — bail.
-        int idx = scene.IndexOf(ImGui.EditorState.SelectedEntity);
-        if (idx < 0) return;
+        // Resolve the selection to its RenderableHandle slot — the same token the
+        // mask shader compares against ShadowEntityInfo.EntityIndex (L2 step 6). No
+        // handle ⇒ not a renderable (e.g. a light picked in the outliner) ⇒ no
+        // outline, which is correct.
+        if (!gpuScene.TryGetHandle(ImGui.EditorState.SelectedEntity, out var selHandle)) return;
+        uint idx = selHandle.Index;
 
         Matrix4x4 view = camera.GetViewMatrix();
         Matrix4x4 proj = camera.GetProjectionMatrix(
@@ -702,7 +708,7 @@ public unsafe partial class Renderer
         TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
 
-        selectionMaskPipeline.Record(cmd, invVP, camera.GetPosition(), renderExtent, (uint)idx);
+        selectionMaskPipeline.Record(cmd, invVP, camera.GetPosition(), renderExtent, idx);
 
         // compute write → outline fragment read
         TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,

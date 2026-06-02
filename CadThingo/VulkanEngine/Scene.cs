@@ -168,10 +168,10 @@ public class Scene
 
     /// <summary>
     /// Position of <paramref name="entity"/> in the flat entity list, or -1 if
-    /// absent. This index is exactly the InstanceCustomIndex the TLAS build
-    /// writes per instance (RebuildTlas walks the same list), so it's how a
-    /// selected entity is mapped to its GPU-side identity (e.g. the selection
-    /// outline mask).
+    /// absent. NOTE: this is a plain list-position lookup and is NO LONGER the
+    /// GPU-side identity — pick / selection / TLAS now resolve through
+    /// <see cref="GpuScene"/>'s stable RenderableHandle (L2 step 6), which survives
+    /// list reorder/removal. Use a handle, not this index, for anything GPU-facing.
     /// </summary>
     public unsafe int IndexOf(Entity* entity) =>
         entity == null ? -1 : _entityList.IndexOf((nint)entity);

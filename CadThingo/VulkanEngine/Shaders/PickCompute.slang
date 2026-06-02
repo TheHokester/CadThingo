@@ -7,9 +7,10 @@
 // instance's custom index to pickResult[0].
 //
 // Instances are per spatial cluster now, so InstanceCustomIndex is the cluster's
-// geometry-block base, not the entity. The hit's entity index comes from
+// geometry-block base, not the entity. The hit's identity comes from
 // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex (RebuildTlas fills
-// that flat table); the CPU maps the result to scene.GetEntity(i). Miss PICK_NONE.
+// that flat table) — a stable RenderableHandle slot; the CPU maps the result back
+// via GpuScene.ResolveSlot. Miss PICK_NONE.
 
 import CommonTypes;   // ShadowEntityInfo
 

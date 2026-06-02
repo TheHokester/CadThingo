@@ -27,12 +27,11 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     protected override string ShaderPath { get; } =
         @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\CullDraws.spv";
 
-    // Per-frame buffers owned by this pipeline. RenderableInput is the CPU input
-    // list filled in Record(); IndirectCmd holds the post-cull
-    // VkDrawIndexedIndirectCommand array; IndirectCount holds one uint the cull
-    // shader InterlockedAdds into and the rasterizer reads via
-    // vkCmdDrawIndexedIndirectCount.
-    private UboBuffer[] RenderableInputBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    // Per-frame buffers owned by this pipeline. The cull *input* (RenderableInputGpu
+    // rows) now lives on GpuScene — extracted there (L2 step 4) and bound at
+    // binding 0. IndirectCmd holds the post-cull VkDrawIndexedIndirectCommand array;
+    // IndirectCount holds one uint the cull shader InterlockedAdds into and the
+    // rasterizer reads via vkCmdDrawIndexedIndirectCount.
     private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
     private UboBuffer[] IndirectCountBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
@@ -67,7 +66,6 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
 
     public override void Dispose()
     {
-        foreach (var b in RenderableInputBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
         foreach (var b in IndirectCmdBuffers)     Gfx.DestroyBuffer(b.buffer, b.alloc);
         foreach (var b in IndirectCountBuffers)   Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
@@ -106,10 +104,6 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     {
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            Gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(RenderableInputGpu)),
-                ref RenderableInputBuffers[i]);
-
             // Indirect-command buffer also needs IndirectBuffer usage so the
             // vkCmdDraw...IndirectCount call can read it without validation errors.
             Gfx.CreateMappedStorageBuffer(
@@ -153,7 +147,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         {
             DescriptorBufferInfo bufIn = new()
             {
-                Buffer = RenderableInputBuffers[i].buffer, Offset = 0,
+                Buffer = Renderer.gpuScene.GetRenderablesBuffer((uint)i), Offset = 0,
                 Range  = (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(RenderableInputGpu)),
             };
             DescriptorBufferInfo bufCmd = new()
@@ -193,78 +187,33 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         }
     }
 
-    // CPU side of the cull pass. Walks scene entities, fills the input buffer,
-    // then records the dispatch + barriers. Returns the renderable count packed
-    // this frame (cached as LastRenderableCount for the geometry pass).
-    public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam, Scene scene)
+    // CPU side of the cull pass. Extraction (the scene walk + opaque/blend
+    // classification) now happens in GpuScene.ExtractRenderables, called once per
+    // frame before this. Here we only: apply the view-dependent back-to-front sort
+    // to the BLEND candidates, read the opaque count, and record the frustum-cull
+    // dispatch + barriers. Returns the opaque count (cached as LastRenderableCount
+    // for the geometry pass).
+    public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam)
     {
-        
-        // Pack RenderableInput rows from the scene
-        // Opaque (OPAQUE + MASK) entities go through the GPU cull → indirect-draw path.
-        // BLEND entities are siphoned into _transparentDraws for the forward+ pass.
-        RenderableInputGpu* inputPtr = (RenderableInputGpu*)RenderableInputBuffers[frameIndex].mapped;
-        uint count = 0;
-        int matCount = scene.MaterialCount;
-        int fallbackMatIdx = matCount; // matches the fallback slot written by the geometry pass
-
+        // View-dependent transparent sort — far (lowest view-space Z) first.
+        // System.Numerics row-vector convention: Vector.Transform(v, m) = v * m.
+        // CreateLookAt produces -Z-forward view space, so farther entities have
+        // more-negative Z; sort ascending for back-to-front order. The candidate
+        // list (model + material + index range) was extracted by GpuScene; only the
+        // camera-dependent depth key + sort live here.
         _transparentDraws.Clear();
         Matrix4x4 viewMat = cam != null ? cam.GetViewMatrix() : Matrix4x4.Identity;
-
-        for (int i = 0; i < scene.EntityCount; i++)
+        foreach (var c in Renderer.gpuScene.TransparentCandidates)
         {
-            Entity* e = scene.GetEntity(i);
-            if (e == null) continue;
-            var meshComp = e->GetComponent<MeshComponent>();
-            if (meshComp == null || meshComp.mesh == null) continue;
-            var transform = e->GetComponent<TransformComponent>();
-            if (transform == null) continue;
-
-            int  matIdx = meshComp.materialIndex >= 0 ? meshComp.materialIndex : fallbackMatIdx;
-            Mesh m      = *meshComp.mesh;
-            var  world  = *transform.GetWorldMatrix();
-
-            // Fallback material is implicitly opaque. Real materials carry their
-            // mode in the Flags bitfield.
-            AlphaMode mode = AlphaMode.Opaque;
-            if (matIdx >= 0 && matIdx < matCount)
-                mode = scene.Materials[matIdx].GetAlphaMode();
-
-            if (mode == AlphaMode.Blend)
-            {
-                // System.Numerics row-vector convention: Vector.Transform(v, m) = v * m.
-                // CreateLookAt produces -Z-forward view space, so farther entities
-                // have more-negative Z. Sort ascending for back-to-front order.
-                var worldOrigin = new Vector4(world.M41, world.M42, world.M43, 1f);
-                float viewZ = Vector4.Transform(worldOrigin, viewMat).Z;
-
-                _transparentDraws.Add(new TransparentDraw
-                {
-                    Model         = world,
-                    MaterialIndex = (uint)matIdx,
-                    IndexCount    = (uint)m.count,
-                    FirstIndex    = (uint)m.offset,
-                    ViewDepth     = viewZ,
-                });
-                continue;
-            }
-
-            if (count >= Renderer.MAX_INSTANCES)
-                throw new InvalidOperationException($"Renderable count exceeds MAX_INSTANCES ({Renderer.MAX_INSTANCES}).");
-
-            inputPtr[count] = new RenderableInputGpu
-            {
-                model         = world,
-                sphereLocal   = m.sphereLocal,
-                indexCount    = (uint)m.count,
-                firstIndex    = (uint)m.offset,
-                materialIndex = (uint)matIdx,
-            };
-            count++;
+            var worldOrigin = new Vector4(c.Model.M41, c.Model.M42, c.Model.M43, 1f);
+            float viewZ = Vector4.Transform(worldOrigin, viewMat).Z;
+            var d = c;
+            d.ViewDepth = viewZ;
+            _transparentDraws.Add(d);
         }
-
-        // Back-to-front: far (lowest view-space Z) first.
         _transparentDraws.Sort((a, b) => a.ViewDepth.CompareTo(b.ViewDepth));
 
+        uint count = Renderer.gpuScene.ExtractedRenderableCount;
         LastRenderableCount = count;
         if (count == 0) return 0;
 

@@ -25,7 +25,7 @@ public struct ShadowEntityInfo
     public uint MaterialIndex; // index into the materials SSBO
     public uint Flags; // copy of PbrMaterial.Flags — bit 0 = MASK, bit 2 = BLEND
 
-    public uint EntityIndex; // scene entity index — pick/selection resolve through this
+    public uint EntityIndex; // RenderableHandle slot index — pick/selection resolve through this (L2 step 6)
 
     // Per-geometry world transform (column-vector 3x4 rows). The cluster BLAS is
     // world-space with an identity instance transform, so the shader applies this
@@ -147,6 +147,19 @@ public sealed unsafe class GpuScene : IDisposable
     /// <summary>Number of valid lights packed by the most recent <see cref="UpdateLights"/>.</summary>
     public uint LightCount { get; private set; }
 
+    // Per-frame cull-input SSBO — one RenderableInputGpu row per OPAQUE/MASK
+    // renderable. Formerly owned + packed by DrawCullPipeline; now extracted here
+    // (L2 step 4) so the cull compute pass is pure frustum cull over this buffer.
+    private readonly UboBuffer[] _renderableBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    // BLEND-mode renderables, captured during extraction WITHOUT a sort key — the
+    // back-to-front sort is view-dependent (camera), so it stays downstream in the
+    // cull pass which owns the camera. This list is the extraction half only.
+    private readonly List<TransparentDraw> _transparentCandidates = new();
+
+    /// <summary>OPAQUE/MASK renderable rows packed by the most recent
+    /// <see cref="ExtractRenderables"/> — drives the cull dispatch + maxDrawCount.</summary>
+    public uint ExtractedRenderableCount { get; private set; }
+
     public GpuScene(GraphicsDevice gfx)
     {
         _gfx = gfx;
@@ -217,6 +230,14 @@ public sealed unsafe class GpuScene : IDisposable
     public Entity* Resolve(RenderableHandle h) =>
         IsValid(h) ? (Entity*)_slotEntity[(int)h.Index] : null;
 
+    /// <summary>Resolves a bare slot index (as carried in ShadowEntityInfo.EntityIndex /
+    /// returned by the pick pass) back to its entity, or null if the slot is free /
+    /// out of range. Generation-less by design: the GPU only stores the slot index,
+    /// and the pick read-back is synchronous, so no slot can be recycled in between.</summary>
+    public Entity* ResolveSlot(uint index) =>
+        index < (uint)_slotEntity.Count && _slotEntity[(int)index] != 0
+            ? (Entity*)_slotEntity[(int)index] : null;
+
     /// <summary>Looks up an already-registered entity's handle.</summary>
     public bool TryGetHandle(Entity* e, out RenderableHandle h) =>
         _handleOf.TryGetValue((nint)e, out h);
@@ -264,6 +285,95 @@ public sealed unsafe class GpuScene : IDisposable
                 (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
                 ref _lightBuffers[i]);
         }
+    }
+
+    /// <summary>Cull-input SSBO for the given frame slot — bound by the cull pass
+    /// at binding 0. Stable for the renderer's lifetime.</summary>
+    public Buffer GetRenderablesBuffer(uint frame) => _renderableBuffers[frame].buffer;
+
+    /// <summary>BLEND-mode renderables extracted this frame, unsorted. The cull pass
+    /// applies the view-dependent back-to-front sort and hands the result to the
+    /// transparent pass.</summary>
+    public IReadOnlyList<TransparentDraw> TransparentCandidates => _transparentCandidates;
+
+    /// <summary>Allocates the per-frame cull-input SSBOs. Call once at init, before
+    /// the cull pipeline binds them.</summary>
+    public void CreateRenderableBuffers()
+    {
+        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        {
+            _gfx.CreateMappedStorageBuffer(
+                (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(RenderableInputGpu)),
+                ref _renderableBuffers[i]);
+        }
+    }
+
+    /// <summary>
+    /// Walks the scene once, packing OPAQUE/MASK renderables into the cull-input
+    /// SSBO and siphoning BLEND renderables into <see cref="TransparentCandidates"/>
+    /// (unsorted — the back-to-front sort is view-dependent, so it stays in the cull
+    /// pass which owns the camera). Returns the opaque count, also cached in
+    /// <see cref="ExtractedRenderableCount"/>. This is the extraction half of the
+    /// former DrawCullPipeline.Record walk; GPU frustum cull reads this buffer.
+    /// </summary>
+    public uint ExtractRenderables(uint frameIndex, Scene scene)
+    {
+        RenderableInputGpu* inputPtr = (RenderableInputGpu*)_renderableBuffers[frameIndex].mapped;
+        uint count = 0;
+        int matCount = scene.MaterialCount;
+        int fallbackMatIdx = matCount; // matches the fallback slot UpdateMaterials writes
+
+        _transparentCandidates.Clear();
+
+        for (int i = 0; i < scene.EntityCount; i++)
+        {
+            Entity* e = scene.GetEntity(i);
+            if (e == null) continue;
+            var meshComp = e->GetComponent<MeshComponent>();
+            if (meshComp == null || meshComp.mesh == null) continue;
+            var transform = e->GetComponent<TransformComponent>();
+            if (transform == null) continue;
+
+            int  matIdx = meshComp.materialIndex >= 0 ? meshComp.materialIndex : fallbackMatIdx;
+            Mesh m      = *meshComp.mesh;
+            var  world  = *transform.GetWorldMatrix();
+
+            // Fallback material is implicitly opaque. Real materials carry their
+            // mode in the Flags bitfield.
+            AlphaMode mode = AlphaMode.Opaque;
+            if (matIdx >= 0 && matIdx < matCount)
+                mode = scene.Materials[matIdx].GetAlphaMode();
+
+            if (mode == AlphaMode.Blend)
+            {
+                // ViewDepth left 0 — the cull pass fills + sorts it (camera-dependent).
+                _transparentCandidates.Add(new TransparentDraw
+                {
+                    Model         = world,
+                    MaterialIndex = (uint)matIdx,
+                    IndexCount    = (uint)m.count,
+                    FirstIndex    = (uint)m.offset,
+                    ViewDepth     = 0f,
+                });
+                continue;
+            }
+
+            if (count >= Renderer.MAX_INSTANCES)
+                throw new InvalidOperationException($"Renderable count exceeds MAX_INSTANCES ({Renderer.MAX_INSTANCES}).");
+
+            inputPtr[count] = new RenderableInputGpu
+            {
+                model         = world,
+                sphereLocal   = m.sphereLocal,
+                indexCount    = (uint)m.count,
+                firstIndex    = (uint)m.offset,
+                materialIndex = (uint)matIdx,
+            };
+            count++;
+        }
+
+        ExtractedRenderableCount = count;
+        return count;
     }
 
     /// <summary>
@@ -369,6 +479,11 @@ public sealed unsafe class GpuScene : IDisposable
         {
             if (_lightBuffers[i].buffer.Handle != 0)
                 _gfx.DestroyBuffer(_lightBuffers[i].buffer, _lightBuffers[i].alloc);
+        }
+        for (int i = 0; i < _renderableBuffers.Length; i++)
+        {
+            if (_renderableBuffers[i].buffer.Handle != 0)
+                _gfx.DestroyBuffer(_renderableBuffers[i].buffer, _renderableBuffers[i].alloc);
         }
     }
 }
