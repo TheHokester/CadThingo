@@ -238,6 +238,11 @@ public unsafe partial class Renderer
         if (vk!.BeginCommandBuffer(cmd, &beginInfo) != Result.Success)
             throw new Exception("Failed to begin command buffer");
 
+        // Open this frame's world-transform cache (L2 step 5) — one reset covers
+        // every render mode below; the active DrawX's extract reads served from it.
+        // (RebuildTlas, which runs out-of-band above, manages its own window.)
+        gpuScene.BeginTransforms();
+
         switch (renderMode)
         {
             case RenderMode.Deferred:

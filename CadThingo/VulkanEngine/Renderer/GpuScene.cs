@@ -272,6 +272,34 @@ public sealed unsafe class GpuScene : IDisposable
         foreach (var key in _toFree) Free((Entity*)key);
     }
 
+    // ── Cached world transforms (L2 step 5) ──────────────────────────────────
+    // TransformComponent.GetWorldMatrix() walks the parent chain on every call (no
+    // cross-frame cache), and lights / cull / TLAS each call it independently. This
+    // memoizes the composed world matrix per entity for the duration of one extract
+    // cycle, so the chain is walked at most once per entity per frame instead of
+    // once per consumer. Reset at the top of each extract cycle (the per-frame draw
+    // path + RebuildTlas) via BeginTransforms; computed lazily on first request.
+    private readonly Dictionary<nint, Matrix4x4> _worldCache = new();
+
+    /// <summary>Clears the per-cycle world-transform cache. MUST be called once at the
+    /// start of each extract cycle (before any <see cref="WorldOf"/> read) — otherwise
+    /// consumers would see last cycle's stale matrices.</summary>
+    public void BeginTransforms() => _worldCache.Clear();
+
+    /// <summary>Composed world matrix for <paramref name="e"/>, memoized for the current
+    /// extract cycle (<see cref="BeginTransforms"/>). Identity if the entity has no
+    /// TransformComponent. Behaviourally identical to <c>*GetWorldMatrix()</c> — just
+    /// computed once per entity per cycle instead of once per consumer.</summary>
+    public Matrix4x4 WorldOf(Entity* e)
+    {
+        nint key = (nint)e;
+        if (_worldCache.TryGetValue(key, out var cached)) return cached;
+        var t = e->GetComponent<TransformComponent>();
+        Matrix4x4 world = t != null ? *t.GetWorldMatrix() : Matrix4x4.Identity;
+        _worldCache[key] = world;
+        return world;
+    }
+
     /// <summary>Light SSBO for the given frame slot. Stable for the renderer's lifetime.</summary>
     public Buffer GetLightStorageBuffer(uint frame) => _lightBuffers[frame].buffer;
 
@@ -336,7 +364,7 @@ public sealed unsafe class GpuScene : IDisposable
 
             int  matIdx = meshComp.materialIndex >= 0 ? meshComp.materialIndex : fallbackMatIdx;
             Mesh m      = *meshComp.mesh;
-            var  world  = *transform.GetWorldMatrix();
+            var  world  = WorldOf(e); // cached (L2 step 5); transform != null checked above
 
             // Fallback material is implicitly opaque. Real materials carry their
             // mode in the Flags bitfield.
@@ -437,16 +465,14 @@ public sealed unsafe class GpuScene : IDisposable
         {
             if (count >= Renderer.MAX_LIGHTS) break;
 
-            // World-space position from the owner transform if present.
+            // World-space position from the owner transform if present. Cached
+            // (L2 step 5); WorldOf returns identity for an owner without a
+            // TransformComponent — same result as the old t == null path.
             Vector3 worldPos = Vector3.Zero;
             if (light.Owner != null)
             {
-                var t = light.Owner->GetComponent<TransformComponent>();
-                if (t != null)
-                {
-                    var w = *t.GetWorldMatrix();
-                    worldPos = new Vector3(w.M41, w.M42, w.M43);
-                }
+                var w = WorldOf(light.Owner);
+                worldPos = new Vector3(w.M41, w.M42, w.M43);
             }
 
             // Normalize direction — guard against zero-vector default.

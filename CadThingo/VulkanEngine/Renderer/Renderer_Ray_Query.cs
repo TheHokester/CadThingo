@@ -652,10 +652,16 @@ public unsafe partial class Renderer
     private void RebuildTlas()
     {
         // Reconcile renderable identity (L2 step 2) on the same cadence as the AS:
-        // every renderable gathered below gets a stable RenderableHandle, freed
-        // when its entity leaves the scene. Nothing consumes the handles yet — step 6
-        // repoints ShadowEntityInfo.EntityIndex / pick / selection onto them.
+        // every renderable gathered below gets a stable RenderableHandle (freed when
+        // its entity leaves the scene), written into ShadowEntityInfo.EntityIndex
+        // below and resolved back by pick / selection (L2 step 6).
         gpuScene.SyncRenderables(scene);
+
+        // Open a fresh world-transform cache window for this rebuild (L2 step 5).
+        // RebuildTlas runs out-of-band (edit-driven, before the per-frame reset), so
+        // it owns its own BeginTransforms — otherwise the gather below would read the
+        // previous cycle's stale matrices.
+        gpuScene.BeginTransforms();
 
         // World-space cluster BLASes depend on the current transforms, so free
         // last build's set before regathering.
@@ -678,7 +684,7 @@ public unsafe partial class Renderer
             var meshComp  = e->GetComponent<MeshComponent>();
             if (transform == null || meshComp == null || meshComp.mesh == null) continue;
 
-            Matrix4x4 world = *transform.GetWorldMatrix();
+            Matrix4x4 world = gpuScene.WorldOf(e); // cached (L2 step 5)
 
             uint  matFlags        = 0u;
             float matTransmission = 0f;
