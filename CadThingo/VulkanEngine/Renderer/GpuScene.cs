@@ -74,10 +74,10 @@ public struct RenderableInputGpu
 {
     public Matrix4x4 model; // 64B
     public Vector4 sphereLocal; // 16B  (xyz center, w radius — local space)
-    public uint indexCount; //  4B  ┐
-    public uint firstIndex; //  4B  │  pulled straight from Mesh
-    public uint materialIndex; //  4B  │
-    public uint _pad; //  4B  ┘  std430 16B alignment
+    public uint indexCount;     //  4B  |
+    public uint firstIndex;     //  4B  | pulled straight from Mesh
+    public uint materialIndex;  //  4B  |
+    public uint _pad;           //  4B  |  std430 16B alignment
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -150,6 +150,105 @@ public sealed unsafe class GpuScene : IDisposable
     public GpuScene(GraphicsDevice gfx)
     {
         _gfx = gfx;
+    }
+
+    // Renderable identity 
+    // Generational slot allocator. Generalizes Scene's material free-list idea to
+    // a stable (index, generation) handle that survives entity-list reorder and
+    // removal. This handle — not Scene.IndexOf — becomes the canonical identity for
+    // the TLAS InstanceCustomIndex, pick results, ShadowEntityInfo.EntityIndex, and
+    // the selection index (those consumers are repointed in L2 step 6). For now this
+    // only *maintains* the map; nothing reads the handles yet.
+    private readonly List<uint> _slotGeneration = new();   // current generation per slot
+    private readonly List<nint> _slotEntity      = new();   // entity ptr per slot; 0 = free
+    private readonly Stack<int> _freeSlots        = new();   // recycled slot indices
+    private readonly Dictionary<nint, RenderableHandle> _handleOf = new();
+    // SyncRenderables scratch — reused so a per-edit reconcile allocates nothing.
+    private readonly HashSet<nint> _present = new();
+    private readonly List<nint>    _toFree  = new();
+
+    /// <summary>Number of entities currently holding a live renderable handle.</summary>
+    public int RenderableCount => _handleOf.Count;
+
+    /// <summary>Returns the entity's stable handle, allocating a slot on first sight.
+    /// Idempotent — the same entity maps to the same slot until it is freed.</summary>
+    public RenderableHandle Register(Entity* e)
+    {
+        nint key = (nint)e;
+        if (_handleOf.TryGetValue(key, out var existing)) return existing;
+
+        int slot;
+        if (_freeSlots.Count > 0)
+        {
+            slot = _freeSlots.Pop();
+            _slotEntity[slot] = key;
+        }
+        else
+        {
+            slot = _slotGeneration.Count;
+            _slotGeneration.Add(0);
+            _slotEntity.Add(key);
+        }
+        var handle = new RenderableHandle((uint)slot, _slotGeneration[slot]);
+        _handleOf[key] = handle;
+        return handle;
+    }
+
+    /// <summary>Releases the entity's slot, bumping its generation so any cached
+    /// handle to it is invalidated. The slot is recycled by the next Register.</summary>
+    public void Free(Entity* e)
+    {
+        nint key = (nint)e;
+        if (!_handleOf.TryGetValue(key, out var h)) return;
+        int slot = (int)h.Index;
+        _slotGeneration[slot]++;      // invalidate outstanding handles to this slot
+        _slotEntity[slot] = 0;
+        _freeSlots.Push(slot);
+        _handleOf.Remove(key);
+    }
+
+    /// <summary>True if the handle still refers to the live entity it was issued for.</summary>
+    public bool IsValid(RenderableHandle h) =>
+        h.Index < _slotGeneration.Count
+        && _slotGeneration[(int)h.Index] == h.Generation
+        && _slotEntity[(int)h.Index] != 0;
+
+    /// <summary>Resolves a handle back to its entity, or null if the handle is stale.</summary>
+    public Entity* Resolve(RenderableHandle h) =>
+        IsValid(h) ? (Entity*)_slotEntity[(int)h.Index] : null;
+
+    /// <summary>Looks up an already-registered entity's handle.</summary>
+    public bool TryGetHandle(Entity* e, out RenderableHandle h) =>
+        _handleOf.TryGetValue((nint)e, out h);
+
+    /// <summary>
+    /// Reconciles the handle map against the scene's current renderable set:
+    /// registers entities that have a live mesh, frees handles whose entity left the
+    /// scene (or lost its mesh). The registration predicate matches RebuildTlas's
+    /// gather, so the handle population tracks the TLAS instance population exactly.
+    /// Identity is independent of active/visibility state, so a visibility toggle
+    /// doesn't churn generations. Called on the TLAS-rebuild cadence (dirty-driven),
+    /// not per frame.
+    /// </summary>
+    public void SyncRenderables(Scene scene)
+    {
+        // 1. Register current renderables (entities with a live mesh).
+        _present.Clear();
+        for (int i = 0; i < scene.EntityCount; i++)
+        {
+            Entity* e = scene.GetEntity(i);
+            if (e == null) continue;
+            var mesh = e->GetComponent<MeshComponent>();
+            if (mesh == null || mesh.mesh == null) continue;
+            _present.Add((nint)e);
+            Register(e);
+        }
+
+        // 2. Free handles whose entity is no longer a present renderable.
+        _toFree.Clear();
+        foreach (var key in _handleOf.Keys)
+            if (!_present.Contains(key)) _toFree.Add(key);
+        foreach (var key in _toFree) Free((Entity*)key);
     }
 
     /// <summary>Light SSBO for the given frame slot. Stable for the renderer's lifetime.</summary>

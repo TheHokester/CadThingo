@@ -651,6 +651,12 @@ public unsafe partial class Renderer
     private static uint PreviousCount = 0;
     private void RebuildTlas()
     {
+        // Reconcile renderable identity (L2 step 2) on the same cadence as the AS:
+        // every renderable gathered below gets a stable RenderableHandle, freed
+        // when its entity leaves the scene. Nothing consumes the handles yet — step 6
+        // repoints ShadowEntityInfo.EntityIndex / pick / selection onto them.
+        gpuScene.SyncRenderables(scene);
+
         // World-space cluster BLASes depend on the current transforms, so free
         // last build's set before regathering.
         DestroyClusterBlases();
