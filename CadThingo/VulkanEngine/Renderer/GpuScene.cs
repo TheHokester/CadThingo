@@ -160,6 +160,29 @@ public sealed unsafe class GpuScene : IDisposable
     /// <see cref="ExtractRenderables"/> — drives the cull dispatch + maxDrawCount.</summary>
     public uint ExtractedRenderableCount { get; private set; }
 
+    //dirty driven scene extraction
+    private const uint AllSlotsDirty = (1u << (int)Renderer.MAX_CONCURRENT_FRAMES) - 1u;
+    private uint _materialDirty   = AllSlotsDirty;
+    private uint _lightDirty      = AllSlotsDirty;
+    private uint _renderableDirty = AllSlotsDirty;
+    private uint _lastMaterialCount;
+
+    /// <summary>Marks the GPU mirror stale for every frame slot. The next time each
+    /// extract runs for a given slot it re-packs that slot, then leaves it clean until
+    /// the next edit. Idempotent and cheap — call it generously; over-triggering only
+    /// costs a re-pack, under-triggering would render stale data.</summary>
+    public void MarkSceneDirty() => _materialDirty = _lightDirty = _renderableDirty = AllSlotsDirty;
+
+    // Test-and-clear one frame-slot's dirty bit. Returns whether that slot still
+    // needed a re-pack (and clears it so a clean slot is skipped next time).
+    private static bool TakeSlot(ref uint mask, uint frame)
+    {
+        uint bit = 1u << (int)frame;
+        bool was = (mask & bit) != 0u;
+        mask &= ~bit;
+        return was;
+    }
+
     public GpuScene(GraphicsDevice gfx)
     {
         _gfx = gfx;
@@ -346,6 +369,12 @@ public sealed unsafe class GpuScene : IDisposable
     /// </summary>
     public uint ExtractRenderables(uint frameIndex, Scene scene)
     {
+        // Dirty-driven (L2 step 7): skip the walk if this slot is already current.
+        // The cull pass still re-sorts transparents by camera every frame — only the
+        // (view-independent) packing is gated here, and the buffer keeps last extract's
+        // rows for this slot, which stay valid until the next MarkSceneDirty.
+        if (!TakeSlot(ref _renderableDirty, frameIndex)) return ExtractedRenderableCount;
+
         RenderableInputGpu* inputPtr = (RenderableInputGpu*)_renderableBuffers[frameIndex].mapped;
         uint count = 0;
         int matCount = scene.MaterialCount;
@@ -415,6 +444,9 @@ public sealed unsafe class GpuScene : IDisposable
     /// </summary>
     public uint UpdateMaterials(uint frameIndex, Scene scene)
     {
+        // Dirty-driven (L2 step 7): this slot's material SSBO is already current.
+        if (!TakeSlot(ref _materialDirty, frameIndex)) return _lastMaterialCount;
+
         int matCount = scene.MaterialCount;
         if (matCount + 1 > (int)Renderer.MAX_MATERIALS)
             throw new InvalidOperationException(
@@ -448,7 +480,8 @@ public sealed unsafe class GpuScene : IDisposable
             AttenuationDistance      = PbrMaterialVolume.NoAbsorptionDistance,
         };
 
-        return (uint)matCount;
+        _lastMaterialCount = (uint)matCount;
+        return _lastMaterialCount;
     }
 
     /// <summary>Walks scene lights into the per-frame light SSBO. Returns the
@@ -457,6 +490,9 @@ public sealed unsafe class GpuScene : IDisposable
     /// before recording its draws.</summary>
     public uint UpdateLights(uint frameIndex, Scene scene)
     {
+        // Dirty-driven (L2 step 7): this slot's light SSBO is already current.
+        if (!TakeSlot(ref _lightDirty, frameIndex)) return LightCount;
+
         scene.EnumerateLights(_lightScratch);
 
         PbrLightGpu* lightPtr = (PbrLightGpu*)_lightBuffers[frameIndex].mapped;

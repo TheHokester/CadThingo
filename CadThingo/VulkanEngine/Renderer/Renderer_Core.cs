@@ -202,7 +202,15 @@ public unsafe partial class Renderer
     //Path-tracing accumulation state (the images live on RenderTargets; this is the
     //CPU-side dirty/restart bookkeeping that drives progressive integration).
     bool accumulatorDirty = false;
-    public void MarkAccumulatorDirty() => accumulatorDirty = true;
+    public void MarkAccumulatorDirty()
+    {
+        accumulatorDirty = true;
+        // Dirty-driven scene extract (L2 step 7) piggybacks on this near-universal
+        // "scene visually changed" signal — every material/light/transform edit calls
+        // it, so the GPU mirror re-packs. Over-triggering (e.g. a PT camera move, which
+        // doesn't change scene data) is harmless: it only costs a re-pack.
+        gpuScene?.MarkSceneDirty();
+    }
 
     // Previous-frame camera snapshot. DrawPathtraced compares against this and
     // flips accumulatorDirty when either differs, so any camera move restarts
@@ -402,6 +410,11 @@ public unsafe partial class Renderer
             ptComputePipeline.WriteEmissiveDescriptors();
             rtPipeline?.WriteEmissiveDescriptors();
         }
+
+        // Stand up the deferred chain as a FrameGraph (render-graph.md §1.8). Imports the
+        // legacy graph's targets (compiled above in SetupDeferredRenderer) and re-derives
+        // sync; DrawDeferred runs its Execute in place of the legacy one.
+        BuildDeferredFrameGraph();
 
         initialized = true;
     }
@@ -603,6 +616,9 @@ public unsafe partial class Renderer
         imGuiUtils?.Dispose();
         
         
+        // Deferred FrameGraph imports (never owns) the legacy graph's targets, so it frees
+        // nothing here — but dispose it first anyway to drop references before the owner.
+        _deferredFrameGraph?.Dispose();
         // Render graph (holds references to depth + g-buffers) then the render targets.
         // RenderGraph.Dispose disposes resources it owns; ImageResource.Dispose is
         // idempotent so RenderTargets.Dispose re-freeing them is a safe no-op.

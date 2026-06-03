@@ -81,12 +81,14 @@ public sealed unsafe class GraphicsDevice : IDisposable
     // ---- Public device-services surface ------------------------------------
 
     public Vk                 Vk             => vk;
+    
+    public ExtDebugUtils? DebugUtils => debugUtils;
     public Device             Device         => device;
     public PhysicalDevice     PhysicalDevice => physicalDevice;
     public GpuMemoryAllocator Allocator      => memAllocator;
     public DescriptorPool     DescriptorPool => descriptorPool;
     public CommandPool        CommandPool    => commandPool;
-
+    
     public Queue GraphicsQueue => graphicsQueue;
     public Queue PresentQueue  => presentQueue;
     public Queue ComputeQueue  => computeQueue;

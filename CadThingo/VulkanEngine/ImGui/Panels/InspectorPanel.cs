@@ -74,7 +74,12 @@ public static unsafe class InspectorPanel
 
         bool active = entity->IsActive;
         if (ImGuiNET.ImGui.Checkbox("Active", ref active))
+        {
             entity->IsActive = active;
+            // Active gates the light set (Scene.EnumerateLights) — restart PT
+            // integration + re-pack the GPU mirror (L2 step 7 dirty signal).
+            Engine.renderer.MarkAccumulatorDirty();
+        }
 
         ImGuiNET.ImGui.Separator();
     }
@@ -334,9 +339,14 @@ public static unsafe class InspectorPanel
         if (!ImGuiNET.ImGui.CollapsingHeader("Light", ImGuiTreeNodeFlags.DefaultOpen))
             return;
 
-        ImGuiNET.ImGui.Checkbox("Enabled", ref l.Enabled);
+        // Enabled / CastShadows feed UpdateLights (the packed light set + the
+        // CastShadows flag), so a toggle must restart PT integration + re-pack the
+        // GPU mirror (L2 step 7) — these were the gaps where neither dirty signal fired.
+        if (ImGuiNET.ImGui.Checkbox("Enabled", ref l.Enabled))
+            Engine.renderer.MarkAccumulatorDirty();
         ImGuiNET.ImGui.SameLine();
-        ImGuiNET.ImGui.Checkbox("Cast shadows", ref l.CastShadows);
+        if (ImGuiNET.ImGui.Checkbox("Cast shadows", ref l.CastShadows))
+            Engine.renderer.MarkAccumulatorDirty();
 
         int type = (int)l.Type;
         if (ImGuiNET.ImGui.Combo("Type", ref type, "Directional\0Point\0Spot\0\0"))

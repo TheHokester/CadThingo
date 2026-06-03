@@ -24,7 +24,7 @@ struct QueueRef
     Queue Handle;
 }
 
-enum QueueClass
+public enum QueueClass
 {
     Graphics,
     AsyncCompute,

@@ -2,5 +2,5 @@
 
 public interface IGraphModule<TInputs, TOutputs>
 {
-    void Build(IGraphBuilder b, in TInputs inputs, in TOutputs outputs);
+    void Build(GraphBuilder b, in TInputs inputs, in TOutputs outputs);
 }

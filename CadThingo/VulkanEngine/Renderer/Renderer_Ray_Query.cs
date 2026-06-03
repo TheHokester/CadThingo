@@ -166,7 +166,12 @@ public unsafe partial class Renderer
     /// (InspectorPanel transforms, FileBrowserPanel visibility) — direct
     /// per-mutation RebuildTlas calls would stall the device on every slider tick.
     /// </summary>
-    public void MarkTlasDirty() => tlasDirty = true;
+    public void MarkTlasDirty()
+    {
+        tlasDirty = true;
+        // Structural / transform / alpha-mode edits also re-pack the GPU mirror (L2 step 7).
+        gpuScene?.MarkSceneDirty();
+    }
     public bool IsTlasDirty => tlasDirty;
 
 
