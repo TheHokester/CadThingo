@@ -30,8 +30,6 @@ public class Scene
 {
     private static Camera Cam;
 
-    public RenderGraph renderGraph;
-
     // Entity* stored as nint so the managed List doesn't need pinning.
     private readonly List<nint> _entityList = new();
 
@@ -81,9 +79,10 @@ public class Scene
     /// </summary>
     public Span<PbrMaterial> MaterialsMutable => CollectionsMarshal.AsSpan(_materials);
 
+    // vk/device/physicalDevice are retained on the signature for call-site stability; the
+    // deferred chain now lives on the renderer's FrameGraph, not a Scene-owned RenderGraph.
     public Scene(Vk vk, Device device, PhysicalDevice physicalDevice)
     {
-        renderGraph = new RenderGraph(vk, device, physicalDevice);
         Cam = new Camera();
     }
 

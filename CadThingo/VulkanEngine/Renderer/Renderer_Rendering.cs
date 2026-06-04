@@ -97,34 +97,29 @@ public unsafe partial class Renderer
     /// </summary>
     private void RebuildRenderTargets(uint width, uint height)
     {
-        // Order matters: the render graph holds references to depth + g-buffer
-        // ImageResources, so dispose it before reallocating the targets. RenderTargets
-        // reallocates the size-dependent attachments (keeping the g-buffer sampler).
-        scene.renderGraph.Dispose();
-        renderTargets.ReallocateSizeDependent(new Extent2D(width, height));
+        // Diagnostic: count full render-target rebuilds so the Stats panel can
+        // correlate spp/s degradation with resize churn (see GpuMemoryAllocator
+        // retained-block investigation).
+        _renderTargetRebuilds++;
 
-        scene.renderGraph = new RenderGraph(vk!, device, physicalDevice);
-        SetupDeferredRenderer(scene.renderGraph, renderExtent.Width, renderExtent.Height);
-        // Re-import the fresh (reallocated) target handles into the deferred FrameGraph.
+        // The deferred FrameGraph owns the g-buffer/depth/HDR transients and imports
+        // FinalColor. Reallocate the imported targets first (FinalColor + PT/selection),
+        // then rebuild the graph: that disposes the old transients, allocates fresh ones at
+        // the new extent, re-imports FinalColor, and re-binds the lighting g-buffer + tonemap
+        // HDR descriptors from the new views.
+        renderTargets.ReallocateSizeDependent(new Extent2D(width, height));
         BuildDeferredFrameGraph();
 
-        // G-buffer ImageViews are fresh — re-bind them on the lighting pass set.
-        PbrDeferredPipeline.WriteGBufferDescriptors();
-
-        // Tonemap's HDR input is mode-dependent: HDRColor (the render-graph
-        // HDR target) for the deferred / forward+ paths, ptOutColor for the
-        // pathtracer. Both ImageViews are fresh post-rebuild — pick the right
-        // one or PT-mode resize ends up reading from the empty HDRColor and
-        // the screen goes black until the next mode flip rebinds it.
-        // Both pathtracer modes (compute + RT pipeline) write ptOutColor.
+        // BuildDeferredFrameGraph bound tonemap's HDR input to the fresh HDR transient (the
+        // deferred source). In a PT mode the input must instead be ptOutColor — also fresh
+        // post-rebuild — so re-point it; otherwise PT-mode resize reads the (correct but
+        // unused) HDR view. Both PT modes (compute + RT pipeline) write ptOutColor.
         bool ptMode = renderMode == RenderMode.RayCompute || renderMode == RenderMode.RayTrace;
-        ImageView hdrInput = ptMode
-            ? ptOutColor.ImageView
-            : scene.renderGraph.GetResource("HDRColor").ImageView;
-        tonemapPipeline.WriteHdrInputDescriptor(hdrInput, gBufferSampler);
+        if (ptMode)
+            tonemapPipeline.WriteHdrInputDescriptor(ptOutColor.ImageView, gBufferSampler);
 
         // FinalColor ImageView is fresh — re-bind it for the ImGui viewport panel.
-        imGuiUtils?.WriteViewportDescriptor(scene.renderGraph.GetResource("FinalColor").ImageView);
+        imGuiUtils?.WriteViewportDescriptor(renderTargets.FinalColor.ImageView);
 
         // PT storage image views are fresh too. WriteStorageImageDescriptors calls
         // MarkAccumulatorDirty internally so the next dispatch clears the
@@ -136,6 +131,10 @@ public unsafe partial class Renderer
         // image) and outline (sampled image) sides.
         selectionMaskPipeline?.WriteMaskImageDescriptor(selectionMask.ImageView);
         outlinePipeline?.WriteMaskDescriptor(selectionMask.ImageView);
+
+        // Diagnostic: sample allocator occupancy now that old targets are freed and
+        // new ones allocated — the steady post-resize state for the history plot.
+        RecordMemorySample();
     }
 
     /// <summary>
@@ -212,7 +211,7 @@ public unsafe partial class Renderer
             vk!.DeviceWaitIdle(device);
             ImageView source = (renderMode == RenderMode.RayCompute || renderMode == RenderMode.RayTrace)
                 ? ptOutColor.ImageView
-                : scene.renderGraph.GetResource("HDRColor").ImageView;
+                : _deferredHdrView;
             tonemapPipeline.WriteHdrInputDescriptor(source, gBufferSampler);
             _lastRenderMode = renderMode;
         }
@@ -303,7 +302,7 @@ public unsafe partial class Renderer
         // viewport panel can sample it), so we dance it through TransferSrcOptimal
         // here and back to ShaderReadOnlyOptimal after the blit. The graph's layout
         // tracker stays consistent because we end where the graph thinks it ends.
-        var finalColor = scene.renderGraph.GetResource("FinalColor");
+        var finalColor = renderTargets.FinalColor;
         TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.TransferSrcOptimal);
         var blit = new ImageBlit
@@ -432,23 +431,10 @@ public unsafe partial class Renderer
         // (The host-coherent write is visible to the cull dispatch on submit.)
         gpuScene.ExtractRenderables(currentFrame, scene);
 
-        // 6. Record the deferred chain (cull → light-cull → geometry → lighting → skybox →
-        //    transparent → tonemap), record-only. The new FrameGraph runs cull/light-cull
-        //    as compute passes and derives all sync from the usage table; flip the flag to
-        //    A/B against the legacy coarse-barrier executor.
-        const bool UseDeferredFrameGraph = true;
-        if (UseDeferredFrameGraph && _deferredFrameGraph != null)
-        {
-            _deferredFrameGraph.Execute(cmd, frameContext);
-        }
-        else
-        {
-            // Legacy graph only owns the 5 graphics passes, so cull/light-cull (their
-            // internal barriers carry the sync) are recorded here, ahead of it.
-            drawCullPipeline.Record(cmd, currentFrame, camera);
-            lightCullPipeline.Record(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
-            scene.renderGraph.Execute(cmd, frameContext);
-        }
+        // 6. Record the deferred chain via the FrameGraph: cull -> light-cull -> geometry ->
+        //    lighting -> skybox -> transparent -> tonemap. Cull/light-cull run as compute
+        //    passes and every barrier is derived from the usage table.
+        _deferredFrameGraph!.Execute(cmd, frameContext);
     }
     /// <summary>
     /// Uses RT in a compute shader
@@ -548,7 +534,7 @@ public unsafe partial class Renderer
         TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
             ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
 
-        var finalColor = scene.renderGraph.GetResource("FinalColor");
+        var finalColor = renderTargets.FinalColor;
         TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
 
@@ -639,7 +625,7 @@ public unsafe partial class Renderer
         TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
             ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
 
-        var finalColor = scene.renderGraph.GetResource("FinalColor");
+        var finalColor = renderTargets.FinalColor;
         TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
 
@@ -734,7 +720,7 @@ public unsafe partial class Renderer
         TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
             ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
 
-        var finalColor = scene.renderGraph.GetResource("FinalColor");
+        var finalColor = renderTargets.FinalColor;
         TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
 
@@ -747,13 +733,23 @@ public unsafe partial class Renderer
     }
 
 
-    // The new frame graph driving the deferred chain (render-graph.md Phase 1 / §1.8).
-    // Built side-by-side with the legacy `scene.renderGraph`, which stays the resource
-    // OWNER (it still allocates the g-buffers / HDR / FinalColor in its Compile); this
-    // graph IMPORTS those handles and re-derives all sync via the usage table. Set
-    // UseDeferredFrameGraph=false in DrawDeferred to fall straight back to the legacy
-    // Execute for A/B comparison.
+    // The frame graph driving the deferred chain (render-graph.md Phase 1 / §1.8). It OWNS
+    // the g-buffers / depth / HDR as transients (allocated in Compile, freed in Dispose) and
+    // imports only FinalColor (RenderTargets-owned, consumed by the swapchain blit + ImGui
+    // viewport). All sync is derived from the usage table. Rebuilt on resize.
     private DeferredGraph? _deferredFrameGraph;
+
+    // Cached view of the FrameGraph's HDR transient, refreshed each BuildDeferredFrameGraph
+    // (the transient is reallocated on every Compile). Tonemap's HDR-input descriptor is
+    // bound to it there; the PT⇄deferred mode flip and the tonemap-operator rebuild read it
+    // to restore the deferred source after pointing tonemap at ptOutColor.
+    private ImageView _deferredHdrView;
+
+    // Cached views of the FrameGraph's 5 g-buffer transients (pos/normal/albedo/material/
+    // emissive), refreshed each BuildDeferredFrameGraph. The lighting set is bound to them
+    // there; RebuildPbrPipelines also rebinds from these onto its fresh descriptor set
+    // (Initialize no longer writes the g-buffer set — the views live on the graph).
+    private readonly ImageView[] _deferredGBufferViews = new ImageView[5];
 
     // Per-frame values the LightCullPass body needs (computed in DrawDeferred from
     // PbrDeferredPipeline.UpdatePerFrame, before the graph executes). Stashed on the
@@ -765,6 +761,35 @@ public unsafe partial class Renderer
     // ---- Deferred FrameGraph debug surface (read by the Stats panel) -----------
     /// <summary>Last-frame per-pass GPU/CPU timings + counts, or null before first compile.</summary>
     public GraphStats? DeferredGraphStats => _deferredFrameGraph?.Stats;
+
+    // ---- Resize-churn diagnostics (GpuMemoryAllocator retained-block check) -----
+    private int _renderTargetRebuilds;
+    /// <summary>Count of full render-target rebuilds since launch (one per resize).</summary>
+    public int RenderTargetRebuilds => _renderTargetRebuilds;
+    /// <summary>Live allocator occupancy — reserved (held from driver) vs. actually used.</summary>
+    public AllocatorStats GpuMemoryStats => gfx.Allocator.GetStats();
+
+    // Per-rebuild MB history (sampled at the END of each RebuildRenderTargets, i.e.
+    // steady post-resize state). The SHAPE discriminates the diagnosis: a monotonic
+    // climb with rebuild count == per-resize leak; a step-then-plateau == one-time
+    // high-water (retained empty block) with no leak.
+    private const int MemHistoryLen = 256;
+    private readonly float[] _usedMbHistory     = new float[MemHistoryLen];
+    private readonly float[] _reservedMbHistory = new float[MemHistoryLen];
+    private int _memHistoryHead;
+    public float[] UsedMbHistory     => _usedMbHistory;
+    public float[] ReservedMbHistory => _reservedMbHistory;
+    public int     MemHistoryHead    => _memHistoryHead;
+    public int     MemHistoryLength  => MemHistoryLen;
+
+    private void RecordMemorySample()
+    {
+        var s = gfx.Allocator.GetStats();
+        const float MB = 1024f * 1024f;
+        _usedMbHistory[_memHistoryHead]     = s.UsedBytes     / MB;
+        _reservedMbHistory[_memHistoryHead] = s.ReservedBytes / MB;
+        _memHistoryHead = (_memHistoryHead + 1) % MemHistoryLen;
+    }
     /// <summary>Graphviz dump of the compiled deferred graph (for "Copy DOT").</summary>
     public string DeferredGraphDot() => _deferredFrameGraph?.ToDot() ?? "(no deferred frame graph)";
     /// <summary>Runtime toggle for the deferred graph's pipeline-statistics collection.</summary>
@@ -775,39 +800,50 @@ public unsafe partial class Renderer
     }
 
     /// <summary>
-    /// (Re)builds the deferred chain as a <see cref="DeferredGraph"/> that imports the
-    /// legacy graph's already-allocated targets. Must be called AFTER
-    /// <see cref="SetupDeferredRenderer"/> (so the imported handles are live) and again
-    /// after every <see cref="RebuildRenderTargets"/> (the handles are fresh post-resize).
-    /// The pass bodies are closures over the renderer's pipelines — same contract as the
-    /// legacy graph: the pipelines only need to exist by the time Execute runs, not now.
+    /// (Re)builds the deferred chain as the <see cref="DeferredGraph"/>. The graph OWNS the
+    /// g-buffers / depth / HDR as transients (allocated in Compile) and imports only
+    /// FinalColor (RenderTargets-owned, consumed outside the graph). Must be called after the
+    /// pipelines it binds exist (PbrDeferred / tonemap, for the post-Compile descriptor
+    /// rebinds) and again after every <see cref="RebuildRenderTargets"/> (fresh extent →
+    /// fresh transients). Pass bodies are closures over the renderer's pipelines — they only
+    /// need to exist by the time Execute runs, not now.
     /// </summary>
     private void BuildDeferredFrameGraph()
     {
         _deferredFrameGraph?.Dispose();
-        var fg = new DeferredGraph(gfx);
+        var fg  = new DeferredGraph(gfx);
+        var ext = renderExtent;
 
-        // Import a legacy-graph target. currentLayout = Undefined every frame: each of
-        // these is fully regenerated by its producing pass, so discarding prior contents
-        // is correct and sidesteps the "frame-0 is Undefined, later frames aren't" split
-        // (transitioning FROM Undefined is always legal). FinalColor is handed back in
-        // ShaderReadOnly for the host blit + ImGui sampler.
-        GraphImage Import(string name, ImageLayout? finalLayout = null)
+        // Deferred intermediates the graph OWNS as transients: it allocates their VkImages in
+        // Compile() and frees them in Dispose(). Produced and consumed entirely within the
+        // chain (geometry writes; lighting/skybox/transparent/tonemap read), so nothing
+        // outside needs a stable handle. Seeded Undefined each frame (a legal discard — every
+        // producing pass fully regenerates its target).
+        GraphImage Color(string name, Format fmt) => fg.CreateImage(new ImageDesc
         {
-            var r = scene.renderGraph.GetResource(name);
-            var desc = new ImageDesc { Format = r._format, Mips = 1, Layers = 1 };
-            return fg.ImportImage(r.Image, r.ImageView, in desc,
-                ImageLayout.Undefined, name, finalLayout);
-        }
+            Format = fmt, Extent = ext, Mips = 1, Layers = 1,
+            Usage = ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.SampledBit,
+        }, name);
 
-        var pos      = Import("GBuffer_Position");
-        var normal   = Import("GBuffer_Normal");
-        var albedo   = Import("GBuffer_Albedo");
-        var material = Import("GBuffer_Material");
-        var emissive = Import("GBuffer_Emissive");
-        var depth    = Import("Depth");
-        var hdr      = Import("HDRColor");
-        var final    = Import("FinalColor", ImageLayout.ShaderReadOnlyOptimal);
+        var pos      = Color("GBuffer_Position", Format.R32G32B32A32Sfloat);
+        var normal   = Color("GBuffer_Normal",   Format.R32G32B32A32Sfloat);
+        var albedo   = Color("GBuffer_Albedo",   Format.R8G8B8A8Unorm);
+        var material = Color("GBuffer_Material",  Format.R8G8B8A8Unorm);
+        var emissive = Color("GBuffer_Emissive", Format.R16G16B16A16Sfloat);
+        var hdr      = Color("HDRColor",          Format.R16G16B16A16Sfloat);
+        var depth    = fg.CreateImage(new ImageDesc
+        {
+            Format = Format.D32Sfloat, Extent = ext, Mips = 1, Layers = 1,
+            Usage = ImageUsageFlags.DepthStencilAttachmentBit,
+        }, "Depth");
+
+        // FinalColor is the one IMPORTED image: the swapchain blit + ImGui viewport sample it,
+        // so RenderTargets owns it and the graph just adopts the handle, handing it back in
+        // ShaderReadOnly each frame. Undefined incoming = discard (tonemap rewrites every pixel).
+        var finalRes  = renderTargets.FinalColor;
+        var finalDesc = new ImageDesc { Format = finalRes._format, Mips = 1, Layers = 1 };
+        var final = fg.ImportImage(finalRes.Image, finalRes.ImageView, in finalDesc,
+            ImageLayout.Undefined, "FinalColor", ImageLayout.ShaderReadOnlyOptimal);
 
         // Per-frame compute-output buffers, imported so the graph derives the cull→geometry
         // and light-cull→lighting barriers + ordering. (The compute INPUTS — renderables and
@@ -888,7 +924,7 @@ public unsafe partial class Renderer
         // does NOT bind depth — the deferred lighting pass reconstructs position from the
         // g-buffer, so depth is left untouched in DepthStencilAttachmentOptimal for the
         // skybox/transparent depth tests. (The legacy graph listed Depth as a lighting
-        // input, which forced a pointless Attachment→ShaderReadOnly→Attachment round-trip.)
+        // input, which forced a pointless Attachment->ShaderReadOnly->Attachment round-trip.)
         fg.AddPass("LightingPass", PassType.Graphics, QueueClass.Graphics,
             b =>
             {
@@ -944,129 +980,26 @@ public unsafe partial class Renderer
         fg.MarkOutput(final);
         fg.Compile();
         _deferredFrameGraph = fg;
+
+        // Compile() just (re)allocated the g-buffer + HDR transients. (Re)bind the only graph
+        // resources read through a PRE-BAKED descriptor set rather than a per-pass res.View:
+        // the lighting pass's 5 g-buffer samplers and tonemap's HDR input. (Geometry / skybox
+        // / transparent / tonemap reach their attachments via res.View, which resolves the
+        // fresh handle automatically.) The cached HDR view also feeds the PT <->deferred and
+        // tonemap-operator rebind paths.
+        _deferredGBufferViews[0] = fg.ResolveView(pos);
+        _deferredGBufferViews[1] = fg.ResolveView(normal);
+        _deferredGBufferViews[2] = fg.ResolveView(albedo);
+        _deferredGBufferViews[3] = fg.ResolveView(material);
+        _deferredGBufferViews[4] = fg.ResolveView(emissive);
+        PbrDeferredPipeline.WriteGBufferDescriptors(
+            _deferredGBufferViews[0], _deferredGBufferViews[1], _deferredGBufferViews[2],
+            _deferredGBufferViews[3], _deferredGBufferViews[4]);
+        _deferredHdrView = fg.ResolveView(hdr);
+        tonemapPipeline.WriteHdrInputDescriptor(_deferredHdrView, gBufferSampler);
     }
 
 
-    /// <summary>
-    /// Comprehensive deferred renderer setup demonstrating rendergraph resource management<br/>
-    /// this implementation shows how to efficiently organise resources for multiple passes<br/>
-    /// </summary>
-    /// <param name="graph"></param>
-    /// <param name="width"></param>
-    /// <param name="height"></param>
-    private void SetupDeferredRenderer(RenderGraph graph, uint width, uint height)
-    {
-        //configure posiiton buffer for world-space vertex positions
-        //High precision format preserves positional accuracy for lighting calculations
-        graph.AddResource(gBufferPosition);
-        
-        
-        //Configure normal buffer for surface orientation data
-        //High precision normals enable accurate lighting and reflections
-        graph.AddResource(gBufferNormal);
-        
-        
-        //configure albedo buffer for surface color information
-        //standard 8bit precision sufficient for color data with gamma encoding
-        graph.AddResource(gBufferAlbedo);
-        
-        
-        graph.AddResource(gBufferMaterial);
-        // Emissive — sampled by the lighting pass and added to the final color before tone-mapping.
-        graph.AddResource(gBufferEmissive);
-        //configure depth buffer for accurate depth information
-        //standard 32bit depth format preserves accurate depth information
-        graph.AddResource(depthImageResource);
-        
-        // HDR linear scene target — produced by the lighting pass (and later the
-        // forward+ transparent pass). Consumed by the tone-map pass which writes
-        // the LDR FinalColor. SampledBit lets the tonemap pass bind it as a texture.
-        graph.AddResource("HDRColor", Format.R16G16B16A16Sfloat, new Extent2D(width, height),
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.SampledBit,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-
-        //configure finalcolor buffer for the completed lighting results
-        // SampledBit lets the ImGui viewport panel bind FinalColor as a CombinedImageSampler.
-        // finalLayout settles to ShaderReadOnlyOptimal each frame so ImGui draws sample valid
-        // contents — the per-frame blit to the swapchain transitions in and out manually.
-        // TransferDstBit lets the pathtracer path blit its ptOutColor into FinalColor —
-        // the viewport panel samples FinalColor regardless of render mode, so PT
-        // pixels need to land here for the user to see them.
-        graph.AddResource("FinalColor", Format.R8G8B8A8Unorm, new Extent2D(width, height),
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        
-        //set names of FInal and hdr color for debug
-        
-        //configure geometry pass for G-buffer population
-        //this pass renders all geometry and stores intermediate data for lighting calculations
-        graph.AddPass("GeometryPass", default,
-            new List<string> { "GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "GBuffer_Emissive", "Depth" },
-            (buffer, frameContext) => {
-                var indirectCmd = drawCullPipeline.GetIndirectCmdBuffer(frameContext.FrameIndex);
-                var indirectCount = drawCullPipeline.GetIndirectCountBuffer(frameContext.FrameIndex);
-                var drawCount = drawCullPipeline.LastRenderableCount;
-                var attachments = new GeometryPipeline.Attachments(
-                    position:  graph.GetResource("GBuffer_Position").ImageView,
-                    normal:    graph.GetResource("GBuffer_Normal").ImageView,
-                    albedo:    graph.GetResource("GBuffer_Albedo").ImageView,
-                    material:  graph.GetResource("GBuffer_Material").ImageView,
-                    emissive:  graph.GetResource("GBuffer_Emissive").ImageView,
-                    depth:     graph.GetResource("Depth").ImageView);
-                
-                geometryPipeline.Record(buffer, frameContext, indirectCmd, indirectCount, drawCount, attachments);
-            });
-        
-        
-        graph.AddPass("LightingPass", new List<string>{"GBuffer_Position", "GBuffer_Normal", "GBuffer_Albedo", "GBuffer_Material", "GBuffer_Emissive", "Depth"},
-            new List<string>{"HDRColor"}, (buffer, frameContext) =>
-            {
-                PbrDeferredPipeline.Record(buffer, frameContext, graph.GetResource("HDRColor").ImageView);
-            });
-
-        // Skybox pass — runs between lighting and transparent. Depth-tested
-        // EQUAL @ 1.0, no depth write; writes only to pixels where the geometry
-        // pass left the cleared far-plane depth (i.e. true sky). PBR shader
-        // emits black for those same pixels via the WorldPos.w sky-gate, so
-        // here LOAD_OP_LOAD preserves the lit framebuffer and the skybox just
-        // overwrites the black sky.
-        graph.AddPass("SkyboxPass", new List<string>(),
-            new List<string>{"HDRColor", "Depth"}, (buffer, frameContext) =>
-            {
-                SkyboxPipeline.Attachments attachments = new(
-                    hdrColor: graph.GetResource("HDRColor").ImageView,
-                    depth: graph.GetResource("Depth").ImageView
-                );
-                skyboxPipeline.Record(buffer, frameContext, attachments);
-            });
-
-        // Forward+ transparent pass — blends BLEND-mode materials into HDRColor on
-        // top of the deferred lighting result, depth-tested LE against the geometry
-        // pass's Depth (no depth write). Declares HDRColor + Depth as writes so the
-        // graph's writer→writer edges serialize this after LightingPass + GeometryPass
-        // and the current-layout tracker preserves HDR contents for blending.
-        // Body is a stub for stage 3 — pipeline + attachments bind but no draws.
-        graph.AddPass("TransparentPass", new List<string>(),
-            new List<string>{"HDRColor", "Depth"}, (buffer, frameContext) =>
-            {
-                TransparentPipeline.Attachments attachments = new(
-                    hdrColor: graph.GetResource("HDRColor").ImageView,
-                    depth: graph.GetResource("Depth").ImageView);
-                transparentPipeline.Record(buffer, frameContext, drawCullPipeline.LastTransparentDraws, attachments);
-            });
-
-        // Post-process: sample HDRColor, apply exposure + Reinhard + inverse gamma,
-        // write LDR into FinalColor. FinalColor's graph-declared finalLayout
-        // (TransferSrcOptimal) is honoured by the post-pass barrier, keeping
-        // the existing blit-to-swapchain path unchanged.
-        graph.AddPass("TonemapPass", new List<string>{"HDRColor"},
-            new List<string>{"FinalColor"}, (buffer, frameContext) =>
-            {
-                tonemapPipeline.Record(buffer, frameContext, graph.GetResource("FinalColor").ImageView);
-            });
-
-        graph.Compile();
-    }
 
 
 

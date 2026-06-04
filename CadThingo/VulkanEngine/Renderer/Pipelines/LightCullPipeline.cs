@@ -235,33 +235,6 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         // One thread group per tile (each group is 16×16 = 256 threads).
         Vk.CmdDispatch(cmd, tileCountX, tileCountY, 1);
 
-        // Barrier: compute writes -> fragment shader reads of the tile buffers.
-        var postBarriers = stackalloc BufferMemoryBarrier[2];
-        postBarriers[0] = new BufferMemoryBarrier
-        {
-            SType         = StructureType.BufferMemoryBarrier,
-            SrcAccessMask = AccessFlags.ShaderWriteBit,
-            DstAccessMask = AccessFlags.ShaderReadBit,
-            SrcQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            Buffer = TileLightCountBuffers[frameIndex].buffer,
-            Offset = 0,
-            Size   = Silk.NET.Vulkan.Vk.WholeSize,
-        };
-        postBarriers[1] = new BufferMemoryBarrier
-        {
-            SType         = StructureType.BufferMemoryBarrier,
-            SrcAccessMask = AccessFlags.ShaderWriteBit,
-            DstAccessMask = AccessFlags.ShaderReadBit,
-            SrcQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            Buffer = TileLightIndicesBuffers[frameIndex].buffer,
-            Offset = 0,
-            Size   = Silk.NET.Vulkan.Vk.WholeSize,
-        };
-        Vk.CmdPipelineBarrier(cmd,
-            PipelineStageFlags.ComputeShaderBit,
-            PipelineStageFlags.FragmentShaderBit,
-            0, 0, null, 2, postBarriers, 0, null);
+       
     }
 }

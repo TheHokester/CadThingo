@@ -268,46 +268,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         uint groups = (count + 63u) / 64u;
         Vk.CmdDispatch(cmd, groups, 1, 1);
 
-        // 4. Barrier: compute writes -> indirect/vertex stage reads
-        var postBarriers = stackalloc BufferMemoryBarrier[3];
-        postBarriers[0] = new BufferMemoryBarrier
-        {
-            SType         = StructureType.BufferMemoryBarrier,
-            SrcAccessMask = AccessFlags.ShaderWriteBit,
-            DstAccessMask = AccessFlags.IndirectCommandReadBit,
-            SrcQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            Buffer = IndirectCmdBuffers[frameIndex].buffer,
-            Offset = 0,
-            Size   = Silk.NET.Vulkan.Vk.WholeSize,
-        };
-        postBarriers[1] = new BufferMemoryBarrier
-        {
-            SType         = StructureType.BufferMemoryBarrier,
-            SrcAccessMask = AccessFlags.ShaderWriteBit,
-            DstAccessMask = AccessFlags.IndirectCommandReadBit,
-            SrcQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            Buffer = IndirectCountBuffers[frameIndex].buffer,
-            Offset = 0,
-            Size   = sizeof(uint),
-        };
-        postBarriers[2] = new BufferMemoryBarrier
-        {
-            SType         = StructureType.BufferMemoryBarrier,
-            SrcAccessMask = AccessFlags.ShaderWriteBit,
-            DstAccessMask = AccessFlags.ShaderReadBit,
-            SrcQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Silk.NET.Vulkan.Vk.QueueFamilyIgnored,
-            Buffer = Engine.ResourceManager.GetInstanceBuffer(frameIndex),
-            Offset = 0,
-            Size   = Silk.NET.Vulkan.Vk.WholeSize,
-        };
-        Vk.CmdPipelineBarrier(cmd,
-            PipelineStageFlags.ComputeShaderBit,
-            PipelineStageFlags.DrawIndirectBit | PipelineStageFlags.VertexShaderBit,
-            0, 0, null, 3, postBarriers, 0, null);
-
+        
         return count;
     }
 }

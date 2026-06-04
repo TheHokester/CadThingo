@@ -48,9 +48,47 @@ public static class StatsPanel
             ImGuiNET.ImGui.TextDisabled("Scene not initialized.");
         }
 
+        DrawGpuMemory();
         DrawRenderGraph();
 
         ImGuiNET.ImGui.End();
+    }
+
+    // GPU-memory occupancy + resize-churn counter. The headline number is the
+    // Reserved−Used gap: if it climbs while you resize the viewport and does NOT
+    // fall back when you return to the original size, the allocator is holding
+    // empty blocks it never releases (the spp/s-degradation root cause under test).
+    private static void DrawGpuMemory()
+    {
+        var r = Engine.renderer;
+        if (r == null) return;
+
+        ImGuiNET.ImGui.Separator();
+        var m = r.GpuMemoryStats;
+        const double MB = 1024.0 * 1024.0;
+        double reserved = m.ReservedBytes / MB;
+        double used     = m.UsedBytes / MB;
+        double gap      = reserved - used;
+
+        var ext = r.RenderExtent;
+        ImGuiNET.ImGui.Text($"renderExtent {ext.Width}x{ext.Height}   rebuilds {r.RenderTargetRebuilds}");
+        ImGuiNET.ImGui.Text($"VRAM reserved {reserved,8:F1} MB   used {used,8:F1} MB");
+        ImGuiNET.ImGui.Text($"  retained (empty) {gap,8:F1} MB   blocks {m.PooledBlocks}+{m.DedicatedBlocks} ded");
+
+        // Per-rebuild history. X axis = rebuild #, so a rising line means each
+        // resize adds memory that never comes back (leak); a flat line after the
+        // first step means one-time high-water (no leak).
+        int len  = r.MemHistoryLength;
+        int head = r.MemHistoryHead;
+        var usedH = r.UsedMbHistory;
+        var resH  = r.ReservedMbHistory;
+        if (usedH.Length == len && r.RenderTargetRebuilds > 0)
+        {
+            ImGuiNET.ImGui.PlotLines("##usedhist", ref usedH[0], len, head,
+                "used MB / rebuild", float.MaxValue, float.MaxValue, new Vector2(0, 50));
+            ImGuiNET.ImGui.PlotLines("##reshist", ref resH[0], len, head,
+                "reserved MB / rebuild", float.MaxValue, float.MaxValue, new Vector2(0, 50));
+        }
     }
 
     // Deferred FrameGraph instrumentation: per-pass GPU/CPU timing, barrier/cull counts,

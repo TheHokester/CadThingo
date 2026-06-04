@@ -35,7 +35,7 @@ public unsafe partial class Renderer
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private bool enableValidationLayers = true;
+    private bool enableValidationLayers = false;
     private IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------
@@ -184,16 +184,8 @@ public unsafe partial class Renderer
     //Camera
     Camera camera;
     public Camera Camera => camera;
-
-    //Depth buffer + Images — owned by RenderTargets (L1.5). Delegating accessors keep
-    //the former field names so the render graph / PbrDeferredPipeline.WriteGBufferDescriptors
-    //and the frame body read them unchanged.
-    internal ImageResource depthImageResource => renderTargets.Depth;
-    internal ImageResource gBufferPosition    => renderTargets.GBufferPosition;
-    internal ImageResource gBufferNormal      => renderTargets.GBufferNormal;
-    internal ImageResource gBufferAlbedo      => renderTargets.GBufferAlbedo;
-    internal ImageResource gBufferMaterial    => renderTargets.GBufferMaterial;
-    internal ImageResource gBufferEmissive    => renderTargets.GBufferEmissive;
+    
+    //Sampler for gbuffers, pathtracing ImageResources and selection mask
     internal Sampler       gBufferSampler     => renderTargets.GBufferSampler;
     private  ImageResource ptAccumulator      => renderTargets.PtAccumulator;
     private  ImageResource ptOutColor         => renderTargets.PtOutColor;
@@ -282,17 +274,17 @@ public unsafe partial class Renderer
         drawCullPipeline.Initialize();
 
         scene = new Scene(vk, device, physicalDevice);//initialise scene
-        // graph.Compile() inside SetupDeferredRenderer allocates the g-buffer
-        // images. The PBR pipeline's set 1 binds those views, so PbrDeferredPipeline
-        // must initialize AFTER this call.
-        SetupDeferredRenderer(scene.renderGraph, renderExtent.Width, renderExtent.Height);
+        // The deferred chain's g-buffers / depth / HDR are now FrameGraph transients,
+        // allocated when BuildDeferredFrameGraph() compiles the graph at the end of
+        // Initialize. PbrDeferredPipeline's g-buffer set is (re)bound there from the
+        // freshly-allocated views, so it can initialize in any order below.
         imGuiUtils = new ImGuiVulkanUtils(this, (uint)queueFamilyIndices.graphicsFamily! );
         imGuiUtils?.init(swapChainExtent.Width, swapChainExtent.Height);
 
         // Bind FinalColor into the ImGui viewport descriptor so the Viewport panel
         // can render the scene as an ImGui.Image. Re-bound on swapchain recreate
         // because the underlying ImageView is rebuilt.
-        imGuiUtils?.WriteViewportDescriptor(scene.renderGraph.GetResource("FinalColor").ImageView);
+        imGuiUtils?.WriteViewportDescriptor(renderTargets.FinalColor.ImageView);
 
         //  Lighting + light-cull pipelines (depend on allocated g-buffer / lights SSBO) 
         PbrDeferredPipeline = new PbrDeferredPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
@@ -349,13 +341,12 @@ public unsafe partial class Renderer
         outlinePipeline.Initialize();
         outlinePipeline.WriteMaskDescriptor(selectionMask.ImageView);
 
-        // Tone-map / post pass — reads HDRColor produced by the lighting pass, writes
-        // the LDR FinalColor that the swapchain blit sources. Initialized after
-        // SetupDeferredRenderer so the HDRColor ImageView exists for the descriptor write.
+        // Tone-map / post pass - reads the FrameGraph's HDRColor transient, writes the LDR
+        // FinalColor that the swapchain blit sources. Its HDR-input descriptor is bound from
+        // the graph's freshly-allocated HDR view in BuildDeferredFrameGraph (below), so no
+        // descriptor write here.
         tonemapPipeline = new TonemapPipeline(this) { Operator = tonemapOperator };
         tonemapPipeline.Initialize();
-        tonemapPipeline.WriteHdrInputDescriptor(
-            scene.renderGraph.GetResource("HDRColor").ImageView, gBufferSampler);
 
         // Transparent forward+ pass — renders BLEND-mode materials between the lighting
         // pass and the tonemap pass. Shares the lights SSBO + TLAS + tile cull buffers
@@ -411,9 +402,10 @@ public unsafe partial class Renderer
             rtPipeline?.WriteEmissiveDescriptors();
         }
 
-        // Stand up the deferred chain as a FrameGraph (render-graph.md §1.8). Imports the
-        // legacy graph's targets (compiled above in SetupDeferredRenderer) and re-derives
-        // sync; DrawDeferred runs its Execute in place of the legacy one.
+        // Stand up the deferred chain as the FrameGraph . It OWNS the
+        // g-buffers / depth / HDR as transients (allocated in its Compile) and imports only
+        // FinalColor; this call also (re)binds the lighting g-buffer + tonemap-HDR
+        // descriptors from the freshly-allocated transient views.
         BuildDeferredFrameGraph();
 
         initialized = true;
@@ -543,6 +535,11 @@ public unsafe partial class Renderer
         transparentPipeline.Initialize();
 
         // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
+        // Set 1 (g-buffer samplers) is no longer written by Initialize — the views live on
+        // the FrameGraph — so rebind it from the cached transient views.
+        PbrDeferredPipeline.WriteGBufferDescriptors(
+            _deferredGBufferViews[0], _deferredGBufferViews[1], _deferredGBufferViews[2],
+            _deferredGBufferViews[3], _deferredGBufferViews[4]);
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         PbrDeferredPipeline.WriteProbeDescriptors();
         transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
@@ -572,8 +569,7 @@ public unsafe partial class Renderer
         tonemapPipeline?.Dispose();
         tonemapPipeline = new TonemapPipeline(this) { Operator = tonemapOperator };
         tonemapPipeline.Initialize();
-        tonemapPipeline.WriteHdrInputDescriptor(
-            scene.renderGraph.GetResource("HDRColor").ImageView, gBufferSampler);
+        tonemapPipeline.WriteHdrInputDescriptor(_deferredHdrView, gBufferSampler);
     }
 
     public void Update(double d)
@@ -616,13 +612,9 @@ public unsafe partial class Renderer
         imGuiUtils?.Dispose();
         
         
-        // Deferred FrameGraph imports (never owns) the legacy graph's targets, so it frees
-        // nothing here — but dispose it first anyway to drop references before the owner.
+        // Deferred FrameGraph owns the g-buffer / depth / HDR transients - dispose it before
+        // RenderTargets, which owns FinalColor + the PT / selection images the graph imports.
         _deferredFrameGraph?.Dispose();
-        // Render graph (holds references to depth + g-buffers) then the render targets.
-        // RenderGraph.Dispose disposes resources it owns; ImageResource.Dispose is
-        // idempotent so RenderTargets.Dispose re-freeing them is a safe no-op.
-        scene?.renderGraph?.Dispose();
         renderTargets.Dispose();
 
         // GpuScene buffers (light SSBO today) — the GPU mirror of Scene's render data.

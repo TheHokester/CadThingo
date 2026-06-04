@@ -31,55 +31,47 @@ public sealed unsafe class RenderTargets : IDisposable
 
     public Extent2D RenderExtent => _extent;
 
-    public ImageResource Depth          { get; private set; } = null!;
-    public ImageResource GBufferPosition { get; private set; } = null!;
-    public ImageResource GBufferNormal   { get; private set; } = null!;
-    public ImageResource GBufferAlbedo   { get; private set; } = null!;
-    public ImageResource GBufferMaterial { get; private set; } = null!;
-    public ImageResource GBufferEmissive { get; private set; } = null!;
+    //render targets now only keeys ownership of shared gbuffer sampler 
     public Sampler       GBufferSampler  { get; private set; }
 
     public ImageResource PtAccumulator { get; private set; } = null!;
     public ImageResource PtOutColor    { get; private set; } = null!;
     public ImageResource SelectionMask { get; private set; } = null!;
+    public ImageResource FinalColor    { get; private set; } = null!;
 
     public void SetExtent(Extent2D extent) => _extent = extent;
 
-    /// <summary>First-time allocation at the current extent — depth + g-buffers + sampler
-    /// + PT + selection.</summary>
+    /// <summary>First-time allocation at the current extent — g-buffer sampler + PT +
+    /// selection + FinalColor. (The g-buffers / depth / HDR live on the FrameGraph now.)</summary>
     public void AllocateAll()
     {
-        CreateDepthResources();
-        CreateGBufferResources();
         CreateGBufferSampler();
         CreatePathTracingResources();
         CreateSelectionResources();
+        CreateFinalColorResources();
+        TransitionSizeDependentImages();   // single batched submit for all initial layouts
     }
 
     /// <summary>Resize path: disposes + recreates the size-dependent targets at the new
-    /// extent. Keeps the g-buffer sampler (extent-independent). The caller disposes the
-    /// render graph first (it holds references to depth + g-buffers) and rebuilds it after.</summary>
+    /// extent. Keeps the g-buffer sampler (extent-independent). The caller rebuilds the
+    /// deferred FrameGraph after this (it owns + reallocates the g-buffer/depth/HDR
+    /// transients and re-imports the fresh FinalColor handle).</summary>
     public void ReallocateSizeDependent(Extent2D extent)
     {
         DisposeSizeDependent();
         _extent = extent;
-        CreateDepthResources();
-        CreateGBufferResources();
         CreatePathTracingResources();
         CreateSelectionResources();
+        CreateFinalColorResources();
+        TransitionSizeDependentImages();   // one drain instead of one per image group
     }
 
     private void DisposeSizeDependent()
     {
-        Depth?.Dispose();
-        GBufferPosition?.Dispose();
-        GBufferNormal?.Dispose();
-        GBufferAlbedo?.Dispose();
-        GBufferMaterial?.Dispose();
-        GBufferEmissive?.Dispose();
         PtAccumulator?.Dispose();
         PtOutColor?.Dispose();
         SelectionMask?.Dispose();
+        FinalColor?.Dispose();
     }
 
     public void Dispose()
@@ -88,45 +80,22 @@ public sealed unsafe class RenderTargets : IDisposable
         if (GBufferSampler.Handle != 0) vk.DestroySampler(_gfx.Device, GBufferSampler, null);
     }
 
-    private void CreateDepthResources()
+    /// <summary>
+    /// Allocates FinalColor - the LDR target the FrameGraph's tonemap pass writes,
+    /// the per-frame swapchain blit sources, and the ImGui viewport panel samples. The graph
+    /// IMPORTS it (it doesn't own it) because consumers outside the graph need a stable
+    /// handle; TransferSrc/Dst cover the blit (and the PT path blitting ptOutColor in).
+    /// Left Undefined here — the graph discards + fully regenerates it each frame and hands
+    /// it back in ShaderReadOnly.
+    /// </summary>
+    private void CreateFinalColorResources()
     {
-        // Depth buffer matches the render target extent — sampled / depth-tested
-        // by the deferred passes which all run at renderExtent. ImageResource object
-        // only; the render graph allocates the VkImage inside Compile().
-        var width = _extent.Width;
-        var height = _extent.Height;
-
-        Depth = new ImageResource(vk, _gfx.Device, "Depth", Format.D32Sfloat, new Extent2D(width, height),
-            ImageUsageFlags.DepthStencilAttachmentBit | ImageUsageFlags.InputAttachmentBit,
-            ImageLayout.Undefined, ImageLayout.DepthStencilAttachmentOptimal);
-    }
-
-    private void CreateGBufferResources()
-    {
-        // G-buffers + lighting all run at the render extent (== panel size in
-        // editor mode), not necessarily the swapchain size.
-        var width = _extent.Width;
-        var height = _extent.Height;
-        // SampledBit required: the lighting pass samples these via CombinedImageSampler descriptors.
-        const ImageUsageFlags gBufferUsage =
-            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.InputAttachmentBit | ImageUsageFlags.SampledBit;
-        GBufferPosition = new ImageResource(vk, _gfx.Device, "GBuffer_Position", Format.R32G32B32A32Sfloat,
-            new Extent2D(width, height), gBufferUsage,
+        FinalColor = new ImageResource(vk, _gfx.Device, "FinalColor", Format.R8G8B8A8Unorm,
+            new Extent2D(_extent.Width, _extent.Height),
+            ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit
+            | ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        GBufferNormal = new ImageResource(vk, _gfx.Device, "GBuffer_Normal", Format.R32G32B32A32Sfloat,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        GBufferAlbedo = new ImageResource(vk, _gfx.Device, "GBuffer_Albedo", Format.R8G8B8A8Unorm,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        GBufferMaterial = new ImageResource(vk, _gfx.Device, "GBuffer_Material", Format.R8G8B8A8Unorm,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        // Emissive G-buffer: HDR range. Geometry pass writes emissiveSampler.rgb;
-        // lighting pass adds it to the final color before tone-mapping.
-        GBufferEmissive = new ImageResource(vk, _gfx.Device, "GBuffer_Emissive", Format.R16G16B16A16Sfloat,
-            new Extent2D(width, height), gBufferUsage,
-            ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
+        FinalColor.Allocate(_gfx.PhysicalDevice);
     }
 
     private void CreateGBufferSampler()
@@ -175,19 +144,10 @@ public sealed unsafe class RenderTargets : IDisposable
             ImageLayout.Undefined, ImageLayout.General);
 
         // Render graph normally calls Allocate inside Compile — these images live
-        // outside the graph, so allocate explicitly.
+        // outside the graph, so allocate explicitly. The Undefined → General transition
+        // is batched with the selection mask's in TransitionSizeDependentImages.
         PtAccumulator.Allocate(_gfx.PhysicalDevice);
         PtOutColor.Allocate(_gfx.PhysicalDevice);
-
-        // One-shot Undefined → General transition so the very first dispatch can
-        // do imageStore without a per-frame "first use" branch. Subsequent
-        // dispatches keep both images in General between frames.
-        var cmd = _gfx.BeginSingleTimeCommands();
-        _gfx.TransitionImageLayout(cmd, PtAccumulator.Image, PtAccumulator._format,
-            ImageLayout.Undefined, ImageLayout.General);
-        _gfx.TransitionImageLayout(cmd, PtOutColor.Image, PtOutColor._format,
-            ImageLayout.Undefined, ImageLayout.General);
-        _gfx.EndSingleTimeCommands(cmd);
     }
 
     /// <summary>
@@ -207,10 +167,25 @@ public sealed unsafe class RenderTargets : IDisposable
             ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
             ImageLayout.Undefined, ImageLayout.General);
         SelectionMask.Allocate(_gfx.PhysicalDevice);
+        // Settles in ShaderReadOnly (see TransitionSizeDependentImages) so the per-frame
+        // block's opening ShaderReadOnly→General transition has a valid source layout.
+    }
 
-        // Settle in ShaderReadOnly so the per-frame block's opening
-        // ShaderReadOnly→General transition has a valid source layout.
+    /// <summary>
+    /// One batched single-time submit that lays out every freshly-allocated size-dependent
+    /// image into the layout its first use expects: the PT accumulator/out-color into General
+    /// (so the first dispatch can imageStore with no first-use branch), and the selection mask
+    /// into ShaderReadOnly. Replaces the previous per-group submits — one GPU drain per resize
+    /// instead of two — so dragging the viewport hitches less. FinalColor needs no transition
+    /// (the FrameGraph imports it Undefined and regenerates it every frame).
+    /// </summary>
+    private void TransitionSizeDependentImages()
+    {
         var cmd = _gfx.BeginSingleTimeCommands();
+        _gfx.TransitionImageLayout(cmd, PtAccumulator.Image, PtAccumulator._format,
+            ImageLayout.Undefined, ImageLayout.General);
+        _gfx.TransitionImageLayout(cmd, PtOutColor.Image, PtOutColor._format,
+            ImageLayout.Undefined, ImageLayout.General);
         _gfx.TransitionImageLayout(cmd, SelectionMask.Image, SelectionMask._format,
             ImageLayout.Undefined, ImageLayout.General);
         _gfx.TransitionImageLayout(cmd, SelectionMask.Image, SelectionMask._format,

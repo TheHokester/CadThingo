@@ -459,17 +459,17 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     }
 
     // Descriptor writes
-    // Writes split into three phases so cross-pipeline / TLAS deps can be wired
-    // post-Initialize:
-    //   - WriteDescriptors  (auto from Initialize): bindings 0,1 of set 0 + set 1 g-buffer.
+    // Writes split into phases so cross-pipeline / TLAS deps can be wired post-Initialize:
+    //   - WriteDescriptors  (auto from Initialize): bindings 0,1 of set 0.
     //   - WriteTileBufferDescriptors(lightCull):    bindings 3,4 of set 0.
     //   - WriteTlasDescriptor(tlas):                binding 2 of set 0.
-    // Set 1 (g-buffer) is also written by WriteGBufferDescriptors after swapchain recreate.
+    // Set 1 (the g-buffer samplers) is written by WriteGBufferDescriptors from the deferred
+    // FrameGraph's freshly-allocated transient views - initial build + every resize. The
+    // views don't exist at Initialize time, so it is NOT called from here.
 
     protected override void WriteDescriptors()
     {
         WriteLightFrameDescriptors();
-        WriteGBufferDescriptors();
         WriteIblDescriptors();
     }
 
@@ -763,19 +763,21 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
     }
 
-    /// <summary>Re-writes the 5 g-buffer sampler bindings on set 1. Run after
-    /// the renderer recreates the g-buffer ImageViews (initial create or
-    /// swapchain recreate).</summary>
-    public void WriteGBufferDescriptors()
+    /// <summary>Re-writes the 5 g-buffer sampler bindings on set 1 from the deferred
+    /// FrameGraph's transient g-buffer views. Called from BuildDeferredFrameGraph after
+    /// Compile (initial build + every resize), since those views are freshly allocated each
+    /// Compile and don't exist when the pipeline first initializes.</summary>
+    public void WriteGBufferDescriptors(ImageView position, ImageView normal,
+        ImageView albedo, ImageView material, ImageView emissive)
     {
         var sampler = Renderer.gBufferSampler;
         var imageInfos = stackalloc DescriptorImageInfo[5]
         {
-            new() { ImageView = Renderer.gBufferPosition.ImageView, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.gBufferNormal  .ImageView, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.gBufferAlbedo  .ImageView, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.gBufferMaterial.ImageView, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.gBufferEmissive.ImageView, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = position, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = normal,   Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = albedo,   Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = material, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = emissive, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
         };
         var writes = stackalloc WriteDescriptorSet[5];
         for (uint i = 0; i < 5; i++)

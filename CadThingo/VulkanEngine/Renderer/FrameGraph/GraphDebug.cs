@@ -86,6 +86,12 @@ internal sealed unsafe class GraphDebug : IDisposable
     private PassTiming[] _timings = [];
     private double       _frameGpuMs;
 
+    // Per-frame-slot guard: a slot's queries are only read once it has been recorded at
+    // least once. Replaces a one-time full-pool reset (which cost a QueueWaitIdle drain on
+    // every framegraph rebuild) — the per-frame CmdResetQueryPool below already defines the
+    // queries before they're written.
+    private bool[] _frameWritten = [];
+
     public GraphDebug(GraphicsDevice gfx)
     {
         _gfx    = gfx;
@@ -101,8 +107,9 @@ internal sealed unsafe class GraphDebug : IDisposable
         _queues    = queues;
         _types     = types;
         _eligible  = eligible;
-        _cpuMs     = new double[_passCount];
-        _timings   = new PassTiming[_passCount];
+        _cpuMs        = new double[_passCount];
+        _timings      = new PassTiming[_passCount];
+        _frameWritten = new bool[frames];
         if (_passCount == 0) return;
 
         // Timestamp pool: begin+end per pass per frame-in-flight.
@@ -142,24 +149,21 @@ internal sealed unsafe class GraphDebug : IDisposable
             }
         }
 
-        // One-time reset of the whole pools so the first per-slot read returns NotReady
-        // (skipped) rather than reading never-initialised queries.
-        if (_ts || _ps)
-        {
-            var cmd = _gfx.BeginSingleTimeCommands();
-            if (_ts) _vk.CmdResetQueryPool(cmd, _tsPool, 0, (uint)(2 * _passCount) * _frames);
-            if (_ps) _vk.CmdResetQueryPool(cmd, _psPool, 0, (uint)_passCount * _frames);
-            _gfx.EndSingleTimeCommands(cmd);
-        }
+        // No up-front pool reset: the per-frame CmdResetQueryPool in BeginFrame defines a
+        // slot's queries before they're written, and _frameWritten gates the read until
+        // then. This avoids a full GPU drain on every framegraph rebuild (every resize).
     }
 
     // ---- per-frame replay hooks ----------------------------------------------
     public void BeginFrame(CommandBuffer cmd, uint frame)
     {
         if (_passCount == 0) return;
-        ResolvePrevious(frame);   // this slot still holds its previous use's (completed) data
+        // Skip the resolve until this slot has been recorded once — otherwise we'd read
+        // queries that were never reset/written (no up-front pool reset anymore).
+        if (_frameWritten[frame]) ResolvePrevious(frame);
         if (_ts) _vk.CmdResetQueryPool(cmd, _tsPool, frame * (uint)(2 * _passCount), (uint)(2 * _passCount));
         if (_ps) _vk.CmdResetQueryPool(cmd, _psPool, frame * (uint)_passCount,        (uint)_passCount);
+        _frameWritten[frame] = true;
     }
 
     public void BeginPass(CommandBuffer cmd, uint frame, int pass)

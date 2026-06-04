@@ -9,7 +9,7 @@ namespace CadThingo.VulkanEngine.Renderer;
 // buffer blocks unconditionally carry MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT so any
 // suballocated buffer with ShaderDeviceAddressBit usage works without re-bucketing.
 //
-// Single-threaded — the renderer's main loop owns it. Add a lock if it grows callers.
+// Single-threaded - the renderer's main loop owns it. Add a lock if it grows callers.
 public readonly struct SubAlloc
 {
     public readonly DeviceMemory Memory;
@@ -28,6 +28,26 @@ public readonly struct SubAlloc
     }
 
     public bool IsValid => Memory.Handle != 0;
+}
+
+// Snapshot of allocator occupancy. ReservedBytes is what we hold from the driver
+// (sum of every live VkDeviceMemory block); UsedBytes is the suballocated portion
+// actually backing resources. A growing Reserved-Used gap that never shrinks is the
+// signature of retained empty blocks (Free never releases a fully-free pooled block).
+public readonly struct AllocatorStats
+{
+    public readonly int   PooledBlocks;
+    public readonly int   DedicatedBlocks;
+    public readonly ulong ReservedBytes;
+    public readonly ulong UsedBytes;
+
+    public AllocatorStats(int pooled, int dedicated, ulong reserved, ulong used)
+    {
+        PooledBlocks    = pooled;
+        DedicatedBlocks = dedicated;
+        ReservedBytes   = reserved;
+        UsedBytes       = used;
+    }
 }
 
 public unsafe sealed class GpuMemoryAllocator : IDisposable
@@ -57,6 +77,7 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
         public List<Node>   Nodes = new();
         public List<int>    Tombstones = new();
         public int          Head;            // index of leftmost node; -1 if block fully torn down
+        public int          BucketKey = -1;  // owning bucket (pooled only); lets Free remove it on release
     }
 
     private readonly Vk             _vk;
@@ -169,6 +190,28 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
                 nodes[id] = n;
             }
         }
+
+        // After coalescing, a single node with no neighbours == the block is entirely
+        // free. Hand it back to the driver so reverting a resize actually lowers committed
+        // VRAM. Without this, the high-water reservation from a large-extent excursion
+        // persists forever (Free used to only ever coalesce), which on a VRAM-pressured
+        // system keeps the path-tracer working set demand-paged - a fixed per-frame
+        // migration cost that survives shrinking back down. Dedicated blocks already
+        // free on their own path above.
+        if (n.Prev < 0 && n.Next < 0)
+            ReleaseEmptyBlock(b, alloc.BlockId);
+    }
+
+    // Unlinks a fully-free pooled block from its bucket + the BlockId table and frees its
+    // VkDeviceMemory. The slot in _allBlocks is nulled (not removed) so existing
+    // SubAlloc.BlockId indices stay valid; a fully-free block has no live suballocations,
+    // so nothing references it.
+    private void ReleaseEmptyBlock(Block block, int blockId)
+    {
+        if (block.BucketKey >= 0 && _buckets.TryGetValue(block.BucketKey, out var list))
+            list.Remove(block);
+        if (blockId >= 0 && blockId < _allBlocks.Count) _allBlocks[blockId] = null;
+        DestroyBlock(block);
     }
 
     public void Dispose()
@@ -186,6 +229,32 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
         _allBlocks.Clear();
         _dedicated.Clear();
         _buckets.Clear();
+    }
+
+    /// <summary>Walks live blocks to report reserved vs. actually-suballocated bytes +
+    /// block counts. Diagnostic only (not on any hot path) — call it from the Stats panel
+    /// to watch whether resize churn ratchets ReservedBytes up without releasing it.</summary>
+    public AllocatorStats GetStats()
+    {
+        ulong reserved = 0, used = 0;
+        int pooled = 0, dedicated = 0;
+
+        foreach (var b in _allBlocks)
+        {
+            if (b == null) continue;
+            pooled++;
+            reserved += b.Size;
+            foreach (var n in b.Nodes)
+                if (n.Alive && !n.Free) used += n.Size;
+        }
+        foreach (var b in _dedicated)
+        {
+            if (b == null) continue;
+            dedicated++;
+            reserved += b.Size;
+            used     += b.Size;   // a dedicated block is wholly used by its one resource
+        }
+        return new AllocatorStats(pooled, dedicated, reserved, used);
     }
 
     // internals
@@ -212,6 +281,7 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
 
         ulong newBlockSize = Math.Max(blockSize, reqs.Size + reqs.Alignment);
         var fresh = CreateBlock(newBlockSize, typeIndex, hostVisible, kind == BucketKind.Buffer);
+        fresh.BucketKey = bucketKey;   // so Free can unlink it from this bucket when it empties
         blockList.Add(fresh);
 
         if (!TrySuballocate(fresh, reqs.Size, reqs.Alignment, out var freshSub))
