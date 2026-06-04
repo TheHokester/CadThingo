@@ -7,6 +7,7 @@ public enum ResourceUsage
     ColorAttachment, DepthAttachment, DepthRead,
     SampledFragment, SampledCompute,
     StorageReadCompute, StorageWriteCompute, StorageRWCompute,
+    StorageReadVertex, StorageReadFragment,
     IndirectArg, IndexBuffer, VertexBuffer, UniformRead,
     TransferSrc, TransferDst,
     StorageRT, AccelStructBuild, AccelStructRead,
@@ -62,6 +63,18 @@ internal static class UsageTable
             PipelineStageFlags2.ComputeShaderBit,
             AccessFlags2.ShaderStorageReadBit | AccessFlags2.ShaderStorageWriteBit,
             ImageLayout.General, true),
+
+        // Storage-buffer reads outside compute — e.g. the geometry VS reading the
+        // post-cull instance buffer, the lighting FS reading the per-tile light lists.
+        ResourceUsage.StorageReadVertex => new(
+            PipelineStageFlags2.VertexShaderBit,
+            AccessFlags2.ShaderStorageReadBit,
+            ImageLayout.General, false),
+
+        ResourceUsage.StorageReadFragment => new(
+            PipelineStageFlags2.FragmentShaderBit,
+            AccessFlags2.ShaderStorageReadBit,
+            ImageLayout.General, false),
 
         ResourceUsage.IndirectArg => new(
             PipelineStageFlags2.DrawIndirectBit,

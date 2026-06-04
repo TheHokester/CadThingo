@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.FrameGraph;
@@ -11,6 +12,16 @@ public unsafe class FrameGraph : IDisposable
     // Restores imported images to their declared final layout after the last pass, so the
     // baked first-use barriers stay valid every frame. Empty when nothing needs restoring.
     private ImageMemoryBarrier2[] _closingImageBarriers = [];
+
+    // Debug/profiling: GPU+CPU timings, pipeline stats, debug-utils labels/names. Created
+    // in Compile once the schedule is known; null only before the first Compile.
+    private GraphDebug? _debug;
+    private double _compileMs;
+    private int _culledCount;
+    private int _barrierCount;
+    private bool[] _live = [];   // per-pass-id liveness, kept for ToDot
+    // Labelled DAG edges captured during Compile, purely for ToDot (allows duplicates).
+    private readonly List<(int from, int to, string label, bool dashed)> _dotEdges = [];
 
     public FrameGraph(GraphicsDevice device) => gfx = device;
 
@@ -92,6 +103,20 @@ public unsafe class FrameGraph : IDisposable
         return new GraphBuffer(id, 0);
     }
 
+    /// <summary>Imports a double-buffered buffer (one handle per frame-in-flight). The
+    /// graph derives barriers as usual; at Execute it resolves the right per-frame handle.
+    /// <paramref name="perFrame"/> must be indexable by <c>FrameContext.FrameIndex</c>.</summary>
+    public GraphBuffer ImportBufferPerFrame(Buffer[] perFrame, in BufferDesc desc, string name)
+    {
+        int id = _nextResourceId++;
+        _resources[id] = new GraphResource
+        {
+            Id = id, Name = name, IsImage = false, Residency = ResidencyKind.Imported,
+            BufferDesc = desc, PhysBufferFrames = perFrame,
+        };
+        return new GraphBuffer(id, 0);
+    }
+
 
     public void AddPass(string name, PassType type, QueueClass queue,
         PassSetup setup, PassExecute execute,
@@ -130,7 +155,8 @@ public unsafe class FrameGraph : IDisposable
         if (Compiled)
             throw new InvalidOperationException("FrameGraph already compiled.");
 
-        int n = _passes.Count;
+        var compileSw = Stopwatch.StartNew();
+        var n = _passes.Count;
 
         // ---- 1. Build the DAG from the version ledger ----------------------------
         // Edges point producer -> consumer ("from must run before to"). Dedupe through a
@@ -140,13 +166,6 @@ public unsafe class FrameGraph : IDisposable
         var adj   = new HashSet<int>[n];
         var preds = new HashSet<int>[n];
         for (int i = 0; i < n; i++) { adj[i] = []; preds[i] = []; }
-
-        void AddEdge(int from, int to)
-        {
-            // from < 0  == "version 0 sentinel / imported — no producing pass" -> no edge.
-            if (from < 0 || to < 0 || from == to) return;
-            if (adj[from].Add(to)) preds[to].Add(from);
-        }
 
         // readers[(res, ver)] = every pass that READS exactly that version. Drives WAR:
         // a write that bumps to v must wait for all readers of v-1.
@@ -159,13 +178,20 @@ public unsafe class FrameGraph : IDisposable
                 list.Add(p);
             }
 
+        _dotEdges.Clear();
         for (int p = 0; p < n; p++)
         {
             var pass = _passes[p];
 
             // RAW: a read of (res, v) depends on whoever produced v.
             foreach (var rd in pass.Reads)
-                AddEdge(ProducerOf(rd.ResourceId, rd.Version), p);
+            {
+                int producer = ProducerOf(rd.ResourceId, rd.Version);
+                AddEdge(producer, p);
+                if (producer >= 0)
+                    _dotEdges.Add((producer, p,
+                        $"{_resources[rd.ResourceId].Name}@{rd.Version} {rd.Usage}", false));
+            }
 
             // WAW + WAR: a write produces (res, v) from the prior version (res, v-1).
             foreach (var wr in pass.Writes)
@@ -175,11 +201,18 @@ public unsafe class FrameGraph : IDisposable
                 if (wr.Version < 1) continue;
 
                 // WAW: serialize after the previous version's producer.
-                AddEdge(ProducerOf(wr.ResourceId, wr.Version - 1), p);
+                int prevProducer = ProducerOf(wr.ResourceId, wr.Version - 1);
+                AddEdge(prevProducer, p);
+                if (prevProducer >= 0)
+                    _dotEdges.Add((prevProducer, p, $"{_resources[wr.ResourceId].Name} WAW", true));
 
                 // WAR: every reader of the previous version must finish before we overwrite.
                 if (readers.TryGetValue((wr.ResourceId, wr.Version - 1), out var rs))
-                    foreach (var reader in rs) AddEdge(reader, p);
+                    foreach (var reader in rs)
+                    {
+                        AddEdge(reader, p);
+                        _dotEdges.Add((reader, p, $"{_resources[wr.ResourceId].Name} WAR", true));
+                    }
             }
         }
 
@@ -228,6 +261,9 @@ public unsafe class FrameGraph : IDisposable
             throw new InvalidOperationException(
                 "FrameGraph: cycle detected among live passes — the version ledger produced a back-edge.");
 
+        _live = live;                  // kept for ToDot
+        _culledCount = n - liveCount;
+
         // ---- 4. Transient lifetimes (first/last touch in schedule order) ---------
         // Consumed by aliasing in Phase 4; computed now so the schedule stays the single
         // source of truth for ordering and the data is ready when aliasing lands.
@@ -247,8 +283,19 @@ public unsafe class FrameGraph : IDisposable
         // are now the frozen plan; Execute() replays them with no per-frame analysis.
         BakeSync();
 
+        // ---- Debug instrumentation: query pools, labels, object names ------------
+        SetupDebug();
+
         Compiled = true;
+        _compileMs = compileSw.Elapsed.TotalMilliseconds;
         return true;
+
+        void AddEdge(int from, int to)
+        {
+            // from < 0  == "version 0 sentinel / imported — no producing pass" -> no edge.
+            if (from < 0 || to < 0 || from == to) return;
+            if (adj[from].Add(to)) preds[to].Add(from);
+        }
 
         // ---- locals --------------------------------------------------------------
         int ProducerOf(int resId, int version)
@@ -288,9 +335,22 @@ public unsafe class FrameGraph : IDisposable
         _resources[h.resourceId].PhysImage ?? throw new InvalidOperationException(
             $"FrameGraph: image '{_resources[h.resourceId].Name}' not allocated.");
 
-    internal Buffer ResolveBuffer(GraphBuffer h) =>
-        _resources[h.resourceId].PhysBuffer ?? throw new InvalidOperationException(
-            $"FrameGraph: buffer '{_resources[h.resourceId].Name}' not allocated.");
+    internal Buffer ResolveBuffer(GraphBuffer h)
+    {
+        var r = _resources[h.resourceId];
+        if (r.PhysBuffer is { } single) return single;
+        throw new InvalidOperationException(r.PhysBufferFrames != null
+            ? $"FrameGraph: buffer '{r.Name}' is per-frame — read it from its owning pipeline in the pass body, not via PassResources."
+            : $"FrameGraph: buffer '{r.Name}' not allocated.");
+    }
+
+    // Resolves a buffer resource's handle for a specific frame-in-flight (used to patch
+    // baked buffer barriers each Execute). Single-handle resources ignore the frame.
+    private Buffer ResolveBufferFrame(int resId, uint frame)
+    {
+        var r = _resources[resId];
+        return r.PhysBufferFrames is { } frames ? frames[frame] : r.PhysBuffer ?? default;
+    }
 
     // ---- Step 5: physical allocation -----------------------------------------
     // Transients touched by a live pass get backing memory + (images) a view; imports
@@ -384,10 +444,12 @@ public unsafe class FrameGraph : IDisposable
             var pass = _passes[passIdx];
             var imgs = new List<ImageMemoryBarrier2>();
             var bufs = new List<BufferMemoryBarrier2>();
-            foreach (var a in pass.Reads)  ProcessAccess(in a, state, imgs, bufs);
-            foreach (var a in pass.Writes) ProcessAccess(in a, state, imgs, bufs);
-            pass.ImageBarriers  = imgs.ToArray();
-            pass.BufferBarriers = bufs.ToArray();
+            var bufRes = new List<int>();
+            foreach (var a in pass.Reads)  ProcessAccess(in a, state, imgs, bufs, bufRes);
+            foreach (var a in pass.Writes) ProcessAccess(in a, state, imgs, bufs, bufRes);
+            pass.ImageBarriers     = imgs.ToArray();
+            pass.BufferBarriers    = bufs.ToArray();
+            pass.BufferBarrierRes  = bufRes.ToArray();
         }
 
         // Closing: hand each imported image back in its declared final layout, so next
@@ -409,7 +471,7 @@ public unsafe class FrameGraph : IDisposable
     }
 
     private void ProcessAccess(in ResourceAccess a, Dictionary<int, UsageInfo> state,
-        List<ImageMemoryBarrier2> imgs, List<BufferMemoryBarrier2> bufs)
+        List<ImageMemoryBarrier2> imgs, List<BufferMemoryBarrier2> bufs, List<int> bufRes)
     {
         var next = UsageTable.Of(a.Usage);
         var cur  = state[a.ResourceId];
@@ -428,10 +490,15 @@ public unsafe class FrameGraph : IDisposable
 
         var res = _resources[a.ResourceId];
         if (a.IsImage)
+        {
             imgs.Add(MakeImageBarrier(res, cur.Stage, cur.Access, cur.Layout,
                                       next.Stage, next.Access, next.Layout));
+        }
         else
+        {
             bufs.Add(MakeBufferBarrier(res, cur.Stage, cur.Access, next.Stage, next.Access));
+            bufRes.Add(res.Id);   // so Execute can patch per-frame buffer handles
+        }
 
         state[a.ResourceId] = next;   // next IS a UsageInfo — no copy needed
     }
@@ -467,7 +534,9 @@ public unsafe class FrameGraph : IDisposable
             DstStageMask = dstStage, DstAccessMask = dstAccess,
             SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
             DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Buffer = res.PhysBuffer!.Value, Offset = 0, Size = Vk.WholeSize,
+            // Per-frame imports have a null PhysBuffer here; Execute patches the .Buffer
+            // field with the right frame's handle (via BufferBarrierRes) before submitting.
+            Buffer = res.PhysBuffer ?? default, Offset = 0, Size = Vk.WholeSize,
         };
 
     private static bool IsDepthFormat(Format f) =>
@@ -483,12 +552,19 @@ public unsafe class FrameGraph : IDisposable
     {
         if (!Compiled) throw new InvalidOperationException("FrameGraph: call Compile() before Execute().");
 
+        _debug?.BeginFrame(cmd, frame.FrameIndex);
         var resources = new PassResources(this);
-        foreach (var passIdx in _executionOrder)
+        for (int i = 0; i < _executionOrder.Count; i++)
         {
-            var pass = _passes[passIdx];
+            var pass = _passes[_executionOrder[i]];
+            // Patch per-frame buffer handles into this pass's baked buffer barriers.
+            for (int k = 0; k < pass.BufferBarriers.Length; k++)
+                pass.BufferBarriers[k].Buffer = ResolveBufferFrame(pass.BufferBarrierRes[k], frame.FrameIndex);
+
+            _debug?.BeginPass(cmd, frame.FrameIndex, i);   // debug label + begin timestamp/stats
             EmitBarriers(cmd, pass.ImageBarriers, pass.BufferBarriers);
             pass.Execute(cmd, resources, in frame);
+            _debug?.EndPass(cmd, frame.FrameIndex, i);      // end timestamp/stats + pop label
         }
         EmitBarriers(cmd, _closingImageBarriers, []);
     }
@@ -512,9 +588,111 @@ public unsafe class FrameGraph : IDisposable
         }
     }
 
+    // ---- Debug: instrumentation setup, stats, DOT export ---------------------
+
+    /// <summary>Per-pass GPU/CPU timings + pipeline stats + counts from the last resolved
+    /// frame, or null before the first Compile. See <see cref="GraphStats"/>.</summary>
+    public GraphStats? Stats => _debug?.Snapshot(_compileMs, _culledCount, _barrierCount);
+
+    /// <summary>Runtime toggle for pipeline-statistics collection (no-op when unsupported).</summary>
+    public bool CollectPipelineStats
+    {
+        get => _debug?.CollectPipelineStats ?? false;
+        set { if (_debug != null) _debug.CollectPipelineStats = value; }
+    }
+
+    private void SetupDebug()
+    {
+        int live = _executionOrder.Count;
+        var names    = new string[live];
+        var queues   = new QueueClass[live];
+        var types    = new PassType[live];
+        var eligible = new bool[live];
+        for (int i = 0; i < live; i++)
+        {
+            var pass = _passes[_executionOrder[i]];
+            names[i]    = pass.Name;
+            queues[i]   = pass.Queue;
+            types[i]    = pass.Type;
+            eligible[i] = pass.Type != PassType.Transfer;   // pipeline stats: draw/dispatch only
+        }
+
+        _barrierCount = _closingImageBarriers.Length;
+        foreach (var idx in _executionOrder)
+            _barrierCount += _passes[idx].ImageBarriers.Length + _passes[idx].BufferBarriers.Length;
+
+        _debug = new GraphDebug(gfx);
+        _debug.Initialize(names, queues, types, eligible, Renderer.MAX_CONCURRENT_FRAMES);
+
+        // Name physical resources so captures read "GBuffer_Position" instead of a raw handle.
+        foreach (var res in _resources.Values)
+        {
+            if (res.IsImage)
+            {
+                if (res.PhysImage is { } img)  _debug.NameObject(ObjectType.Image,     img.Handle,  res.Name);
+                if (res.PhysView  is { } view) _debug.NameObject(ObjectType.ImageView, view.Handle, res.Name + "/view");
+            }
+            else if (res.PhysBuffer is { } buf)
+            {
+                _debug.NameObject(ObjectType.Buffer, buf.Handle, res.Name);
+            }
+            else if (res.PhysBufferFrames is { } frames)
+            {
+                for (int f = 0; f < frames.Length; f++)
+                    _debug.NameObject(ObjectType.Buffer, frames[f].Handle, $"{res.Name}#{f}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Graphviz dump of the compiled DAG: nodes are passes (filled by queue, greyed if
+    /// culled, prefixed with their schedule index); solid edges are RAW data deps labelled
+    /// <c>resource@version usage</c>; dashed edges are WAW/WAR ordering deps. Paste into any
+    /// Graphviz viewer to see why passes ordered the way they did.
+    /// </summary>
+    public string ToDot()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("digraph FrameGraph {");
+        sb.AppendLine("  rankdir=LR;");
+        sb.AppendLine("  node [shape=box, style=filled, fontname=\"Consolas\"];");
+
+        for (int p = 0; p < _passes.Count; p++)
+        {
+            var pass = _passes[p];
+            bool isLive = p < _live.Length && _live[p];
+            int order = _executionOrder.IndexOf(p);
+            string fill = isLive ? QueueFill(pass.Queue) : "\"#dddddd\"";
+            string label = isLive
+                ? $"{order}: {Escape(pass.Name)}\\n{pass.Type}/{pass.Queue}"
+                : $"{Escape(pass.Name)}\\n(culled)";
+            string extra = isLive ? "" : ", fontcolor=\"#888888\"";
+            sb.AppendLine($"  p{p} [label=\"{label}\", fillcolor={fill}{extra}];");
+        }
+
+        foreach (var (from, to, lbl, dashed) in _dotEdges)
+        {
+            string style = dashed ? ", style=dashed, color=\"#999999\"" : "";
+            sb.AppendLine($"  p{from} -> p{to} [label=\"{Escape(lbl)}\", fontsize=9{style}];");
+        }
+
+        sb.AppendLine("}");
+        return sb.ToString();
+
+        static string QueueFill(QueueClass q) => q switch
+        {
+            QueueClass.Graphics     => "\"#cfe8cf\"",
+            QueueClass.AsyncCompute => "\"#cfe0f5\"",
+            QueueClass.Transfer     => "\"#f5e3cf\"",
+            _ => "\"#eeeeee\"",
+        };
+        static string Escape(string s) => s.Replace("\"", "\\\"");
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
+        _debug?.Dispose();
         var vk  = gfx.Vk;
         var dev = gfx.Device;
         foreach (var res in _resources.Values)

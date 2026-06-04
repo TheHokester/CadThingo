@@ -78,6 +78,14 @@ public sealed unsafe class GraphicsDevice : IDisposable
     // renders all 6 faces of a cubemap in one draw via gl_ViewIndex.
     private bool multiviewEnabled = false;
 
+    // Debug/profiling capability cache (filled in CreateLogicalDevice). timestampPeriod
+    // is ns-per-tick from the device limits; graphicsTimestampValidBits masks the high
+    // bits of a raw timestamp the graphics queue doesn't write. pipelineStatisticsEnabled
+    // reflects whether the optional pipelineStatisticsQuery feature was turned on.
+    private float timestampPeriod;
+    private uint  graphicsTimestampValidBits;
+    private bool  pipelineStatisticsEnabled;
+
     // ---- Public device-services surface ------------------------------------
 
     public Vk                 Vk             => vk;
@@ -98,6 +106,16 @@ public sealed unsafe class GraphicsDevice : IDisposable
     public SurfaceKHR         Surface            => surface;
     public KhrSurface?        KhrSurface         => khrSurface;
     public QueueFamilyIndices QueueFamilyIndices => queueFamilyIndices;
+
+    // ---- Debug / profiling capabilities ------------------------------------
+    /// <summary>Nanoseconds represented by one timestamp-query tick (device limit).</summary>
+    public float TimestampPeriod => timestampPeriod;
+    /// <summary>Valid low-bit count of a graphics-queue timestamp; 0 ⇒ the queue can't timestamp.</summary>
+    public uint  TimestampValidBits => graphicsTimestampValidBits;
+    /// <summary>True iff the graphics queue can write timestamps with a non-zero period.</summary>
+    public bool  TimestampsSupported => timestampPeriod != 0f && graphicsTimestampValidBits != 0;
+    /// <summary>True iff the optional pipelineStatisticsQuery feature was enabled at device creation.</summary>
+    public bool  PipelineStatisticsSupported => pipelineStatisticsEnabled;
 
     // Read-only handle accessor — pipelines that load their own device-extension
     // dispatch tables (e.g. RtPipeline → KhrRayTracingPipeline) need the instance
@@ -555,6 +573,29 @@ public sealed unsafe class GraphicsDevice : IDisposable
         //rayQuery shader uses indexing into a large sampled-image array.
         if (coreSupported.Features.ShaderSampledImageArrayDynamicIndexing)
             features.Features.ShaderSampledImageArrayDynamicIndexing = true;
+
+        // Optional: per-pass pipeline-statistics queries for the render-graph debug
+        // overlay (VS/FS/compute invocations, primitives, …). Enable only if supported;
+        // GraphDebug gates its pool on PipelineStatisticsSupported.
+        if (coreSupported.Features.PipelineStatisticsQuery)
+        {
+            features.Features.PipelineStatisticsQuery = true;
+            pipelineStatisticsEnabled = true;
+        }
+
+        // Cache timestamp capabilities for the render-graph GPU timer. Period is ns/tick
+        // from the device limits; valid-bits comes from the graphics queue family (0 ⇒
+        // the queue can't timestamp, so GraphDebug skips GPU timing).
+        vk.GetPhysicalDeviceProperties(physicalDevice, out var tsProps);
+        timestampPeriod = tsProps.Limits.TimestampPeriod;
+        uint qfCount = 0;
+        vk.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qfCount, null);
+        var qfProps = new QueueFamilyProperties[(int)qfCount];
+        fixed (QueueFamilyProperties* pQf = qfProps)
+            vk.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qfCount, pQf);
+        graphicsTimestampValidBits = queueFamilyIndices.graphicsFamily.HasValue
+            ? qfProps[(int)queueFamilyIndices.graphicsFamily.Value].TimestampValidBits
+            : 0;
 
         //vulkan 1.1
         PhysicalDeviceVulkan11Features vulkan11Features = new(){SType = StructureType.PhysicalDeviceVulkan11Features};

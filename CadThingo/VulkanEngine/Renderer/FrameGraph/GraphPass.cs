@@ -36,6 +36,9 @@ internal sealed class GraphPass
     // syncing before this pass.
     public ImageMemoryBarrier2[]  ImageBarriers  = [];
     public BufferMemoryBarrier2[] BufferBarriers = [];
+    // Parallel to BufferBarriers: the resource id each barrier targets, so Execute can
+    // patch the .Buffer field per frame for double-buffered (per-frame) imports.
+    public int[] BufferBarrierRes = [];
 }
 
 public readonly struct PassResources

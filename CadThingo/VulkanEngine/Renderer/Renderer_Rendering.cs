@@ -405,6 +405,8 @@ public unsafe partial class Renderer
         geometryPipeline.UpdateUbo(currentFrame, camera);
         var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
         transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
+        // Stash for the LightCullPass body (it runs inside the FrameGraph, below).
+        _frameLightCount = lightCount; _frameTileCountX = tileCountX; _frameTileCountY = tileCountY;
         // Skybox always updates — pass body is conditional on EditorState.SkyboxEnabled
         // so we can flip the toggle without re-recording the graph.
         skyboxPipeline.UpdatePerFrame(currentFrame, camera, ImGui.EditorState.SkyboxIntensity);
@@ -427,27 +429,26 @@ public unsafe partial class Renderer
 
         // 5b. Scene extraction (L2 step 4) — the single ECS walk that packs the
         // cull-input SSBO + classifies BLEND candidates. Must precede the cull pass.
+        // (The host-coherent write is visible to the cull dispatch on submit.)
         gpuScene.ExtractRenderables(currentFrame, scene);
 
-        // 5b. GPU cull pass — runs before the geometry pass and produces the
-        // indirect command + post-cull instance buffers the geometry pass consumes.
-        // Reads GpuScene.Renderables; pure frustum cull now (no scene walk).
-        drawCullPipeline.Record(cmd, currentFrame, camera);
-
-        // 5c. Tiled light-cull — bins lights into per-tile slot lists for the
-        // lighting fragment shader. Buffer barrier inside makes the writes
-        // visible to the fragment stage of the lighting pass.
-        lightCullPipeline.Record(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
-
-        // 6. Record all render-graph passes (geometry → lighting → skybox → transparent
-        //    → tonemap), record-only. The new FrameGraph imports the legacy graph's
-        //    targets and derives all sync from the usage table; flip the flag to A/B
-        //    against the legacy coarse-barrier executor.
+        // 6. Record the deferred chain (cull → light-cull → geometry → lighting → skybox →
+        //    transparent → tonemap), record-only. The new FrameGraph runs cull/light-cull
+        //    as compute passes and derives all sync from the usage table; flip the flag to
+        //    A/B against the legacy coarse-barrier executor.
         const bool UseDeferredFrameGraph = true;
         if (UseDeferredFrameGraph && _deferredFrameGraph != null)
+        {
             _deferredFrameGraph.Execute(cmd, frameContext);
+        }
         else
+        {
+            // Legacy graph only owns the 5 graphics passes, so cull/light-cull (their
+            // internal barriers carry the sync) are recorded here, ahead of it.
+            drawCullPipeline.Record(cmd, currentFrame, camera);
+            lightCullPipeline.Record(cmd, currentFrame, camera, lightCount, tileCountX, tileCountY);
             scene.renderGraph.Execute(cmd, frameContext);
+        }
     }
     /// <summary>
     /// Uses RT in a compute shader
@@ -754,6 +755,25 @@ public unsafe partial class Renderer
     // Execute for A/B comparison.
     private DeferredGraph? _deferredFrameGraph;
 
+    // Per-frame values the LightCullPass body needs (computed in DrawDeferred from
+    // PbrDeferredPipeline.UpdatePerFrame, before the graph executes). Stashed on the
+    // renderer because the pass closures are built once but these change every frame.
+    private uint _frameLightCount;
+    private uint _frameTileCountX;
+    private uint _frameTileCountY;
+
+    // ---- Deferred FrameGraph debug surface (read by the Stats panel) -----------
+    /// <summary>Last-frame per-pass GPU/CPU timings + counts, or null before first compile.</summary>
+    public GraphStats? DeferredGraphStats => _deferredFrameGraph?.Stats;
+    /// <summary>Graphviz dump of the compiled deferred graph (for "Copy DOT").</summary>
+    public string DeferredGraphDot() => _deferredFrameGraph?.ToDot() ?? "(no deferred frame graph)";
+    /// <summary>Runtime toggle for the deferred graph's pipeline-statistics collection.</summary>
+    public bool DeferredGraphPipelineStats
+    {
+        get => _deferredFrameGraph?.CollectPipelineStats ?? false;
+        set { if (_deferredFrameGraph != null) _deferredFrameGraph.CollectPipelineStats = value; }
+    }
+
     /// <summary>
     /// (Re)builds the deferred chain as a <see cref="DeferredGraph"/> that imports the
     /// legacy graph's already-allocated targets. Must be called AFTER
@@ -789,12 +809,63 @@ public unsafe partial class Renderer
         var hdr      = Import("HDRColor");
         var final    = Import("FinalColor", ImageLayout.ShaderReadOnlyOptimal);
 
-        // Geometry → g-buffers + depth. The indirect-draw buffers are fetched in the body
-        // (cull still runs manually in DrawDeferred — folding it in needs per-frame buffer
-        // resolution the compile-once graph doesn't do yet; see DrawDeferred note).
+        // Per-frame compute-output buffers, imported so the graph derives the cull→geometry
+        // and light-cull→lighting barriers + ordering. (The compute INPUTS — renderables and
+        // lights — are host-coherent mapped writes, visible on submit, so they need no graph
+        // barrier and aren't declared.) BufferDesc is unused for imports.
+        var indirectCmdF   = new Buffer[MAX_CONCURRENT_FRAMES];
+        var indirectCountF = new Buffer[MAX_CONCURRENT_FRAMES];
+        var instanceF      = new Buffer[MAX_CONCURRENT_FRAMES];
+        var tileCountF     = new Buffer[MAX_CONCURRENT_FRAMES];
+        var tileIndicesF   = new Buffer[MAX_CONCURRENT_FRAMES];
+        for (uint i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            indirectCmdF[i]   = drawCullPipeline.GetIndirectCmdBuffer(i);
+            indirectCountF[i] = drawCullPipeline.GetIndirectCountBuffer(i);
+            instanceF[i]      = Engine.ResourceManager.GetInstanceBuffer(i);
+            tileCountF[i]     = lightCullPipeline.GetTileLightCountBuffer(i);
+            tileIndicesF[i]   = lightCullPipeline.GetTileLightIndicesBuffer(i);
+        }
+        var indirectCmd   = fg.ImportBufferPerFrame(indirectCmdF,   default, "IndirectCmd");
+        var indirectCount = fg.ImportBufferPerFrame(indirectCountF, default, "IndirectCount");
+        var instance      = fg.ImportBufferPerFrame(instanceF,      default, "InstanceData");
+        var tileCount     = fg.ImportBufferPerFrame(tileCountF,     default, "TileLightCount");
+        var tileIndices   = fg.ImportBufferPerFrame(tileIndicesF,   default, "TileLightIndices");
+
+        // Cull (compute): frustum-tests renderables → post-cull indirect draw commands +
+        // instance data. Its declared writes both keep it alive (writes imported buffers)
+        // and order it before geometry (RAW on the indirect + instance buffers). Record()
+        // also runs the view-dependent transparent sort consumed by TransparentPass.
+        fg.AddPass("CullPass", PassType.Compute, QueueClass.Graphics,
+            b =>
+            {
+                indirectCmd   = b.Write(indirectCmd,   ResourceUsage.StorageWriteCompute);
+                indirectCount = b.Write(indirectCount, ResourceUsage.StorageWriteCompute);
+                instance      = b.Write(instance,      ResourceUsage.StorageWriteCompute);
+            },
+            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+                drawCullPipeline.Record(cmd, f.FrameIndex, f.Camera));
+
+        // Light-cull (compute): bins lights into the per-tile lists the lighting FS reads.
+        // Tile counts/light count are computed in DrawDeferred and stashed on the renderer.
+        fg.AddPass("LightCullPass", PassType.Compute, QueueClass.Graphics,
+            b =>
+            {
+                tileCount   = b.Write(tileCount,   ResourceUsage.StorageWriteCompute);
+                tileIndices = b.Write(tileIndices, ResourceUsage.StorageWriteCompute);
+            },
+            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+                lightCullPipeline.Record(cmd, f.FrameIndex, f.Camera,
+                    _frameLightCount, _frameTileCountX, _frameTileCountY));
+
+        // Geometry → g-buffers + depth. Reads the post-cull indirect buffers (IndirectArg)
+        // + instance data (vertex storage read) → RAW edges order it after CullPass.
         fg.AddPass("GeometryPass", PassType.Graphics, QueueClass.Graphics,
             b =>
             {
+                b.Read(indirectCmd,   ResourceUsage.IndirectArg);
+                b.Read(indirectCount, ResourceUsage.IndirectArg);
+                b.Read(instance,      ResourceUsage.StorageReadVertex);
                 pos      = b.Write(pos,      ResourceUsage.ColorAttachment);
                 normal   = b.Write(normal,   ResourceUsage.ColorAttachment);
                 albedo   = b.Write(albedo,   ResourceUsage.ColorAttachment);
@@ -826,6 +897,10 @@ public unsafe partial class Renderer
                 b.Read(albedo,   ResourceUsage.SampledFragment);
                 b.Read(material, ResourceUsage.SampledFragment);
                 b.Read(emissive, ResourceUsage.SampledFragment);
+                // Per-tile light lists from LightCullPass, read by the lighting FS → RAW
+                // edge orders lighting after light-cull.
+                b.Read(tileCount,   ResourceUsage.StorageReadFragment);
+                b.Read(tileIndices, ResourceUsage.StorageReadFragment);
                 hdr = b.Write(hdr, ResourceUsage.ColorAttachment);
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>

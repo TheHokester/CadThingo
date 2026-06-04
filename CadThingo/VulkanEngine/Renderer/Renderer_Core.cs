@@ -28,14 +28,14 @@ public unsafe partial class Renderer
     // Cleanup(). Renderer exposes the same-named delegating accessors below so the rest
     // of the Renderer partials and every pipeline / ImageResource / ResourceManager
     // call site keep reaching device services unchanged while the deeper L1/L2/L3
-    // repoints land (L1 of the renderer refactor).
+    // repoints land (L1 of the renderer refactor).a
     internal GraphicsDevice gfx = null!;
 
     public bool initialized = false;
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private bool enableValidationLayers = false;
+    private bool enableValidationLayers = true;
     private IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------

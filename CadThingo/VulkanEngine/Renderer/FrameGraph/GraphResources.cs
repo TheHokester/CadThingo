@@ -44,6 +44,8 @@ internal sealed class GraphResource
     public Image? PhysImage;
     public ImageView? PhysView;
     public Buffer? PhysBuffer;
+    
+    public Buffer[]? PhysBufferFrames; //for use when resources require per frame buffers
     public SubAlloc? Alloc; // transients only
     public ImageLayout InitialLayout; // imported: layout the resource arrives in each frame
     public ImageLayout FinalLayout;   // imported images: layout the graph hands back on exit

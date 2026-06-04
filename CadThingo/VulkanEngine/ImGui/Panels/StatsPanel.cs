@@ -48,6 +48,64 @@ public static class StatsPanel
             ImGuiNET.ImGui.TextDisabled("Scene not initialized.");
         }
 
+        DrawRenderGraph();
+
         ImGuiNET.ImGui.End();
+    }
+
+    // Deferred FrameGraph instrumentation: per-pass GPU/CPU timing, barrier/cull counts,
+    // optional pipeline statistics, and a DOT export. All values come from the renderer's
+    // GraphStats snapshot (GPU timings are resolved a frame late, so they lag slightly).
+    private static void DrawRenderGraph()
+    {
+        var stats = Engine.renderer?.DeferredGraphStats;
+        if (stats is not { } gs) return;
+
+        ImGuiNET.ImGui.Separator();
+        if (!ImGuiNET.ImGui.CollapsingHeader("Render Graph (deferred)")) return;
+
+        ImGuiNET.ImGui.Text($"{gs.LivePassCount} passes ({gs.CulledPassCount} culled)   "
+                          + $"{gs.BarrierCount} barriers   compile {gs.CompileMs:F2} ms");
+        ImGuiNET.ImGui.Text($"GPU frame {gs.FrameGpuMs,6:F3} ms");
+        if (!gs.GpuTimingAvailable) ImGuiNET.ImGui.TextDisabled("(GPU timestamps unavailable on this device)");
+
+        bool ps = gs.PipelineStatsOn;
+        if (ImGuiNET.ImGui.Checkbox("Pipeline stats", ref ps) && Engine.renderer != null)
+            Engine.renderer.DeferredGraphPipelineStats = ps;
+        ImGuiNET.ImGui.SameLine();
+        if (ImGuiNET.ImGui.Button("Copy DOT") && Engine.renderer != null)
+            ImGuiNET.ImGui.SetClipboardText(Engine.renderer.DeferredGraphDot());
+
+        int cols = gs.PipelineStatsOn ? 6 : 3;
+        var flags = ImGuiNET.ImGuiTableFlags.Borders | ImGuiNET.ImGuiTableFlags.RowBg
+                  | ImGuiNET.ImGuiTableFlags.SizingStretchProp;
+        if (ImGuiNET.ImGui.BeginTable("##fgpasses", cols, flags))
+        {
+            ImGuiNET.ImGui.TableSetupColumn("Pass");
+            ImGuiNET.ImGui.TableSetupColumn("GPU ms");
+            ImGuiNET.ImGui.TableSetupColumn("CPU ms");
+            if (gs.PipelineStatsOn)
+            {
+                ImGuiNET.ImGui.TableSetupColumn("VS");
+                ImGuiNET.ImGui.TableSetupColumn("prim");
+                ImGuiNET.ImGui.TableSetupColumn("FS");
+            }
+            ImGuiNET.ImGui.TableHeadersRow();
+
+            foreach (var t in gs.Passes)
+            {
+                ImGuiNET.ImGui.TableNextRow();
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text(t.Name);
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{t.GpuMs:F3}");
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{t.CpuRecordMs:F3}");
+                if (gs.PipelineStatsOn)
+                {
+                    ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{t.Stats.VertexInvocations}");
+                    ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{t.Stats.Primitives}");
+                    ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{t.Stats.FragmentInvocations}");
+                }
+            }
+            ImGuiNET.ImGui.EndTable();
+        }
     }
 }
