@@ -52,6 +52,17 @@ public readonly struct AllocatorStats
 
 public unsafe sealed class GpuMemoryAllocator : IDisposable
 {
+    // Residency-priority hints (VK_EXT_memory_priority). Range 0..1; higher = the driver
+    // fights harder to keep the block resident when the process is over its WDDM/VidMm
+    // budget. PriorityDefault matches Vulkan's implicit 0.5 when no priority struct is
+    // chained, so anything left untagged behaves exactly as before. Folded into the bucket
+    // key (quantized) so a block only ever holds one priority tier — the driver can then
+    // evict a whole cold block instead of one whose priority is whatever its first tenant
+    // happened to request. No-op unless memory-priority was enabled at device creation.
+    public const float PriorityDefault = 0.5f;
+    public const float PriorityHigh    = 0.9f;   // hot working set: render targets, PT images, BVH/TLAS, live geometry
+    public const float PriorityLow     = 0.25f;  // cold / transient: staging, precompute scratch
+
     private enum BucketKind { Buffer, ImageOptimal, ImageLinear }
 
     // Node slot: lives at a stable index in Block.Nodes for the slot's lifetime.
@@ -78,11 +89,13 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
         public List<int>    Tombstones = new();
         public int          Head;            // index of leftmost node; -1 if block fully torn down
         public int          BucketKey = -1;  // owning bucket (pooled only); lets Free remove it on release
+        public float        Priority;        // VK_EXT_memory_priority value baked into this block
     }
 
     private readonly Vk             _vk;
     private readonly Device         _device;
     private readonly PhysicalDevice _physical;
+    private readonly bool           _memoryPriorityEnabled;
 
     private readonly Dictionary<int, List<Block>> _buckets = new();
     private readonly List<Block?> _allBlocks = new();
@@ -92,26 +105,28 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
     private const ulong IMAGE_BLOCK_DEVICE_LOCAL  = 256UL * 1024 * 1024;
     private const ulong HOST_VISIBLE_BLOCK        = 16UL  * 1024 * 1024;
 
-    public GpuMemoryAllocator(Vk vk, Device device, PhysicalDevice physical)
+    public GpuMemoryAllocator(Vk vk, Device device, PhysicalDevice physical, bool memoryPriorityEnabled = false)
     {
         _vk = vk;
         _device = device;
         _physical = physical;
+        _memoryPriorityEnabled = memoryPriorityEnabled;
     }
 
-    public SubAlloc AllocateForBuffer(VkBuffer buffer, MemoryPropertyFlags props)
+    public SubAlloc AllocateForBuffer(VkBuffer buffer, MemoryPropertyFlags props, float priority = PriorityDefault)
     {
         _vk.GetBufferMemoryRequirements(_device, buffer, out var reqs);
-        var alloc = Allocate(reqs, props, BucketKind.Buffer);
+        var alloc = Allocate(reqs, props, BucketKind.Buffer, priority);
         _vk.BindBufferMemory(_device, buffer, alloc.Memory, alloc.Offset);
         return alloc;
     }
 
-    public SubAlloc AllocateForImage(Image image, MemoryPropertyFlags props, ImageTiling tiling = ImageTiling.Optimal)
+    public SubAlloc AllocateForImage(Image image, MemoryPropertyFlags props,
+        ImageTiling tiling = ImageTiling.Optimal, float priority = PriorityDefault)
     {
         _vk.GetImageMemoryRequirements(_device, image, out var reqs);
         var kind = tiling == ImageTiling.Linear ? BucketKind.ImageLinear : BucketKind.ImageOptimal;
-        var alloc = Allocate(reqs, props, kind);
+        var alloc = Allocate(reqs, props, kind, priority);
         _vk.BindImageMemory(_device, image, alloc.Memory, alloc.Offset);
         return alloc;
     }
@@ -259,16 +274,21 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
 
     // internals
 
-    private SubAlloc Allocate(MemoryRequirements reqs, MemoryPropertyFlags props, BucketKind kind)
+    private SubAlloc Allocate(MemoryRequirements reqs, MemoryPropertyFlags props, BucketKind kind, float priority)
     {
         uint typeIndex = FindMemoryType(reqs.MemoryTypeBits, props);
         bool hostVisible = (props & MemoryPropertyFlags.HostVisibleBit) != 0;
         ulong blockSize  = TargetBlockSize(kind, hostVisible);
 
         if (reqs.Size + reqs.Alignment >= blockSize / 2)
-            return AllocateDedicated(reqs.Size, typeIndex, hostVisible, kind == BucketKind.Buffer);
+            return AllocateDedicated(reqs.Size, typeIndex, hostVisible, kind == BucketKind.Buffer, priority);
 
-        int bucketKey = ((int)typeIndex << 8) | (int)kind;
+        // Priority tier is part of the bucket key so a block holds only same-priority
+        // resources - otherwise a hot resource sharing a block with cold ones would be
+        // pulled down to the block's (first-tenant) priority. typeIndex < 32 (bits 16+),
+        // tier 0..10 (bits 8-15), kind 0..2 (bits 0-7) never collide.
+        int tier = PriorityTier(priority);
+        int bucketKey = ((int)typeIndex << 16) | (tier << 8) | (int)kind;
         if (!_buckets.TryGetValue(bucketKey, out var blockList))
         {
             blockList = new List<Block>();
@@ -280,7 +300,7 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
                 return sub;
 
         ulong newBlockSize = Math.Max(blockSize, reqs.Size + reqs.Alignment);
-        var fresh = CreateBlock(newBlockSize, typeIndex, hostVisible, kind == BucketKind.Buffer);
+        var fresh = CreateBlock(newBlockSize, typeIndex, hostVisible, kind == BucketKind.Buffer, priority);
         fresh.BucketKey = bucketKey;   // so Free can unlink it from this bucket when it empties
         blockList.Add(fresh);
 
@@ -288,6 +308,11 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
             throw new Exception("Suballocation failed in freshly-created block — alignment math is wrong");
         return freshSub;
     }
+
+    // Quantize 0..1 priority to 0..10 so near-equal requests share a bucket instead of
+    // fragmenting into one block each. The exact (clamped) float still flows to the block.
+    private static int PriorityTier(float priority) =>
+        (int)MathF.Round(Math.Clamp(priority, 0f, 1f) * 10f);
 
     private bool TrySuballocate(Block block, ulong size, ulong alignment, out SubAlloc result)
     {
@@ -360,7 +385,7 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
         return false;
     }
 
-    private Block CreateBlock(ulong size, uint memoryTypeIndex, bool hostVisible, bool bufferBlock)
+    private Block CreateBlock(ulong size, uint memoryTypeIndex, bool hostVisible, bool bufferBlock, float priority)
     {
         var info = new MemoryAllocateInfo
         {
@@ -368,6 +393,8 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
             AllocationSize  = size,
             MemoryTypeIndex = memoryTypeIndex,
         };
+        void** tail = (void**)&info.PNext;
+
         MemoryAllocateFlagsInfo flagsInfo = default;
         if (bufferBlock)
         {
@@ -378,7 +405,22 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
                 SType = StructureType.MemoryAllocateFlagsInfo,
                 Flags = MemoryAllocateFlags.DeviceAddressBit,
             };
-            info.PNext = &flagsInfo;
+            *tail = &flagsInfo;
+            tail  = (void**)&flagsInfo.PNext;
+        }
+
+        // VK_EXT_memory_priority: hint how hard the driver should fight to keep this block
+        // resident under WDDM budget pressure. Skipped (block gets the implicit 0.5) when
+        // the extension wasn't enabled at device creation.
+        MemoryPriorityAllocateInfoEXT priorityInfo = default;
+        if (_memoryPriorityEnabled)
+        {
+            priorityInfo = new MemoryPriorityAllocateInfoEXT
+            {
+                SType    = StructureType.MemoryPriorityAllocateInfoExt,
+                Priority = Math.Clamp(priority, 0f, 1f),
+            };
+            *tail = &priorityInfo;
         }
 
         if (_vk.AllocateMemory(_device, &info, null, out var memory) != Result.Success)
@@ -400,15 +442,16 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
             HostVisible     = hostVisible,
             Mapped          = mapped,
             Head            = 0,
+            Priority        = priority,
         };
         block.Nodes.Add(new Node { Offset = 0, Size = size, Free = true, Alive = true, Prev = -1, Next = -1 });
         _allBlocks.Add(block);
         return block;
     }
 
-    private SubAlloc AllocateDedicated(ulong size, uint memoryTypeIndex, bool hostVisible, bool bufferBlock)
+    private SubAlloc AllocateDedicated(ulong size, uint memoryTypeIndex, bool hostVisible, bool bufferBlock, float priority)
     {
-        var block = CreateBlock(size, memoryTypeIndex, hostVisible, bufferBlock);
+        var block = CreateBlock(size, memoryTypeIndex, hostVisible, bufferBlock, priority);
         _allBlocks.RemoveAt(_allBlocks.Count - 1);  // detach from sub-alloc tracking
         _dedicated.Add(block);
         int dedicatedId = _dedicated.Count - 1;

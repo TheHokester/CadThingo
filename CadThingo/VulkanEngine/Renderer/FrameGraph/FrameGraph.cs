@@ -391,7 +391,11 @@ public unsafe class FrameGraph : IDisposable
         if (vk.CreateImage(dev, ref info, null, out var image) != Result.Success)
             throw new Exception($"FrameGraph: failed to create image '{res.Name}'.");
         
-        var alloc = gfx.Allocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
+        // High residency priority: graph transients are the g-buffers / depth / HDR
+        // targets, written and read every frame — keep them resident ahead of cold
+        // resources under WDDM budget pressure.
+        var alloc = gfx.Allocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit,
+            ImageTiling.Optimal, GpuMemoryAllocator.PriorityHigh);
 
         bool depth = IsDepthFormat(d.Format);
         var viewInfo = new ImageViewCreateInfo

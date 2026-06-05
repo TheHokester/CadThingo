@@ -35,7 +35,7 @@ public unsafe partial class Renderer
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private bool enableValidationLayers = false;
+    private bool enableValidationLayers = true;
     private IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------

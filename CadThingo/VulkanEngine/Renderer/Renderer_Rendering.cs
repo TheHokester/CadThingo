@@ -768,6 +768,11 @@ public unsafe partial class Renderer
     public int RenderTargetRebuilds => _renderTargetRebuilds;
     /// <summary>Live allocator occupancy — reserved (held from driver) vs. actually used.</summary>
     public AllocatorStats GpuMemoryStats => gfx.Allocator.GetStats();
+    /// <summary>Driver-reported WDDM budget/usage for the device-local heap (VK_EXT_memory_budget),
+    /// or Available=false when the extension isn't enabled. This is the authoritative number our
+    /// hand-rolled reserved/used counters approximate - it includes the OS budget our committed
+    /// allocations are racing against.</summary>
+    public MemoryBudgetInfo GpuMemoryBudget => gfx.QueryMemoryBudget();
 
     // Per-rebuild MB history (sampled at the END of each RebuildRenderTargets, i.e.
     // steady post-resize state). The SHAPE discriminates the diagnosis: a monotonic

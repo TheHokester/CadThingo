@@ -95,7 +95,8 @@ public sealed unsafe class RenderTargets : IDisposable
             ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit
             | ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
-        FinalColor.Allocate(_gfx.PhysicalDevice);
+        // High priority: FinalColor is regenerated and sampled every frame (the viewport source).
+        FinalColor.Allocate(_gfx.PhysicalDevice, GpuMemoryAllocator.PriorityHigh);
     }
 
     private void CreateGBufferSampler()
@@ -146,8 +147,11 @@ public sealed unsafe class RenderTargets : IDisposable
         // Render graph normally calls Allocate inside Compile — these images live
         // outside the graph, so allocate explicitly. The Undefined → General transition
         // is batched with the selection mask's in TransitionSizeDependentImages.
-        PtAccumulator.Allocate(_gfx.PhysicalDevice);
-        PtOutColor.Allocate(_gfx.PhysicalDevice);
+        // High residency priority: the accumulator + out-color are the path tracer's hot
+        // working set, touched every frame - keep them resident ahead of cold resources
+        // when the process is over its WDDM budget.
+        PtAccumulator.Allocate(_gfx.PhysicalDevice, GpuMemoryAllocator.PriorityHigh);
+        PtOutColor.Allocate(_gfx.PhysicalDevice, GpuMemoryAllocator.PriorityHigh);
     }
 
     /// <summary>

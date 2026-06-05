@@ -204,7 +204,7 @@ public unsafe partial class Renderer
     /// </summary>
     private void CreateBufferWithDeviceAddress(
         ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out SubAlloc alloc)
+        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault)
     {
         // Allocator buffer blocks unconditionally carry MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
         // so this is now just a buffer create + bind. Caller still owns the
@@ -218,7 +218,7 @@ public unsafe partial class Renderer
         };
         if (vk!.CreateBuffer(device, &bufferInfo, null, out buffer) != Result.Success)
             throw new Exception("Failed to create device-address buffer");
-        alloc = memAllocator.AllocateForBuffer(buffer, memProps);
+        alloc = memAllocator.AllocateForBuffer(buffer, memProps, priority);
     }
 
     /// <summary>
@@ -617,9 +617,12 @@ public unsafe partial class Renderer
                 device, AccelerationStructureBuildTypeKHR.DeviceKhr,
                 &buildInfo, pMaxPrims, &sizes);
 
+            // High priority: BLAS storage is the persistent geometry BVH the path tracer
+            // traverses every frame — must stay resident under WDDM budget pressure.
             CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize,
                 BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
-                MemoryPropertyFlags.DeviceLocalBit, out var storage, out var storageAlloc);
+                MemoryPropertyFlags.DeviceLocalBit, out var storage, out var storageAlloc,
+                GpuMemoryAllocator.PriorityHigh);
 
             EnsureScratchCapacity(sizes.BuildScratchSize);
 
@@ -849,10 +852,12 @@ public unsafe partial class Renderer
             khrAccelStruct.DestroyAccelerationStructure(device, tlas, null);
             DestroyBuffer(tlasStorage, tlasStorageAlloc);
         }
+        // High priority: TLAS storage is the top-level BVH traversed every path-trace frame.
         CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize,
             BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit,
-            out tlasStorage, out tlasStorageAlloc);
+            out tlasStorage, out tlasStorageAlloc,
+            GpuMemoryAllocator.PriorityHigh);
 
         var createInfo = new AccelerationStructureCreateInfoKHR
         {

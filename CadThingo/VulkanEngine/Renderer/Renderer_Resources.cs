@@ -54,8 +54,8 @@ public unsafe partial class Renderer
     public void EndSingleTimeCommands(CommandBuffer cmd) => gfx.EndSingleTimeCommands(cmd);
 
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out SubAlloc alloc)
-        => gfx.CreateBuffer(size, usage, memProps, out buffer, out alloc);
+        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault)
+        => gfx.CreateBuffer(size, usage, memProps, out buffer, out alloc, priority);
 
     public void CopyBuffer(Buffer src, Buffer dst, ulong size) => gfx.CopyBuffer(src, dst, size);
 
@@ -366,7 +366,7 @@ public unsafe class ImageResource : IDisposable
         ImageView = view;
         IsAllocated = true;
     }
-    public void Allocate(PhysicalDevice physicalDevice)
+    public void Allocate(PhysicalDevice physicalDevice, float priority = GpuMemoryAllocator.PriorityDefault)
     {
         //configure image creation info based on resource properties
         ImageCreateInfo imageInfo = new()
@@ -388,7 +388,7 @@ public unsafe class ImageResource : IDisposable
             throw new Exception("Failed to create image for resource " + _name);
         }
 
-        ImageAlloc = _allocator.AllocateForImage(Image, MemoryPropertyFlags.DeviceLocalBit);
+        ImageAlloc = _allocator.AllocateForImage(Image, MemoryPropertyFlags.DeviceLocalBit, ImageTiling.Optimal, priority);
 
         bool isDepth = _format is Format.D32Sfloat
             or Format.D24UnormS8Uint

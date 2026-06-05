@@ -214,19 +214,22 @@ public unsafe class ResourceManager
 
         // StorageBufferBit so the PBR lighting shadow-ray alpha-test path can bind
         // these as ByteAddressBuffers and pull UVs / indices at hit time.
+        // High residency priority: the global VB/IB back every raster draw AND every
+        // path-trace hit (bound as ByteAddressBuffers + AS build input) — keep this
+        // live geometry resident ahead of cold resources under WDDM budget pressure.
         renderer.CreateBuffer(vbSize,
             BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
             BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
-            out globalVertexBuffer, out globalVertexBufferAlloc);
+            out globalVertexBuffer, out globalVertexBufferAlloc, Renderer.GpuMemoryAllocator.PriorityHigh);
 
         renderer.CreateBuffer(ibSize,
             BufferUsageFlags.IndexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
             BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
-            out globalIndexBuffer, out globalIndexBufferAlloc);
+            out globalIndexBuffer, out globalIndexBufferAlloc, Renderer.GpuMemoryAllocator.PriorityHigh);
         
         CreateBindlessDescriptorSetLayout();
         for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)

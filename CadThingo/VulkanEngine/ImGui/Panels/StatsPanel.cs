@@ -75,6 +75,26 @@ public static class StatsPanel
         ImGuiNET.ImGui.Text($"VRAM reserved {reserved,8:F1} MB   used {used,8:F1} MB");
         ImGuiNET.ImGui.Text($"  retained (empty) {gap,8:F1} MB   blocks {m.PooledBlocks}+{m.DedicatedBlocks} ded");
 
+        // Authoritative WDDM budget (VK_EXT_memory_budget). Headroom is what stands between
+        // us and the OS demand-paging our working set — colour it red as it runs out. This
+        // is the gauge that turns the silent residency cliff into something you can see.
+        var b = r.GpuMemoryBudget;
+        if (b.Available)
+        {
+            double budgetMb = b.Budget / MB;
+            double usageMb  = b.Usage  / MB;
+            double headMb   = b.Headroom / MB;
+            ImGuiNET.ImGui.Text($"WDDM budget {usageMb,8:F1} / {budgetMb,8:F1} MB  ({b.Fraction * 100f,4:F0}%)");
+            var col = b.Fraction >= 0.95f ? new Vector4(1f, 0.3f, 0.3f, 1f)
+                    : b.Fraction >= 0.80f ? new Vector4(1f, 0.8f, 0.2f, 1f)
+                    : new Vector4(0.5f, 0.9f, 0.5f, 1f);
+            ImGuiNET.ImGui.TextColored(col, $"  headroom {headMb,8:F1} MB");
+        }
+        else
+        {
+            ImGuiNET.ImGui.TextDisabled("WDDM budget unavailable (VK_EXT_memory_budget off)");
+        }
+
         // Per-rebuild history. X axis = rebuild #, so a rising line means each
         // resize adds memory that never comes back (leak); a flat line after the
         // first step means one-time high-water (no leak).

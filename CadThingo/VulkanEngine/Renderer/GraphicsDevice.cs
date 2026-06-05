@@ -9,7 +9,33 @@ using Silk.NET.Windowing;
 namespace CadThingo.VulkanEngine.Renderer;
 
 /// <summary>
-/// The Vulkan RHI context — instance, debug messenger, surface, physical/logical
+/// Snapshot of the device-local heap's residency budget (VK_EXT_memory_budget).
+/// <see cref="Budget"/> is the OS-managed ceiling this process should stay under (the
+/// dynamic WDDM/VidMm per-process budget on Windows); <see cref="Usage"/> is what the
+/// driver currently has committed against it. <see cref="Available"/> is false when the
+/// extension isn't enabled — the byte fields are then meaningless zeros.
+/// </summary>
+public readonly struct MemoryBudgetInfo
+{
+    public readonly bool  Available;
+    public readonly ulong Budget;
+    public readonly ulong Usage;
+
+    public MemoryBudgetInfo(bool available, ulong budget, ulong usage)
+    {
+        Available = available;
+        Budget    = budget;
+        Usage     = usage;
+    }
+
+    /// <summary>Bytes of budget still uncommitted (0 if already over).</summary>
+    public ulong Headroom => Budget > Usage ? Budget - Usage : 0;
+    /// <summary>Usage as a fraction of budget; ≥1.0 means at/over the cliff.</summary>
+    public float Fraction => Budget > 0 ? (float)Usage / Budget : 0f;
+}
+
+/// <summary>
+/// The Vulkan RHI context - instance, debug messenger, surface, physical/logical
 /// device, queues, the suballocating memory allocator, descriptor pool, and command
 /// pool — plus the device-level service helpers every pipeline and resource owner
 /// builds on (buffer/image creation, layout transitions, single-time commands,
@@ -77,6 +103,12 @@ public sealed unsafe class GraphicsDevice : IDisposable
     // Vulkan 1.1 multiview. Required for the reflection-probe capture pass that
     // renders all 6 faces of a cubemap in one draw via gl_ViewIndex.
     private bool multiviewEnabled = false;
+    // WDDM residency-control extensions. memoryPriority gates the per-allocation
+    // keep-resident hint the allocator chains; pageable lets the driver act on those
+    // hints under pressure; memoryBudget gates QueryMemoryBudget.
+    private bool memoryPriorityEnabled = false;
+    private bool pageableDeviceLocalMemoryEnabled = false;
+    private bool memoryBudgetEnabled = false;
 
     // Debug/profiling capability cache (filled in CreateLogicalDevice). timestampPeriod
     // is ns-per-tick from the device limits; graphicsTimestampValidBits masks the high
@@ -125,6 +157,14 @@ public sealed unsafe class GraphicsDevice : IDisposable
     public bool DescriptorIndexingEnabled => descriptorIndexEnabled;
     public bool MultiviewEnabled           => multiviewEnabled;
 
+    /// <summary>True iff VK_EXT_memory_priority is enabled — the allocator's per-allocation
+    /// keep-resident hints have effect. With VK_EXT_pageable_device_local_memory also on
+    /// (<see cref="PageableDeviceLocalMemoryEnabled"/>) the driver acts on them under pressure.</summary>
+    public bool MemoryPriorityEnabled           => memoryPriorityEnabled;
+    public bool PageableDeviceLocalMemoryEnabled => pageableDeviceLocalMemoryEnabled;
+    /// <summary>True iff VK_EXT_memory_budget is enabled — <see cref="QueryMemoryBudget"/> returns live data.</summary>
+    public bool MemoryBudgetEnabled             => memoryBudgetEnabled;
+
     /// <summary>
     /// True iff both KHR_acceleration_structure and KHR_ray_query are enabled with their
     /// device features active. Gates the ray-traced shadow path; callers should fall back
@@ -149,8 +189,8 @@ public sealed unsafe class GraphicsDevice : IDisposable
     // ---- Lifecycle ---------------------------------------------------------
 
     /// <summary>
-    /// Brings up the full device context in dependency order: instance → debug →
-    /// surface → physical device → logical device → memory allocator → command pool.
+    /// Brings up the full device context in dependency order: instance -> debug ->
+    /// surface -> physical device -> logical device -> memory allocator -> command pool.
     /// The descriptor pool is created separately via <see cref="CreateDescriptorPool"/>
     /// because its sizing depends on app-level budgets owned by the Renderer.
     /// </summary>
@@ -161,8 +201,10 @@ public sealed unsafe class GraphicsDevice : IDisposable
         CreateSurface();
         PickPhysicalDevice();
         CreateLogicalDevice();
-        // Must exist before ANY buffer/image allocation downstream.
-        memAllocator = new GpuMemoryAllocator(vk, device, physicalDevice);
+        // Must exist before ANY buffer/image allocation downstream. Pass whether
+        // VK_EXT_memory_priority landed so the allocator only chains the priority
+        // struct when the driver will honour it.
+        memAllocator = new GpuMemoryAllocator(vk, device, physicalDevice, memoryPriorityEnabled);
         CreateCommandPool();
     }
 
@@ -429,6 +471,14 @@ public sealed unsafe class GraphicsDevice : IDisposable
         "VK_EXT_descriptor_indexing",
         "VK_EXT_robustness2",
         "VK_EXT_shader_tile_image",
+        // Residency control under the Windows WDDM per-process budget. memory_priority
+        // lets each allocation carry a keep-resident hint; pageable_device_local_memory
+        // (depends on memory_priority) makes the driver honour those hints when demoting
+        // allocations under pressure; memory_budget exposes the live budget/usage so we
+        // can see headroom instead of falling off the cliff blind.
+        "VK_EXT_memory_priority",
+        "VK_EXT_pageable_device_local_memory",
+        "VK_EXT_memory_budget",
     };
 
     private void AddSupportedOptionalExtensions()
@@ -464,10 +514,10 @@ public sealed unsafe class GraphicsDevice : IDisposable
         List<DeviceQueueCreateInfo> queueCreateInfos = new();
         HashSet<uint> uniqueQueueFamilies = new HashSet<uint>()
         {
-            queueFamilyIndices.graphicsFamily.Value,
-            queueFamilyIndices.presentFamily.Value,
-            queueFamilyIndices.computeFamily.Value,
-            queueFamilyIndices.transferFamily.Value
+            queueFamilyIndices.graphicsFamily!.Value,
+            queueFamilyIndices.presentFamily!.Value,
+            queueFamilyIndices.computeFamily!.Value,
+            queueFamilyIndices.transferFamily!.Value
         };
 
         float queuePriority = 1.0f;
@@ -524,6 +574,14 @@ public sealed unsafe class GraphicsDevice : IDisposable
         {
             SType = StructureType.PhysicalDeviceRayTracingInvocationReorderFeaturesNV
         };
+        var memPrioritySupported = new PhysicalDeviceMemoryPriorityFeaturesEXT
+        {
+            SType = StructureType.PhysicalDeviceMemoryPriorityFeaturesExt
+        };
+        var pageableSupported = new PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT
+        {
+            SType = StructureType.PhysicalDevicePageableDeviceLocalMemoryFeaturesExt
+        };
 
         coreSupported.PNext             = &vulkan11Supported;
         vulkan11Supported.PNext         = &vulkan12Supported;
@@ -533,7 +591,9 @@ public sealed unsafe class GraphicsDevice : IDisposable
         accelerationStructureFeaturesSupported.PNext = &rayQueryFeaturesSupported;
         rayQueryFeaturesSupported.PNext = &rayTracingPipelineFeaturesSupported;
         rayTracingPipelineFeaturesSupported.PNext = &serFeaturesSupported;
-        serFeaturesSupported.PNext = null;
+        serFeaturesSupported.PNext      = &memPrioritySupported;
+        memPrioritySupported.PNext      = &pageableSupported;
+        pageableSupported.PNext         = null;
 
         vk.GetPhysicalDeviceFeatures2(physicalDevice, &coreSupported);
 
@@ -703,6 +763,24 @@ public sealed unsafe class GraphicsDevice : IDisposable
             serEnable.RayTracingInvocationReorder = true;
         }
 
+        //prepare WDDM residency-control features. memoryPriority is the per-allocation
+        //keep-resident hint; pageableDeviceLocalMemory lets the driver act on those hints
+        //and *requires* memoryPriority to be enabled (VUID-...-pageableDeviceLocalMemory-06849),
+        //so it's gated on memoryPriority landing.
+        var hasMemoryPriority = hasExtension("VK_EXT_memory_priority");
+        PhysicalDeviceMemoryPriorityFeaturesEXT memPriorityEnable = new(){SType = StructureType.PhysicalDeviceMemoryPriorityFeaturesExt};
+        if (hasMemoryPriority && memPrioritySupported.MemoryPriority)
+        {
+            memPriorityEnable.MemoryPriority = true;
+        }
+
+        var hasPageable = hasExtension("VK_EXT_pageable_device_local_memory");
+        PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageableEnable = new(){SType = StructureType.PhysicalDevicePageableDeviceLocalMemoryFeaturesExt};
+        if (hasPageable && pageableSupported.PageableDeviceLocalMemory && memPriorityEnable.MemoryPriority)
+        {
+            pageableEnable.PageableDeviceLocalMemory = true;
+        }
+
         //chain all features together: 1.1 -> 1.2 -> 1.3 -> optional ext structs
         features.PNext = &vulkan11Features;
         vulkan11Features.PNext = &vulkan12Features;
@@ -739,6 +817,18 @@ public sealed unsafe class GraphicsDevice : IDisposable
             tailNext = (void**)&serEnable.PNext;
         }
 
+        if (hasMemoryPriority && memPriorityEnable.MemoryPriority)
+        {
+            *tailNext = &memPriorityEnable;
+            tailNext = (void**)&memPriorityEnable.PNext;
+        }
+
+        if (hasPageable && pageableEnable.PageableDeviceLocalMemory)
+        {
+            *tailNext = &pageableEnable;
+            tailNext = (void**)&pageableEnable.PNext;
+        }
+
         //record which features ended up enabled
         descriptorIndexEnabled = descriptorIndexingEnabled && (vulkan12Features.DescriptorBindingPartiallyBound && vulkan12Features.DescriptorBindingUpdateUnusedWhilePending);
         robustness2Enabled = hasRobust2 && (robust2Enable.RobustBufferAccess2 || robust2Enable.RobustImageAccess2 || robust2Enable.NullDescriptor);
@@ -747,12 +837,18 @@ public sealed unsafe class GraphicsDevice : IDisposable
         rayTracePipelineEnabled = hasRayTracingPipeline && rayTracingPipelineEnable.RayTracingPipeline;
         serEnabled = hasSer && serEnable.RayTracingInvocationReorder;
         multiviewEnabled = vulkan11Features.Multiview;
+        memoryPriorityEnabled = hasMemoryPriority && memPriorityEnable.MemoryPriority;
+        pageableDeviceLocalMemoryEnabled = hasPageable && pageableEnable.PageableDeviceLocalMemory;
+        // memory_budget has no feature bit — enabling the extension is sufficient.
+        memoryBudgetEnabled = hasExtension("VK_EXT_memory_budget");
 
         Console.WriteLine($"----> RayShadowsSupported: {RayShadowsSupported} " +
                           $"(rayQuery={rayQueryEnabled}, accelStruct={accelerationStructureEnabled})");
         Console.WriteLine($"----> RayTracePipelineSupported: {RayTracePipelineSupported} " +
                           $"(rayTracingPipeline={rayTracePipelineEnabled})");
         Console.WriteLine($"----> SerSupported: {SerSupported} (invocationReorder={serEnabled})");
+        Console.WriteLine($"----> Memory residency control: priority={memoryPriorityEnabled}, " +
+                          $"pageable={pageableDeviceLocalMemoryEnabled}, budget={memoryBudgetEnabled}");
 
         bool printFeatures = false;
         if (printFeatures)
@@ -996,6 +1092,36 @@ public sealed unsafe class GraphicsDevice : IDisposable
         throw new Exception("No suitable memory type found.");
     }
 
+    /// <summary>
+    /// Live residency budget for the device-local heap (VK_EXT_memory_budget), or a
+    /// default (Available=false) struct when the extension isn't enabled. On Windows the
+    /// budget is the dynamic WDDM/VidMm per-process ceiling - well below physical VRAM and
+    /// shared across apps - and usage is what the driver currently has committed against it.
+    /// Cheap (one query); safe to call per frame for a headroom gauge / budget-aware scaling.
+    /// </summary>
+    public MemoryBudgetInfo QueryMemoryBudget()
+    {
+        if (!memoryBudgetEnabled) return default;
+
+        var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT
+        {
+            SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt
+        };
+        var props2 = new PhysicalDeviceMemoryProperties2
+        {
+            SType = StructureType.PhysicalDeviceMemoryProperties2,
+            PNext = &budget
+        };
+        vk.GetPhysicalDeviceMemoryProperties2(physicalDevice, &props2);
+
+        var mem = props2.MemoryProperties;
+        for (uint i = 0; i < mem.MemoryHeapCount; i++)
+            if ((mem.MemoryHeaps[(int)i].Flags & MemoryHeapFlags.DeviceLocalBit) != 0)
+                return new MemoryBudgetInfo(true, budget.HeapBudget[(int)i], budget.HeapUsage[(int)i]);
+
+        return default;
+    }
+
     public Format FindDepthFormat()
     {
         Format depthFormat =
@@ -1081,7 +1207,7 @@ public sealed unsafe class GraphicsDevice : IDisposable
     }
 
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out SubAlloc alloc)
+        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault)
     {
         BufferCreateInfo bufferInfo = new()
         {
@@ -1096,7 +1222,7 @@ public sealed unsafe class GraphicsDevice : IDisposable
         // DeviceAddress flag is already baked into every buffer-bucket block by
         // the allocator — no per-call PNext chain needed. Caller still has to set
         // ShaderDeviceAddressBit in `usage` for the buffer itself, which they do.
-        alloc = memAllocator.AllocateForBuffer(buffer, memProps);
+        alloc = memAllocator.AllocateForBuffer(buffer, memProps, priority);
     }
 
     public void CopyBuffer(Buffer src, Buffer dst, ulong size)
