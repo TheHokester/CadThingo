@@ -597,23 +597,44 @@ queues. The transfer-upload buffers are the natural first Concurrent candidates.
 
 ## 3. Phase 3 — async compute + subgraph modules (sketch)
 
+> **Modules split across phases.** The module *composition* layer (authoring: scopes,
+> ports, wire-time validation, flatten-into-parent, DOT/debug boxes) depends on nothing in
+> Phase 2 or 3 — it is pure Phase-1 single-queue authoring and is **recommended to pull
+> forward** (see "Recommended order of attack" below). Only the module behaviors that need
+> later phases stay here: `PreferAsync` on internal passes (the async scheduler) and
+> aliasing of module-internal scratch (Phase 4). Both degrade gracefully — `PreferAsync` is
+> already ignored in Phase 1-2, aliasing simply does not happen yet — so building the
+> composition layer now and letting the internals light up later is the intended layering.
+> Full design: `render-graph.md` §9 (the logical-subgraph / physical-flatten decision, the
+> A-vs-B analysis, composition-vs-replication, host-shared modules, the three-tier model).
+
 - **Async:** `PreferAsync` passes get placed on `QueuePlan.AsyncCompute` *only* inside an
   overlap window (between the signal of their last graphics-queue dependency and the wait
   of their first consumer); never if it forces an immediate graphics-queue wait. Falls
   back to graphics + barriers when `AsyncCompute is null`. First candidates: light-cull,
   any SSAO, denoiser à-trous.
-- **Modules:** finish `IGraphModule` — fix the signature to `out TOutputs`:
+- **Modules (composition layer — pull forward):** finish `IGraphModule` — fix the signature
+  to `out TOutputs` and take a graph-scope builder, not the per-pass one:
   ```csharp
   public interface IGraphModule<TInputs, TOutputs>
-  { void Build(IGraphBuilder b, in TInputs inputs, out TOutputs outputs); }
+  { void Build(GraphScope scope, in TInputs inputs, out TOutputs outputs); }
   ```
-  Internal resources auto-namespaced under `b.Scope`. Validate ports (format/usage/extent)
-  at wire time. This is how PT/RT, the host post-stack (tonemap+outline), and even the
-  deferred lighting chain become drop-in modules. Folding `DrawPathtraced`/`DrawRayTraced`/
-  `RecordSelectionOutline`/`ProcessPickRequest` in here is what finally deletes their
-  hand-rolled `CmdPipelineBarrier` blocks and the `_lastRenderMode` tonemap-rebind hack
-  (because tonemap becomes one host module reading a stable `SceneColorHDR`/`FinalColor` —
-  this is the L3 contract from `renderer-refactor.md`).
+  `GraphScope` wraps `(FrameGraph, prefix)` and forwards `CreateImage`/`CreateBuffer`/
+  `AddPass` with the prefix applied to names; top-level building uses a root (empty-prefix)
+  scope so module and top-level authoring share one surface. Validate ports
+  (format/usage/extent) at wire time against the resource's `ImageDesc`. Tag each
+  `GraphPass` with its scope for DOT clusters + nested debug labels. This is how PT/RT, the
+  host post-stack (tonemap+outline), and even the deferred lighting chain become drop-in
+  modules. Folding `DrawPathtraced`/`DrawRayTraced`/`RecordSelectionOutline`/
+  `ProcessPickRequest` in here is what finally deletes their hand-rolled `CmdPipelineBarrier`
+  blocks and the `_lastRenderMode` tonemap-rebind hack (tonemap becomes one host module
+  reading a stable `SceneColorHDR`/`FinalColor` — the L3 contract from
+  `renderer-refactor.md`).
+- **Replication is not nesting.** Probes / shadow cascades / multi-viewport are the *same*
+  passes run N times, not a containment problem: author the technique as one composition
+  module and fan out inside a single pass (multiview / instanced draw / loop in `Execute`).
+  Unrolling N copies forfeits cross-instance aliasing (quad-view's K g-buffer sets) — see
+  `render-graph.md` §9.3.
 
 This phase composes with L3: each `IRenderCore.Render` builds its technique as a module
 appended to the host graph.
@@ -628,6 +649,63 @@ barrier (+ undefined→target transition, contents are garbage) at the first use
 second resource. **Hazard:** a transient aliased across the graphics/async boundary must
 not alias anything live in the overlap window — so aliasing is computed *after* queue
 assignment. Surface `AliasedSavedBytes` + an alias-map view in the debug panel.
+
+---
+
+## 5. Code organization — feature folders + directory-aware shader build (parallel track)
+
+Standalone from the graph phases but composes with them: the end state is "feature = folder
+= graph-module" (`render-graph.md` §14). Land it incrementally; each step below builds.
+
+### 5.0 Where the code is today
+
+| Concern | Location | State |
+|---|---|---|
+| Pipelines | `Renderer/Pipelines/*.cs` | 17 files, flat |
+| Shader source | `VulkanEngine/Shaders/*.slang` | 23 files, flat; incl. shared modules CommonTypes/PbrUtils/IblCommon/PTUtils |
+| Compiled | `Assets/Shaders/*.spv` | flat |
+| `.spv` reference | each pipeline | **hardcoded absolute path** (`@"C:\Users\jamie\...\Assets\Shaders\Geometry.spv"`); also in `Renderer_Ibl.cs`, `ImGuiVulkanUtils.cs`, `ReflectionProbeSystem.cs` |
+| Compile | `VulkanEngine/Shaders/shaderCompile.bat` | one `slangc` line per shader; per-shader flags (`-capability spvRayQueryKHR`/`spvRayTracingKHR`) and a variant (`PathTraceRT` -> `.spv` + `_SER.spv` via `-DUSE_SER=1`) |
+
+Name drift across the three folders is the "hard to find" pain: `PbrDeferredPipeline.cs` ->
+`PbrShader.slang` -> `PBR.spv`; `DrawCullPipeline.cs` -> `CullDraws.slang` -> `CullDraws.spv`.
+
+### 5.1 Path resolver (do first; no files move)
+
+Replace every absolute `.spv` path with a content-root-relative resolver: one helper that
+maps a logical shader name to its path (rooted at the app's content dir, not a machine
+path). This is brittleness independent of any restructure — the project does not build on
+another machine today. **Source location and compiled-output location are separate axes:**
+sources can later move into feature folders while `.spv` stays flat in `Assets/Shaders/`;
+the resolver hides that from pipelines. After this step the absolute strings are gone and
+the build still produces identical `.spv`.
+
+### 5.2 Directory-aware, manifest-driven compile (do second)
+
+A pure glob cannot replace the `.bat`: shaders carry metadata it cannot infer — per-shader
+capabilities, variants, and (once sources nest) `-I Shaders/Lib` for the shared `import`s.
+Drive compilation from a small manifest (per shader: source path, target, flags, defines,
+output name(s)/variants) walked over `Features/**/Kernels` + `Shaders/Lib`. Wire it into an
+MSBuild pre-build target so shaders compile on `dotnet build` instead of the manual pre-run
+step (CLAUDE.md's current footgun). Verify `.spv` outputs are byte-identical (or
+render-identical for the ray-query / SER variants) before moving on.
+
+### 5.3 Move into feature folders (do third)
+
+`git mv` each `.slang` into its feature's `Kernels/` (shared modules into `Shaders/Lib/`) and
+each pipeline `.cs` alongside its module; fix namespaces and the naming drift
+(`PbrShader`/`PBR` -> `Pbr`). Use `git mv` so history follows; the manifest + resolver from
+5.1/5.2 absorb the new paths.
+
+### 5.4 Land the first module into its folder (do fourth)
+
+`DeferredModule` (the Phase-1 module slice, §1.8 + `render-graph.md` §9) is authored directly
+in `Features/Deferred/` — the restructure and the first module become one commit.
+
+> **Edge cases to decide consciously:** the ImGui shader (`ImGuiVulkanUtils.cs`) is UI infra
+> — likely stays put; the IBL bake pipelines are inlined in `Renderer_Ibl.cs` (good candidate
+> to pull into `Features/Ibl/`); `VulkanTut/` is dead tutorial code — exclude and delete, do
+> not migrate.
 
 ---
 
@@ -679,3 +757,11 @@ empty/trivial graph) → **1.8 (deferred parity — the milestone)** → 1.10 (d
 recommended stopping point): hand-rolled barriers gone, compute/RT/transfer unified, the
 transfer-upload win banked, debug tooling shipped — without the async scheduler or aliasing
 where the subtle bugs live.
+
+> **Current track (decided).** With 1.1-1.8 and 1.10 complete, the chosen next step is not
+> 1.9 or Phase 2 but the **module composition layer pulled forward** (§3, "Modules
+> (composition layer)") together with the **code-organization restructure** (§5): introduce
+> `GraphScope` + typed ports, wrap the deferred chain as `DeferredModule`, and migrate to
+> feature folders + a manifest-driven shader build. It needs nothing from Phase 2/3, directly
+> serves L3, and removes the `_lastRenderMode` tonemap-rebind hack. 1.9 and Phase 2 follow
+> after.

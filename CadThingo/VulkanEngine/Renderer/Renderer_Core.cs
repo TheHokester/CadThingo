@@ -35,7 +35,7 @@ public unsafe partial class Renderer
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private bool enableValidationLayers = true;
+    private bool enableValidationLayers = false;
     private IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------
@@ -525,14 +525,14 @@ public unsafe partial class Renderer
         if (!initialized) return;
         vk!.DeviceWaitIdle(device);
 
-        transparentPipeline?.Dispose();
-        PbrDeferredPipeline?.Dispose();
+        // In-place rebuild: same pipeline objects, fresh GPU handles -- so the DeferredModule
+        // (and any other holder of these refs) stays valid without rebuilding the graph.
+        // SoftShadowsEnabled is a spec constant, read by Rebuild's Initialize.
+        PbrDeferredPipeline.SoftShadowsEnabled = softShadowsEnabled;
+        PbrDeferredPipeline.Rebuild();
 
-        PbrDeferredPipeline = new PbrDeferredPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
-        PbrDeferredPipeline.Initialize();
-
-        transparentPipeline = new TransparentPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
-        transparentPipeline.Initialize();
+        transparentPipeline.SoftShadowsEnabled = softShadowsEnabled;
+        transparentPipeline.Rebuild();
 
         // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
         // Set 1 (g-buffer samplers) is no longer written by Initialize — the views live on
@@ -566,9 +566,10 @@ public unsafe partial class Renderer
         if (!initialized) return;
         vk!.DeviceWaitIdle(device);
 
-        tonemapPipeline?.Dispose();
-        tonemapPipeline = new TonemapPipeline(this) { Operator = tonemapOperator };
-        tonemapPipeline.Initialize();
+        // In-place rebuild (stable object identity, fresh GPU handles) so the DeferredModule's
+        // tonemap ref stays valid. Operator is a spec constant, read by Rebuild's Initialize.
+        tonemapPipeline.Operator = tonemapOperator;
+        tonemapPipeline.Rebuild();
         tonemapPipeline.WriteHdrInputDescriptor(_deferredHdrView, gBufferSampler);
     }
 

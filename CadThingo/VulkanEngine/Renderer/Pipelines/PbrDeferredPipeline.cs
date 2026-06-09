@@ -59,16 +59,16 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     private UboBuffer[] LightingUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
     /// <summary>True = wire the PCSS-style soft-shadow specialization constant on,
-    /// pulled into the fragment shader as <c>constant_id 0</c>. Read once at
-    /// pipeline build; toggling requires Dispose + rebuild.</summary>
-    public bool SoftShadowsEnabled { get; init; } = true;
+    /// pulled into the fragment shader as <c>constant_id 0</c>. Read at each pipeline
+    /// build; set then call <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
+    public bool SoftShadowsEnabled { get; set; } = true;
 
     public PbrDeferredPipeline(Renderer renderer) : base(renderer) { }
 
-    public override void Dispose()
+    protected override void ReleaseGpuResources()
     {
         foreach (var b in LightingUniformBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
-        base.Dispose();
+        base.ReleaseGpuResources();
     }
 
     internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, ImageView HdrTarget)

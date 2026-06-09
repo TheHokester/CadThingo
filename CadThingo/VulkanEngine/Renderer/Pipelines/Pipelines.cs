@@ -81,6 +81,23 @@ public abstract unsafe class PipelineBase : IDisposable
         WriteDescriptors();
     }
 
+    /// <summary>Rebuilds this pipeline's GPU objects in place, preserving object identity so
+    /// any held reference (render-graph module fields, cross-pipeline bindings) stays valid:
+    /// tears everything down via <see cref="ReleaseGpuResources"/> and recreates it via
+    /// <see cref="Initialize"/> on the same instance. Deliberately does NOT route through
+    /// <see cref="Dispose"/> -- reusing an object after Dispose violates the IDisposable
+    /// contract and would break the moment a Dispose override adds a _disposed guard /
+    /// finalizer / SuppressFinalize. The caller must have idled the device (e.g. after
+    /// toggling a spec-constant setting) and is responsible for re-applying any external
+    /// descriptor writes Initialize does not perform (cross-pipeline / graph-transient binds).
+    /// Replaces the old "Dispose + new + Initialize" pattern, which orphaned references the
+    /// owner had handed out.</summary>
+    public void Rebuild()
+    {
+        ReleaseGpuResources();
+        Initialize();
+    }
+
     // Required: populate descriptorSetLayouts and (optionally) pushConstantRanges.
     protected abstract void CreateDescriptorSetLayouts();
 
@@ -113,7 +130,14 @@ public abstract unsafe class PipelineBase : IDisposable
     protected virtual void CreateDescriptorSets()     { }
     protected virtual void WriteDescriptors()         { }
 
-    public virtual void Dispose()
+    public virtual void Dispose() => ReleaseGpuResources();
+
+    /// <summary>The single GPU-teardown path, shared by <see cref="Dispose"/> (terminal) and
+    /// <see cref="Rebuild"/> (followed by a fresh <see cref="Initialize"/>). Concrete pipelines
+    /// override THIS -- not Dispose -- to free their own owned resources (UBOs/SSBOs/samplers),
+    /// then call <c>base.ReleaseGpuResources()</c>. Routing Rebuild through here rather than
+    /// Dispose keeps re-init off the IDisposable path.</summary>
+    protected virtual void ReleaseGpuResources()
     {
         if (PipelineHandle.Handle       != 0) Vk.DestroyPipeline(Device, PipelineHandle, null);
         if (PipelineLayoutHandle.Handle != 0) Vk.DestroyPipelineLayout(Device, PipelineLayoutHandle, null);

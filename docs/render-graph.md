@@ -27,6 +27,7 @@ the graph consumes the `GraphicsDevice` (L1) for queues/allocator/sync, imports
 11. [Public API sketch](#11-public-api-sketch)
 12. [Integration with L1/L2/L3](#12-integration-with-l1l2l3)
 13. [Phasing](#13-phasing)
+14. [Code organization (feature folders)](#14-code-organization-feature-folders)
 
 ---
 
@@ -278,24 +279,139 @@ computed **after** queue assignment.
 
 ## 9. Subgraph modules (features)
 
-The "append-and-wire" requirement: a feature is a **module** that contributes a set of
-passes + its own internal resources, exposing typed **ports**. Modules compose and
-nest. The parent wires a module's input ports to existing handles and consumes its
-output ports.
+A feature is a **module**: a unit that contributes a set of passes plus its own internal
+resources, exposing typed **ports**. The parent wires a module's input ports to existing
+handles and consumes its outputs. The load-bearing question is *how a module relates to
+the graph*, because that answer drives culling, sync, aliasing, and scheduling.
+
+### 9.1 The decision: logical subgraph, physical flatten
+
+Two readings of "module = subgraph":
+
+- **Option A — logical subgraph, physical flatten.** A module is a *builder* that, when
+  called, appends its passes directly into the parent's single flat pass/resource
+  registry. It is a subgraph in the sense of *an authored, named, port-bounded region* of
+  the one graph — not a separate runtime object.
+- **Option B — runtime nested subgraph.** A module is its own `FrameGraph`, compiled
+  independently, that the parent treats as an opaque node with input/output ports.
+
+**Decision: Option A.** The analogy is function inlining in a compiler. The function
+(module) is a real, reusable, named unit in the source, but the optimizer flattens it into
+the caller so it can do dead-code elimination, register allocation, and scheduling *across*
+the boundary. The graph compiler (§6) is exactly that kind of optimizer, and its headline
+features — culling, sync, aliasing, async scheduling — are all cross-procedural
+optimizations that need a global view.
+
+### 9.2 Why flatten wins
+
+Each compiler stage breaks at an opaque boundary (B) and composes for free when flat (A):
+
+| Stage | Flat (A) | Nested (B) |
+|---|---|---|
+| Dead-pass cull (§6.2) | reverse-reachability already drops an unconsumed module's passes | each subgraph needs a weaker self-cull keyed on which output ports are read |
+| Sync (§7) | a module-to-module seam is just another versioned access in the one barrier walk — tightest possible | re-derive sync at every seam (exit-state vs entry-expectation); conservative, bug-prone |
+| Aliasing (§4, Phase 4) | module-internal scratch can alias parent transients via global lifetimes | each subgraph owns its pool; no cross-boundary aliasing — exactly where denoiser scratch wants it |
+| Async (§8, Phase 3) | scheduler interleaves a module's `PreferAsync` pass with parent work | an opaque node cannot be interleaved |
+| Cost to build | ~nothing — `Compile`/sync/execute untouched; modules are an authoring veneer | duplicate the whole flat machine + a stitching meta-layer |
+
+The one thing flatten gives up: **hard encapsulation.** A flattened module physically
+*can* reach past its ports (it holds a graph scope). Encapsulation becomes ports + scope +
+convention, not enforcement — the same trade as `internal` vs a hard module boundary.
+Acceptable for a single-author engine; see §9.7 for the escape hatch if that changes.
+
+### 9.3 Composition vs replication — different axes
+
+The A/B debate quietly conflates two things:
+
+- **Composition** — different passes wired together once, authored as a named unit (bloom,
+  denoiser, tonemap, the deferred chain). Appears one-to-few times. *This is what modules
+  are for.*
+- **Replication** — the *same* passes executed N times with per-instance data (probes,
+  shadow cascades, multi-viewport). N can be large or dynamic.
+
+**Replication is not a graph-nesting problem.** Neither unrolling N copies into the flat
+graph nor N nested subgraphs is right; the correct tool is a per-pass primitive — Vulkan
+multiview, instanced/indirect draw, or a loop inside one `Execute` body — wrapped by a
+normal composition module. This matters because probes/cascades/viewports *look* like they
+want containment (a vote for B), but the technique is still authored as one composition
+module (A) and one pass fans out to N layers, so you keep cross-instance transient
+**aliasing** (quad-view: four g-buffer sets collapse to one when rendered sequentially) and
+async overlap that B would forfeit.
+
+### 9.4 Module shape
 
 ```csharp
-interface IGraphModule
+public interface IGraphModule<TInputs, TOutputs>
 {
-    // Registers this module's passes into `b`, reading `inputs`, returning outputs.
-    // Internal resources are auto-namespaced under `b.Scope` (e.g. "svgf/variance").
-    void Build(IGraphBuilder b, in TInputs inputs, out TOutputs outputs);
+    // Appends this module's passes into `scope` (which prefixes names + AddPass),
+    // reading `inputs`, producing `outputs`. NOTE: out, not in -- the current stub is wrong.
+    void Build(GraphScope scope, in TInputs inputs, out TOutputs outputs);
 }
 ```
 
-Ports are validated at wire time (format/usage/extent compatibility), so a mismatch is
-a compile error, not a runtime corruption.
+- **`GraphScope`** is a thin facade over `(FrameGraph g, string prefix)` exposing
+  `CreateImage`/`CreateBuffer`/`AddPass`, each forwarding with the scope prefix applied to
+  names. Top-level building uses a root scope (empty prefix) so module and top-level
+  authoring share one surface. This is the *graph*-scope builder; the existing
+  `IGraphBuilder` (`Read`/`Write`) stays the *pass*-scope builder used inside a pass setup.
+- **Ports** are structs of `GraphImage`/`GraphBuffer`. The scope offers
+  `ExpectImage(handle, format, usage)` that reads the resource's `ImageDesc` and throws on
+  format/extent/usage mismatch *at build time* — a wiring mistake is a compile error, not
+  runtime corruption.
+- **Naming/scope** is prefixing (`svgf/atrous/pingA`); nested scopes concatenate; two
+  instances of one module suffix the scope (`tonemap#0`). Resource ids are already globally
+  unique, so instancing otherwise just works.
+- **Debug visibility** preserves the "they're subgraphs" mental model even though they are
+  flat: tag each `GraphPass` with its scope, then `ToDot()` emits `subgraph cluster_<scope>`
+  boxes and `GraphDebug` pushes one debug-utils label around each scope's contiguous pass
+  run — so modules appear as nested, named regions in RenderDoc / Nsight.
 
-**Worked example — a drop-in SVGF denoiser** (illustrative; not to be implemented now):
+### 9.5 Host-shared modules
+
+A module reused by many cores (tonemap, and the rest of the post-stack) is a **host**
+module, not a per-core one: the host appends it after whichever core's module ran this
+frame (Deferred / PT-compute / PT-RT / Forward+). So the module system's real job is to
+**compose a core module + host modules in one graph**, wiring the core's `SceneColorHDR`
+output to the host post-stack's input. That core-to-host seam getting its sync *derived*
+(not hand-stitched) is precisely flatten's payoff — and exactly the L3 contract
+(`renderer-refactor.md`): the core produces `SceneColorHDR` in a known layout; the host
+owns tonemap -> outline -> present. This is what finally deletes the `_lastRenderMode`
+tonemap-rebind hack.
+
+### 9.6 Use cases and verdicts
+
+| Use case | Stresses | Verdict |
+|---|---|---|
+| Bloom / SSAO / DOF | multi-pass pyramids, variable depth | A |
+| Denoiser (SVGF) | internal scratch, async, cross-alias | A (decisively) |
+| Tonemap / post-stack | reuse across cores | A, host-shared (§9.5) |
+| Pick / ID buffer | editor pass | A |
+| Probe capture (roadmap) | N-way replication | A wrapper + per-pass multiview (§9.3) |
+| Shadow cascades | per-cascade view | A wrapper + multiview |
+| Multi-viewport / quad-view | replicate whole core | A — cross-instance aliasing collapses K g-buffer sets to 1 |
+| Runtime-toggled FX | dynamic topology | A — register-always + global cull; often no recompile |
+| Hot-reload / opaque 3rd-party effect | independent recompile, isolation | the only real B case (§9.7) |
+
+### 9.7 Recommendation: three tiers
+
+1. **Default: A (logical subgraph, physical flatten)** for all composition — everything on
+   the roadmap.
+2. **A per-pass replication primitive** (multiview / instanced draw / loop-in-`Execute`)
+   for data-parallel N. Author the technique as an A-module; let one pass fan out. Never
+   unroll N copies into the graph.
+3. **B kept as a future "sealed module" escape hatch**, gated by a single explicit trigger:
+   *you need an opaque subgraph whose internals the host compiler must not see* (untrusted
+   plugin, or caching a massive stable precompute). Implement it then as "bake the module to
+   one super-pass with conservative boundary barriers" — A does not preclude it. Until that
+   trigger fires, do not build it.
+
+> Whole-graph (re)compile is microseconds at these pass counts and runs only on topology
+> change — so B's "independent recompile" advantage solves a problem this engine does not
+> have, at the cost of the global optimizations it does.
+
+### 9.8 Worked example — a drop-in SVGF denoiser
+
+(illustrative; not to be implemented now)
 
 ```
 Module: SvgfDenoiser
@@ -320,8 +436,11 @@ tonemap.Build(b, new TonemapInputs(svgfOut.Denoised), out var ldr);  // SceneCol
 ```
 
 Remove the denoiser by not calling `svgf.Build`; dead-pass culling (§6.2) drops its
-resources automatically. This is how host post-stack (tonemap + outline) and even the
+resources automatically. This is how the host post-stack (tonemap + outline) and even the
 whole deferred lighting chain become modules too.
+
+> Code lives where it composes: §14 maps a module's passes, pipelines, and kernels onto a
+> single deletable feature folder so the graph boundary and the on-disk boundary coincide.
 
 ## 10. Debug & metrics
 
@@ -428,3 +547,56 @@ This also retires the manual barrier code in `DrawDeferred`/`DrawPathtraced`/
 > hand-rolled barriers, unifies compute/RT/transfer into one scheduler, gives you the
 > transfer-queue upload win, and ships the debug tooling — without taking on the async
 > scheduler or aliasing, which are where the subtle bugs live.
+
+## 14. Code organization (feature folders)
+
+The graph makes the **module** the unit of *composition* (§9). This section makes it the
+unit of *code organization* too, so the logical boundary (ports, passes) and the physical
+boundary (a folder on disk) coincide. The restructure and the module work are the same
+refactor seen from two angles — do them together.
+
+### 14.1 Target: feature = folder = graph-module
+
+Today the code lives in three *separate flat* folders whose names do not even line up
+across them (`PbrDeferredPipeline.cs` -> `PbrShader.slang` -> `PBR.spv`), each `.spv`
+referenced by a hardcoded absolute path, all compiled by a flat per-file `.bat`. The
+target collapses that into per-feature folders:
+
+```
+Renderer/Features/
+    Deferred/
+        DeferredModule.cs          (IGraphModule)
+        GeometryPipeline.cs  PbrDeferredPipeline.cs  SkyboxPipeline.cs  TransparentPipeline.cs
+        Kernels/  Geometry.slang  Pbr.slang  Skybox.slang  Transparent.slang
+    PathTrace/   PathTraceModule.cs  PTComputePipeline.cs  RTPipeline.cs  Kernels/...
+    Ibl/         ...  Kernels/ (EquirectToCube, IrradianceConvolve, PrefilterEnv, BrdfLutGen)
+    Cull/  LightCull/  Tonemap/  Outline/  Pick/  Selection/  Probe/
+Shaders/Lib/     CommonTypes.slang  PbrUtils.slang  IblCommon.slang  PTUtils.slang
+```
+
+A feature folder is *one or more* passes/pipelines + their kernels — organize by
+feature/module, not strictly by single pass (IBL bake is 4 shaders, deferred is 4
+pipelines, PT is compute + RT). The folder becomes deletable/portable as a unit, mirroring
+the graph's "dead-cull a module by not building it" (§9.8).
+
+### 14.2 The tension: shared shader code is not pass-local
+
+`CommonTypes`/`PbrUtils`/`IblCommon`/`PTUtils` are `import`ed across features, and the
+BRDF/lighting math in `PbrUtils` is shared by deferred, transparent, PT-compute, and
+PathTraceRT. The rendering *math* is shared even when the *passes* differ — the same
+host-shared-vs-core-local split as §9.5, now in the filesystem. Hence the two-tier layout:
+feature `Kernels/` for pass-local shaders + a shared `Shaders/Lib/` for cross-cutting
+modules (the compiler resolves them via `-I Shaders/Lib`). Do not push shared lighting math
+down into one pass folder.
+
+### 14.3 The real work is the build seam, not the move
+
+The folder move is mechanical; two prerequisites are the actual work and are worth doing on
+their own even if no file moves: (1) replace every hardcoded **absolute** `.spv` path with a
+content-root-relative resolver (the project does not build on another machine today), and
+(2) replace the flat `.bat` with a manifest-driven, directory-aware compile that carries
+per-shader capability flags + variants (e.g. `PathTraceRT` -> `.spv` + `_SER.spv`) and adds
+`-I Shaders/Lib`. Keep **source location and compiled-output location as separate axes** —
+sources move into feature folders while `.spv` can stay flat in `Assets/Shaders/`; the
+resolver hides the difference. Concrete steps, current-state details, and a
+buildable-after-each sequence live in `render-graph-implementation.md` §5.

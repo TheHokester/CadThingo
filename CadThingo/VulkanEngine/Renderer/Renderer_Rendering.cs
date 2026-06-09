@@ -4,6 +4,8 @@ using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;   // PassType, QueueClass, ResourceUsage, GraphImage, ImageDesc, PassResources
+using CadThingo.VulkanEngine.Renderer.Features.Deferred;  // DeferredModule
+using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;  // TonemapModule
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
@@ -816,191 +818,43 @@ public unsafe partial class Renderer
     private void BuildDeferredFrameGraph()
     {
         _deferredFrameGraph?.Dispose();
-        var fg  = new DeferredGraph(gfx);
-        var ext = renderExtent;
+        var fg = new DeferredGraph(gfx);
 
-        // Deferred intermediates the graph OWNS as transients: it allocates their VkImages in
-        // Compile() and frees them in Dispose(). Produced and consumed entirely within the
-        // chain (geometry writes; lighting/skybox/transparent/tonemap read), so nothing
-        // outside needs a stable handle. Seeded Undefined each frame (a legal discard — every
-        // producing pass fully regenerates its target).
-        GraphImage Color(string name, Format fmt) => fg.CreateImage(new ImageDesc
-        {
-            Format = fmt, Extent = ext, Mips = 1, Layers = 1,
-            Usage = ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.SampledBit,
-        }, name);
+        // The deferred technique as a core module (render-graph.md sec 9) producing the HDR
+        // handle, with tonemap as a NESTED submodule inside it (Features/Tonemapping) that
+        // consumes the HDR and writes FinalColor -- so "Deferred" -> "Deferred/Tonemap" shows as
+        // nested clusters in ToDot. Pipelines stay renderer-owned and are injected (the tonemap
+        // submodule wraps the renderer's TonemapPipeline); the per-frame light-cull dims are
+        // pulled at Execute via the delegate. Recreated each call so a resize / pipeline rebuild
+        // picks up fresh refs + the new FinalColor handle.
+        var tonemap = new TonemapModule(tonemapPipeline);
+        var module = new DeferredModule(
+            drawCullPipeline, lightCullPipeline, geometryPipeline, PbrDeferredPipeline,
+            skyboxPipeline, transparentPipeline, tonemap,
+            () => (_frameLightCount, _frameTileCountX, _frameTileCountY));
 
-        var pos      = Color("GBuffer_Position", Format.R32G32B32A32Sfloat);
-        var normal   = Color("GBuffer_Normal",   Format.R32G32B32A32Sfloat);
-        var albedo   = Color("GBuffer_Albedo",   Format.R8G8B8A8Unorm);
-        var material = Color("GBuffer_Material",  Format.R8G8B8A8Unorm);
-        var emissive = Color("GBuffer_Emissive", Format.R16G16B16A16Sfloat);
-        var hdr      = Color("HDRColor",          Format.R16G16B16A16Sfloat);
-        var depth    = fg.CreateImage(new ImageDesc
-        {
-            Format = Format.D32Sfloat, Extent = ext, Mips = 1, Layers = 1,
-            Usage = ImageUsageFlags.DepthStencilAttachmentBit,
-        }, "Depth");
+        module.Build(fg.RootScope().Child("Deferred"),
+            new DeferredModule.Inputs(renderTargets.FinalColor, renderExtent), out var o);
 
-        // FinalColor is the one IMPORTED image: the swapchain blit + ImGui viewport sample it,
-        // so RenderTargets owns it and the graph just adopts the handle, handing it back in
-        // ShaderReadOnly each frame. Undefined incoming = discard (tonemap rewrites every pixel).
-        var finalRes  = renderTargets.FinalColor;
-        var finalDesc = new ImageDesc { Format = finalRes._format, Mips = 1, Layers = 1 };
-        var final = fg.ImportImage(finalRes.Image, finalRes.ImageView, in finalDesc,
-            ImageLayout.Undefined, "FinalColor", ImageLayout.ShaderReadOnlyOptimal);
-
-        // Per-frame compute-output buffers, imported so the graph derives the cull→geometry
-        // and light-cull→lighting barriers + ordering. (The compute INPUTS — renderables and
-        // lights — are host-coherent mapped writes, visible on submit, so they need no graph
-        // barrier and aren't declared.) BufferDesc is unused for imports.
-        var indirectCmdF   = new Buffer[MAX_CONCURRENT_FRAMES];
-        var indirectCountF = new Buffer[MAX_CONCURRENT_FRAMES];
-        var instanceF      = new Buffer[MAX_CONCURRENT_FRAMES];
-        var tileCountF     = new Buffer[MAX_CONCURRENT_FRAMES];
-        var tileIndicesF   = new Buffer[MAX_CONCURRENT_FRAMES];
-        for (uint i = 0; i < MAX_CONCURRENT_FRAMES; i++)
-        {
-            indirectCmdF[i]   = drawCullPipeline.GetIndirectCmdBuffer(i);
-            indirectCountF[i] = drawCullPipeline.GetIndirectCountBuffer(i);
-            instanceF[i]      = Engine.ResourceManager.GetInstanceBuffer(i);
-            tileCountF[i]     = lightCullPipeline.GetTileLightCountBuffer(i);
-            tileIndicesF[i]   = lightCullPipeline.GetTileLightIndicesBuffer(i);
-        }
-        var indirectCmd   = fg.ImportBufferPerFrame(indirectCmdF,   default, "IndirectCmd");
-        var indirectCount = fg.ImportBufferPerFrame(indirectCountF, default, "IndirectCount");
-        var instance      = fg.ImportBufferPerFrame(instanceF,      default, "InstanceData");
-        var tileCount     = fg.ImportBufferPerFrame(tileCountF,     default, "TileLightCount");
-        var tileIndices   = fg.ImportBufferPerFrame(tileIndicesF,   default, "TileLightIndices");
-
-        // Cull (compute): frustum-tests renderables → post-cull indirect draw commands +
-        // instance data. Its declared writes both keep it alive (writes imported buffers)
-        // and order it before geometry (RAW on the indirect + instance buffers). Record()
-        // also runs the view-dependent transparent sort consumed by TransparentPass.
-        fg.AddPass("CullPass", PassType.Compute, QueueClass.Graphics,
-            b =>
-            {
-                indirectCmd   = b.Write(indirectCmd,   ResourceUsage.StorageWriteCompute);
-                indirectCount = b.Write(indirectCount, ResourceUsage.StorageWriteCompute);
-                instance      = b.Write(instance,      ResourceUsage.StorageWriteCompute);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                drawCullPipeline.Record(cmd, f.FrameIndex, f.Camera));
-
-        // Light-cull (compute): bins lights into the per-tile lists the lighting FS reads.
-        // Tile counts/light count are computed in DrawDeferred and stashed on the renderer.
-        fg.AddPass("LightCullPass", PassType.Compute, QueueClass.Graphics,
-            b =>
-            {
-                tileCount   = b.Write(tileCount,   ResourceUsage.StorageWriteCompute);
-                tileIndices = b.Write(tileIndices, ResourceUsage.StorageWriteCompute);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                lightCullPipeline.Record(cmd, f.FrameIndex, f.Camera,
-                    _frameLightCount, _frameTileCountX, _frameTileCountY));
-
-        // Geometry → g-buffers + depth. Reads the post-cull indirect buffers (IndirectArg)
-        // + instance data (vertex storage read) → RAW edges order it after CullPass.
-        fg.AddPass("GeometryPass", PassType.Graphics, QueueClass.Graphics,
-            b =>
-            {
-                b.Read(indirectCmd,   ResourceUsage.IndirectArg);
-                b.Read(indirectCount, ResourceUsage.IndirectArg);
-                b.Read(instance,      ResourceUsage.StorageReadVertex);
-                pos      = b.Write(pos,      ResourceUsage.ColorAttachment);
-                normal   = b.Write(normal,   ResourceUsage.ColorAttachment);
-                albedo   = b.Write(albedo,   ResourceUsage.ColorAttachment);
-                material = b.Write(material, ResourceUsage.ColorAttachment);
-                emissive = b.Write(emissive, ResourceUsage.ColorAttachment);
-                depth    = b.Write(depth,    ResourceUsage.DepthAttachment);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-            {
-                var indirectCmd   = drawCullPipeline.GetIndirectCmdBuffer(f.FrameIndex);
-                var indirectCount = drawCullPipeline.GetIndirectCountBuffer(f.FrameIndex);
-                var drawCount     = drawCullPipeline.LastRenderableCount;
-                var attachments = new GeometryPipeline.Attachments(
-                    res.View(pos), res.View(normal), res.View(albedo),
-                    res.View(material), res.View(emissive), res.View(depth));
-                geometryPipeline.Record(cmd, f, indirectCmd, indirectCount, drawCount, attachments);
-            });
-
-        // Lighting samples the five g-buffers (ShaderReadOnly) and writes HDRColor@v1. It
-        // does NOT bind depth — the deferred lighting pass reconstructs position from the
-        // g-buffer, so depth is left untouched in DepthStencilAttachmentOptimal for the
-        // skybox/transparent depth tests. (The legacy graph listed Depth as a lighting
-        // input, which forced a pointless Attachment->ShaderReadOnly->Attachment round-trip.)
-        fg.AddPass("LightingPass", PassType.Graphics, QueueClass.Graphics,
-            b =>
-            {
-                b.Read(pos,      ResourceUsage.SampledFragment);
-                b.Read(normal,   ResourceUsage.SampledFragment);
-                b.Read(albedo,   ResourceUsage.SampledFragment);
-                b.Read(material, ResourceUsage.SampledFragment);
-                b.Read(emissive, ResourceUsage.SampledFragment);
-                // Per-tile light lists from LightCullPass, read by the lighting FS → RAW
-                // edge orders lighting after light-cull.
-                b.Read(tileCount,   ResourceUsage.StorageReadFragment);
-                b.Read(tileIndices, ResourceUsage.StorageReadFragment);
-                hdr = b.Write(hdr, ResourceUsage.ColorAttachment);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                PbrDeferredPipeline.Record(cmd, f, res.View(hdr)));
-
-        // Skybox / Transparent both LOAD HDRColor and depth-test (DepthWriteEnable=false)
-        // against the geometry depth. Their CmdBeginRendering binds depth as a
-        // DepthStencilAttachmentOptimal attachment, so depth is declared DepthAttachment
-        // here (matching that layout) — not DepthRead/ReadOnlyOptimal, which would mismatch
-        // the attachment layout. The depth WAW chain geometry→skybox→transparent and the
-        // HDRColor version chain Lighting→Skybox→Transparent both fall out of the ledger.
-        fg.AddPass("SkyboxPass", PassType.Graphics, QueueClass.Graphics,
-            b =>
-            {
-                hdr   = b.Write(hdr,   ResourceUsage.ColorAttachment);
-                depth = b.Write(depth, ResourceUsage.DepthAttachment);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                skyboxPipeline.Record(cmd, f, new SkyboxPipeline.Attachments(res.View(hdr), res.View(depth))));
-
-        fg.AddPass("TransparentPass", PassType.Graphics, QueueClass.Graphics,
-            b =>
-            {
-                hdr   = b.Write(hdr,   ResourceUsage.ColorAttachment);
-                depth = b.Write(depth, ResourceUsage.DepthAttachment);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                transparentPipeline.Record(cmd, f, drawCullPipeline.LastTransparentDraws,
-                    new TransparentPipeline.Attachments(res.View(hdr), res.View(depth))));
-
-        // Tonemap reads HDRColor@v3, writes FinalColor.
-        fg.AddPass("TonemapPass", PassType.Graphics, QueueClass.Graphics,
-            b =>
-            {
-                b.Read(hdr, ResourceUsage.SampledFragment);
-                final = b.Write(final, ResourceUsage.ColorAttachment);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                tonemapPipeline.Record(cmd, f, res.View(final)));
-
-        fg.MarkOutput(final);
+        fg.MarkOutput(o.Final);
         fg.Compile();
         _deferredFrameGraph = fg;
 
         // Compile() just (re)allocated the g-buffer + HDR transients. (Re)bind the only graph
         // resources read through a PRE-BAKED descriptor set rather than a per-pass res.View:
-        // the lighting pass's 5 g-buffer samplers and tonemap's HDR input. (Geometry / skybox
-        // / transparent / tonemap reach their attachments via res.View, which resolves the
-        // fresh handle automatically.) The cached HDR view also feeds the PT <->deferred and
-        // tonemap-operator rebind paths.
-        _deferredGBufferViews[0] = fg.ResolveView(pos);
-        _deferredGBufferViews[1] = fg.ResolveView(normal);
-        _deferredGBufferViews[2] = fg.ResolveView(albedo);
-        _deferredGBufferViews[3] = fg.ResolveView(material);
-        _deferredGBufferViews[4] = fg.ResolveView(emissive);
+        // the lighting pass's 5 g-buffer samplers and tonemap's HDR input. This stays host-side
+        // because these cached views also feed RebuildPbrPipelines and the PT<->deferred /
+        // tonemap-operator rebind paths. (Geometry / skybox / transparent / tonemap reach their
+        // attachments via res.View, which resolves the fresh handle automatically.)
+        _deferredGBufferViews[0] = fg.ResolveView(o.Position);
+        _deferredGBufferViews[1] = fg.ResolveView(o.Normal);
+        _deferredGBufferViews[2] = fg.ResolveView(o.Albedo);
+        _deferredGBufferViews[3] = fg.ResolveView(o.Material);
+        _deferredGBufferViews[4] = fg.ResolveView(o.Emissive);
         PbrDeferredPipeline.WriteGBufferDescriptors(
             _deferredGBufferViews[0], _deferredGBufferViews[1], _deferredGBufferViews[2],
             _deferredGBufferViews[3], _deferredGBufferViews[4]);
-        _deferredHdrView = fg.ResolveView(hdr);
+        _deferredHdrView = fg.ResolveView(o.Hdr);
         tonemapPipeline.WriteHdrInputDescriptor(_deferredHdrView, gBufferSampler);
     }
 

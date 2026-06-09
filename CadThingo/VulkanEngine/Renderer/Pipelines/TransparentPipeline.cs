@@ -54,7 +54,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
 
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 
-    public bool SoftShadowsEnabled { get; init; } = true;
+    public bool SoftShadowsEnabled { get; set; } = true;
 
     private const int SetFrame    = 0;
     private const int SetBindless = 1;
@@ -75,10 +75,10 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         };
     }
 
-    public override void Dispose()
+    protected override void ReleaseGpuResources()
     {
         foreach (var b in FrameUniformBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
-        base.Dispose();
+        base.ReleaseGpuResources();
     }
     internal readonly ref struct Attachments(ImageView hdrColor, ImageView depth)
     {

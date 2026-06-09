@@ -19,6 +19,11 @@ internal struct ResourceAccess
 internal sealed class GraphPass
 {
     public string Name;
+    // Module scope prefix this pass was authored under ("" at top level, else e.g.
+    // "Deferred" or "Deferred/Sub"). Set by AddPass from the GraphScope; used by ToDot to
+    // emit nested module clusters and to flag cross-module edges. Name is the fully
+    // qualified "scope/leaf"; Scope is just the prefix.
+    public string Scope = "";
     public PassType Type;
     public QueueClass Queue; // phase 1 always graphics
     public bool PreferAsync; //phase 3 hint

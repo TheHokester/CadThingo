@@ -36,9 +36,9 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
     public float Gamma    { get; set; } = 2.0f;
 
     /// <summary>Selects the tone-map curve via <c>constant_id 0</c> in
-    /// Tonemap.slang. Read once at pipeline build; toggling requires
-    /// Dispose + rebuild.</summary>
-    public TonemapOperator Operator { get; init; } = TonemapOperator.Filmic;
+    /// Tonemap.slang. Read at each pipeline build; set then call
+    /// <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
+    public TonemapOperator Operator { get; set; } = TonemapOperator.Filmic;
 
     public TonemapPipeline(Renderer renderer) : base(renderer)
     {

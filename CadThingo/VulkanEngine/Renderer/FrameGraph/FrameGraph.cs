@@ -49,7 +49,12 @@ public unsafe class FrameGraph : IDisposable
     /// produces it. Call once per externally-observed target before <see cref="Compile"/>.</summary>
     public void MarkOutput(GraphImage h)  => _outputs.Add(h.resourceId);
     public void MarkOutput(GraphBuffer h) => _outputs.Add(h.resourceId);
-    
+
+    /// <summary>The root authoring scope (empty prefix). Top-level graph building and module
+    /// <see cref="IGraphModule{TInputs,TOutputs}.Build"/> calls go through a
+    /// <see cref="GraphScope"/>; nest deeper with <see cref="GraphScope.Child"/>.</summary>
+    public GraphScope RootScope() => new(this, "");
+
     // ---- Resource declaration -------------------------------------------------
     // Transients are graph-owned: virtual until Compile()'s step 5 allocates them.
     // Imports adopt an externally-owned handle and are never allocated or freed here.
@@ -120,11 +125,11 @@ public unsafe class FrameGraph : IDisposable
 
     public void AddPass(string name, PassType type, QueueClass queue,
         PassSetup setup, PassExecute execute,
-        bool preferAsync = false, bool hasSideEffects = false)
+        bool preferAsync = false, bool hasSideEffects = false, string scope = "")
     {
         var pass = new GraphPass
         {
-            Name = name, Type = type, Queue = queue, PreferAsync = preferAsync, HasSideEffects = hasSideEffects, Execute = execute
+            Name = name, Scope = scope, Type = type, Queue = queue, PreferAsync = preferAsync, HasSideEffects = hasSideEffects, Execute = execute
         };
         _passes.Add(pass);
         CurrentPassIndex = _passes.Count - 1;
@@ -649,39 +654,160 @@ public unsafe class FrameGraph : IDisposable
     }
 
     /// <summary>
-    /// Graphviz dump of the compiled DAG: nodes are passes (filled by queue, greyed if
-    /// culled, prefixed with their schedule index); solid edges are RAW data deps labelled
-    /// <c>resource@version usage</c>; dashed edges are WAW/WAR ordering deps. Paste into any
-    /// Graphviz viewer to see why passes ordered the way they did.
+    /// Graphviz dump of the compiled DAG. Passes are nodes (filled by queue, greyed if culled,
+    /// prefixed with their schedule index), grouped into nested <c>subgraph cluster_*</c> boxes
+    /// by module scope so the module hierarchy is visible (a module nested in another nests its
+    /// box). Solid edges are RAW data deps labelled <c>resource@version usage</c>; dashed edges
+    /// are WAW/WAR ordering deps; an edge whose endpoints live in different modules is drawn in
+    /// blue (and thicker) so module crossings stand out. Two boundary nodes sit outside every
+    /// cluster: <c>INPUTS</c> (dotted edges to the first pass that touches each imported
+    /// resource) and <c>OUTPUTS</c> (dotted edges from the last writer of each MarkOutput'd
+    /// resource), labelled with the resource name -- so what enters and leaves the graph is
+    /// explicit. Paste into any Graphviz viewer.
     /// </summary>
     public string ToDot()
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("digraph FrameGraph {");
         sb.AppendLine("  rankdir=LR;");
+        sb.AppendLine("  compound=true;");
         sb.AppendLine("  node [shape=box, style=filled, fontname=\"Consolas\"];");
 
+        // Build the module-scope cluster tree from each pass's Scope ("" = top level,
+        // "Deferred", "Deferred/Sub", ...). Intermediate levels are materialized even when they
+        // hold no passes directly, so a module that only contains submodules still nests.
+        var root = new DotCluster("");
         for (int p = 0; p < _passes.Count; p++)
+            ClusterFor(root, _passes[p].Scope).Passes.Add(p);
+
+        EmitCluster(root, 0);
+
+        // Boundary: imported resources enter at their first live access (Inputs source node);
+        // marked outputs leave from their last live writer (Outputs sink node). Both sit outside
+        // every module cluster -- they are the graph's external surface, not part of a module.
+        var inEdges = new List<(int pass, string res)>();
+        foreach (var res in _resources.Values.OrderBy(r => r.Id))
         {
-            var pass = _passes[p];
-            bool isLive = p < _live.Length && _live[p];
-            int order = _executionOrder.IndexOf(p);
-            string fill = isLive ? QueueFill(pass.Queue) : "\"#dddddd\"";
-            string label = isLive
-                ? $"{order}: {Escape(pass.Name)}\\n{pass.Type}/{pass.Queue}"
-                : $"{Escape(pass.Name)}\\n(culled)";
-            string extra = isLive ? "" : ", fontcolor=\"#888888\"";
-            sb.AppendLine($"  p{p} [label=\"{label}\", fillcolor={fill}{extra}];");
+            if (res.Residency != ResidencyKind.Imported) continue;
+            int pi = FirstLiveAccess(res.Id);
+            if (pi >= 0) inEdges.Add((pi, res.Name));
+        }
+        var outEdges = new List<(int pass, string res)>();
+        foreach (int resId in _outputs.OrderBy(x => x))
+        {
+            if (!_resources.TryGetValue(resId, out var ores)) continue;
+            int pi = LastLiveWriter(resId);
+            if (pi < 0) pi = FirstLiveAccess(resId);   // imported + marked but never written: pass-through
+            if (pi >= 0) outEdges.Add((pi, ores.Name));
+        }
+        if (inEdges.Count > 0)
+        {
+            sb.AppendLine("  INPUTS [shape=cds, style=filled, fillcolor=\"#fff0c0\", fontname=\"Consolas\", label=\"inputs\\n(imported)\"];");
+            foreach (var (pi, res) in inEdges)
+                sb.AppendLine($"  INPUTS -> p{pi} [label=\"{Escape(res)}\", fontsize=9, style=dotted, color=\"#b08000\"];");
+        }
+        if (outEdges.Count > 0)
+        {
+            sb.AppendLine("  OUTPUTS [shape=cds, style=filled, fillcolor=\"#ffd0d0\", fontname=\"Consolas\", label=\"outputs\\n(marked)\"];");
+            foreach (var (pi, res) in outEdges)
+                sb.AppendLine($"  p{pi} -> OUTPUTS [label=\"{Escape(res)}\", fontsize=9, style=dotted, color=\"#b03030\"];");
         }
 
+        // Edges last (Graphviz wants nodes defined in their cluster first). Cross-module edges
+        // -- from/to passes in different scopes -- are accented so module boundaries are obvious.
         foreach (var (from, to, lbl, dashed) in _dotEdges)
         {
-            string style = dashed ? ", style=dashed, color=\"#999999\"" : "";
-            sb.AppendLine($"  p{from} -> p{to} [label=\"{Escape(lbl)}\", fontsize=9{style}];");
+            bool crossModule = !string.Equals(_passes[from].Scope, _passes[to].Scope, StringComparison.Ordinal);
+            string color  = crossModule ? "\"#3060c0\"" : dashed ? "\"#999999\"" : "\"#333333\"";
+            string dash   = dashed ? ", style=dashed" : "";
+            string weight = crossModule ? ", penwidth=1.6" : "";
+            sb.AppendLine($"  p{from} -> p{to} [label=\"{Escape(lbl)}\", fontsize=9, color={color}{dash}{weight}];");
         }
 
         sb.AppendLine("}");
         return sb.ToString();
+
+        // ---- locals --------------------------------------------------------------
+        // Navigate/create the cluster node for a "/"-delimited scope path.
+        DotCluster ClusterFor(DotCluster r, string scope)
+        {
+            if (string.IsNullOrEmpty(scope)) return r;
+            var node = r;
+            var path = "";
+            foreach (var seg in scope.Split('/'))
+            {
+                path = path.Length == 0 ? seg : $"{path}/{seg}";
+                if (!node.Children.TryGetValue(seg, out var child))
+                    node.Children[seg] = child = new DotCluster(path);
+                node = child;
+            }
+            return node;
+        }
+
+        // Emit this cluster's direct passes, then recurse into child module clusters.
+        void EmitCluster(DotCluster node, int depth)
+        {
+            string ind = new(' ', (depth + 1) * 2);
+            foreach (int p in node.Passes) sb.AppendLine(ind + NodeLine(p));
+            foreach (var (seg, child) in node.Children)
+            {
+                sb.AppendLine($"{ind}subgraph cluster_{Sanitize(child.Path)} {{");
+                sb.AppendLine($"{ind}  label=\"{Escape(seg)}\"; labeljust=l; fontname=\"Consolas\"; fontsize=11;");
+                sb.AppendLine($"{ind}  style=\"filled,rounded\"; fillcolor=\"#f4f4fb\"; color=\"#b9b9c8\";");
+                EmitCluster(child, depth + 1);
+                sb.AppendLine($"{ind}}}");
+            }
+        }
+
+        string NodeLine(int p)
+        {
+            var pass = _passes[p];
+            bool isLive = p < _live.Length && _live[p];
+            int order = _executionOrder.IndexOf(p);
+            string leaf = Leaf(pass.Name);
+            string fill = isLive ? QueueFill(pass.Queue) : "\"#dddddd\"";
+            string label = isLive
+                ? $"{order}: {Escape(leaf)}\\n{pass.Type}/{pass.Queue}"
+                : $"{Escape(leaf)}\\n(culled)";
+            string extra = isLive ? "" : ", fontcolor=\"#888888\"";
+            return $"p{p} [label=\"{label}\", fillcolor={fill}{extra}];";
+        }
+
+        // First live pass (schedule order) that reads or writes a resource, or -1.
+        int FirstLiveAccess(int resId)
+        {
+            foreach (int pi in _executionOrder)
+            {
+                foreach (var a in _passes[pi].Reads)  if (a.ResourceId == resId) return pi;
+                foreach (var a in _passes[pi].Writes) if (a.ResourceId == resId) return pi;
+            }
+            return -1;
+        }
+
+        // Last live pass (schedule order) that writes a resource, or -1.
+        int LastLiveWriter(int resId)
+        {
+            for (int k = _executionOrder.Count - 1; k >= 0; k--)
+                foreach (var a in _passes[_executionOrder[k]].Writes)
+                    if (a.ResourceId == resId) return _executionOrder[k];
+            return -1;
+        }
+
+        // Leaf = the segment after the last "/" (the unscoped pass name).
+        static string Leaf(string name)
+        {
+            int i = name.LastIndexOf('/');
+            return i < 0 ? name : name[(i + 1)..];
+        }
+
+        // Graphviz cluster ids must be alphanumeric; map "/" and punctuation to "_".
+        static string Sanitize(string s)
+        {
+            var chars = s.ToCharArray();
+            for (int i = 0; i < chars.Length; i++)
+                if (!char.IsLetterOrDigit(chars[i])) chars[i] = '_';
+            return new string(chars);
+        }
 
         static string QueueFill(QueueClass q) => q switch
         {
@@ -691,6 +817,15 @@ public unsafe class FrameGraph : IDisposable
             _ => "\"#eeeeee\"",
         };
         static string Escape(string s) => s.Replace("\"", "\\\"");
+    }
+
+    // Module-scope tree, built transiently by ToDot to emit nested Graphviz clusters. Children
+    // are sorted so the DOT output is deterministic frame to frame.
+    private sealed class DotCluster(string path)
+    {
+        public readonly string Path = path;
+        public readonly SortedDictionary<string, DotCluster> Children = new(StringComparer.Ordinal);
+        public readonly List<int> Passes = [];
     }
 
     public void Dispose()
