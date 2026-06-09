@@ -3,16 +3,11 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.FrameGraph;   // PassType, QueueClass, ResourceUsage, GraphImage, ImageDesc, PassResources
-using CadThingo.VulkanEngine.Renderer.Features.Deferred;  // DeferredModule
-using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;  // TonemapModule
+using CadThingo.VulkanEngine.Renderer.FrameGraph;   // GraphStats (deferred-graph debug surface)
+using CadThingo.VulkanEngine.Renderer.RenderCores;  // IRenderCore, RenderFrame
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
-
-// The graph type shares its name with its namespace; alias it so bare `FrameGraph`
-// never has to disambiguate type-vs-namespace.
-using DeferredGraph = CadThingo.VulkanEngine.Renderer.FrameGraph.FrameGraph;
 
 namespace CadThingo.VulkanEngine.Renderer;
 
@@ -104,30 +99,23 @@ public unsafe partial class Renderer
         // retained-block investigation).
         _renderTargetRebuilds++;
 
-        // The deferred FrameGraph owns the g-buffer/depth/HDR transients and imports
-        // FinalColor. Reallocate the imported targets first (FinalColor + PT/selection),
-        // then rebuild the graph: that disposes the old transients, allocates fresh ones at
-        // the new extent, re-imports FinalColor, and re-binds the lighting g-buffer + tonemap
-        // HDR descriptors from the new views.
+        // The cores own their size-dependent technique state. Reallocate the shared host targets
+        // first (FinalColor + PT accumulator/out + selection), then rebuild each core: DeferredCore
+        // re-compiles its graph (fresh g-buffer/depth/HDR transients, re-imports FinalColor,
+        // re-binds its lighting + tonemap descriptors); the PT cores rebind their storage images
+        // (which marks the accumulator dirty so the next dispatch clears fresh memory).
         renderTargets.ReallocateSizeDependent(new Extent2D(width, height));
-        BuildDeferredFrameGraph();
+        deferredCore.Resize(renderExtent);
+        ptComputeCore.Resize(renderExtent);
+        ptRtCore?.Resize(renderExtent);
 
-        // BuildDeferredFrameGraph bound tonemap's HDR input to the fresh HDR transient (the
-        // deferred source). In a PT mode the input must instead be ptOutColor — also fresh
-        // post-rebuild — so re-point it; otherwise PT-mode resize reads the (correct but
-        // unused) HDR view. Both PT modes (compute + RT pipeline) write ptOutColor.
-        bool ptMode = renderMode == RenderMode.RayCompute || renderMode == RenderMode.RayTrace;
-        if (ptMode)
-            tonemapPipeline.WriteHdrInputDescriptor(ptOutColor.ImageView, gBufferSampler);
+        // Re-point tonemap's HDR input at the ACTIVE core's fresh scene-colour source (deferred
+        // HDR vs PT ptOutColor). Subsumes the old per-mode branch: DeferredCore.Resize just bound
+        // tonemap to the new deferred HDR, so in a PT mode we must override it back to ptOutColor.
+        _activeCore.Activate();
 
         // FinalColor ImageView is fresh — re-bind it for the ImGui viewport panel.
         imGuiUtils?.WriteViewportDescriptor(renderTargets.FinalColor.ImageView);
-
-        // PT storage image views are fresh too. WriteStorageImageDescriptors calls
-        // MarkAccumulatorDirty internally so the next dispatch clears the
-        // (also-fresh) accumulator instead of reading garbage memory.
-        ptComputePipeline?.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-        rtPipeline?.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
 
         // Selection mask view is fresh — re-bind it on both the compute (storage
         // image) and outline (sampled image) sides.
@@ -203,19 +191,17 @@ public unsafe partial class Renderer
         //     so it sits here before the per-frame command buffer is recorded.
         ProcessPickRequest();
 
-        // 0d. Render-mode change: rebind tonemap's HDR input so its single
-        //     shared descriptor set points at the right source. DeviceWaitIdle
-        //     ensures no in-flight frame is still using the old binding.
-        //     Mode flips are user-driven (ImGui combo), so the hitch is
-        //     acceptable; per-frame double-buffered descriptors would avoid it.
-        if (renderMode != _lastRenderMode)
+        // 0d. Render-mode change: swap the active core. Its Activate() rebinds tonemap's HDR
+        //     input to the core's scene-colour source (deferred HDR vs PT ptOutColor).
+        //     DeviceWaitIdle ensures no in-flight frame is still using the old binding. Mode
+        //     flips are user-driven (ImGui combo), so the hitch is acceptable. This replaces the
+        //     old per-frame _lastRenderMode tonemap-rebind check.
+        var desiredCore = CoreFor(renderMode);
+        if (!ReferenceEquals(desiredCore, _activeCore))
         {
             vk!.DeviceWaitIdle(device);
-            ImageView source = (renderMode == RenderMode.RayCompute || renderMode == RenderMode.RayTrace)
-                ? ptOutColor.ImageView
-                : _deferredHdrView;
-            tonemapPipeline.WriteHdrInputDescriptor(source, gBufferSampler);
-            _lastRenderMode = renderMode;
+            _activeCore = desiredCore;
+            _activeCore.Activate();
         }
 
         var ctx = new FrameContext()
@@ -251,27 +237,11 @@ public unsafe partial class Renderer
         // (RebuildTlas, which runs out-of-band above, manages its own window.)
         gpuScene.BeginTransforms();
 
-        switch (renderMode)
-        {
-            case RenderMode.Deferred:
-                DrawDeferred(cmd, ctx);
-                break;
-            case RenderMode.ForwardPlus:
-                DrawRayQueried(cmd, ctx);
-                break;
-            case RenderMode.RayCompute:
-                DrawPathtraced(cmd, ctx);
-                break;
-            case RenderMode.RayTrace:
-                // Opt-in RT-pipeline path tracer; falls back to deferred if the
-                // device didn't expose the feature (rtPipeline == null).
-                if (rtPipeline != null) DrawRayTraced(cmd, ctx);
-                else                    DrawDeferred(cmd, ctx);
-                break;
-            default:
-                DrawDeferred(cmd, ctx);
-                break;
-        }
+        // Dispatch the active render core (L3). It records its technique into cmd and leaves
+        // FinalColor in ShaderReadOnlyOptimal for the host post-stack below. The core was selected
+        // + Activated from renderMode at step 0d (RayTrace falls back to the deferred core when the
+        // RT pipeline is unsupported, via CoreFor).
+        _activeCore.Render(new RenderFrame { Cmd = cmd, Frame = ctx });
 
         // 6b. Selection outline. Both render modes leave FinalColor in
         //     ShaderReadOnly here; this composites the outline overlay in place
@@ -388,259 +358,6 @@ public unsafe partial class Renderer
         frameRing.Advance();
     }
     /// <summary>
-    /// Refactor of existing rendering code in DrawFrame(), the logic unique to DrawFrame()
-    /// </summary>
-    private void DrawDeferred(CommandBuffer cmd, FrameContext frameContext)
-    {
-        // Reflection-probe scheduler bookkeeping. Cheap CPU-only walk; the
-        //     capture draw + prefilter dispatch land in Phase 4. Runs before the
-        //     geometry pass so the captured cube is visible to downstream
-        //     shaders within the same frame once it's hooked up.
-        reflectionProbeSystem.Tick(frameCounter, scene);
-
-        // Per-frame material SSBO snapshot — needs to land before the geometry
-        // pass reads it. PT does the same in DrawPathtraced so inspector edits
-        // are visible in either renderer.
-        UpdateMaterials(currentFrame, scene);
-
-        geometryPipeline.UpdateUbo(currentFrame, camera);
-        var (lightCount, tileCountX, tileCountY) = PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
-        transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
-        // Stash for the LightCullPass body (it runs inside the FrameGraph, below).
-        _frameLightCount = lightCount; _frameTileCountX = tileCountX; _frameTileCountY = tileCountY;
-        // Skybox always updates — pass body is conditional on EditorState.SkyboxEnabled
-        // so we can flip the toggle without re-recording the graph.
-        skyboxPipeline.UpdatePerFrame(currentFrame, camera, ImGui.EditorState.SkyboxIntensity);
-
-        // 5a-ter. Reflection-probe cluster cull. Tile-only today (zSlices=1);
-        // when 3D froxels land the shader-side index math stays identical.
-        // Cheap CPU work (~0.1ms for 16 probes × ~8000 tiles at 1080p).
-        float aspect = (float)renderExtent.Width / renderExtent.Height;
-        reflectionProbeSystem.BuildClusters(currentFrame, camera, aspect, 0.1f, 100f,
-            tileCountX, tileCountY);
-        // Refresh the per-probe SSBO read by the PBR lighting shader.
-        reflectionProbeSystem.WriteProbeRecords(currentFrame);
-
-        // 5a-bis. Reflection-probe capture for the next dirty probe (if any).
-        // Bounded to one probe per frame; the actual draw recording happens
-        // here so the captured cube is visible to any later sampling pass
-        // within the same command buffer. No-op if no probe needs capturing
-        // or if the capture shader wasn't compiled into ProbeCapture.spv.
-        reflectionProbeSystem.RecordCapture(cmd, currentFrame, frameCounter, scene);
-
-        // 5b. Scene extraction (L2 step 4) — the single ECS walk that packs the
-        // cull-input SSBO + classifies BLEND candidates. Must precede the cull pass.
-        // (The host-coherent write is visible to the cull dispatch on submit.)
-        gpuScene.ExtractRenderables(currentFrame, scene);
-
-        // 6. Record the deferred chain via the FrameGraph: cull -> light-cull -> geometry ->
-        //    lighting -> skybox -> transparent -> tonemap. Cull/light-cull run as compute
-        //    passes and every barrier is derived from the usage table.
-        _deferredFrameGraph!.Execute(cmd, frameContext);
-    }
-    /// <summary>
-    /// Uses RT in a compute shader
-    /// </summary>
-    private void DrawRayQueried(CommandBuffer cmd, FrameContext frameContext)
-    {
-
-    }
-
-    /// <summary>
-    /// Progressive ray-query pathtracer. Dispatches PTCompute.spv into
-    /// ptAccumulator + ptOutColor, then blits ptOutColor into FinalColor so the
-    /// viewport panel (which samples FinalColor) shows the result.
-    ///
-    /// Does NOT run the render graph — the deferred chain is bypassed entirely.
-    /// FinalColor's layout tracker stays valid because the graph's _currentLayout
-    /// settles at ShaderReadOnly per its declared finalLayout, and this method
-    /// leaves FinalColor in that same state.
-    /// </summary>
-    private void DrawPathtraced(CommandBuffer cmd, FrameContext frameContext)
-    {
-        // Camera motion → restart accumulation. Cheap structural-equality check
-        // against last frame's snapshot; only runs when PT is active. If the
-        // camera class ever grows a built-in dirty flag, swap this out for that.
-        if (camera != null)
-        {
-            var view = camera.GetViewMatrix();
-            var pos  = camera.GetPosition();
-            var fov  = camera.Fov;
-            if (view != _ptLastCameraView || pos != _ptLastCameraPos || fov != _ptLastCameraFov)
-            {
-                MarkAccumulatorDirty();
-                _ptLastCameraView = view;
-                _ptLastCameraPos  = pos;
-                _ptLastCameraFov  = fov;
-            }
-        }
-
-        // Refresh per-frame SSBOs — lights AND materials. PT used to skip the
-        // material upload (only the deferred geometry pass did it), which is
-        // why inspector edits never landed in PT mode.
-        uint lightCount = UpdateLights(currentFrame, scene);
-        UpdateMaterials(currentFrame, scene);
-
-        // Bridge Renderer's dirty signal into the pipeline's accumulator-reset.
-        if (accumulatorDirty)
-        {
-            ptComputePipeline.MarkAccumulatorDirty();
-            accumulatorDirty = false;
-        }
-
-        ptComputePipeline.UpdatePerFrame(currentFrame, camera, lightCount, renderExtent);
-
-        //  Pre-dispatch barrier 
-        // ptAccumulator: previous frame's compute read+write → this frame's same.
-        // ptOutColor:    previous frame's tonemap fragment read (or first-frame
-        //                Undefined→General) → this frame's compute write.
-        // Both stay in General the whole time; tonemap reads ptOutColor in
-        // ShaderReadOnly between dispatch and end-of-frame, but is re-stamped
-        // back to General before the next dispatch lands here.
-        var preBarriers = stackalloc ImageMemoryBarrier[2];
-        preBarriers[0] = new ImageMemoryBarrier
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.General,
-            NewLayout = ImageLayout.General,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = ptAccumulator.Image,
-            SrcAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
-            DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
-            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
-        };
-        preBarriers[1] = new ImageMemoryBarrier
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.General,
-            NewLayout = ImageLayout.General,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = ptOutColor.Image,
-            SrcAccessMask = AccessFlags.ShaderReadBit,
-            DstAccessMask = AccessFlags.ShaderWriteBit,
-            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
-        };
-        vk!.CmdPipelineBarrier(cmd,
-            PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.FragmentShaderBit,
-            PipelineStageFlags.ComputeShaderBit,
-            0, 0, null, 0, null, 2, preBarriers);
-
-        ptComputePipeline.Record(cmd, frameContext);
-
-        // Tonemap into FinalColor
-        // Tonemap's HDR input descriptor was rebound to ptOutColor at the top of
-        // DrawFrame on the mode-change boundary. It expects the image in
-        // ShaderReadOnly and writes FinalColor as a color attachment.
-        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
-            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
-
-        var finalColor = renderTargets.FinalColor;
-        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
-            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
-
-        tonemapPipeline.Record(cmd, frameContext, finalColor.ImageView);
-
-        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
-            ImageLayout.ColorAttachmentOptimal, ImageLayout.ShaderReadOnlyOptimal);
-
-        // ptOutColor back to General so next frame's dispatch + pre-barrier
-        // path are layout-uniform.
-        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
-            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
-    }
-
-    /// <summary>
-    /// RT-pipeline path tracer. Mirrors DrawPathtraced but dispatches via
-    /// CmdTraceRays into the SAME ptAccumulator + ptOutColor images, then blits
-    /// through the tonemap into FinalColor. Only reached when rtPipeline != null
-    /// (RayTracePipelineSupported).
-    /// </summary>
-    private void DrawRayTraced(CommandBuffer cmd, FrameContext frameContext)
-    {
-        var rt = rtPipeline!;
-
-        // Camera motion → restart accumulation (shared snapshot with the compute path).
-        if (camera != null)
-        {
-            var view = camera.GetViewMatrix();
-            var pos  = camera.GetPosition();
-            var fov  = camera.Fov;
-            if (view != _ptLastCameraView || pos != _ptLastCameraPos || fov != _ptLastCameraFov)
-            {
-                MarkAccumulatorDirty();
-                _ptLastCameraView = view;
-                _ptLastCameraPos  = pos;
-                _ptLastCameraFov  = fov;
-            }
-        }
-
-        uint lightCount = UpdateLights(currentFrame, scene);
-        UpdateMaterials(currentFrame, scene);
-
-        if (accumulatorDirty)
-        {
-            rt.MarkAccumulatorDirty();
-            accumulatorDirty = false;
-        }
-
-        rt.UpdatePerFrame(currentFrame, camera, lightCount, renderExtent);
-
-        //  Pre-dispatch barrier — same as the compute path but the writer stage
-        //  is the ray-tracing stage rather than compute. Both images stay in
-        //  General; tonemap reads ptOutColor in ShaderReadOnly between trace and
-        //  end-of-frame, re-stamped to General before the next trace.
-        var preBarriers = stackalloc ImageMemoryBarrier[2];
-        preBarriers[0] = new ImageMemoryBarrier
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.General,
-            NewLayout = ImageLayout.General,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = ptAccumulator.Image,
-            SrcAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
-            DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
-            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
-        };
-        preBarriers[1] = new ImageMemoryBarrier
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.General,
-            NewLayout = ImageLayout.General,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = ptOutColor.Image,
-            SrcAccessMask = AccessFlags.ShaderReadBit,
-            DstAccessMask = AccessFlags.ShaderWriteBit,
-            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
-        };
-        vk!.CmdPipelineBarrier(cmd,
-            PipelineStageFlags.RayTracingShaderBitKhr | PipelineStageFlags.FragmentShaderBit,
-            PipelineStageFlags.RayTracingShaderBitKhr,
-            0, 0, null, 0, null, 2, preBarriers);
-
-        rt.Record(cmd, frameContext);
-
-        // Tonemap into FinalColor (HDR input rebound to ptOutColor on the mode flip).
-        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
-            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
-
-        var finalColor = renderTargets.FinalColor;
-        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
-            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
-
-        tonemapPipeline.Record(cmd, frameContext, finalColor.ImageView);
-
-        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
-            ImageLayout.ColorAttachmentOptimal, ImageLayout.ShaderReadOnlyOptimal);
-
-        TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
-            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
-    }
-
-    /// <summary>
     /// Consumes a pending viewport pick (posted by ViewportPanel as a render-
     /// target pixel) and resolves it to an entity by casting one ray through the
     /// TLAS in a compute dispatch. The pick pass returns the hit's
@@ -735,34 +452,10 @@ public unsafe partial class Renderer
     }
 
 
-    // The frame graph driving the deferred chain (render-graph.md Phase 1 / §1.8). It OWNS
-    // the g-buffers / depth / HDR as transients (allocated in Compile, freed in Dispose) and
-    // imports only FinalColor (RenderTargets-owned, consumed by the swapchain blit + ImGui
-    // viewport). All sync is derived from the usage table. Rebuilt on resize.
-    private DeferredGraph? _deferredFrameGraph;
-
-    // Cached view of the FrameGraph's HDR transient, refreshed each BuildDeferredFrameGraph
-    // (the transient is reallocated on every Compile). Tonemap's HDR-input descriptor is
-    // bound to it there; the PT⇄deferred mode flip and the tonemap-operator rebuild read it
-    // to restore the deferred source after pointing tonemap at ptOutColor.
-    private ImageView _deferredHdrView;
-
-    // Cached views of the FrameGraph's 5 g-buffer transients (pos/normal/albedo/material/
-    // emissive), refreshed each BuildDeferredFrameGraph. The lighting set is bound to them
-    // there; RebuildPbrPipelines also rebinds from these onto its fresh descriptor set
-    // (Initialize no longer writes the g-buffer set — the views live on the graph).
-    private readonly ImageView[] _deferredGBufferViews = new ImageView[5];
-
-    // Per-frame values the LightCullPass body needs (computed in DrawDeferred from
-    // PbrDeferredPipeline.UpdatePerFrame, before the graph executes). Stashed on the
-    // renderer because the pass closures are built once but these change every frame.
-    private uint _frameLightCount;
-    private uint _frameTileCountX;
-    private uint _frameTileCountY;
-
-    // ---- Deferred FrameGraph debug surface (read by the Stats panel) -----------
+    // ---- Deferred FrameGraph debug surface (read by the Stats panel; the graph is owned by
+    // DeferredCore now, so these forward to it) -----------------------------------------------
     /// <summary>Last-frame per-pass GPU/CPU timings + counts, or null before first compile.</summary>
-    public GraphStats? DeferredGraphStats => _deferredFrameGraph?.Stats;
+    public GraphStats? DeferredGraphStats => deferredCore?.GraphStats;
 
     // ---- Resize-churn diagnostics (GpuMemoryAllocator retained-block check) -----
     private int _renderTargetRebuilds;
@@ -798,65 +491,14 @@ public unsafe partial class Renderer
         _memHistoryHead = (_memHistoryHead + 1) % MemHistoryLen;
     }
     /// <summary>Graphviz dump of the compiled deferred graph (for "Copy DOT").</summary>
-    public string DeferredGraphDot() => _deferredFrameGraph?.ToDot() ?? "(no deferred frame graph)";
+    public string DeferredGraphDot() => deferredCore?.ToDot() ?? "(no deferred frame graph)";
     /// <summary>Runtime toggle for the deferred graph's pipeline-statistics collection.</summary>
     public bool DeferredGraphPipelineStats
     {
-        get => _deferredFrameGraph?.CollectPipelineStats ?? false;
-        set { if (_deferredFrameGraph != null) _deferredFrameGraph.CollectPipelineStats = value; }
+        get => deferredCore?.CollectPipelineStats ?? false;
+        set { if (deferredCore != null) deferredCore.CollectPipelineStats = value; }
     }
 
-    /// <summary>
-    /// (Re)builds the deferred chain as the <see cref="DeferredGraph"/>. The graph OWNS the
-    /// g-buffers / depth / HDR as transients (allocated in Compile) and imports only
-    /// FinalColor (RenderTargets-owned, consumed outside the graph). Must be called after the
-    /// pipelines it binds exist (PbrDeferred / tonemap, for the post-Compile descriptor
-    /// rebinds) and again after every <see cref="RebuildRenderTargets"/> (fresh extent →
-    /// fresh transients). Pass bodies are closures over the renderer's pipelines — they only
-    /// need to exist by the time Execute runs, not now.
-    /// </summary>
-    private void BuildDeferredFrameGraph()
-    {
-        _deferredFrameGraph?.Dispose();
-        var fg = new DeferredGraph(gfx);
-
-        // The deferred technique as a core module (render-graph.md sec 9) producing the HDR
-        // handle, with tonemap as a NESTED submodule inside it (Features/Tonemapping) that
-        // consumes the HDR and writes FinalColor -- so "Deferred" -> "Deferred/Tonemap" shows as
-        // nested clusters in ToDot. Pipelines stay renderer-owned and are injected (the tonemap
-        // submodule wraps the renderer's TonemapPipeline); the per-frame light-cull dims are
-        // pulled at Execute via the delegate. Recreated each call so a resize / pipeline rebuild
-        // picks up fresh refs + the new FinalColor handle.
-        var tonemap = new TonemapModule(tonemapPipeline);
-        var module = new DeferredModule(
-            drawCullPipeline, lightCullPipeline, geometryPipeline, PbrDeferredPipeline,
-            skyboxPipeline, transparentPipeline, tonemap,
-            () => (_frameLightCount, _frameTileCountX, _frameTileCountY));
-
-        module.Build(fg.RootScope().Child("Deferred"),
-            new DeferredModule.Inputs(renderTargets.FinalColor, renderExtent), out var o);
-
-        fg.MarkOutput(o.Final);
-        fg.Compile();
-        _deferredFrameGraph = fg;
-
-        // Compile() just (re)allocated the g-buffer + HDR transients. (Re)bind the only graph
-        // resources read through a PRE-BAKED descriptor set rather than a per-pass res.View:
-        // the lighting pass's 5 g-buffer samplers and tonemap's HDR input. This stays host-side
-        // because these cached views also feed RebuildPbrPipelines and the PT<->deferred /
-        // tonemap-operator rebind paths. (Geometry / skybox / transparent / tonemap reach their
-        // attachments via res.View, which resolves the fresh handle automatically.)
-        _deferredGBufferViews[0] = fg.ResolveView(o.Position);
-        _deferredGBufferViews[1] = fg.ResolveView(o.Normal);
-        _deferredGBufferViews[2] = fg.ResolveView(o.Albedo);
-        _deferredGBufferViews[3] = fg.ResolveView(o.Material);
-        _deferredGBufferViews[4] = fg.ResolveView(o.Emissive);
-        PbrDeferredPipeline.WriteGBufferDescriptors(
-            _deferredGBufferViews[0], _deferredGBufferViews[1], _deferredGBufferViews[2],
-            _deferredGBufferViews[3], _deferredGBufferViews[4]);
-        _deferredHdrView = fg.ResolveView(o.Hdr);
-        tonemapPipeline.WriteHdrInputDescriptor(_deferredHdrView, gBufferSampler);
-    }
 
 
 

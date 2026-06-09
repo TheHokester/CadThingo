@@ -764,9 +764,9 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     }
 
     /// <summary>Re-writes the 5 g-buffer sampler bindings on set 1 from the deferred
-    /// FrameGraph's transient g-buffer views. Called from BuildDeferredFrameGraph after
-    /// Compile (initial build + every resize), since those views are freshly allocated each
-    /// Compile and don't exist when the pipeline first initializes.</summary>
+    /// FrameGraph's transient g-buffer views. Called from DeferredCore (after its graph Compile,
+    /// on initial build + every resize, and on PBR pipeline rebuild), since those views are
+    /// freshly allocated each Compile and don't exist when the pipeline first initializes.</summary>
     public void WriteGBufferDescriptors(ImageView position, ImageView normal,
         ImageView albedo, ImageView material, ImageView emissive)
     {

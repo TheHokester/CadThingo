@@ -2,6 +2,10 @@ using System.Numerics;
 using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.RenderCores;
+using CadThingo.VulkanEngine.Renderer.Features.Deferred;
+using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
+using CadThingo.VulkanEngine.Renderer.Features.Forward;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -69,12 +73,27 @@ public unsafe partial class Renderer
         RayTrace =3
     }
     public RenderMode renderMode = RenderMode.Deferred;
-    // Tracks the last mode DrawFrame actually rendered. When this differs from
-    // `renderMode` at the top of a frame, tonemap's HDR-input descriptor is
-    // rebound to the appropriate source (HDRColor vs ptOutColor) under
-    // DeviceWaitIdle. Initialized to the same default so the first frame
-    // doesn't trigger a spurious rebind.
-    private RenderMode _lastRenderMode = RenderMode.Deferred;
+
+    // L3 render cores (renderer-refactor.md): one pluggable technique each, built eagerly (all
+    // their pipelines already exist up front). DrawFrame dispatches to _activeCore; a mode change
+    // swaps it + Activates (which rebinds tonemap's HDR input to the new core's scene-colour
+    // source -- replacing the old per-frame _lastRenderMode check). See IRenderCore.
+    private DeferredCore         deferredCore    = null!;
+    private PathtraceComputeCore ptComputeCore   = null!;
+    private PathtraceRTCore?     ptRtCore;            // null when the RT pipeline is unsupported
+    private ForwardPlusCore      forwardPlusCore = null!;
+    private IRenderCore          _activeCore     = null!;
+
+    // Maps a render mode to its core. RayTrace falls back to the deferred core when the device
+    // didn't expose the RT pipeline (ptRtCore == null), matching the old DrawFrame fallback.
+    private IRenderCore CoreFor(RenderMode mode) => mode switch
+    {
+        RenderMode.Deferred    => deferredCore,
+        RenderMode.ForwardPlus => forwardPlusCore,
+        RenderMode.RayCompute  => ptComputeCore,
+        RenderMode.RayTrace    => (IRenderCore?)ptRtCore ?? deferredCore,
+        _                      => deferredCore,
+    };
     
     
     // Runtime reflection probes — GPU resources + CPU registry. Allocated after
@@ -203,19 +222,16 @@ public unsafe partial class Renderer
         // doesn't change scene data) is harmless: it only costs a re-pack.
         gpuScene?.MarkSceneDirty();
     }
+    // Read/clear hooks for the path-trace cores (L3): the dirty flag lives here because
+    // MarkAccumulatorDirty is called from all over the editor, but the per-frame
+    // consume-and-clear is the PT core's job (bridged into its pipeline's accumulator reset).
+    internal bool AccumulatorDirty => accumulatorDirty;
+    internal void ClearAccumulatorDirty() => accumulatorDirty = false;
 
-    // Previous-frame camera snapshot. DrawPathtraced compares against this and
-    // flips accumulatorDirty when either differs, so any camera move restarts
-    // progressive integration. Identity / zero defaults mean the first PT
-    // frame after switching modes always restarts (which is what we want).
-    private Matrix4x4 _ptLastCameraView = Matrix4x4.Identity;
-    private Vector3   _ptLastCameraPos  = Vector3.Zero;
-    // FOV doesn't move the view matrix, so it needs its own snapshot — otherwise
-    // a FOV edit (camera panel or PT settings) wouldn't restart accumulation.
-    private float     _ptLastCameraFov  = 0f;
-    
-    
-    
+    // (The previous-frame camera snapshot that drove PT accumulator restarts now lives in
+    // PathTraceCoreBase, the owner of the PT render technique.)
+
+
     public void Initialize()
     {
         // Bring up the Vulkan RHI context (instance → debug → surface → physical →
@@ -275,9 +291,9 @@ public unsafe partial class Renderer
 
         scene = new Scene(vk, device, physicalDevice);//initialise scene
         // The deferred chain's g-buffers / depth / HDR are now FrameGraph transients,
-        // allocated when BuildDeferredFrameGraph() compiles the graph at the end of
-        // Initialize. PbrDeferredPipeline's g-buffer set is (re)bound there from the
-        // freshly-allocated views, so it can initialize in any order below.
+        // allocated when DeferredCore (constructed at the end of Initialize) compiles its graph.
+        // PbrDeferredPipeline's g-buffer set is (re)bound there from the freshly-allocated views,
+        // so it can initialize in any order below.
         imGuiUtils = new ImGuiVulkanUtils(this, (uint)queueFamilyIndices.graphicsFamily! );
         imGuiUtils?.init(swapChainExtent.Width, swapChainExtent.Height);
 
@@ -342,9 +358,9 @@ public unsafe partial class Renderer
         outlinePipeline.WriteMaskDescriptor(selectionMask.ImageView);
 
         // Tone-map / post pass - reads the FrameGraph's HDRColor transient, writes the LDR
-        // FinalColor that the swapchain blit sources. Its HDR-input descriptor is bound from
-        // the graph's freshly-allocated HDR view in BuildDeferredFrameGraph (below), so no
-        // descriptor write here.
+        // FinalColor that the swapchain blit sources. Its HDR-input descriptor is bound from the
+        // graph's freshly-allocated HDR view when DeferredCore compiles its graph (and re-pointed
+        // per active core via IRenderCore.Activate), so no descriptor write here.
         tonemapPipeline = new TonemapPipeline(this) { Operator = tonemapOperator };
         tonemapPipeline.Initialize();
 
@@ -402,11 +418,18 @@ public unsafe partial class Renderer
             rtPipeline?.WriteEmissiveDescriptors();
         }
 
-        // Stand up the deferred chain as the FrameGraph . It OWNS the
-        // g-buffers / depth / HDR as transients (allocated in its Compile) and imports only
-        // FinalColor; this call also (re)binds the lighting g-buffer + tonemap-HDR
-        // descriptors from the freshly-allocated transient views.
-        BuildDeferredFrameGraph();
+        // Stand up the L3 render cores (eager). DeferredCore's ctor builds + compiles the deferred
+        // FrameGraph (which OWNS the g-buffers / depth / HDR transients and imports FinalColor) and
+        // rebinds the lighting g-buffer + tonemap-HDR descriptors from the fresh transient views.
+        // The PT/RT cores wrap the renderer-owned PT pipelines (RT only when the device exposed it).
+        // The active core is chosen from renderMode and Activated (binds tonemap's HDR input to its
+        // scene-colour source).
+        deferredCore    = new DeferredCore(this);
+        ptComputeCore   = new PathtraceComputeCore(this);
+        if (rtPipeline != null) ptRtCore = new PathtraceRTCore(this);
+        forwardPlusCore = new ForwardPlusCore(this);
+        _activeCore = CoreFor(renderMode);
+        _activeCore.Activate();
 
         initialized = true;
     }
@@ -535,11 +558,9 @@ public unsafe partial class Renderer
         transparentPipeline.Rebuild();
 
         // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
-        // Set 1 (g-buffer samplers) is no longer written by Initialize — the views live on
-        // the FrameGraph — so rebind it from the cached transient views.
-        PbrDeferredPipeline.WriteGBufferDescriptors(
-            _deferredGBufferViews[0], _deferredGBufferViews[1], _deferredGBufferViews[2],
-            _deferredGBufferViews[3], _deferredGBufferViews[4]);
+        // Set 1 (g-buffer samplers) is no longer written by Initialize — the views live on the
+        // deferred FrameGraph — so let DeferredCore rebind it from its cached transient views.
+        deferredCore.OnPbrPipelineRebuilt();
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         PbrDeferredPipeline.WriteProbeDescriptors();
         transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
@@ -570,7 +591,9 @@ public unsafe partial class Renderer
         // tonemap ref stays valid. Operator is a spec constant, read by Rebuild's Initialize.
         tonemapPipeline.Operator = tonemapOperator;
         tonemapPipeline.Rebuild();
-        tonemapPipeline.WriteHdrInputDescriptor(_deferredHdrView, gBufferSampler);
+        // Rebind the fresh tonemap descriptor set to the ACTIVE core's HDR source (deferred HDR vs
+        // PT ptOutColor) — fixes the old always-rebind-to-deferred bug in PT mode.
+        _activeCore.Activate();
     }
 
     public void Update(double d)
@@ -613,9 +636,13 @@ public unsafe partial class Renderer
         imGuiUtils?.Dispose();
         
         
-        // Deferred FrameGraph owns the g-buffer / depth / HDR transients - dispose it before
-        // RenderTargets, which owns FinalColor + the PT / selection images the graph imports.
-        _deferredFrameGraph?.Dispose();
+        // Render cores: DeferredCore owns the deferred FrameGraph (g-buffer / depth / HDR
+        // transients) — dispose the cores before RenderTargets, which owns FinalColor + the PT /
+        // selection images the graph imports. The PT / forward cores own no GPU resources.
+        deferredCore?.Dispose();
+        ptComputeCore?.Dispose();
+        ptRtCore?.Dispose();
+        forwardPlusCore?.Dispose();
         renderTargets.Dispose();
 
         // GpuScene buffers (light SSBO today) — the GPU mirror of Scene's render data.

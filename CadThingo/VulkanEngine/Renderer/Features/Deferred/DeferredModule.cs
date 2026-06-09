@@ -129,7 +129,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 _cull.Record(cmd, f.FrameIndex, f.Camera));
 
         // Light-cull (compute): bins lights into the per-tile lists the lighting FS reads.
-        // Tile/light counts are computed in DrawDeferred and read back via _lightCullParams.
+        // Tile/light counts are computed in DeferredCore.Render and read back via _lightCullParams.
         scope.AddPass("LightCullPass", PassType.Compute, QueueClass.Graphics,
             b =>
             {
