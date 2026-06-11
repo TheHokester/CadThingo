@@ -54,8 +54,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
 
     // GraphicsPipeline overrides
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\ProbeCapture.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("ProbeCapture");
 
     protected override Format[] ColorAttachmentFormats { get; } = [ Format.R16G16B16A16Sfloat ];
 

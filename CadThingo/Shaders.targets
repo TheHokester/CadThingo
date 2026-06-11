@@ -1,0 +1,160 @@
+<Project>
+
+  <!-- ================================================================================
+       Directory-aware, manifest-driven Slang -> SPIR-V compile.
+
+       Replaces the manual VulkanEngine/Shaders/shaderCompile.bat: shaders now compile as
+       part of `dotnet build` / `dotnet run` (render-graph-implementation.md section 5.2).
+
+       Two source roots, both output under Assets/Shaders/:
+         - Legacy shaders in VulkanEngine/Shaders/  -> Assets/Shaders/<name>.spv          (flat)
+         - Feature kernels in Features/<F>/Kernels/  -> Assets/Shaders/<F>/<name>.spv      (per-feature)
+       So a kernel's .spv mirrors the feature it came from instead of colliding in one flat dir
+       (resolved at runtime by ShaderPaths.Spv / ShaderPaths.Kernel).
+       ================================================================================ -->
+
+  <PropertyGroup>
+    <!-- Compile shaders during the build. Opt out (e.g. a machine without the Vulkan SDK)
+         with: dotnet build -p:CompileShadersOnBuild=false -->
+    <CompileShadersOnBuild Condition="'$(CompileShadersOnBuild)' == ''">true</CompileShadersOnBuild>
+
+    <!-- Root for compiled .spv. Legacy shaders land directly here; feature kernels land in a
+         per-feature subfolder under it (see the Kernel items below). -->
+    <SpvOutputDir Condition="'$(SpvOutputDir)' == ''">$(MSBuildProjectDirectory)\Assets\Shaders</SpvOutputDir>
+
+    <!-- slangc resolution: explicit override > VULKAN_SDK env > historical fallback.
+         Override with: dotnet build -p:SlangCompiler="C:\path\to\slangc.exe" -->
+    <SlangCompiler Condition="'$(SlangCompiler)' == '' and '$(VULKAN_SDK)' != ''">$(VULKAN_SDK)\Bin\slangc.exe</SlangCompiler>
+    <SlangCompiler Condition="'$(SlangCompiler)' == ''">D:\VulkanSDK\Bin\slangc.exe</SlangCompiler>
+
+    <!-- Extra slangc args for `import` search paths. Points at the flat shared-module dir so
+         kernels living under Features/**/Kernels can `import PTUtils` / `import CommonTypes`
+         etc. and resolve them across directories. slangc also searches each source's own dir,
+         so adding this dir (where today's flat shaders already live) leaves their output
+         byte-identical. In section 5.3, when the shared modules move to Shaders\Lib, repoint
+         this there (and add that dir too if kernels and libs end up split). -->
+    <ShaderIncludeArgs Condition="'$(ShaderIncludeArgs)' == ''">-I "$(MSBuildProjectDirectory)\VulkanEngine\Shaders"</ShaderIncludeArgs>
+  </PropertyGroup>
+
+  <!-- ===== Manifest ================================================================
+       Two item types, both discovered by glob:
+         Shader  : legacy entry shaders in VulkanEngine/Shaders/  -> flat output
+         Kernel  : feature kernels in Features/<F>/Kernels/        -> per-feature output
+       Per-item metadata:
+         OutputName : the .spv stem (Shader only; defaults to the source filename)
+         Flags      : extra slangc flags (capabilities / defines; default none)
+  -->
+  <ItemGroup>
+    <Shader Include="VulkanEngine\Shaders\**\*.slang">
+      <OutputName>%(Filename)</OutputName>
+      <Flags></Flags>
+    </Shader>
+
+    <!-- Shared library modules: imported by other shaders, never compiled standalone. -->
+    <Shader Remove="VulkanEngine\Shaders\CommonTypes.slang" />
+    <Shader Remove="VulkanEngine\Shaders\PbrUtils.slang" />
+    <Shader Remove="VulkanEngine\Shaders\IblCommon.slang" />
+    <Shader Remove="VulkanEngine\Shaders\PTUtils.slang" />
+    <Shader Remove="VulkanEngine\Shaders\Lib\**\*.slang" />
+    <Shader Remove="Shaders\Lib\**\*.slang" />
+
+    <!-- Ray-query shaders (inline RayQuery). -->
+    <Shader Update="VulkanEngine\Shaders\PbrShader.slang"     OutputName="PBR" Flags="-capability spvRayQueryKHR" />
+    <Shader Update="VulkanEngine\Shaders\Transparent.slang"   Flags="-capability spvRayQueryKHR" />
+    <Shader Update="VulkanEngine\Shaders\PTCompute.slang"     Flags="-capability spvRayQueryKHR" />
+    <Shader Update="VulkanEngine\Shaders\PickCompute.slang"   Flags="-capability spvRayQueryKHR" />
+    <Shader Update="VulkanEngine\Shaders\SelectionMask.slang" Flags="-capability spvRayQueryKHR" />
+
+    <!-- Ray-tracing-pipeline shader (base variant). -->
+    <Shader Update="VulkanEngine\Shaders\PathTraceRT.slang"   Flags="-capability spvRayTracingKHR" />
+
+    <!-- Shared library modules tracked as compile *inputs* so editing one rebuilds its
+         importers (incremental correctness), but never compiled to their own .spv. -->
+    <ShaderLib Include="VulkanEngine\Shaders\CommonTypes.slang" />
+    <ShaderLib Include="VulkanEngine\Shaders\PbrUtils.slang" />
+    <ShaderLib Include="VulkanEngine\Shaders\IblCommon.slang" />
+    <ShaderLib Include="VulkanEngine\Shaders\PTUtils.slang" />
+
+    <!-- Variants: same source, extra defines, distinct output. A separate item type keeps
+         the base manifest one-output-per-source (no duplicate-identity batching). -->
+    <ShaderVariant Include="VulkanEngine\Shaders\PathTraceRT.slang"
+                   OutputName="PathTraceRT_SER"
+                   Flags="-capability spvRayTracingKHR -DUSE_SER=1" />
+
+    <!-- ===== Feature kernels ======================================================
+         Discovered under Features/<F>/Kernels/. Output mirrors the feature folder:
+         %(RecursiveDir) is the path the glob's ** matched (the <F> between Features\ and
+         \Kernels\), so a kernel compiles to Assets/Shaders/<F>/<name>.spv. -->
+    <Kernel Include="VulkanEngine\Renderer\Features\**\Kernels\*.slang">
+      <Flags></Flags>
+      <!-- Feature = the folder directly above Kernels (e.g. WavefrontPathTracer). The .spv
+           mirrors that, dropping the literal Kernels segment, so the output is
+           Assets/Shaders/<Feature>/<name>.spv. (Single-level features; a nested feature would
+           collapse to its innermost folder name.) -->
+      <Feature>$([System.IO.Path]::GetFileName($([System.IO.Path]::GetDirectoryName($([System.IO.Path]::GetDirectoryName('%(FullPath)'))))))</Feature>
+    </Kernel>
+
+    <!-- Shared `module X;` files are import-only (the descriptor-set/DSL + shading helpers) and
+         must never be compiled standalone. Prefer a Kernels\Lib\ subfolder for new ones
+         (auto-excluded); the two that currently sit directly in Kernels\ are excluded by name. -->
+    <Kernel Remove="VulkanEngine\Renderer\Features\**\Kernels\Lib\**\*.slang" />
+    <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\WavefrontBindings.slang" />
+    <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\WavefrontShading.slang" />
+
+    <!-- WIP kernels that don't compile yet; TEMPORARY skip so `dotnet build` stays green.
+         Remove each line once the kernel builds:
+           Generate -> references generatePrimaryRay (not yet in an imported module)
+           Connect / Finalize -> no [shader] entry point yet (imports-only stubs) -->
+    <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\Generate.slang" />
+    <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\Connect.slang" />
+    <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\Finalize.slang" />
+
+    <!-- Wavefront kernels use inline ray queries (Extend traces; others harmlessly carry it). -->
+    <Kernel Update="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\*.slang"
+            Flags="-capability spvRayQueryKHR" />
+
+    <!-- Shared feature modules tracked as incremental inputs (editing one rebuilds its
+         importing kernels) but never compiled to their own .spv. -->
+    <ShaderLib Include="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\WavefrontBindings.slang" />
+    <ShaderLib Include="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\WavefrontShading.slang" />
+  </ItemGroup>
+
+  <!-- ===== Compile target =========================================================
+       Runs before the build; Inputs/Outputs make it incremental (any source newer than
+       any output -> recompile). Library modules are inputs, so a shared `import` edit
+       rebuilds everything that imports it.
+  -->
+  <Target Name="CompileShaders"
+          Condition="'$(CompileShadersOnBuild)' == 'true'"
+          BeforeTargets="BeforeBuild"
+          Inputs="@(Shader);@(ShaderVariant);@(Kernel);@(ShaderLib)"
+          Outputs="@(Shader->'$(SpvOutputDir)\%(OutputName).spv');@(ShaderVariant->'$(SpvOutputDir)\%(OutputName).spv');@(Kernel->'$(SpvOutputDir)\%(Feature)\%(Filename).spv')">
+
+    <Error Condition="!Exists('$(SlangCompiler)')"
+           Text="slangc not found at '$(SlangCompiler)'. Install the Vulkan SDK (sets VULKAN_SDK), or pass -p:SlangCompiler=&lt;path-to-slangc.exe&gt;." />
+
+    <!-- Output root + one subdir per feature that has kernels. -->
+    <MakeDir Directories="$(SpvOutputDir)" />
+    <MakeDir Directories="@(Kernel->'$(SpvOutputDir)\%(Feature)')" />
+
+    <!-- The Identity != '' guard is required: on a *partial* incremental build MSBuild
+         filters these item lists to only the out-of-date entries, which can leave one list
+         empty. A batched Exec over an empty list otherwise fires once with blank metadata
+         (slangc with no input, output ".spv"). The per-batch guard skips that empty run. -->
+    <Message Importance="high" Condition="'%(Shader.Identity)' != ''" Text="slangc %(Shader.Identity) -> %(Shader.OutputName).spv" />
+    <Exec Condition="'%(Shader.Identity)' != ''"
+          Command="&quot;$(SlangCompiler)&quot; &quot;%(Shader.FullPath)&quot; -target spirv $(ShaderIncludeArgs) %(Shader.Flags) -o &quot;$(SpvOutputDir)\%(Shader.OutputName).spv&quot;"
+          WorkingDirectory="$(MSBuildProjectDirectory)" />
+
+    <Message Importance="high" Condition="'%(ShaderVariant.Identity)' != ''" Text="slangc %(ShaderVariant.Identity) (variant) -> %(ShaderVariant.OutputName).spv" />
+    <Exec Condition="'%(ShaderVariant.Identity)' != ''"
+          Command="&quot;$(SlangCompiler)&quot; &quot;%(ShaderVariant.FullPath)&quot; -target spirv $(ShaderIncludeArgs) %(ShaderVariant.Flags) -o &quot;$(SpvOutputDir)\%(ShaderVariant.OutputName).spv&quot;"
+          WorkingDirectory="$(MSBuildProjectDirectory)" />
+
+    <Message Importance="high" Condition="'%(Kernel.Identity)' != ''" Text="slangc %(Kernel.Identity) -> %(Kernel.Feature)\%(Kernel.Filename).spv" />
+    <Exec Condition="'%(Kernel.Identity)' != ''"
+          Command="&quot;$(SlangCompiler)&quot; &quot;%(Kernel.FullPath)&quot; -target spirv $(ShaderIncludeArgs) %(Kernel.Flags) -o &quot;$(SpvOutputDir)\%(Kernel.Feature)\%(Kernel.Filename).spv&quot;"
+          WorkingDirectory="$(MSBuildProjectDirectory)" />
+  </Target>
+
+</Project>

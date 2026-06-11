@@ -1,26 +1,6 @@
 ﻿import PTUtils;   // pathtracer math; re-exports PbrUtils + CommonTypes
 
-//frame uniform
-struct PathFrameUBO {
-    float4x4 invView;
-    float4x4 invProj;
-    float4 camPos;
-    uint frameIndex;
-    uint bounceCap;
-    uint lightCount;
-    uint resetAccum;//0 - keep, 1 = overwrite
-    float2 screenSize;
-    float fov;
-    float tanHalfFov;
-    float prefilteredCubeMipLevels;
-    float scaleIBLAmbient;
-    float focusDistance;
-    float aperture;
-    float paniniDistance = 1.0f;
-    float verticalCompression = 0.0f;
-    uint  emissiveTriCount;     // emissive area-light triangles in the alias table
-    float totalEmissivePower;   // Σ area·luminance(Le) — alias-table normaliser
-};
+
 
 //set 0 per-frame IO
 //RGBA32F intentionally, R16F starves dark regions after ~64 samples
@@ -59,19 +39,12 @@ struct PathFrameUBO {
 // envCube for sharp miss-ray background sampling.
 [[vk::binding(3, 3)]] SamplerCube envCube;
 
-//camera mode enum
-enum CameraMode : uint{
-    PINHOLE = 0u,
-    THIN_LENS = 1u,
-    PANINI = 2u,
-    FISHEYE = 3u,
-    ORTHOGRAPHIC = 4u,
-}
+
 //Specialization constants
 [[vk::constant_id(0)]] const bool ENABLE_NEE       = true;   // next event estimation
 [[vk::constant_id(1)]] const bool RUSSIAN_ROULETTE = true;   // path termination
 [[vk::constant_id(2)]] const uint MAX_BOUNCES      = 8u;     // hard cap; ubo.bounceCap clamps below
-[[vk::constant_id(3)]] const uint MODE             = 0u;     // 0 = PINHOLE; CameraMode enum values
+[[vk::constant_id(3)]] const uint MODE             = (uint)CameraMode.PINHOLE;     // 0 = PINHOLE; CameraMode enum values
 
 // Material LOD. On bounces >= this, traceRay skips the normal / metallic-
 // roughness / clearcoat / transmission texture fetches and falls back to the
@@ -86,24 +59,7 @@ static const uint MATERIAL_LOD_BOUNCE = 2u;
 // fetchTriangleIndex) live in CommonTypes and take the ByteAddressBuffer as a
 // parameter — call sites below pass globalVertices / globalIndices.
 
-RayDesc generatePrimaryRay(float2 ndc, inout uint rngState) {
-    if (MODE == (uint)CameraMode.PINHOLE) {
-        return generatePinholeRay(ndc, frameUBO.tanHalfFov);
-    } else if (MODE == (uint)CameraMode.THIN_LENS) {
-        // Thin lens needs two uniform [0,1] samples for the disk; advance the
-        // rng twice so different lanes don't end up correlated.
-        float2 lensUV = float2(rand(rngState), rand(rngState));
-        return generateThinLensRay(ndc, frameUBO.tanHalfFov, lensUV,
-                                   frameUBO.focusDistance, frameUBO.aperture);
-    } else if (MODE == (uint)CameraMode.PANINI) {
-        return generatePaniniRay(ndc, frameUBO.fov, frameUBO.paniniDistance,
-                                 frameUBO.verticalCompression);
-    } else if (MODE == (uint)CameraMode.FISHEYE) {
-        return generateFisheyeRay(ndc, frameUBO.fov);
-    }
-    // ORTHOGRAPHIC + unknown — sentinel ray (TMax < 0); main() skips it.
-    return RayDesc(float3(0.0), 0.0, float3(0.0), RAY_INVALID_TMAX);
-}
+
 
 float2 computeUV(uint indexOffset, uint primIdx, float2 bary) {
     uint i0 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 0u);
@@ -543,7 +499,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
     // primary ray: camera-space helpers in PTUtils, then lift to world with
     // invView so origin lands at the actual camera and forward points along
     // -view. transformRayToWorld preserves the fisheye TMax<0 sentinel.
-    RayDesc ray = transformRayToWorld(generatePrimaryRay(ndc, rngState),
+    RayDesc ray = transformRayToWorld(generatePrimaryRay(ndc, rngState, (CameraMode)MODE, frameUBO),
                                       frameUBO.invView);
 
     float3 radiance   = float3(0.0);

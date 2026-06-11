@@ -24,8 +24,7 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
         public uint      _pad;           //  4
     }
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\SelectionMask.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("SelectionMask");
 
     public SelectionMaskPipeline(Renderer renderer) : base(renderer)
     {

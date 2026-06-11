@@ -32,8 +32,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         public float probeMipLevels;
     }
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PBR.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("PBR");
 
     // Lighting writes linear HDR scene-referred color; tone-map + gamma run in
     // the separate TonemapPipeline pass that consumes this attachment.

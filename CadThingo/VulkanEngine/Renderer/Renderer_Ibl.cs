@@ -329,16 +329,14 @@ public unsafe partial class Renderer
 
     internal void CreateIblBakePipelines()
     {
-        const string shaderDir = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\";
-
         equirectToCubePipeline = new IblBakePipeline(this,
-            shaderDir + "EquirectToCube.spv",     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
+            ShaderPaths.Spv("EquirectToCube"),     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
         irradianceConvolvePipeline = new IblBakePipeline(this,
-            shaderDir + "IrradianceConvolve.spv", hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
+            ShaderPaths.Spv("IrradianceConvolve"), hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
         prefilterEnvPipeline = new IblBakePipeline(this,
-            shaderDir + "PrefilterEnv.spv",       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
+            ShaderPaths.Spv("PrefilterEnv"),       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
         brdfLutGenPipeline = new IblBakePipeline(this,
-            shaderDir + "BrdfLutGen.spv",         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
+            ShaderPaths.Spv("BrdfLutGen"),         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
 
         equirectToCubePipeline    .Initialize();
         irradianceConvolvePipeline.Initialize();

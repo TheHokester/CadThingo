@@ -25,8 +25,7 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
         public float Gamma;
     }
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\Tonemap.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("Tonemap");
 
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R8G8B8A8Unorm };
 

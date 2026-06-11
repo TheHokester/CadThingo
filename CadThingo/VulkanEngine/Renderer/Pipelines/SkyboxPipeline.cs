@@ -25,8 +25,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         public float     _pad2;
     }
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\Skybox.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("Skybox");
 
     // Writes the same HDRColor as the lighting / transparent passes so it gets
     // tone-mapped with everything else.

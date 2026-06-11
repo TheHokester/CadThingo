@@ -727,8 +727,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
 
     private void CreateImGuiPipeline()
     {
-        byte[] shaderCode = File.ReadAllBytes
-            ("C:\\Users\\jamie\\RiderProjects\\CadThingo\\CadThingo\\Assets\\Shaders\\ImGui.spv");
+        byte[] shaderCode = File.ReadAllBytes(ShaderPaths.Spv("ImGui"));
 
         var shaderInfo = new ShaderModuleCreateInfo()
         {

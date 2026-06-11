@@ -181,11 +181,11 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
 
     private void TryCreateCapturePipeline()
     {
-        string spv = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\ProbeCapture.spv";
+        string spv = ShaderPaths.Spv("ProbeCapture");
         if (!System.IO.File.Exists(spv))
         {
             Console.WriteLine("[Probe] ProbeCapture.spv not found — capture pipeline skipped. " +
-                              "Run VulkanEngine/Shaders/shaderCompile.bat to enable probe captures.");
+                              "Build the project (shaders compile automatically) to enable probe captures.");
             return;
         }
         capturePipeline = new ProbeCapturePipeline(_renderer);

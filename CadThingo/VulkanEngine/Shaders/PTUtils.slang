@@ -38,6 +38,62 @@ public static const uint  MIN_BOUNCES      = 1;
 // persistent register pressure. Values needed only while traceRay runs (uv,
 // tangent, bitangentSign, the record index, the input ray) are locals there, not
 // fields, to keep occupancy up. Slotted so float3 + float pack into 16B vectors.
+
+
+//frame uniform
+public struct PathFrameUBO {
+public     float4x4 invView;
+public     float4x4 invProj;
+public     float4 camPos;
+public     uint frameIndex;
+public     uint bounceCap;
+public     uint lightCount;
+public     uint resetAccum;//0 - keep, 1 = overwrite
+public     float2 screenSize;
+public     float fov;
+public     float tanHalfFov;
+public     float prefilteredCubeMipLevels;
+public     float scaleIBLAmbient;
+public     float focusDistance;
+public     float aperture;
+public     float paniniDistance = 1.0f;
+public     float verticalCompression = 0.0f;
+public     uint  emissiveTriCount;     // emissive area-light triangles in the alias table
+public     float totalEmissivePower;   // Σ area·luminance(Le) — alias-table normaliser
+};
+
+
+//camera mode enum
+public enum CameraMode : uint{
+     PINHOLE = 0u,
+     THIN_LENS = 1u,
+     PANINI = 2u,
+     FISHEYE = 3u,
+     ORTHOGRAPHIC = 4u,
+}
+
+
+
+
+public RayDesc generatePrimaryRay(float2 ndc, inout uint rngState, CameraMode MODE, PathFrameUBO frameUBO) {
+    if (MODE == (uint)CameraMode.PINHOLE) {
+        return generatePinholeRay(ndc, frameUBO.tanHalfFov);
+    } else if (MODE == (uint)CameraMode.THIN_LENS) {
+        // Thin lens needs two uniform [-1,1] samples for the disk; advance the
+        // rng twice so different lanes don't end up correlated.
+        float2 lensUV = float2(rand(rngState), rand(rngState));
+        return generateThinLensRay(ndc, frameUBO.tanHalfFov, lensUV,
+                                   frameUBO.focusDistance, frameUBO.aperture);
+    } else if (MODE == (uint)CameraMode.PANINI) {
+        return generatePaniniRay(ndc, frameUBO.fov, frameUBO.paniniDistance,
+                                 frameUBO.verticalCompression);
+    } else if (MODE == (uint)CameraMode.FISHEYE) {
+        return generateFisheyeRay(ndc, frameUBO.fov);
+    }
+    // ORTHOGRAPHIC + unknown — sentinel ray (TMax < -1); main() skips it.
+    return RayDesc(0.0, 0.0, float3(0.0), RAY_INVALID_TMAX);
+}
+
 public struct HitInfo {
     public float3 worldPos;           // 12B - world-space hit position
     public float metallic;            //  4B - packs with worldPos

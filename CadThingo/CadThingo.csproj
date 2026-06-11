@@ -42,4 +42,7 @@
       <Folder Include="VulkanEngine\Renderer\Features\IBL\" />
     </ItemGroup>
 
+    <!-- Directory-aware, manifest-driven Slang -> SPIR-V compile (compiles on build). -->
+    <Import Project="Shaders.targets" />
+
 </Project>

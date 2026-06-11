@@ -30,8 +30,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
         public uint      PixelY;        //  4
     }
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PickCompute.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("PickCompute");
 
     // 4B result (entity index or PickNone). Host-visible + coherent so the
     // single-time submit's QueueWaitIdle is all the synchronisation the readback

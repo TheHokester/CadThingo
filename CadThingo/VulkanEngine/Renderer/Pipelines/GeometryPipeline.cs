@@ -17,8 +17,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     //Per frame uniform buffers for geometry pipeline
     private UboBuffer[] GeometryUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\Geometry.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("Geometry");
     protected override Format[] ColorAttachmentFormats { get; } =
     [
         Format.R32G32B32A32Sfloat, // Position

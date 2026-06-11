@@ -63,8 +63,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase
     private const int SetBindless = 2;
     private const int SetIbl      = 3;
 
-    private const string ShaderPath =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\PTCompute.spv";
+    private static readonly string ShaderPath = ShaderPaths.Spv("PTCompute");
 
     // Multi-PSO pattern: one pipeline per camera mode, mode baked via spec
     // constant id=3. Mode switch at Record time = `CmdBindPipeline` only, no

@@ -14,27 +14,7 @@
 
 import PTUtils;   // BSDF/sampling/RNG/camera + re-exported PbrUtils/CommonTypes
 
-// Must match PathFrameUBO in PTCompute.slang / PTComputePipeline.cs byte-for-byte.
-struct PathFrameUBO {
-    float4x4 invView;
-    float4x4 invProj;
-    float4   camPos;
-    uint     frameIndex;
-    uint     bounceCap;
-    uint     lightCount;
-    uint     resetAccum;
-    float2   screenSize;
-    float    fov;
-    float    tanHalfFov;
-    float    prefilteredCubeMipLevels;
-    float    scaleIBLAmbient;
-    float    focusDistance;
-    float    aperture;
-    float    paniniDistance;
-    float    verticalCompression;
-    uint     emissiveTriCount;
-    float    totalEmissivePower;
-};
+
 
 // Set 0 — per-frame IO (binding indices match PTCompute set 0).
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO>       frameUBO;

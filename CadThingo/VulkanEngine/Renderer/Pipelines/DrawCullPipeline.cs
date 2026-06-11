@@ -24,8 +24,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         public uint    _pad2;
     }
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\CullDraws.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("CullDraws");
 
     // Per-frame buffers owned by this pipeline. The cull *input* (RenderableInputGpu
     // rows) now lives on GpuScene — extracted there (L2 step 4) and bound at

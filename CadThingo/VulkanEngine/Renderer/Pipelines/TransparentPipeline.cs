@@ -49,8 +49,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         public uint      _pad2;
     }
 
-    protected override string ShaderPath { get; } =
-        @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Shaders\Transparent.spv";
+    protected override string ShaderPath { get; } = ShaderPaths.Spv("Transparent");
 
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 
