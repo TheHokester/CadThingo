@@ -1,6 +1,24 @@
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.RenderCores;
+
+/// <summary>
+/// Optional capability for cores that drive a <see cref="FrameGraph.FrameGraph"/> (deferred,
+/// wavefront PT). The host's render-graph debug surface (Stats panel) queries the ACTIVE core
+/// through this so the panel reflects whatever technique is running, not a hard-wired one. Cores
+/// without a graph (the megakernel PT cores, forward+) simply don't implement it -> the host's
+/// `_activeCore as IGraphCore` is null and the panel shows nothing.
+/// </summary>
+internal interface IGraphCore
+{
+    /// <summary>Last-frame per-pass GPU/CPU timings + counts, or null before first compile.</summary>
+    GraphStats? GraphStats { get; }
+    /// <summary>Graphviz dump of the compiled graph (for "Copy DOT").</summary>
+    string ToDot();
+    /// <summary>Runtime toggle for the graph's pipeline-statistics collection.</summary>
+    bool CollectPipelineStats { get; set; }
+}
 
 /// <summary>
 /// The per-frame context handed to an <see cref="IRenderCore"/> (renderer-refactor.md L3).

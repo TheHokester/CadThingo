@@ -21,12 +21,15 @@ void main(uint3 gid : SV_DispatchThreadID) {
     float2 ndc = ((float2(gid.xy)+0.5+j)/frameUBO.screenSize)*2.0-1.0;
     ndc.x *= frameUBO.screenSize.x/frameUBO.screenSize.y;
     //generate primary ray
-    RayDesc ray = transformRayToWorld(generatePrimaryRay(ndc, rng), frameUBO.invView);
-    //store ray data
+    RayDesc ray = transformRayToWorld(generatePrimaryRay(ndc, rng, (CameraMode)mode, frameUBO), frameUBO.invView);
+    //store ray data. MIS state seeds in the w-lanes: psRayDir.w = prevBsdfPdf (0 on the
+    //primary), psThroughput.w = prevWasDelta flag = 1 so a directly-visible emitter is taken
+    //at full weight (NEE had no prior chance to sample it).
     psRayOrigin[px]=float4(ray.Origin,0);
     psRayDir[px]=float4(ray.Direction,0);
-    psThroughput[px]=float4(1,1,1,0); 
-    psRadiance[px]=float4(0,0,0,0); 
+    psThroughput[px]=float4(1,1,1,1.0);
+    psRadiance[px]=float4(0,0,0,0);
+    psSigmaA[px]=float4(0,0,0,0);   // start in vacuum (no medium absorption); P2.6 Beer-Lambert
     psRng[px]=rng; 
     rayQueue0[px]=px;
     

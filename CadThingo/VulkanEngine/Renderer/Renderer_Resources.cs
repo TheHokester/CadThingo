@@ -86,12 +86,13 @@ public unsafe partial class Renderer
         //   - AccelerationStructure: TLAS                       →  MAX_FRAMES + headroom
         var poolSizes = new DescriptorPoolSize[]
         {
-            new() { Type = DescriptorType.UniformBuffer,            DescriptorCount = 16 },
+            new() { Type = DescriptorType.UniformBuffer,            DescriptorCount = 24 },
             // Storage buffer budget: bindless mat+instance (2 × MAX_FRAMES), light SSBO
             // (MAX_FRAMES), cull pass (renderables + cmds + instancesOut + count =
-            // 4 × MAX_FRAMES), PBR shadow-alpha set (ShadowEntityInfo + global vb + ib).
-            // Round up generously.
-            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 48 },
+            // 4 × MAX_FRAMES), PBR shadow-alpha set (ShadowEntityInfo + global vb + ib),
+            // plus the wavefront tracer (set 0 lights/shadow/emissive × MAX_FRAMES, set 1
+            // vb/ib, and the 18-binding set-4 SoA working set). Round up generously.
+            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 96 },
             new() { Type = DescriptorType.SampledImage,             DescriptorCount = MAX_BINDLESS_TEXTURES * MAX_CONCURRENT_FRAMES },
             new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
             // 5 g-buffer samplers (set 1) + 3 IBL samplers × MAX_FRAMES on set 0
@@ -99,8 +100,9 @@ public unsafe partial class Renderer
             // Probe prefilter sets reuse iblCubeSampler — one CombinedImageSampler
             // each. MaxProbes (16) × MipLevels (9) = 144. Cheap to oversize.
             new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 32 + 200 },
-            // PBR (1) + Transparent (1) + PT (MAX_FRAMES) + Pick (1) + headroom.
-            new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 8 },
+            // PBR (1) + Transparent (1) + PT (MAX_FRAMES) + Wavefront (MAX_FRAMES) +
+            // Pick (1) + SelectionMask (1) + headroom.
+            new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 16 },
             // IBL bake passes need StorageImage descriptors — one per dispatch.
             // Worst case is the prefilter chain (1 set × prefilteredCubeMipLevels
             // mips) + equirect→cube + irradiance + BRDF LUT ≈ 11 sets. Reflection
@@ -109,7 +111,9 @@ public unsafe partial class Renderer
             new() { Type = DescriptorType.StorageImage,             DescriptorCount = 24 + 200 },
         };
         // Sizing is an app-level budget (above); GraphicsDevice owns the pool handle.
-        gfx.CreateDescriptorPool(poolSizes, maxSets: 48 + 200,
+        // +16 over the historical 48+200 for the wavefront tracer's 5 sets (set 0 ×MAX_FRAMES,
+        // sets 1/3/4) with headroom.
+        gfx.CreateDescriptorPool(poolSizes, maxSets: 48 + 200 + 16,
             DescriptorPoolCreateFlags.UpdateAfterBindBit | DescriptorPoolCreateFlags.FreeDescriptorSetBit);
     }
    

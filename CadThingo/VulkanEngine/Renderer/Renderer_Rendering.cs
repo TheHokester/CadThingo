@@ -108,6 +108,9 @@ public unsafe partial class Renderer
         deferredCore.Resize(renderExtent);
         ptComputeCore.Resize(renderExtent);
         ptRtCore?.Resize(renderExtent);
+        // Wavefront core reallocates its SoA working set to the new extent + rebuilds its graph
+        // (re-importing the fresh PT/Final targets); marks the accumulator dirty internally.
+        wavefrontCore.Resize(renderExtent);
 
         // Re-point tonemap's HDR input at the ACTIVE core's fresh scene-colour source (deferred
         // HDR vs PT ptOutColor). Subsumes the old per-mode branch: DeferredCore.Resize just bound
@@ -452,10 +455,15 @@ public unsafe partial class Renderer
     }
 
 
-    // ---- Deferred FrameGraph debug surface (read by the Stats panel; the graph is owned by
-    // DeferredCore now, so these forward to it) -----------------------------------------------
-    /// <summary>Last-frame per-pass GPU/CPU timings + counts, or null before first compile.</summary>
-    public GraphStats? DeferredGraphStats => deferredCore?.GraphStats;
+    // ---- Active-core FrameGraph debug surface (read by the Stats panel) ----------------------
+    // The graph is owned by whichever core is active (DeferredCore, WavefrontPTCore, ...), so these
+    // forward to `_activeCore` through IGraphCore. Cores with no graph (megakernel PT, forward+)
+    // aren't IGraphCore -> null, and the panel shows nothing.
+    private IGraphCore? ActiveGraphCore => _activeCore as IGraphCore;
+    /// <summary>Last-frame per-pass GPU/CPU timings + counts, or null when the active core has no graph.</summary>
+    public GraphStats? ActiveGraphStats => ActiveGraphCore?.GraphStats;
+    /// <summary>The active core's human-readable name (for the panel header).</summary>
+    public string ActiveCoreName => _activeCore?.Name ?? "";
 
     // ---- Resize-churn diagnostics (GpuMemoryAllocator retained-block check) -----
     private int _renderTargetRebuilds;
@@ -490,14 +498,21 @@ public unsafe partial class Renderer
         _reservedMbHistory[_memHistoryHead] = s.ReservedBytes / MB;
         _memHistoryHead = (_memHistoryHead + 1) % MemHistoryLen;
     }
-    /// <summary>Graphviz dump of the compiled deferred graph (for "Copy DOT").</summary>
-    public string DeferredGraphDot() => deferredCore?.ToDot() ?? "(no deferred frame graph)";
-    /// <summary>Runtime toggle for the deferred graph's pipeline-statistics collection.</summary>
-    public bool DeferredGraphPipelineStats
+    /// <summary>Graphviz dump of the active core's compiled graph (for "Copy DOT").</summary>
+    public string ActiveGraphDot() => ActiveGraphCore?.ToDot() ?? "(active core has no frame graph)";
+    /// <summary>Runtime toggle for the active core's graph pipeline-statistics collection.</summary>
+    public bool ActiveGraphPipelineStats
     {
-        get => deferredCore?.CollectPipelineStats ?? false;
-        set { if (deferredCore != null) deferredCore.CollectPipelineStats = value; }
+        get => ActiveGraphCore?.CollectPipelineStats ?? false;
+        set { if (ActiveGraphCore is { } g) g.CollectPipelineStats = value; }
     }
+
+    /// <summary>TEMP debug: per-bounce [extend, shade, connect] indirect workgroup counts for the
+    /// wavefront tracer (compaction visualization), or null when wavefront isn't the active core.
+    /// ~a frame stale, best-effort. Remove with the pipeline's _argsReadback readback feature.</summary>
+    public uint[]? WavefrontDispatchCounts =>
+        ReferenceEquals(_activeCore, wavefrontCore) && wavefrontPipeline != null
+            ? wavefrontPipeline.ReadDispatchArgs() : null;
 
 
 

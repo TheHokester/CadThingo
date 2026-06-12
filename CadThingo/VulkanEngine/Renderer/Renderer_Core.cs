@@ -6,6 +6,7 @@ using CadThingo.VulkanEngine.Renderer.RenderCores;
 using CadThingo.VulkanEngine.Renderer.Features.Deferred;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Forward;
+using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -39,7 +40,7 @@ public unsafe partial class Renderer
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private bool enableValidationLayers = false;
+    private bool enableValidationLayers = true;
     private IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------
@@ -70,7 +71,8 @@ public unsafe partial class Renderer
         Deferred = 0,
         ForwardPlus = 1,
         RayCompute = 2,
-        RayTrace =3
+        RayTrace =3,
+        RayWavefront = 4
     }
     public RenderMode renderMode = RenderMode.Deferred;
 
@@ -82,6 +84,7 @@ public unsafe partial class Renderer
     private PathtraceComputeCore ptComputeCore   = null!;
     private PathtraceRTCore?     ptRtCore;            // null when the RT pipeline is unsupported
     private ForwardPlusCore      forwardPlusCore = null!;
+    private WavefrontPTCore      wavefrontCore   = null!;  // graph-resident wavefront path tracer
     private IRenderCore          _activeCore     = null!;
 
     // Maps a render mode to its core. RayTrace falls back to the deferred core when the device
@@ -92,6 +95,7 @@ public unsafe partial class Renderer
         RenderMode.ForwardPlus => forwardPlusCore,
         RenderMode.RayCompute  => ptComputeCore,
         RenderMode.RayTrace    => (IRenderCore?)ptRtCore ?? deferredCore,
+        RenderMode.RayWavefront => wavefrontCore,
         _                      => deferredCore,
     };
     
@@ -168,6 +172,7 @@ public unsafe partial class Renderer
     internal TransparentPipeline  transparentPipeline;   // forward+ BLEND-mode pass between lighting and tonemap
     internal SkyboxPipeline       skyboxPipeline;        // background env-cube draw, between lighting and transparent
     internal PTComputePipeline    ptComputePipeline;
+    internal WavefrontPTPipeline  wavefrontPipeline;     // graph-resident wavefront path tracer (RenderMode.RayWavefront)
     internal RTPipeline?          rtPipeline;            // opt-in RT-pipeline path tracer (null when unsupported)
     internal PickPipeline         pickPipeline;          // ray-query object picking (TLAS InstanceCustomIndex → entity)
     internal SelectionMaskPipeline selectionMaskPipeline; // ray-query coverage mask of the selected entity
@@ -326,6 +331,16 @@ public unsafe partial class Renderer
         // owned and stable across rebakes, so set 3 only needs writing once.
         ptComputePipeline.WriteIblDescriptors();
 
+        // Wavefront path tracer (RenderMode.RayWavefront). Shares the same accumulator /
+        // out-color images + scene buffers as the megakernel; the set-4 SoA working set is
+        // pipeline-owned. Set 1 / set 4 / frame UBO are written by Initialize; storage images +
+        // lights + IBL here, and TLAS / shadow / emissive below after InitRayQuery.
+        wavefrontPipeline = new WavefrontPTPipeline(this);
+        wavefrontPipeline.Initialize();
+        wavefrontPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
+        wavefrontPipeline.WriteLightsDescriptor();
+        wavefrontPipeline.WriteIblDescriptors();
+
         // Opt-in RT-pipeline path tracer (RenderMode.RayTrace). Shares the same
         // accumulator/outColor images + scene buffers as the compute path; only
         // built when the device exposes the feature. TLAS/shadow/emissive sets
@@ -398,6 +413,7 @@ public unsafe partial class Renderer
             PbrDeferredPipeline.WriteTlasDescriptor(tlas);
             transparentPipeline.WriteTlasDescriptor(tlas);
             ptComputePipeline.WriteTlasDescriptor(tlas);
+            wavefrontPipeline.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
             pickPipeline.WriteTlasDescriptor(tlas);
             selectionMaskPipeline.WriteTlasDescriptor(tlas);
@@ -406,6 +422,7 @@ public unsafe partial class Renderer
             // InitRayQuery because the SSBO is allocated inside RebuildTlas.
             PbrDeferredPipeline.WriteShadowAlphaDescriptors();
             ptComputePipeline.WriteShadowInfoDescriptor();
+            wavefrontPipeline.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();
             // Pick + selection resolve the hit entity through the same flat
             // ShadowEntityInfo table (per-cluster instances → entity via
@@ -415,6 +432,7 @@ public unsafe partial class Renderer
             // Emissive area-light buffers (built inside RebuildTlas, always
             // allocated with ≥1 slot so the binding is valid even with no emitters).
             ptComputePipeline.WriteEmissiveDescriptors();
+            wavefrontPipeline.WriteEmissiveDescriptors();
             rtPipeline?.WriteEmissiveDescriptors();
         }
 
@@ -428,6 +446,9 @@ public unsafe partial class Renderer
         ptComputeCore   = new PathtraceComputeCore(this);
         if (rtPipeline != null) ptRtCore = new PathtraceRTCore(this);
         forwardPlusCore = new ForwardPlusCore(this);
+        // Wavefront core builds + compiles its own FrameGraph in the ctor (like DeferredCore),
+        // importing the pipeline-owned set-4 buffers + the PT/Final targets.
+        wavefrontCore   = new WavefrontPTCore(this);
         _activeCore = CoreFor(renderMode);
         _activeCore.Activate();
 
@@ -643,6 +664,7 @@ public unsafe partial class Renderer
         ptComputeCore?.Dispose();
         ptRtCore?.Dispose();
         forwardPlusCore?.Dispose();
+        wavefrontCore?.Dispose();
         renderTargets.Dispose();
 
         // GpuScene buffers (light SSBO today) — the GPU mirror of Scene's render data.
@@ -659,6 +681,7 @@ public unsafe partial class Renderer
         selectionMaskPipeline?.Dispose();
         pickPipeline       ?.Dispose();
         rtPipeline         ?.Dispose();
+        wavefrontPipeline  ?.Dispose();
         ptComputePipeline  ?.Dispose();
         skyboxPipeline     ?.Dispose();
         transparentPipeline?.Dispose();

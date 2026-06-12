@@ -24,7 +24,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 /// renderer-owned and are reached through <see cref="_host"/>; this core only owns the graph + the
 /// cached handles + the build/rebind orchestration.
 /// </summary>
-internal sealed class DeferredCore : IRenderCore
+internal sealed class DeferredCore : IRenderCore, IGraphCore
 {
     private readonly Renderer _host;
 

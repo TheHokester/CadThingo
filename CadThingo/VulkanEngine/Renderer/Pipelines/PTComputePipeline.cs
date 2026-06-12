@@ -21,7 +21,7 @@ namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 //  Inherits from PipelineBase (not ComputePipeline) because the base's
 //  CreatePipeline is sealed and has no spec-constant hook — we need full
 //  control to build one PSO per camera mode at init.
-public sealed unsafe class PTComputePipeline : PipelineBase
+public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 {
     // Matches PTCompute.slang::PathFrameUBO byte-for-byte.
     [StructLayout(LayoutKind.Sequential)]

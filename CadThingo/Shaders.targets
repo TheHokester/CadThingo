@@ -101,14 +101,6 @@
     <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\WavefrontBindings.slang" />
     <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\WavefrontShading.slang" />
 
-    <!-- WIP kernels that don't compile yet; TEMPORARY skip so `dotnet build` stays green.
-         Remove each line once the kernel builds:
-           Generate -> references generatePrimaryRay (not yet in an imported module)
-           Connect / Finalize -> no [shader] entry point yet (imports-only stubs) -->
-    <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\Generate.slang" />
-    <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\Connect.slang" />
-    <Kernel Remove="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\Finalize.slang" />
-
     <!-- Wavefront kernels use inline ray queries (Extend traces; others harmlessly carry it). -->
     <Kernel Update="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\*.slang"
             Flags="-capability spvRayQueryKHR" />

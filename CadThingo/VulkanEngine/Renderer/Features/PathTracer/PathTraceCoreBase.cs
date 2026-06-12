@@ -46,9 +46,17 @@ internal abstract unsafe class PathTraceCoreBase : IRenderCore
     /// <summary>Re-point tonemap's shared HDR-input descriptor at ptOutColor (the PT scene-colour
     /// image). Called by the host on mode switch / after a tonemap rebuild -- replaces the per-frame
     /// _lastRenderMode rebind.</summary>
-    public void Activate() =>
+    public void Activate()
+    {
         _host.tonemapPipeline.WriteHdrInputDescriptor(
             _host.renderTargets.PtOutColor.ImageView, _host.gBufferSampler);
+        // The accumulator + ptOutColor are shared across all PT cores (compute / RT / wavefront),
+        // so on a switch into this core they still hold the previous core's progressive result.
+        // Restart integration deterministically here (after the host's DeviceWaitIdle) rather than
+        // leaning on the host accumulator-dirty flag, which otherwise lands a frame late and can
+        // leave the stale image visible.
+        PipelineMarkAccumulatorDirty();
+    }
 
     /// <summary>Rebind the pipeline's storage-image descriptors to the freshly-reallocated
     /// accumulator + ptOutColor (WriteStorageImageDescriptors marks the accumulator dirty

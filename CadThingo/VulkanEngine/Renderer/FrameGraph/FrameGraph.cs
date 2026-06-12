@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Silk.NET.Vulkan;
+using Silk.NET.Vulkan.Extensions.EXT;
 
 namespace CadThingo.VulkanEngine.Renderer.FrameGraph;
 
@@ -571,6 +572,7 @@ public unsafe class FrameGraph : IDisposable
                 pass.BufferBarriers[k].Buffer = ResolveBufferFrame(pass.BufferBarrierRes[k], frame.FrameIndex);
 
             _debug?.BeginPass(cmd, frame.FrameIndex, i);   // debug label + begin timestamp/stats
+            
             EmitBarriers(cmd, pass.ImageBarriers, pass.BufferBarriers);
             pass.Execute(cmd, resources, in frame);
             _debug?.EndPass(cmd, frame.FrameIndex, i);      // end timestamp/stats + pop label
@@ -578,6 +580,7 @@ public unsafe class FrameGraph : IDisposable
         EmitBarriers(cmd, _closingImageBarriers, []);
     }
 
+    
     private void EmitBarriers(CommandBuffer cmd, ImageMemoryBarrier2[] imgs, BufferMemoryBarrier2[] bufs)
     {
         uint imgCount = (uint)imgs.Length;

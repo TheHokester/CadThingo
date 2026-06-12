@@ -962,6 +962,7 @@ public unsafe partial class Renderer
             PbrDeferredPipeline?.WriteTlasDescriptor(tlas);
             transparentPipeline?.WriteTlasDescriptor(tlas);
             ptComputePipeline?.WriteTlasDescriptor(tlas);
+            wavefrontPipeline?.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
             pickPipeline?.WriteTlasDescriptor(tlas);
             selectionMaskPipeline?.WriteTlasDescriptor(tlas);
@@ -971,6 +972,7 @@ public unsafe partial class Renderer
         {
             PbrDeferredPipeline?.WriteShadowAlphaDescriptors();
             ptComputePipeline?.WriteShadowInfoDescriptor();
+            wavefrontPipeline?.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();
             pickPipeline?.WriteEntityInfoDescriptor();
             selectionMaskPipeline?.WriteEntityInfoDescriptor();
@@ -983,6 +985,7 @@ public unsafe partial class Renderer
         if (emissiveBuffersResized)
         {
             ptComputePipeline?.WriteEmissiveDescriptors();
+            wavefrontPipeline?.WriteEmissiveDescriptors();
             rtPipeline?.WriteEmissiveDescriptors();
             emissiveBuffersResized = false;
         }

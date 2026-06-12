@@ -50,8 +50,43 @@ public static class StatsPanel
 
         DrawGpuMemory();
         DrawRenderGraph();
+        DrawWavefrontCompaction();
 
         ImGuiNET.ImGui.End();
+    }
+
+    // TEMP/debug: per-bounce indirect launch sizes for the wavefront path tracer, read back from
+    // the dispatchArgs buffer. Shrinking Extend/Shade/Connect columns down the bounces == compaction
+    // working. Counts are workgroups (x64 ~= max rays). Only shown when wavefront is the active core.
+    // Remove with the pipeline's _argsReadback feature.
+    private static void DrawWavefrontCompaction()
+    {
+        var counts = Engine.renderer?.WavefrontDispatchCounts;
+        if (counts == null || counts.Length < 3) return;
+
+        ImGuiNET.ImGui.Separator();
+        if (!ImGuiNET.ImGui.CollapsingHeader("Wavefront compaction (workgroups, x64 ~= rays)")) return;
+
+        int bounces = counts.Length / 3;
+        var flags = ImGuiNET.ImGuiTableFlags.Borders | ImGuiNET.ImGuiTableFlags.RowBg
+                  | ImGuiNET.ImGuiTableFlags.SizingStretchProp;
+        if (ImGuiNET.ImGui.BeginTable("##wfcompact", 4, flags))
+        {
+            ImGuiNET.ImGui.TableSetupColumn("Bounce");
+            ImGuiNET.ImGui.TableSetupColumn("Extend");
+            ImGuiNET.ImGui.TableSetupColumn("Shade");
+            ImGuiNET.ImGui.TableSetupColumn("Connect");
+            ImGuiNET.ImGui.TableHeadersRow();
+            for (int b = 0; b < bounces; b++)
+            {
+                ImGuiNET.ImGui.TableNextRow();
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{b}");
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * 3 + 0]}");
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * 3 + 1]}");
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * 3 + 2]}");
+            }
+            ImGuiNET.ImGui.EndTable();
+        }
     }
 
     // GPU-memory occupancy + resize-churn counter. The headline number is the
@@ -116,11 +151,11 @@ public static class StatsPanel
     // GraphStats snapshot (GPU timings are resolved a frame late, so they lag slightly).
     private static void DrawRenderGraph()
     {
-        var stats = Engine.renderer?.DeferredGraphStats;
+        var stats = Engine.renderer?.ActiveGraphStats;
         if (stats is not { } gs) return;
 
         ImGuiNET.ImGui.Separator();
-        if (!ImGuiNET.ImGui.CollapsingHeader("Render Graph (deferred)")) return;
+        if (!ImGuiNET.ImGui.CollapsingHeader($"Render Graph ({Engine.renderer!.ActiveCoreName})")) return;
 
         ImGuiNET.ImGui.Text($"{gs.LivePassCount} passes ({gs.CulledPassCount} culled)   "
                           + $"{gs.BarrierCount} barriers   compile {gs.CompileMs:F2} ms");
@@ -129,10 +164,10 @@ public static class StatsPanel
 
         bool ps = gs.PipelineStatsOn;
         if (ImGuiNET.ImGui.Checkbox("Pipeline stats", ref ps) && Engine.renderer != null)
-            Engine.renderer.DeferredGraphPipelineStats = ps;
+            Engine.renderer.ActiveGraphPipelineStats = ps;
         ImGuiNET.ImGui.SameLine();
         if (ImGuiNET.ImGui.Button("Copy DOT") && Engine.renderer != null)
-            ImGuiNET.ImGui.SetClipboardText(Engine.renderer.DeferredGraphDot());
+            ImGuiNET.ImGui.SetClipboardText(Engine.renderer.ActiveGraphDot());
 
         int cols = gs.PipelineStatsOn ? 6 : 3;
         var flags = ImGuiNET.ImGuiTableFlags.Borders | ImGuiNET.ImGuiTableFlags.RowBg

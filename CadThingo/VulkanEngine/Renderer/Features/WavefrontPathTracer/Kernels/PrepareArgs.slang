@@ -11,7 +11,7 @@ struct ArgsPc {
 
 [shader("compute")]
 [numthreads(1,1,1)]
-void main() { 
+void main() {
     if(args.copyToNextRay != 0) {
         counters[RAY_COUNT] = counters[NEXT_RAY_COUNT];
         counters[NEXT_RAY_COUNT] = 0;
