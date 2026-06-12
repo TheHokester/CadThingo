@@ -33,9 +33,17 @@ void main(uint3 gid : SV_DispatchThreadID) {
     psRng[px]=rng; 
     rayQueue0[px]=px;
     
-    //set ray counters if this is the first ray
-    if (px==0) { 
-        counters[RAY_COUNT]=dim.x*dim.y; 
-        counters[NEXT_RAY_COUNT]=0; 
+    //set ray counters + the first stage's indirect args if this is the first ray. This folds
+    //the old PrepExtend(0) dispatch in: seed every counter the bounce chain consumes (the
+    //arrival ticket COMPLETED_WG must start at 0) and write extend-args[0] = wfGroupCount(N) so
+    //Extend(0) launches without a separate prep. N is dense + known here, so no last-group dance.
+    if (px==0) {
+        uint n = dim.x*dim.y;
+        counters[RAY_COUNT]      = n;
+        counters[NEXT_RAY_COUNT] = 0;
+        counters[SHADOW_COUNT]   = 0;
+        counters[COMPLETED_WG]   = 0;
+        for(uint c = 0u; c < WF_SHADE_CLASSES; c++) counters[SHADE_COUNT_0 + c] = 0u;  // all C bins
+        wfWriteArgs(wfExtendArgsOffset(0u), wfGroupCount(n));
     }
 }

@@ -10,8 +10,12 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// Imports the pipeline-owned set-4 SoA working set + the host-owned accumulator / out-color /
 /// FinalColor, then unrolls the indirect chain:
 ///
-///   Generate -> [ PrepExtend -> Extend -> PrepShade -> Shade -> PrepConnect -> Connect ] x MAX_BOUNCES
-///            -> Finalize -> Tonemap
+///   Generate -> [ Extend -> Shade -> Connect ] x MAX_BOUNCES -> Finalize -> Tonemap
+///
+/// Each stage's indirect-args generation is fused onto the tail of its producer (Generate writes
+/// extend-args[0]; Extend's tail writes shade-args; Shade's tail writes connect-args + the next
+/// bounce's extend-args), so there are no standalone PrepareArgs dispatches -- the last workgroup
+/// to finish a producer writes the downstream launch dims (wfFuseTailElect in WavefrontBindings).
 ///
 /// "Import for barriers, bind for access": the kernels touch the set-4 buffers + storage images
 /// through the bound descriptor sets (pipeline-owned, written once); the graph imports the SAME
@@ -38,6 +42,8 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
     // lives on the pipeline (it also sizes the per-bounce dispatchArgs buffer + readback); reference
     // it here so the unroll count and the buffer layout can never drift. Change it in WavefrontPTPipeline.
     private const uint MAX_BOUNCES = WavefrontPTPipeline.MaxBounces;
+    // P3: material-sorted shading fans the shade stage out to C bins, one Shade pass per class.
+    private const uint SHADE_CLASSES = WavefrontPTPipeline.ShadeClasses;
 
     private readonly WavefrontPTPipeline _pipe;
     private readonly TonemapPipeline     _tonemap;
@@ -79,7 +85,9 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
         var final = scope.ImportImage(inp.FinalColor.Image, inp.FinalColor.ImageView, in finalDesc,
             ImageLayout.Undefined, "FinalColor", ImageLayout.ShaderReadOnlyOptimal);
 
-        // ---- Generate: dense primary rays, seed rayQueue0 + counters ----
+        // ---- Generate: dense primary rays, seed rayQueue0 + counters + extend-args[0] ----
+        // Generate also writes the first bounce's indirect launch dims (the old PrepExtend(0)
+        // dispatch, fused in): N is dense + known, so no last-group election is needed here.
         scope.AddPass("Generate", PassType.Compute, QueueClass.Graphics,
             bld =>
             {
@@ -91,27 +99,26 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                 psSigmaA     = bld.Write(psSigmaA,     ResourceUsage.StorageWriteCompute);   // init vacuum
                 rayQ0        = bld.Write(rayQ0,        ResourceUsage.StorageWriteCompute);
                 counters     = bld.Write(counters,     ResourceUsage.StorageWriteCompute);
+                dispatchArgs = bld.Write(dispatchArgs, ResourceUsage.StorageWriteCompute);   // extend-args[0]
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordGenerate(cmd, f));
 
+        // Per bounce: Extend -> Shade -> Connect. The arg-prep that used to sit before each
+        // worker (PrepExtend / PrepShade / PrepConnect, one 1-thread dispatch + two barriers
+        // apiece) is now FUSED onto the producer's tail (the last group to finish writes the
+        // downstream stage's indirect args -- see Extend/Shade .slang + wfFuseTailElect). So
+        // each Extend/Shade declares dispatchArgs as BOTH an indirect Read (its own launch dims,
+        // written upstream) and a storage Write (the next stage's dims). The graph processes
+        // reads before writes, so the derived barriers are: <upstream write> -> indirect-read,
+        // then indirect-read -> storage-write; the next worker's indirect-read barrier then
+        // publishes this tail's write. counters stays RW on every pass to keep the chain linear.
         for (uint b = 0; b < MAX_BOUNCES; b++)
         {
             uint bb = b;                       // capture for the deferred execute closures
-            bool copyNext = bb > 0;            // PrepExtend(b>0) copies nextRayCount -> rayCount
             GraphBuffer src = (bb % 2 == 0) ? rayQ0 : rayQ1;   // ping-pong read queue
 
-            // PrepExtendArgs: extend args from rayCount; zero shadeCount[0].
-            scope.AddPass($"PrepExtend{bb}", PassType.Compute, QueueClass.Graphics,
-                bld =>
-                {
-                    counters     = bld.Write(counters,     ResourceUsage.StorageRWCompute);
-                    dispatchArgs = bld.Write(dispatchArgs, ResourceUsage.StorageWriteCompute);
-                },
-                (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                    _pipe.RecordPrep(cmd, f.FrameIndex, WavefrontPTPipeline.RAY_COUNT,
-                        WavefrontPTPipeline.ExtendArgsOffset(bb), /*resetShade*/1u, copyNext));
-
             // Extend: trace the live rays; miss -> radiance += env; hit -> append to shadeQueue.
+            // Fused tail: writes shade-args[bb], zeroes shadowCount + nextRayCount (was PrepShade).
             scope.AddPass($"Extend{bb}", PassType.Compute, QueueClass.Graphics,
                 bld =>
                 {
@@ -127,61 +134,54 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                     hitBary    = bld.Write(hitBary,    ResourceUsage.StorageWriteCompute);
                     shadeQ     = bld.Write(shadeQ,     ResourceUsage.StorageWriteCompute);
                     counters   = bld.Write(counters,   ResourceUsage.StorageRWCompute);
-                    bld.Read(dispatchArgs, ResourceUsage.IndirectArg);
+                    bld.Read(dispatchArgs, ResourceUsage.IndirectArg);                       // own launch dims
+                    dispatchArgs = bld.Write(dispatchArgs, ResourceUsage.StorageWriteCompute); // fused: shade-args[bb]
                 },
                 (CommandBuffer cmd, PassResources res, in FrameContext f) =>
                     _pipe.RecordExtend(cmd, f.FrameIndex, bb));
 
-            // PrepShadeArgs: shade args from shadeCount; zero shadowCount + nextRayCount.
-            scope.AddPass($"PrepShade{bb}", PassType.Compute, QueueClass.Graphics,
-                bld =>
-                {
-                    counters     = bld.Write(counters,     ResourceUsage.StorageRWCompute);
-                    dispatchArgs = bld.Write(dispatchArgs, ResourceUsage.StorageWriteCompute);
-                },
-                (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                    _pipe.RecordPrep(cmd, f.FrameIndex, WavefrontPTPipeline.SHADE_COUNT_0,
-                        WavefrontPTPipeline.ShadeArgsOffset(bb), /*resetShadow+next*/2u, false));
-
-            // Shade: re-derive hit, pick up emissive, BSDF-sample + re-queue, write shadow record.
-            scope.AddPass($"Shade{bb}", PassType.Compute, QueueClass.Graphics,
-                bld =>
-                {
-                    bld.Read(shadeQ,     ResourceUsage.StorageReadCompute);
-                    bld.Read(hitRecPrim, ResourceUsage.StorageReadCompute);
-                    bld.Read(hitT,       ResourceUsage.StorageReadCompute);
-                    bld.Read(hitBary,    ResourceUsage.StorageReadCompute);
-                    psRng        = bld.Write(psRng,        ResourceUsage.StorageRWCompute);
-                    psRayOrigin  = bld.Write(psRayOrigin,  ResourceUsage.StorageRWCompute);
-                    psRayDir     = bld.Write(psRayDir,     ResourceUsage.StorageRWCompute);
-                    psThroughput = bld.Write(psThroughput, ResourceUsage.StorageRWCompute);
-                    psRadiance   = bld.Write(psRadiance,   ResourceUsage.StorageRWCompute);
-                    psSigmaA     = bld.Write(psSigmaA,     ResourceUsage.StorageWriteCompute);   // P2.6 set on transmit
-                    // Re-queue survivors into the OTHER ping-pong queue (dst = !src).
-                    if (bb % 2 == 0) rayQ1 = bld.Write(rayQ1, ResourceUsage.StorageWriteCompute);
-                    else             rayQ0 = bld.Write(rayQ0, ResourceUsage.StorageWriteCompute);
-                    shadowPath   = bld.Write(shadowPath,   ResourceUsage.StorageWriteCompute);
-                    shadowOrigin = bld.Write(shadowOrigin, ResourceUsage.StorageWriteCompute);
-                    shadowDir    = bld.Write(shadowDir,    ResourceUsage.StorageWriteCompute);
-                    shadowLe     = bld.Write(shadowLe,     ResourceUsage.StorageWriteCompute);
-                    counters     = bld.Write(counters,     ResourceUsage.StorageRWCompute);
-                    bld.Read(dispatchArgs, ResourceUsage.IndirectArg);
-                },
-                (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                    _pipe.RecordShade(cmd, f.FrameIndex, bb));
-
-            // PrepConnectArgs: connect args from shadowCount.
-            scope.AddPass($"PrepConnect{bb}", PassType.Compute, QueueClass.Graphics,
-                bld =>
-                {
-                    counters     = bld.Write(counters,     ResourceUsage.StorageRWCompute);
-                    dispatchArgs = bld.Write(dispatchArgs, ResourceUsage.StorageWriteCompute);
-                },
-                (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                    _pipe.RecordPrep(cmd, f.FrameIndex, WavefrontPTPipeline.SHADOW_COUNT,
-                        WavefrontPTPipeline.ConnectArgsOffset(bb), /*reset*/0u, false));
+            // Shade: one pass per material class (P3.5). Each shades its own queue bin (selected by
+            // the push class) + the shared hit*, and writes nextRay*/shadow*/psRadiance through the
+            // SAME handles, so the graph serializes the C passes via WAW on counters / the dst queue /
+            // the shadow + persistent buffers. Empty bins still dispatch one group (shade-args use
+            // max(1,..)) -- needed because the LAST class carries the fused tail (connect-args[bb] +
+            // extend-args[bb+1]); by then SHADOW_COUNT / NEXT_RAY_COUNT are summed across all classes.
+            // P3a binds the FULL PSO to every class (RecordShade); P3b will bake per-class PSOs.
+            for (uint c = 0; c < SHADE_CLASSES; c++)
+            {
+                uint cc        = c;
+                bool lastClass = cc == SHADE_CLASSES - 1u;
+                scope.AddPass($"Shade{bb}_c{cc}", PassType.Compute, QueueClass.Graphics,
+                    bld =>
+                    {
+                        bld.Read(shadeQ,     ResourceUsage.StorageReadCompute);
+                        bld.Read(hitRecPrim, ResourceUsage.StorageReadCompute);
+                        bld.Read(hitT,       ResourceUsage.StorageReadCompute);
+                        bld.Read(hitBary,    ResourceUsage.StorageReadCompute);
+                        psRng        = bld.Write(psRng,        ResourceUsage.StorageRWCompute);
+                        psRayOrigin  = bld.Write(psRayOrigin,  ResourceUsage.StorageRWCompute);
+                        psRayDir     = bld.Write(psRayDir,     ResourceUsage.StorageRWCompute);
+                        psThroughput = bld.Write(psThroughput, ResourceUsage.StorageRWCompute);
+                        psRadiance   = bld.Write(psRadiance,   ResourceUsage.StorageRWCompute);
+                        psSigmaA     = bld.Write(psSigmaA,     ResourceUsage.StorageWriteCompute);   // P2.6 set on transmit
+                        // Re-queue survivors into the OTHER ping-pong queue (dst = !src).
+                        if (bb % 2 == 0) rayQ1 = bld.Write(rayQ1, ResourceUsage.StorageWriteCompute);
+                        else             rayQ0 = bld.Write(rayQ0, ResourceUsage.StorageWriteCompute);
+                        shadowPath   = bld.Write(shadowPath,   ResourceUsage.StorageWriteCompute);
+                        shadowOrigin = bld.Write(shadowOrigin, ResourceUsage.StorageWriteCompute);
+                        shadowDir    = bld.Write(shadowDir,    ResourceUsage.StorageWriteCompute);
+                        shadowLe     = bld.Write(shadowLe,     ResourceUsage.StorageWriteCompute);
+                        counters     = bld.Write(counters,     ResourceUsage.StorageRWCompute);
+                        bld.Read(dispatchArgs, ResourceUsage.IndirectArg);                        // own class's launch dims
+                        if (lastClass)                                                            // fused tail on the last class only
+                            dispatchArgs = bld.Write(dispatchArgs, ResourceUsage.StorageWriteCompute); // connect-args[bb] + extend-args[bb+1]
+                    },
+                    (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+                        _pipe.RecordShade(cmd, f.FrameIndex, bb, cc));
+            }
 
             // Connect (2.5): fire the occlusion ray per shadow record; add shadowLe if visible.
+            // No fused tail (leaf of the bounce); reads its own connect-args, counters RW links it.
             scope.AddPass($"Connect{bb}", PassType.Compute, QueueClass.Graphics,
                 bld =>
                 {

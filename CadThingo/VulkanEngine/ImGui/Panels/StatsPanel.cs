@@ -59,31 +59,41 @@ public static class StatsPanel
     // the dispatchArgs buffer. Shrinking Extend/Shade/Connect columns down the bounces == compaction
     // working. Counts are workgroups (x64 ~= max rays). Only shown when wavefront is the active core.
     // Remove with the pipeline's _argsReadback feature.
+    // Shade-class column labels (P3 material-sorted shading); order matches SC_* in WavefrontShading.
+    static readonly string[] _wfShadeClassLabels = { "Diff", "Cond", "Diel", "Full" };
+
     private static void DrawWavefrontCompaction()
     {
         var counts = Engine.renderer?.WavefrontDispatchCounts;
-        if (counts == null || counts.Length < 3) return;
+        int spb = (int)Renderer.Features.WavefrontPathTracer.WavefrontPTPipeline.StagesPerBounce;  // [extend | shade x C | connect]
+        int classes = (int)Renderer.Features.WavefrontPathTracer.WavefrontPTPipeline.ShadeClasses;
+        if (counts == null || counts.Length < spb) return;
 
         ImGuiNET.ImGui.Separator();
         if (!ImGuiNET.ImGui.CollapsingHeader("Wavefront compaction (workgroups, x64 ~= rays)")) return;
 
-        int bounces = counts.Length / 3;
+        int bounces = counts.Length / spb;
         var flags = ImGuiNET.ImGuiTableFlags.Borders | ImGuiNET.ImGuiTableFlags.RowBg
                   | ImGuiNET.ImGuiTableFlags.SizingStretchProp;
-        if (ImGuiNET.ImGui.BeginTable("##wfcompact", 4, flags))
+        // Bounce | Extend | <C shade-class columns> | Connect
+        if (ImGuiNET.ImGui.BeginTable("##wfcompact", 3 + classes, flags))
         {
             ImGuiNET.ImGui.TableSetupColumn("Bounce");
             ImGuiNET.ImGui.TableSetupColumn("Extend");
-            ImGuiNET.ImGui.TableSetupColumn("Shade");
+            for (int c = 0; c < classes; c++)
+                ImGuiNET.ImGui.TableSetupColumn(c < _wfShadeClassLabels.Length ? _wfShadeClassLabels[c] : $"Sh{c}");
             ImGuiNET.ImGui.TableSetupColumn("Connect");
             ImGuiNET.ImGui.TableHeadersRow();
             for (int b = 0; b < bounces; b++)
             {
                 ImGuiNET.ImGui.TableNextRow();
                 ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{b}");
-                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * 3 + 0]}");
-                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * 3 + 1]}");
-                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * 3 + 2]}");
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * spb + 0]}");          // extend
+                for (int c = 0; c < classes; c++)
+                {
+                    ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * spb + 1 + c]}");  // shade[c]
+                }
+                ImGuiNET.ImGui.TableNextColumn(); ImGuiNET.ImGui.Text($"{counts[b * spb + 1 + classes]}");// connect
             }
             ImGuiNET.ImGui.EndTable();
         }

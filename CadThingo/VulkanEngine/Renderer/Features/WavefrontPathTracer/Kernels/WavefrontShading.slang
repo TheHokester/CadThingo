@@ -28,6 +28,25 @@ public float3 wfFireflyClamp(float3 c) {
 }
 
 
+// --- P3.1 Shading-class taxonomy (material-sorted shading) -------------------
+// C = 4 routing classes, superset-ordered so DIFFUSE subset CONDUCTOR subset DIELECTRIC subset
+// FULL (lobe sets are additive). classifyShadingClass returns the MINIMAL covering class for a
+// material, from factors + bound-texture presence only (never resolved texels) -- cheap enough to
+// run in Extend's routing tail, and conservative: a metallic-/transmission-TEXTURED material routes
+// to the wider class even at factor 0, and anything ambiguous falls to FULL (== the verbatim P2
+// BSDF), so a misjudgement only ever over-shades, never mis-shades. Used by Extend (P3.3) to bin
+// the shade queue; P3b feeds the class into a SHADING_CLASS spec constant to dead-strip lobes.
+public static const uint SC_DIFFUSE = 0u, SC_CONDUCTOR = 1u, SC_DIELECTRIC = 2u, SC_FULL = 3u;
+public static const uint SC_COUNT   = WF_SHADE_CLASSES;   // canonical count lives in WavefrontBindings
+
+public uint classifyShadingClass(PbrMaterial m) {
+    if (m.clearcoatFactor > 0.0 || m.clearcoatTex >= 0)         return SC_FULL;        // coat => all lobes
+    if (m.transmissionFactor > 0.0 || m.transmissionTex >= 0)   return SC_DIELECTRIC;  // + transmit lobe
+    if (m.metallicFactor > 0.0 || m.physicalDescriptorTex >= 0) return SC_CONDUCTOR;   // metal possible
+    return SC_DIFFUSE;
+}
+
+
 // --- UV / alpha --------------------------------------------------------------
 public float2 computeUV(uint indexOffset, uint primIdx, float2 bary) {
     uint i0 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 0u);

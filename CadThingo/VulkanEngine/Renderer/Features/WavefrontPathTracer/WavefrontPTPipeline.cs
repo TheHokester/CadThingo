@@ -49,11 +49,10 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         public float     totalEmissivePower;
     }
 
-    // Matches WavefrontBindings::WavefrontPush (workers) and ArgsPc (PrepareArgs).
+    // Matches WavefrontBindings::WavefrontPush. maxBounces lets Shade's fused tail guard the
+    // extend-args[bounce+1] write on the last bounce (the args buffer has no slot past it).
     [StructLayout(LayoutKind.Sequential)]
-    private struct WavefrontPush { public uint bounce; public uint srcParity; public uint argsClass; }
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ArgsPush { public uint countIndex; public uint argsByteOffset; public uint resetMask; public uint copyToNextRay; }
+    private struct WavefrontPush { public uint bounce; public uint srcParity; public uint argsClass; public uint maxBounces; }
 
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
 
@@ -63,11 +62,13 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private const int SetIbl       = 3;
     private const int SetWavefront = 4;
 
+    // ---- Material-sorted shading (P3): C routing classes (must match WavefrontBindings.WF_SHADE_CLASSES) -
+    public const uint ShadeClasses = 4u;
+
     // ---- Counter slot indices (must match WavefrontBindings.slang) -----------
+    // shadeCount occupies SHADE_COUNT_0 .. SHADE_COUNT_0+ShadeClasses-1 (slots 1..4), one per class;
+    // SHADOW_COUNT/NEXT_RAY_COUNT/COMPLETED_WG sit past them.
     public const uint RAY_COUNT = 0, SHADE_COUNT_0 = 1, SHADOW_COUNT = 5, NEXT_RAY_COUNT = 6;
-    // resetMask bits consumed by PrepareArgs.slang.
-    private const uint RESET_SHADE  = 1u;   // zero shadeCount[0]
-    private const uint RESET_SHADOW = 2u;   // zero shadowCount + nextRayCount
 
     // THE bounce-count knob. Single source of truth: the module unrolls this many bounce bodies,
     // the dispatchArgs buffer + readback are sized from it, so changing it here keeps everything
@@ -79,30 +80,29 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     public const uint MaxBounces = 4u;
 
     // ---- dispatchArgs byte layout (PER BOUNCE) -------------------------------
-    // Each VkDispatchIndirectCommand is 12 bytes (x,y,z). Rather than 3 shared slots reused
-    // every bounce (which makes the args un-inspectable -- every Extend dispatch reads the
-    // same bytes, so a capture shows one value), each bounce b owns a contiguous block of
-    // STAGES_PER_BOUNCE commands: [extend | shade | connect]. The buffer then RETAINS every
-    // bounce's launch size, so RenderDoc / Nsight (or a readback) shows the indirect args
-    // shrinking down the chain -- the visible proof of compaction.
-    private const uint  StagesPerBounce  = 3u;       // extend, shade, connect
+    // Each VkDispatchIndirectCommand is 12 bytes (x,y,z). Each bounce b owns a contiguous block of
+    // STAGES_PER_BOUNCE commands: [extend | shade[0..C-1] | connect] (P3: the shade stage fans out
+    // to one indirect command per material class). The buffer RETAINS every bounce's launch size, so
+    // a RenderDoc/Nsight capture (or the readback) shows the indirect args shrinking down the chain
+    // -- the visible proof of compaction. Offsets MUST mirror WavefrontBindings.wf*ArgsOffset.
+    public  const uint  StagesPerBounce  = 2u + ShadeClasses;   // extend + C shade + connect
     private const uint  ArgStride        = 12u;      // sizeof(VkDispatchIndirectCommand)
-    public static uint  ExtendArgsOffset (uint bounce) => (bounce * StagesPerBounce + 0u) * ArgStride;
-    public static uint  ShadeArgsOffset  (uint bounce) => (bounce * StagesPerBounce + 1u) * ArgStride;
-    public static uint  ConnectArgsOffset(uint bounce) => (bounce * StagesPerBounce + 2u) * ArgStride;
-    private const ulong DispatchArgsBytes = (ulong)MaxBounces * StagesPerBounce * ArgStride;  // 4*3*12 = 144
-    private const ulong CountersBytes     = 32;   // 8 uints; indices reach NEXT_RAY_COUNT=6
+    public static uint  ExtendArgsOffset (uint bounce)            => (bounce * StagesPerBounce + 0u)             * ArgStride;
+    public static uint  ShadeArgsOffset  (uint bounce, uint cls)  => (bounce * StagesPerBounce + 1u + cls)       * ArgStride;
+    public static uint  ConnectArgsOffset(uint bounce)            => (bounce * StagesPerBounce + 1u + ShadeClasses) * ArgStride;
+    private const ulong DispatchArgsBytes = (ulong)MaxBounces * StagesPerBounce * ArgStride;  // 4*6*12 = 288
+    private const ulong CountersBytes     = 32;   // 8 uints; indices reach COMPLETED_WG=7
 
     private static readonly string GenerateSpv = ShaderPaths.Kernel("WavefrontPathTracer", "Generate");
     private static readonly string ExtendSpv   = ShaderPaths.Kernel("WavefrontPathTracer", "Extend");
     private static readonly string ShadeSpv    = ShaderPaths.Kernel("WavefrontPathTracer", "Shade");
     private static readonly string ConnectSpv  = ShaderPaths.Kernel("WavefrontPathTracer", "Connect");
     private static readonly string FinalizeSpv = ShaderPaths.Kernel("WavefrontPathTracer", "Finalize");
-    private static readonly string PrepArgsSpv = ShaderPaths.Kernel("WavefrontPathTracer", "PrepareArgs");
 
-    // Generate is baked per camera mode (spec id 0); the other five are single PSOs.
+    // Generate is baked per camera mode (spec id 0); the other four are single PSOs. (No
+    // PrepareArgs PSO anymore -- arg generation is fused onto the producers' tails.)
     private readonly Pipeline[] _generatePsos = new Pipeline[4];
-    private Pipeline _extendPso, _shadePso, _connectPso, _finalizePso, _prepArgsPso;
+    private Pipeline _extendPso, _shadePso, _connectPso, _finalizePso;
 
     // Camera / DoF controls (IPathTracerCamera). Generate bakes the same four
     // CameraMode PSOs as the megakernel (spec id 0); these feed PathFrameUBO so
@@ -168,14 +168,15 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 
     public WavefrontPTPipeline(Renderer renderer) : base(renderer)
     {
-        // One push-constant range covers WavefrontPush (12B) and ArgsPush (16B).
+        // One 16-byte ComputeBit range for WavefrontPush (the workers; Generate/Finalize don't
+        // read it and Slang dead-strips it from their modules).
         PushConstantRanges = new[]
         {
             new PushConstantRange
             {
                 StageFlags = ShaderStageFlags.ComputeBit,
                 Offset     = 0,
-                Size       = (uint)sizeof(ArgsPush),   // 16, the larger of the two
+                Size       = (uint)sizeof(WavefrontPush),   // 16 (4 uints)
             }
         };
     }
@@ -254,7 +255,6 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         _shadePso    = CreateComputePso(ShadeSpv,    null);
         _connectPso  = CreateComputePso(ConnectSpv,  null);
         _finalizePso = CreateComputePso(FinalizeSpv, null);
-        _prepArgsPso = CreateComputePso(PrepArgsSpv, null);
 
         // Alias mode 0 to PipelineHandle so base.Dispose destroys exactly one PSO
         // via that path; everything else is torn down in our Dispose override.
@@ -319,7 +319,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         CreateField(B_HIT_BARY,      f2);
         CreateField(B_RAY_QUEUE0,    u1);
         CreateField(B_RAY_QUEUE1,    u1);
-        CreateField(B_SHADE_QUEUE,   u1);   // single bin in P1 (C=1)
+        CreateField(B_SHADE_QUEUE,   ShadeClasses * u1);   // P3: C bins, class c owns [c*N, (c+1)*N)
         CreateField(B_SHADOW_PATH,   u1);
         CreateField(B_SHADOW_ORIGIN, f4);
         CreateField(B_SHADOW_DIR,    f4);
@@ -600,9 +600,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 5, sets, 0, null);
     }
 
-    private void PushWavefront(CommandBuffer cmd, uint bounce)
+    private void PushWavefront(CommandBuffer cmd, uint bounce, uint argsClass)
     {
-        var pc = new WavefrontPush { bounce = bounce, srcParity = bounce & 1u, argsClass = 0 };
+        var pc = new WavefrontPush { bounce = bounce, srcParity = bounce & 1u, argsClass = argsClass, maxBounces = MaxBounces };
         Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.ComputeBit, 0, (uint)sizeof(WavefrontPush), &pc);
     }
 
@@ -616,38 +616,30 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         Vk.CmdDispatch(cmd, (ctx.RenderExtent.Width + 7u) / 8u, (ctx.RenderExtent.Height + 7u) / 8u, 1);
     }
 
-    /// <summary>1-workgroup arg/counter prep (one PSO, parameterized by push constant).</summary>
-    public void RecordPrep(CommandBuffer cmd, uint frameIndex, uint countIndex, uint argsByteOffset,
-        uint resetMask, bool copyToNextRay)
-    {
-        Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _prepArgsPso);
-        BindSets(cmd, frameIndex);
-        var pc = new ArgsPush { countIndex = countIndex, argsByteOffset = argsByteOffset, resetMask = resetMask, copyToNextRay = copyToNextRay ? 1u : 0u };
-        Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.ComputeBit, 0, (uint)sizeof(ArgsPush), &pc);
-        Vk.CmdDispatch(cmd, 1, 1, 1);
-    }
-
     public void RecordExtend(CommandBuffer cmd, uint frameIndex, uint bounce)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _extendPso);
         BindSets(cmd, frameIndex);
-        PushWavefront(cmd, bounce);
+        PushWavefront(cmd, bounce, 0u);
         Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ExtendArgsOffset(bounce));
     }
 
-    public void RecordShade(CommandBuffer cmd, uint frameIndex, uint bounce)
+    /// <summary>Shade one material-class bin (P3). <paramref name="shadingClass"/> selects the
+    /// queue slice + counter slot via the push constant and the per-class indirect args. In P3a all
+    /// classes bind the same (FULL) PSO; P3b will bake a per-class lobe-stripped PSO.</summary>
+    public void RecordShade(CommandBuffer cmd, uint frameIndex, uint bounce, uint shadingClass)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _shadePso);
         BindSets(cmd, frameIndex);
-        PushWavefront(cmd, bounce);
-        Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ShadeArgsOffset(bounce));
+        PushWavefront(cmd, bounce, shadingClass);
+        Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ShadeArgsOffset(bounce, shadingClass));
     }
 
     public void RecordConnect(CommandBuffer cmd, uint frameIndex, uint bounce)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _connectPso);
         BindSets(cmd, frameIndex);
-        PushWavefront(cmd, bounce);   // Connect ignores it, but keeps the range covered
+        PushWavefront(cmd, bounce, 0u);   // Connect ignores argsClass, but keeps the range covered
         Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ConnectArgsOffset(bounce));
     }
 
@@ -704,7 +696,6 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         if (_shadePso.Handle    != 0) Vk.DestroyPipeline(Device, _shadePso, null);
         if (_connectPso.Handle  != 0) Vk.DestroyPipeline(Device, _connectPso, null);
         if (_finalizePso.Handle != 0) Vk.DestroyPipeline(Device, _finalizePso, null);
-        if (_prepArgsPso.Handle != 0) Vk.DestroyPipeline(Device, _prepArgsPso, null);
 
         FreeSet4();
         foreach (var b in _frameUbos) Gfx.DestroyBuffer(b.buffer, b.alloc);
