@@ -1,5 +1,13 @@
 import WavefrontShading;   // re-exports WavefrontBindings + PTUtils + PbrUtils + CommonTypes
 
+// P3b: the material class this PSO shades, baked at PSO-create (one PSO per class; see
+// WavefrontPTPipeline._shadePsos). Folds into LOBE_MASK so the transmit/clearcoat lobes -- and
+// their resolveHit texel fetches + sampleBsdf branches -- dead-strip for the opaque classes.
+// Default SC_FULL (all lobes) keeps an unspecialized build identical to P3a. Independent of the
+// `pc.argsClass` push that selects the QUEUE BIN, so a class->PSO collapse stays free.
+[[vk::constant_id(0)]] const uint SHADING_CLASS = SC_FULL;
+static const uint LOBE_MASK = classLobeMask(SHADING_CLASS);
+
 // P2 Shade: re-derive the hit, MIS-weighted emissive pickup (2.3), next-event estimation
 // into a precomputed shadow record (2.4), then BSDF-sample + NaN scrub + Russian roulette
 // for the indirect ray (2.7). MIS state round-trips the queue in the w-lanes: psRayDir.w =
@@ -28,7 +36,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
         uint   p     = shadeQueue[cls * pathCount + tid.x];   // class bin: [cls*pathCount, ...)
         uint   rng   = psRng[p];
         float3 inDir = psRayDir[p].xyz;            // incoming ray direction at this hit
-        HitInfo h    = resolveHit(hitRecPrim[p], hitT[p], hitBary[p], psRayOrigin[p].xyz, inDir, pc.bounce);
+        HitInfo h    = resolveHit(hitRecPrim[p], hitT[p], hitBary[p], psRayOrigin[p].xyz, inDir, pc.bounce, LOBE_MASK);
         float3 V     = -inDir;
         float3 thr   = psThroughput[p].xyz;        // throughput INTO this bounce (NEE + emissive use it)
 
@@ -72,7 +80,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
                     if(NdotL > 0.0){
                         sDir    = pick.sample.L;
                         sTMax   = max(pick.sample.distance - 2e-3, 0.0);
-                        float3 brdf = evaluateFullBrdf(h, V, pick.sample.L);
+                        float3 brdf = evaluateFullBrdf(h, V, pick.sample.L, LOBE_MASK);
                         contrib = thr * brdf * pick.sample.radiance * NdotL * pick.weight / pAnalytic;
                         castSh  = pick.sample.castShadows ? 1.0 : 0.0;
                         valid   = true;
@@ -86,9 +94,9 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
                     if(NdotL > 0.0){
                         sDir    = es.L;
                         sTMax   = max(es.dist - 2e-3, 0.0);
-                        float  pB   = bsdfPdfForDir(h, V, es.L);
+                        float  pB   = bsdfPdfForDir(h, V, es.L, LOBE_MASK);
                         float  w    = powerHeuristic(es.pdf, pB);
-                        float3 brdf = evaluateFullBrdf(h, V, es.L);
+                        float3 brdf = evaluateFullBrdf(h, V, es.L, LOBE_MASK);
                         contrib = thr * brdf * es.radiance * NdotL * w / (es.pdf * (1.0 - pAnalytic));
                         castSh  = 1.0;
                         valid   = true;
@@ -110,7 +118,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
         // Path death falls through (alive=false) instead of returning so the thread still
         // reaches the fused tail. rng is written back once at the end -- it captures every
         // advance (NEE pick, sampleBsdf, the RR draw), matching the old per-return writes.
-        BsdfSample bs = sampleBsdf(h, V, rng);
+        BsdfSample bs = sampleBsdf(h, V, rng, LOBE_MASK);
         bool alive = bs.valid;
         if(alive) thr *= bs.weight;
         if(alive && (any(isnan(thr)) || any(isinf(thr)))) alive = false;

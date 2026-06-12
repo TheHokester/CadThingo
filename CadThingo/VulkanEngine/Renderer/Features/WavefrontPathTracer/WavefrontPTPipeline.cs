@@ -99,10 +99,12 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private static readonly string ConnectSpv  = ShaderPaths.Kernel("WavefrontPathTracer", "Connect");
     private static readonly string FinalizeSpv = ShaderPaths.Kernel("WavefrontPathTracer", "Finalize");
 
-    // Generate is baked per camera mode (spec id 0); the other four are single PSOs. (No
+    // Generate is baked per camera mode (spec id 0); Shade is baked per material class (P3b
+    // SHADING_CLASS spec id 0 -> lobe stripping); Extend/Connect/Finalize are single PSOs. (No
     // PrepareArgs PSO anymore -- arg generation is fused onto the producers' tails.)
     private readonly Pipeline[] _generatePsos = new Pipeline[4];
-    private Pipeline _extendPso, _shadePso, _connectPso, _finalizePso;
+    private readonly Pipeline[] _shadePsos    = new Pipeline[ShadeClasses];
+    private Pipeline _extendPso, _connectPso, _finalizePso;
 
     // Camera / DoF controls (IPathTracerCamera). Generate bakes the same four
     // CameraMode PSOs as the megakernel (spec id 0); these feed PathFrameUBO so
@@ -251,8 +253,16 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
             _generatePsos[mode] = CreateComputePso(GenerateSpv, &specInfo);
         }
 
+        // Shade: one PSO per material class, SHADING_CLASS baked via the same spec id 0 (Shade is a
+        // distinct shader, so reusing the entry/info is fine). P3b lobe-strips per class; in P3a the
+        // shader ignored the constant so all four were byte-identical.
+        for (uint cls = 0; cls < ShadeClasses; cls++)
+        {
+            specData = cls;
+            _shadePsos[cls] = CreateComputePso(ShadeSpv, &specInfo);
+        }
+
         _extendPso   = CreateComputePso(ExtendSpv,   null);
-        _shadePso    = CreateComputePso(ShadeSpv,    null);
         _connectPso  = CreateComputePso(ConnectSpv,  null);
         _finalizePso = CreateComputePso(FinalizeSpv, null);
 
@@ -629,10 +639,11 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     /// classes bind the same (FULL) PSO; P3b will bake a per-class lobe-stripped PSO.</summary>
     public void RecordShade(CommandBuffer cmd, uint frameIndex, uint bounce, uint shadingClass)
     {
-        Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _shadePso);
+        uint cls = shadingClass < ShadeClasses ? shadingClass : ShadeClasses - 1u;
+        Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _shadePsos[cls]);
         BindSets(cmd, frameIndex);
-        PushWavefront(cmd, bounce, shadingClass);
-        Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ShadeArgsOffset(bounce, shadingClass));
+        PushWavefront(cmd, bounce, cls);
+        Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ShadeArgsOffset(bounce, cls));
     }
 
     public void RecordConnect(CommandBuffer cmd, uint frameIndex, uint bounce)
@@ -692,8 +703,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     {
         for (int i = 1; i < _generatePsos.Length; i++)
             if (_generatePsos[i].Handle != 0) Vk.DestroyPipeline(Device, _generatePsos[i], null);
+        foreach (var pso in _shadePsos)
+            if (pso.Handle != 0) Vk.DestroyPipeline(Device, pso, null);
         if (_extendPso.Handle   != 0) Vk.DestroyPipeline(Device, _extendPso, null);
-        if (_shadePso.Handle    != 0) Vk.DestroyPipeline(Device, _shadePso, null);
         if (_connectPso.Handle  != 0) Vk.DestroyPipeline(Device, _connectPso, null);
         if (_finalizePso.Handle != 0) Vk.DestroyPipeline(Device, _finalizePso, null);
 

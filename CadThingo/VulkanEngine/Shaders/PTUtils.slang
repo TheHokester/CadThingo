@@ -403,6 +403,17 @@ public float evaluateClearcoatBrdf(HitInfo h, float3 V, float3 L) {
     return (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
 }
 
+// Lobe-mask bits for compile-time lobe stripping (wavefront P3b material-sorted shading). The
+// shared BSDF functions take a `lobeMask` that defaults to LOBE_ALL, so callers that don't pass
+// one (the megakernel, the RT pipeline) fold every gate to "on" and stay byte-identical. The
+// wavefront Shade passes a spec-constant-derived mask per material class, which dead-strips the
+// transmit / clearcoat branches (and their texel fetches in resolveHit) for the opaque classes.
+public static const uint LOBE_DIFFUSE   = 1u;
+public static const uint LOBE_SPEC      = 2u;
+public static const uint LOBE_TRANSMIT  = 4u;
+public static const uint LOBE_CLEARCOAT = 8u;
+public static const uint LOBE_ALL       = LOBE_DIFFUSE | LOBE_SPEC | LOBE_TRANSMIT | LOBE_CLEARCOAT;
+
 // Full layered BRDF: base + clearcoat
 // Single-Fresnel approximation: light reflected by the coat is removed from
 // what reaches the base via baseAtten = (1 - clearcoat * F_cc(NdotV)). The
@@ -410,9 +421,9 @@ public float evaluateClearcoatBrdf(HitInfo h, float3 V, float3 L) {
 // (squared), which is darker. Single-fresnel matches what UE / Filament /
 // most realtime PBRs do; swap to squared if you want stricter physical
 // correctness at the cost of energy.
-public float3 evaluateFullBrdf(HitInfo h, float3 V, float3 L) {
+public float3 evaluateFullBrdf(HitInfo h, float3 V, float3 L, uint lobeMask = LOBE_ALL) {
     float3 base = evaluatePbrBrdf(h, V, L);
-    if (h.clearcoat <= 0.0) return base;
+    if ((lobeMask & LOBE_CLEARCOAT) == 0u || h.clearcoat <= 0.0) return base;
 
     float NdotV = max(dot(h.clearcoatNormal, V), 0.0);
     float Fcc_v = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - NdotV, 5.0);
@@ -509,7 +520,7 @@ public float powerHeuristic(float a, float b) {
 // for the spec / diffuse / clearcoat branches; the delta transmit lobe has
 // zero contribution to non-delta directions and is excluded.
 public float bsdfCombinedPdf(HitInfo h, float3 V, float3 wi,
-                     float Pcc, float Pspec, float Pdiff) {
+                     float Pcc, float Pspec, float Pdiff, uint lobeMask = LOBE_ALL) {
     float NdotV = max(dot(h.normal, V), 0.0);
     float NdotL = max(dot(h.normal, wi), 0.0);
     if (NdotL <= 0.0 || NdotV <= 0.0) return 0.0;
@@ -524,7 +535,7 @@ public float bsdfCombinedPdf(HitInfo h, float3 V, float3 wi,
     float pdfSpec = (G1V_b * D_b) / max(4.0 * NdotV, 1e-6);
 
     float pdfCC = 0.0;
-    if (Pcc > 0.0) {
+    if ((lobeMask & LOBE_CLEARCOAT) != 0u && Pcc > 0.0) {
         // Clearcoat normal currently mirrors shading normal; revisit when a
         // separate clearcoat tangent frame is plumbed for the orange-peel
         // normal-map case.
@@ -541,7 +552,7 @@ public float bsdfCombinedPdf(HitInfo h, float3 V, float3 wi,
 // recompute the BSDF pdf for a light direction (MIS). Returns false when the
 // material has no sampleable lobe (Sum ≈ 0). `NdotV` is dot(shadingN, V).
 public bool bsdfLobeProbs(HitInfo h, float NdotV,
-    out float Pcc, out float Pspec, out float Ptrans, out float Pdiff) {
+    out float Pcc, out float Pspec, out float Ptrans, out float Pdiff, uint lobeMask = LOBE_ALL) {
     Pcc = 0.0; Pspec = 0.0; Ptrans = 0.0; Pdiff = 0.0;
     float nv = max(NdotV, 0.0);
 
@@ -549,13 +560,16 @@ public bool bsdfLobeProbs(HitInfo h, float NdotV,
     float3 Fv  = FresnelSchlick(nv, F0);
     float  Fl  = clamp(luminance(Fv), 0.05, 0.95);
 
-    float Fcc_v     = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - nv, 5.0);
-    float ccRaw     = h.clearcoat * Fcc_v;
+    float ccRaw = 0.0;
+    if ((lobeMask & LOBE_CLEARCOAT) != 0u) {
+        float Fcc_v = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - nv, 5.0);
+        ccRaw       = h.clearcoat * Fcc_v;
+    }
     float baseAtten = 1.0 - ccRaw;
 
     float Pcc_raw   = ccRaw;
     float Pspec_raw = Fl * baseAtten;
-    float Pt_raw    = (1.0 - Fl) * h.transmission * baseAtten;
+    float Pt_raw    = ((lobeMask & LOBE_TRANSMIT) != 0u) ? (1.0 - Fl) * h.transmission * baseAtten : 0.0;
     float Pd_raw    = (1.0 - Fl) * (1.0 - h.transmission) * (1.0 - h.metallic) * baseAtten;
     float Sum = Pcc_raw + Pspec_raw + Pt_raw + Pd_raw;
     if (Sum <= 1e-6) return false;
@@ -571,15 +585,15 @@ public bool bsdfLobeProbs(HitInfo h, float NdotV,
 // to MIS-weight a light sample, and by the indirect leg to weight the emissive
 // pickup. Delta transmission contributes nothing to non-delta directions, so
 // it's excluded inside bsdfCombinedPdf.
-public float bsdfPdfForDir(HitInfo h, float3 V, float3 wi) {
+public float bsdfPdfForDir(HitInfo h, float3 V, float3 wi, uint lobeMask = LOBE_ALL) {
     float NdotV = dot(h.normal, V);
     if (NdotV <= 0.0) return 0.0;
     float Pcc, Pspec, Ptrans, Pdiff;
-    if (!bsdfLobeProbs(h, NdotV, Pcc, Pspec, Ptrans, Pdiff)) return 0.0;
-    return bsdfCombinedPdf(h, V, wi, Pcc, Pspec, Pdiff);
+    if (!bsdfLobeProbs(h, NdotV, Pcc, Pspec, Ptrans, Pdiff, lobeMask)) return 0.0;
+    return bsdfCombinedPdf(h, V, wi, Pcc, Pspec, Pdiff, lobeMask);
 }
 
-public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
+public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState, uint lobeMask = LOBE_ALL) {
     BsdfSample s;
     s.wi       = float3(0.0);
     s.pdf      = 0.0;
@@ -609,15 +623,18 @@ public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
     float3 F0  = lerp(float3(h.F0), h.baseColor.rgb, h.metallic);
     float3 Fv  = FresnelSchlick(NdotV, F0);
     float  Fl  = clamp(luminance(Fv), 0.05, 0.95);
-    float  Fcc_v     = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - NdotV, 5.0);
-    float  baseAtten = 1.0 - h.clearcoat * Fcc_v;
+    float  baseAtten = 1.0;
+    if ((lobeMask & LOBE_CLEARCOAT) != 0u) {
+        float Fcc_v = CLEARCOAT_F0 + (1.0 - CLEARCOAT_F0) * pow(1.0 - NdotV, 5.0);
+        baseAtten   = 1.0 - h.clearcoat * Fcc_v;
+    }
 
     float Pcc, Pspec, Ptrans, Pdiff;
-    if (!bsdfLobeProbs(h, NdotV, Pcc, Pspec, Ptrans, Pdiff)) return s;
+    if (!bsdfLobeProbs(h, NdotV, Pcc, Pspec, Ptrans, Pdiff, lobeMask)) return s;
 
     float u  = rand(rngState);
 
-    if (u < Pcc) {
+    if ((lobeMask & LOBE_CLEARCOAT) != 0u && u < Pcc) {
         // Clearcoat GGX-VNDF reflection
         float u1 = rand(rngState);
         float u2 = rand(rngState);
@@ -626,11 +643,11 @@ public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
         if (Lt.z <= 0.0) return s;
 
         s.wi  = normalize(Lt.x * T + Lt.y * B + Lt.z * N);
-        s.pdf = bsdfCombinedPdf(h, V, s.wi, Pcc, Pspec, Pdiff);
+        s.pdf = bsdfCombinedPdf(h, V, s.wi, Pcc, Pspec, Pdiff, lobeMask);
         if (s.pdf <= 0.0) return s;
 
         float NdotL = Lt.z;
-        s.weight = evaluateFullBrdf(h, V, s.wi) * NdotL / s.pdf;
+        s.weight = evaluateFullBrdf(h, V, s.wi, lobeMask) * NdotL / s.pdf;
         s.valid  = true;
         return s;
     }
@@ -644,16 +661,16 @@ public BsdfSample sampleBsdf(HitInfo h, float3 V, inout uint rngState) {
         if (Lt.z <= 0.0) return s;
 
         s.wi  = normalize(Lt.x * T + Lt.y * B + Lt.z * N);
-        s.pdf = bsdfCombinedPdf(h, V, s.wi, Pcc, Pspec, Pdiff);
+        s.pdf = bsdfCombinedPdf(h, V, s.wi, Pcc, Pspec, Pdiff, lobeMask);
         if (s.pdf <= 0.0) return s;
 
         float NdotL = Lt.z;
-        s.weight = evaluateFullBrdf(h, V, s.wi) * NdotL / s.pdf;
+        s.weight = evaluateFullBrdf(h, V, s.wi, lobeMask) * NdotL / s.pdf;
         s.valid  = true;
         return s;
     }
 
-    if (u < Pcc + Pspec + Ptrans) {
+    if ((lobeMask & LOBE_TRANSMIT) != 0u && u < Pcc + Pspec + Ptrans) {
         // Delta refraction (smooth glass)
         float etaI = h.frontFace ? 1.0   : h.ior;
         float etaT = h.frontFace ? h.ior : 1.0;

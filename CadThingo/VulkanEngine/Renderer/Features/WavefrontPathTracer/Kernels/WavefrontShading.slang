@@ -39,10 +39,27 @@ public float3 wfFireflyClamp(float3 c) {
 public static const uint SC_DIFFUSE = 0u, SC_CONDUCTOR = 1u, SC_DIELECTRIC = 2u, SC_FULL = 3u;
 public static const uint SC_COUNT   = WF_SHADE_CLASSES;   // canonical count lives in WavefrontBindings
 
+// Lobe mask for a shading class -> drives compile-time lobe stripping (P3b). Superset-ordered:
+// every class has diffuse + base-spec; DIELECTRIC adds the transmit lobe; FULL adds clearcoat.
+// Spec-folded in Shade (from SHADING_CLASS) so the stripped lobes -- and their resolveHit texel
+// fetches + sampleBsdf branches -- dead-strip for the opaque classes. LOBE_* live in PTUtils.
+public uint classLobeMask(uint shadingClass) {
+    uint m = LOBE_DIFFUSE | LOBE_SPEC;
+    if (shadingClass >= SC_DIELECTRIC) m |= LOBE_TRANSMIT;    // DIELECTRIC, FULL
+    if (shadingClass >= SC_FULL)       m |= LOBE_CLEARCOAT;   // FULL only
+    return m;
+}
+
 public uint classifyShadingClass(PbrMaterial m) {
-    if (m.clearcoatFactor > 0.0 || m.clearcoatTex >= 0)         return SC_FULL;        // coat => all lobes
-    if (m.transmissionFactor > 0.0 || m.transmissionTex >= 0)   return SC_DIELECTRIC;  // + transmit lobe
-    if (m.metallicFactor > 0.0 || m.physicalDescriptorTex >= 0) return SC_CONDUCTOR;   // metal possible
+    // Classify on FACTORS ONLY. This engine leaves UNSET texture slots pointing at shared
+    // GltfDefaults textures -- valid bindless indices (>= 0), NOT -1 -- so a `tex >= 0` presence
+    // test is ~always true and would dump every material into FULL (the first branch). And textures
+    // compose MULTIPLICATIVELY here (metallic = metallicFactor * tex, transmission/clearcoat likewise,
+    // per resolveHit), so a zero factor kills its lobe regardless of the bound texture -- making
+    // factors alone both correct and conservative. Order matters: widest lobe set first (supersets win).
+    if (m.clearcoatFactor    > 0.0) return SC_FULL;        // coat => all lobes
+    if (m.transmissionFactor > 0.0) return SC_DIELECTRIC;  // + transmit lobe
+    if (m.metallicFactor     > 0.0) return SC_CONDUCTOR;   // metal possible (same lobes as DIFFUSE; coherence split)
     return SC_DIFFUSE;
 }
 
@@ -71,7 +88,7 @@ public float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float
 // The post-commit material/geometry block of PTCompute.slang::traceRay, run from the
 // stored recordIndex+primIdx+bary+t instead of a live RayQuery. `bounce` drives the
 // MATERIAL_LOD detail-fetch skip on deep bounces.
-public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin, float3 rayDir, uint bounce) {
+public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin, float3 rayDir, uint bounce, uint lobeMask = LOBE_ALL) {
     HitInfo h = (HitInfo)0;
     h.hit      = true;
     h.hitT     = triT;
@@ -145,20 +162,31 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
         h.normal  = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
     }
 
-    h.transmission = mat.transmissionFactor;
-    if (mat.transmissionTex >= 0 && !lowDetail)
-        h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].SampleLevel(s, uv, 0.0).r;
+    // P3b: skip the transmission / clearcoat reads entirely for classes whose PSO strips those
+    // lobes. The factors live in the already-loaded material struct (cheap), but the texel fetches
+    // are real memory traffic -- and since unset tex slots point at valid GltfDefaults textures
+    // (tex >= 0 is ~always true here), they would otherwise ALWAYS fire on bounces 0-1. Gated on
+    // the spec-folded lobeMask so the SampleLevel calls dead-strip for opaque classes.
+    h.transmission = 0.0;
+    if ((lobeMask & LOBE_TRANSMIT) != 0u) {
+        h.transmission = mat.transmissionFactor;
+        if (mat.transmissionTex >= 0 && !lowDetail)
+            h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].SampleLevel(s, uv, 0.0).r;
+    }
     h.ior = mat.ior;
 
     float f0_eta = (mat.ior - 1.0) / (mat.ior + 1.0);
     h.F0 = f0_eta * f0_eta;
 
-    h.clearcoat = mat.clearcoatFactor;
-    if (mat.clearcoatTex >= 0 && !lowDetail)
-        h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].SampleLevel(s, uv, 0.0).r;
-    h.clearcoatRoughness = mat.clearcoatRoughnessFactor;
-    if (mat.clearcoatRoughnessTex >= 0 && !lowDetail)
-        h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].SampleLevel(s, uv, 0.0).g;
+    h.clearcoat          = 0.0;
+    h.clearcoatRoughness = mat.clearcoatRoughnessFactor;   // floored below; value unused when clearcoat=0
+    if ((lobeMask & LOBE_CLEARCOAT) != 0u) {
+        h.clearcoat = mat.clearcoatFactor;
+        if (mat.clearcoatTex >= 0 && !lowDetail)
+            h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].SampleLevel(s, uv, 0.0).r;
+        if (mat.clearcoatRoughnessTex >= 0 && !lowDetail)
+            h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].SampleLevel(s, uv, 0.0).g;
+    }
 
     // Floor roughness so GGX D() stays evaluable (0 -> 0/0 NaN at the mirror dir).
     h.clearcoatRoughness = max(h.clearcoatRoughness, 0.045);
