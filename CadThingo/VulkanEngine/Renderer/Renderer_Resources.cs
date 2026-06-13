@@ -91,8 +91,9 @@ public unsafe partial class Renderer
             // (MAX_FRAMES), cull pass (renderables + cmds + instancesOut + count =
             // 4 × MAX_FRAMES), PBR shadow-alpha set (ShadowEntityInfo + global vb + ib),
             // plus the wavefront tracer (set 0 lights/shadow/emissive × MAX_FRAMES, set 1
-            // vb/ib, and the 18-binding set-4 SoA working set). Round up generously.
-            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 96 },
+            // vb/ib, and the 25-binding set-4 SoA working set: ping-ponged shadow records
+            // + connectArgs + shadowRadiance on top of the original 18). Round up generously.
+            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 128 },
             new() { Type = DescriptorType.SampledImage,             DescriptorCount = MAX_BINDLESS_TEXTURES * MAX_CONCURRENT_FRAMES },
             new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
             // 5 g-buffer samplers (set 1) + 3 IBL samplers × MAX_FRAMES on set 0

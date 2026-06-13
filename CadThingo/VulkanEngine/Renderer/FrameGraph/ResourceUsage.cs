@@ -12,13 +12,28 @@ public enum ResourceUsage
     TransferSrc, TransferDst,
     StorageRT, AccelStructBuild, AccelStructRead,
     Present,
+
+    // Compute storage RW whose accessors are MUTUALLY SAFE BY CONSTRUCTION (disjoint element
+    // sets, or commutative updates the caller has reasoned about): consecutive accesses with
+    // this same usage get NO barrier (like read-after-read), so the later pass can overlap the
+    // earlier one on the queue. A barrier IS emitted on the transition into and out of the
+    // concurrent run, so visibility against ordinary readers/writers stays intact. Versions
+    // still bump per access, so the DAG (schedule order) is unchanged -- only barriers relax.
+    StorageConcurrentCompute,
+
+    // A buffer consumed as BOTH the indirect-dispatch source AND a compute storage read in the
+    // same pass (e.g. VkDispatchIndirectCommand words plus a trailing count the kernel reads).
+    // One usage so the single derived barrier's dst scope covers both access kinds -- declaring
+    // them as two reads would bake the barrier from the first and leave the second un-published.
+    IndirectArgStorageRead,
 }
 
 internal readonly record struct UsageInfo(
     PipelineStageFlags2 Stage,
     AccessFlags2 Access,
     ImageLayout Layout,
-    bool IsWrite);
+    bool IsWrite,
+    bool IsConcurrent = false);
 
 internal static class UsageTable
 {
@@ -116,6 +131,16 @@ internal static class UsageTable
             PipelineStageFlags2.BottomOfPipeBit,
             AccessFlags2.None,
             ImageLayout.PresentSrcKhr, false),
+
+        ResourceUsage.StorageConcurrentCompute => new(
+            PipelineStageFlags2.ComputeShaderBit,
+            AccessFlags2.ShaderStorageReadBit | AccessFlags2.ShaderStorageWriteBit,
+            ImageLayout.General, true, IsConcurrent: true),
+
+        ResourceUsage.IndirectArgStorageRead => new(
+            PipelineStageFlags2.DrawIndirectBit | PipelineStageFlags2.ComputeShaderBit,
+            AccessFlags2.IndirectCommandReadBit | AccessFlags2.ShaderStorageReadBit,
+            ImageLayout.Undefined /* buffer only */, false),
 
         _ => throw new ArgumentOutOfRangeException(nameof(u), u, null)
     };

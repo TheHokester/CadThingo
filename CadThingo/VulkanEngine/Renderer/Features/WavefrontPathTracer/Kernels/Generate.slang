@@ -27,10 +27,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
     //at full weight (NEE had no prior chance to sample it).
     psRayOrigin[px]=float4(ray.Origin,0);
     psRayDir[px]=float4(ray.Direction,0);
-    psThroughput[px]=float4(1,1,1,1.0);
-    psRadiance[px]=float4(0,0,0,0);
-    psSigmaA[px]=float4(0,0,0,0);   // start in vacuum (no medium absorption); P2.6 Beer-Lambert
-    psRng[px]=rng; 
+    psThroughput[px]=wfPackHalf4(float4(1,1,1,1.0));
+    psRadiance[px]=uint2(0,0);      // packed half4 zeros
+    psSigmaA[px]=uint2(0,0);        // start in vacuum (no medium absorption); P2.6 Beer-Lambert
+    shadowRadiance[px]=uint2(0,0);  // Connect's NEE accumulator, folded by Finalize
+    psRng[px]=rng;
     rayQueue0[px]=px;
     
     //set ray counters + the first stage's indirect args if this is the first ray. This folds

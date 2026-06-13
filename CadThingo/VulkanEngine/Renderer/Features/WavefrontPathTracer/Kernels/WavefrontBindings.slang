@@ -53,20 +53,39 @@ public [[vk::binding(3, 3)]] SamplerCube envCube;
 
 
 
+// ---- fp16 packing ------------------------------------------------------------------------
+// The wide per-path payloads are stored as packed halves (uint2 = half4, uint = half2):
+// ~44B/path off the working set AND half the load/store traffic in the hot kernels. Values
+// stay fp32 in registers (f32tof16 at store, f16tof32 at load), so no 16-bit storage device
+// features are needed. Flag lanes survive exactly (-1/0/1 are exact halves); the firefly
+// clamp (256) bounds radiance/contribution well inside half range (65504). KEPT fp32: ray
+// origins + dirs (trace precision; psRayDir.w carries the MIS pdf, which can exceed half
+// range at low roughness), shadowOrigin (w = tMax), hitT.
+public uint2 wfPackHalf4(float4 v) {
+    return uint2(f32tof16(v.x) | (f32tof16(v.y) << 16),
+                 f32tof16(v.z) | (f32tof16(v.w) << 16));
+}
+public float4 wfUnpackHalf4(uint2 p) {
+    return float4(f16tof32(p.x & 0xFFFFu), f16tof32(p.x >> 16),
+                  f16tof32(p.y & 0xFFFFu), f16tof32(p.y >> 16));
+}
+public uint  wfPackHalf2(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }
+public float2 wfUnpackHalf2(uint p) { return float2(f16tof32(p & 0xFFFFu), f16tof32(p >> 16)); }
+
 // Persistent path state — survives every bounce. Indexed by pathIdx (= pixel index).
 public [[vk::binding(0,4)]]  RWStructuredBuffer<float4> psRayOrigin;  // xyz = ray O          (w free)
 public [[vk::binding(1,4)]]  RWStructuredBuffer<float4> psRayDir;     // xyz = ray D          (w = prevBsdfPdf, P2 MIS)
-public [[vk::binding(2,4)]]  RWStructuredBuffer<float4> psThroughput; // xyz = throughput β   (w = packed flags: prevWasDelta|inMedium, P2)
-public [[vk::binding(3,4)]]  RWStructuredBuffer<float4> psRadiance;   // xyz = radiance L     (w free)
+public [[vk::binding(2,4)]]  RWStructuredBuffer<uint2>  psThroughput; // PACKED half4: xyz = β, w = flags (1 = prevWasDelta, -1 = escaped w/ env stash)
+public [[vk::binding(3,4)]]  RWStructuredBuffer<uint2>  psRadiance;   // PACKED half4: xyz = radiance L
 public [[vk::binding(4,4)]]  RWStructuredBuffer<uint>   psRng;        // PRNG state (own array: frequent RMW, perfect coalescing)
-public [[vk::binding(5,4)]]  RWStructuredBuffer<float4> psSigmaA;     // xyz = medium σ_a     (P2 only; omit binding in P1)
+public [[vk::binding(5,4)]]  RWStructuredBuffer<uint2>  psSigmaA;     // PACKED half4: xyz = medium σ_a
 
 // Compact hit — transient Extend→Shade. Indexed by pathIdx (NOT by queue slot): a material
 // sort/bin reorders the index list, so the hit must stay reachable from pathIdx, not from a
 // position that the sort destroys (see "Material-sorted shading"). Everything else recomputed.
 public [[vk::binding(6,4)]]  RWStructuredBuffer<uint2>  hitRecPrim;   // x = recordIndex (instanceID+geometryIndex), y = primIdx
 public [[vk::binding(7,4)]]  RWStructuredBuffer<float>  hitT;         // committed ray t
-public [[vk::binding(8,4)]]  RWStructuredBuffer<float2> hitBary;      // committed barycentrics
+public [[vk::binding(8,4)]]  RWStructuredBuffer<uint>   hitBary;      // PACKED half2: committed barycentrics
 
 // Work queues — index lists (this is the ONLY thing a material sort reshuffles; state stays put).
 // rayQueue ping-pongs by bounce parity (src/dst via push constant). shadeQueue is a single bin in
@@ -77,15 +96,56 @@ public [[vk::binding(11,4)]] RWStructuredBuffer<uint>   shadeQueue;   // pathIdx
 
 // Shadow records — Shade→Connect. Indexed by SHADOW SLOT (dense [0,shadowCount)). ≤1 record
 // per path per bounce ⇒ shadowPath values are unique ⇒ Connect's radiance add needs no atomics.
-public [[vk::binding(12,4)]] RWStructuredBuffer<uint>   shadowPath;   // target pathIdx
-public [[vk::binding(13,4)]] RWStructuredBuffer<float4> shadowOrigin; // xyz = O, w = tMax
-public [[vk::binding(14,4)]] RWStructuredBuffer<float4> shadowDir;    // xyz = D              (w free)
-public [[vk::binding(15,4)]] RWStructuredBuffer<float4> shadowLe;     // xyz = precomputed β·f·W·Le·cosθ contribution
+// PING-PONGED BY BOUNCE PARITY: bounce b's records live in set b&1 (Shade(b) writes it,
+// Connect(b) reads it) while Shade(b+1) fills the OTHER set -- so Connect(b) has no WAR
+// against Shade(b+1) and its async overlap window stretches to Extend(b+1)+Shade(b+1)+
+// Extend(b+2) (its real downstream consumer is Shade(b+2), which reuses set b&1).
+// Access through the rdShadow*/wrShadowRec helpers below, never the raw arrays.
+public [[vk::binding(12,4)]] RWStructuredBuffer<uint>   shadowPath0;   // target pathIdx
+public [[vk::binding(13,4)]] RWStructuredBuffer<float4> shadowOrigin0; // xyz = O, w = tMax (fp32: positions + distances)
+public [[vk::binding(14,4)]] RWStructuredBuffer<uint2>  shadowDir0;    // PACKED half4: xyz = D, w = castShadows
+public [[vk::binding(15,4)]] RWStructuredBuffer<uint2>  shadowLe0;     // PACKED half4: xyz = precomputed β·f·W·Le·cosθ contribution
+public [[vk::binding(19,4)]] RWStructuredBuffer<uint>   shadowPath1;
+public [[vk::binding(20,4)]] RWStructuredBuffer<float4> shadowOrigin1;
+public [[vk::binding(21,4)]] RWStructuredBuffer<uint2>  shadowDir1;
+public [[vk::binding(22,4)]] RWStructuredBuffer<uint2>  shadowLe1;
+
+// Connect's NEE contributions accumulate HERE, not in psRadiance: Connect is then the only
+// writer of this buffer all frame (Generate zeroes it, Finalize folds it into the path
+// radiance), so it conflicts with no graphics pass at all -- the other half of the wide
+// async window. PACKED half4: xyz = summed visible NEE contribution for this path.
+public [[vk::binding(24,4)]] RWStructuredBuffer<uint2>  shadowRadiance;
+
+public uint   rdShadowPath  (uint par, uint i) { return par == 0u ? shadowPath0[i]   : shadowPath1[i]; }
+public float4 rdShadowOrigin(uint par, uint i) { return par == 0u ? shadowOrigin0[i] : shadowOrigin1[i]; }
+public float4 rdShadowDir   (uint par, uint i) { return wfUnpackHalf4(par == 0u ? shadowDir0[i] : shadowDir1[i]); }
+public float3 rdShadowLe    (uint par, uint i) { return wfUnpackHalf4(par == 0u ? shadowLe0[i]  : shadowLe1[i]).xyz; }
+public void wrShadowRec(uint par, uint s, uint path, float4 origin, float4 dir, float3 le) {
+    if (par == 0u) {
+        shadowPath0[s] = path; shadowOrigin0[s] = origin;
+        shadowDir0[s] = wfPackHalf4(dir); shadowLe0[s] = wfPackHalf4(float4(le, 0.0));
+    } else {
+        shadowPath1[s] = path; shadowOrigin1[s] = origin;
+        shadowDir1[s] = wfPackHalf4(dir); shadowLe1[s] = wfPackHalf4(float4(le, 0.0));
+    }
+}
 
 // Counters + indirect args. Both array-shaped so the shade stage can fan out to one entry
 // per shading class in P3 (shadeCount[c] / shade-args[c]) with sizing-only changes.
 public [[vk::binding(16,4)]] RWStructuredBuffer<uint>   counters;     // rayCount, shadeCount[C], shadowCount, nextRayCount  (C=1 in P1/P2)
-public [[vk::binding(17,4)]] RWStructuredBuffer<uint>   dispatchArgs; // VkDispatchIndirectCommand[]: extend, shade[C], connect
+public [[vk::binding(17,4)]] RWStructuredBuffer<uint>   dispatchArgs; // VkDispatchIndirectCommand[]: extend, shade[C], connect(DEBUG-only, see below)
+
+// Connect's OWN indirect-args buffers (decoupling): Connect(b) overlaps the next bounce's
+// workers, and Extend's fused tail writes dispatchArgs (shade-args[b+1]) -- if Connect's
+// launch dims lived there too, that write would force a barrier between them. So Shade's
+// tail writes Connect's dims HERE instead, 16B per bounce: [groups, 1, 1, shadowCount]. The
+// 4th word is the exact record count, read by the Connect kernel as its thread gate (it must
+// NOT read counters[SHADOW_COUNT]: Extend(b+1)'s tail zeroes that while Connect(b) is in
+// flight). PING-PONGED BY BOUNCE PARITY like the shadow records (Shade(b+1)'s tail writes
+// the other buffer, so Connect(b)'s indirect read has no WAR against it). The dispatchArgs
+// connect slot is still written, but ONLY for the Stats-panel readback.
+public [[vk::binding(18,4)]] RWStructuredBuffer<uint>   connectArgs0;
+public [[vk::binding(23,4)]] RWStructuredBuffer<uint>   connectArgs1;
 
 
 // ---- Fused dispatch-arg generation (replaces the standalone PrepareArgs dispatches) --------
@@ -120,20 +180,47 @@ public void wfWriteArgs(uint byteOffset, uint groups){
     dispatchArgs[w + 2u] = 1u;
 }
 
+// Write Connect(b)'s launch dims + exact record count into its parity buffer (16B stride:
+// the indirect fetch reads words 0-2 at byte offset b*16, the kernel reads word 3).
+public void wfWriteConnectArgs(uint bounce, uint groups, uint count){
+    uint w = bounce * 4u;
+    if ((bounce & 1u) == 0u) {
+        connectArgs0[w + 0u] = groups; connectArgs0[w + 1u] = 1u;
+        connectArgs0[w + 2u] = 1u;     connectArgs0[w + 3u] = count;
+    } else {
+        connectArgs1[w + 0u] = groups; connectArgs1[w + 1u] = 1u;
+        connectArgs1[w + 2u] = 1u;     connectArgs1[w + 3u] = count;
+    }
+}
+public uint wfConnectCount(uint bounce){
+    return (bounce & 1u) == 0u ? connectArgs0[bounce * 4u + 3u] : connectArgs1[bounce * 4u + 3u];
+}
+
 // Device-coherent read of a counter the other groups built with InterlockedAdd (an RMW of +0
 // observes the committed value, unlike a plain load that may sit in L1).
 public uint wfCounterLoad(uint idx){ uint v; InterlockedAdd(counters[idx], 0u, v); return v; }
 
+// Total launch size of the merged shade stage: the sum over the C class bins, each clamped
+// with the same max(1,..) the launcher (Extend's tail) used per class. The counts were written
+// by Extend and published by the pass barrier, and nothing rewrites them until the elected
+// tail zeroes them (which happens-after every group has arrived), so plain loads are safe.
+public uint wfShadeTotalGroups(){
+    uint total = 0u;
+    for(uint c = 0u; c < WF_SHADE_CLASSES; c++)
+        total += wfGroupCount(counters[SHADE_COUNT_0 + c]);
+    return total;
+}
+
 // "Last group out" election for the fused tail. ALL threads of the group MUST call this from
-// uniform control flow (it issues a group sync). `activeCount` is the value this dispatch was
-// fanned out over (RAY_COUNT for Extend, SHADE_COUNT_0 for Shade); numGroups == wfGroupCount of
-// it == the launch size. Returns true in thread 0 of exactly the last group to arrive -- that
-// thread alone may then atomically read the final counters and write the next stage's args.
-public bool wfFuseTailElect(uint groupThreadId, uint activeCount){
+// uniform control flow (it issues a group sync). `numGroups` is the TOTAL number of workgroups
+// ticketing this election -- wfGroupCount(RAY_COUNT) for Extend, wfShadeTotalGroups() for the
+// merged shade stage (all C class dispatches share the ticket, so the tail runs in whichever
+// class's group arrives last). Returns true in thread 0 of exactly that group -- that thread
+// alone may then atomically read the final counters and write the next stage's args.
+public bool wfFuseTailElect(uint groupThreadId, uint numGroups){
     GroupMemoryBarrierWithGroupSync();          // this group's global writes issued; all threads here
     if(groupThreadId != 0u) return false;
     DeviceMemoryBarrier();                       // order them device-wide before the arrival ticket
-    uint numGroups = wfGroupCount(activeCount);
     uint ticket;
     InterlockedAdd(counters[COMPLETED_WG], 1u, ticket);
     if(ticket + 1u != numGroups) return false;

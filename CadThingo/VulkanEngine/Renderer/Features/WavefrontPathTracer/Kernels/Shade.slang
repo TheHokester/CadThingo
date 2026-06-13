@@ -36,16 +36,17 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
         uint   p     = shadeQueue[cls * pathCount + tid.x];   // class bin: [cls*pathCount, ...)
         uint   rng   = psRng[p];
         float3 inDir = psRayDir[p].xyz;            // incoming ray direction at this hit
-        HitInfo h    = resolveHit(hitRecPrim[p], hitT[p], hitBary[p], psRayOrigin[p].xyz, inDir, pc.bounce, LOBE_MASK);
+        HitInfo h    = resolveHit(hitRecPrim[p], hitT[p], wfUnpackHalf2(hitBary[p]), psRayOrigin[p].xyz, inDir, pc.bounce, LOBE_MASK);
         float3 V     = -inDir;
-        float3 thr   = psThroughput[p].xyz;        // throughput INTO this bounce (NEE + emissive use it)
+        float4 thr4  = wfUnpackHalf4(psThroughput[p]);
+        float3 thr   = thr4.xyz;                   // throughput INTO this bounce (NEE + emissive use it)
 
         // ---- 2.3 emissive pickup, MIS-weighted against the emissive-NEE strategy ----
         // Full weight when the previous bounce was delta (NEE couldn't sample it) or on the
         // primary ray; otherwise power-heuristic vs the light-sampling pdf this emitter would
         // have had from the previous vertex (factor-based, so it matches the alias weighting).
         float prevBsdfPdf  = psRayDir[p].w;
-        bool  prevWasDelta = psThroughput[p].w > 0.5;
+        bool  prevWasDelta = thr4.w > 0.5;
         float misEm = 1.0;
         if(!prevWasDelta && frameUBO.emissiveTriCount > 0u && frameUBO.totalEmissivePower > 0.0){
             float lumLe = luminance(materials[h.matidx].emissiveFactor);
@@ -55,7 +56,9 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
                 misEm = powerHeuristic(prevBsdfPdf, pLight);
             }
         }
-        psRadiance[p].xyz += wfFireflyClamp(thr * h.emissive * misEm);
+        float4 rad = wfUnpackHalf4(psRadiance[p]);
+        rad.xyz += wfFireflyClamp(thr * h.emissive * misEm);
+        psRadiance[p] = wfPackHalf4(rad);
 
         // ---- 2.4 NEE: stochastically pick ONE light category and emit ONE shadow record.
         // Shade precomputes the full contribution (Connect has no BSDF/light data); the dense
@@ -107,10 +110,10 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
             if(valid){
                 uint s;
                 InterlockedAdd(counters[SHADOW_COUNT], 1u, s);
-                shadowPath[s]   = p;
-                shadowOrigin[s] = float4(sOrigin, sTMax);
-                shadowDir[s]    = float4(sDir, castSh);                 // w: 1 = test occlusion, 0 = unshadowed
-                shadowLe[s]     = float4(wfFireflyClamp(contrib), 0.0);
+                // Parity set b&1 (ping-pong: Connect(b) reads this while Shade(b+1) fills
+                // the other). dir.w: 1 = test occlusion, 0 = unshadowed.
+                wrShadowRec(pc.bounce & 1u, s, p,
+                    float4(sOrigin, sTMax), float4(sDir, castSh), wfFireflyClamp(contrib));
             }
         }
 
@@ -134,13 +137,13 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
             // (reflect / diffuse / TIR) leaves psSigmaA untouched, so a ray trapped in a solid keeps
             // absorbing.
             if(bs.transmit)
-                psSigmaA[p] = float4(h.frontFace ? mediumSigmaA(materials[h.matidx]) : float3(0.0), 0.0);
+                psSigmaA[p] = wfPackHalf4(float4(h.frontFace ? mediumSigmaA(materials[h.matidx]) : float3(0.0), 0.0));
 
             // Next-bounce state + MIS state for the next Shade (psRayDir.w / psThroughput.w).
             float3 oN = bs.transmit ? -h.geometricNormal : h.geometricNormal;
             psRayOrigin[p]  = float4(h.worldPos + oN * 1e-3f, 0);
             psRayDir[p]     = float4(bs.wi, bs.pdf);
-            psThroughput[p] = float4(thr, bs.isDelta ? 1.0 : 0.0);
+            psThroughput[p] = wfPackHalf4(float4(thr, bs.isDelta ? 1.0 : 0.0));
 
             uint slot;
             InterlockedAdd(counters[NEXT_RAY_COUNT], 1u, slot);
@@ -151,10 +154,17 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
     }
 
     // ---- fused PrepConnect(bounce) + PrepExtend(bounce+1) ----
-    
-    if(cls == WF_SHADE_CLASSES - 1u && wfFuseTailElect(git.x, shadeCount)){
+    // The C class dispatches run CONCURRENTLY (one graph pass, no internal barriers), so the
+    // election spans all of them: numGroups = sum of every class's launch size, and the tail
+    // runs in whichever class's group arrives last -- by then SHADOW_COUNT / NEXT_RAY_COUNT
+    // hold the totals across all classes.
+    if(wfFuseTailElect(git.x, wfShadeTotalGroups())){
         uint nShadow = wfCounterLoad(SHADOW_COUNT);
-        // Connect is a leaf: plain ceil, fine for it to launch 0 groups when there are no records.
+        // Connect is a leaf: plain ceil, fine for it to launch 0 groups when there are no
+        // records. Its dims + exact count go to connectArgs (its own buffer, so the launch
+        // doesn't barrier against Extend(b+1)'s dispatchArgs tail-write); the dispatchArgs
+        // connect slot is ALSO written but is DEBUG-ONLY (Stats-panel readback).
+        wfWriteConnectArgs(pc.bounce, (nShadow + 63u) / 64u, nShadow);
         wfWriteArgs(wfConnectArgsOffset(pc.bounce), (nShadow + 63u) / 64u);
 
         if(pc.bounce + 1u < pc.maxBounces){

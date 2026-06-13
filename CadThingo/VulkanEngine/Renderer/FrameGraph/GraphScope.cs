@@ -22,6 +22,11 @@ public readonly struct GraphScope
     /// emitted as <c>Prefix/name</c>.</summary>
     public string Prefix { get; }
 
+    /// <summary>True when a pass declared <see cref="QueueClass.AsyncCompute"/> will really
+    /// run on the device's dedicated compute queue. Modules branch on this to pick between
+    /// an async layout and a single-queue fallback (e.g. the wavefront PT's Connect overlap).</summary>
+    public bool AsyncComputeAvailable => _g.AsyncComputeAvailable;
+
     internal GraphScope(FrameGraph g, string prefix)
     {
         _g = g;

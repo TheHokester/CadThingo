@@ -77,7 +77,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     // glass-heavy scenes that need more enter/exit refraction events (multilayered glass truncates
     // at MaxBounces). Structural (the graph is unrolled at build), so a change needs a graph rebuild
     // -- already covered by WavefrontPTCore's ctor / Resize.
-    public const uint MaxBounces = 4u;
+    public const uint MaxBounces = 8u;
 
     // ---- dispatchArgs byte layout (PER BOUNCE) -------------------------------
     // Each VkDispatchIndirectCommand is 12 bytes (x,y,z). Each bounce b owns a contiguous block of
@@ -85,6 +85,8 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     // to one indirect command per material class). The buffer RETAINS every bounce's launch size, so
     // a RenderDoc/Nsight capture (or the readback) shows the indirect args shrinking down the chain
     // -- the visible proof of compaction. Offsets MUST mirror WavefrontBindings.wf*ArgsOffset.
+    // NOTE: the connect slot is DEBUG-ONLY (kept so the Stats-panel readback layout is stable);
+    // Connect actually launches from ConnectArgsBuffer (see B_CONNECT_ARGS / RecordConnect).
     public  const uint  StagesPerBounce  = 2u + ShadeClasses;   // extend + C shade + connect
     private const uint  ArgStride        = 12u;      // sizeof(VkDispatchIndirectCommand)
     public static uint  ExtendArgsOffset (uint bounce)            => (bounce * StagesPerBounce + 0u)             * ArgStride;
@@ -125,9 +127,12 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private const int B_PS_RAY_ORIGIN = 0, B_PS_RAY_DIR = 1, B_PS_THROUGHPUT = 2, B_PS_RADIANCE = 3,
                       B_PS_RNG = 4, B_PS_SIGMA_A = 5, B_HIT_REC_PRIM = 6, B_HIT_T = 7, B_HIT_BARY = 8,
                       B_RAY_QUEUE0 = 9, B_RAY_QUEUE1 = 10, B_SHADE_QUEUE = 11,
-                      B_SHADOW_PATH = 12, B_SHADOW_ORIGIN = 13, B_SHADOW_DIR = 14, B_SHADOW_LE = 15,
-                      B_COUNTERS = 16, B_DISPATCH_ARGS = 17;
-    private const int Set4BindingCount = 18;
+                      B_SHADOW_PATH0 = 12, B_SHADOW_ORIGIN0 = 13, B_SHADOW_DIR0 = 14, B_SHADOW_LE0 = 15,
+                      B_COUNTERS = 16, B_DISPATCH_ARGS = 17, B_CONNECT_ARGS0 = 18,
+                      // Ping-pong partners (bounce parity 1) + Connect's private NEE accumulator.
+                      B_SHADOW_PATH1 = 19, B_SHADOW_ORIGIN1 = 20, B_SHADOW_DIR1 = 21, B_SHADOW_LE1 = 22,
+                      B_CONNECT_ARGS1 = 23, B_SHADOW_RADIANCE = 24;
+    private const int Set4BindingCount = 25;
 
     private readonly Buffer[]   _set4Buf   = new Buffer[Set4BindingCount];
     private readonly SubAlloc[] _set4Alloc = new SubAlloc[Set4BindingCount];
@@ -145,12 +150,19 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     public Buffer RayQueue0     => _set4Buf[B_RAY_QUEUE0];
     public Buffer RayQueue1     => _set4Buf[B_RAY_QUEUE1];
     public Buffer ShadeQueue    => _set4Buf[B_SHADE_QUEUE];
-    public Buffer ShadowPath    => _set4Buf[B_SHADOW_PATH];
-    public Buffer ShadowOrigin  => _set4Buf[B_SHADOW_ORIGIN];
-    public Buffer ShadowDir     => _set4Buf[B_SHADOW_DIR];
-    public Buffer ShadowLe      => _set4Buf[B_SHADOW_LE];
+    public Buffer ShadowPath0   => _set4Buf[B_SHADOW_PATH0];
+    public Buffer ShadowOrigin0 => _set4Buf[B_SHADOW_ORIGIN0];
+    public Buffer ShadowDir0    => _set4Buf[B_SHADOW_DIR0];
+    public Buffer ShadowLe0     => _set4Buf[B_SHADOW_LE0];
+    public Buffer ShadowPath1   => _set4Buf[B_SHADOW_PATH1];
+    public Buffer ShadowOrigin1 => _set4Buf[B_SHADOW_ORIGIN1];
+    public Buffer ShadowDir1    => _set4Buf[B_SHADOW_DIR1];
+    public Buffer ShadowLe1     => _set4Buf[B_SHADOW_LE1];
+    public Buffer ShadowRadiance => _set4Buf[B_SHADOW_RADIANCE];
     public Buffer Counters      => _set4Buf[B_COUNTERS];
     public Buffer DispatchArgsBuffer => _set4Buf[B_DISPATCH_ARGS];
+    public Buffer ConnectArgsBuffer0 => _set4Buf[B_CONNECT_ARGS0];
+    public Buffer ConnectArgsBuffer1 => _set4Buf[B_CONNECT_ARGS1];
 
     private UboBuffer[] _frameUbos = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
@@ -312,40 +324,73 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 
     private static uint PathCount(Extent2D e) => e.Width * e.Height;
 
-    /// <summary>Allocate the device-local SoA working set at <paramref name="pathCount"/> paths.</summary>
+    /// <summary>Allocate the device-local SoA working set at <paramref name="pathCount"/> paths.
+    /// h4/h2 fields are fp16-PACKED (uint2 = half4, uint = half2; see WavefrontBindings'
+    /// wfPackHalf4) -- ~44B/path off the footprint and half the payload traffic in the hot
+    /// kernels. Ray origins/dirs, shadowOrigin and hitT stay fp32 (trace precision; the MIS
+    /// pdf in psRayDir.w exceeds half range at low roughness).</summary>
     private void AllocSet4(uint pathCount)
     {
         ulong N  = pathCount;
-        ulong f4 = N * 16, f2 = N * 8, f1 = N * 4, u1 = N * 4, u2 = N * 8;
+        ulong f4 = N * 16, f1 = N * 4, u1 = N * 4, u2 = N * 8, h4 = N * 8, h2 = N * 4;
 
         CreateField(B_PS_RAY_ORIGIN, f4);
         CreateField(B_PS_RAY_DIR,    f4);
-        CreateField(B_PS_THROUGHPUT, f4);
-        CreateField(B_PS_RADIANCE,   f4);
+        CreateField(B_PS_THROUGHPUT, h4);
+        CreateField(B_PS_RADIANCE,   h4, crossQueue: true);   // Connect (async queue) accumulates NEE
         CreateField(B_PS_RNG,        u1);
-        CreateField(B_PS_SIGMA_A,    f4);   // P1: allocated + bound, never written
+        CreateField(B_PS_SIGMA_A,    h4);
         CreateField(B_HIT_REC_PRIM,  u2);
         CreateField(B_HIT_T,         f1);
-        CreateField(B_HIT_BARY,      f2);
+        CreateField(B_HIT_BARY,      h2);
         CreateField(B_RAY_QUEUE0,    u1);
         CreateField(B_RAY_QUEUE1,    u1);
         CreateField(B_SHADE_QUEUE,   ShadeClasses * u1);   // P3: C bins, class c owns [c*N, (c+1)*N)
-        CreateField(B_SHADOW_PATH,   u1);
-        CreateField(B_SHADOW_ORIGIN, f4);
-        CreateField(B_SHADOW_DIR,    f4);
-        CreateField(B_SHADOW_LE,     f4);
+        // Shadow records + connect-args are PING-PONGED by bounce parity (set b&1): Connect(b)
+        // reads its set while Shade(b+1) fills the other, so the async Connect's downstream
+        // consumer moves from Shade(b+1) to Shade(b+2) -- a full bounce of overlap window.
+        CreateField(B_SHADOW_PATH0,   u1, crossQueue: true);
+        CreateField(B_SHADOW_ORIGIN0, f4, crossQueue: true);
+        CreateField(B_SHADOW_DIR0,    h4, crossQueue: true);
+        CreateField(B_SHADOW_LE0,     h4, crossQueue: true);
+        CreateField(B_SHADOW_PATH1,   u1, crossQueue: true);
+        CreateField(B_SHADOW_ORIGIN1, f4, crossQueue: true);
+        CreateField(B_SHADOW_DIR1,    h4, crossQueue: true);
+        CreateField(B_SHADOW_LE1,     h4, crossQueue: true);
+        // Connect's private NEE accumulator (packed half4): Generate zeroes it, the Connects
+        // += into it, Finalize folds it -- no graphics pass ever touches it mid-frame.
+        CreateField(B_SHADOW_RADIANCE, h4, crossQueue: true);
         CreateField(B_COUNTERS,      CountersBytes);
         // dispatchArgs is also the indirect source for the three worker dispatches. Reset
         // in-shader (PrepareArgs) so no TransferDst / CmdFillBuffer is needed. TransferSrc is
         // for the TEMP/debug RecordArgsReadback copy (drop it if that feature is removed).
         CreateField(B_DISPATCH_ARGS, DispatchArgsBytes,
             BufferUsageFlags.IndirectBufferBit | BufferUsageFlags.TransferSrcBit);
+        // Connect's own indirect sources (decoupling): 16B per bounce = [groups,1,1,count],
+        // written by Shade's fused tail, so Connect(b)'s launch never barriers against
+        // Extend(b+1)'s dispatchArgs tail-write. The 4th word is the kernel's thread gate.
+        CreateField(B_CONNECT_ARGS0, (ulong)MaxBounces * 16u,
+            BufferUsageFlags.IndirectBufferBit, crossQueue: true);
+        CreateField(B_CONNECT_ARGS1, (ulong)MaxBounces * 16u,
+            BufferUsageFlags.IndirectBufferBit, crossQueue: true);
     }
 
-    private void CreateField(int binding, ulong size, BufferUsageFlags extra = 0) =>
+    // crossQueue: the buffer is touched by Connect, which the graph runs on the dedicated
+    // async-compute queue when the device has one -- CONCURRENT sharing skips queue-family
+    // ownership transfers (the graph's timeline semaphores carry the memory dependency).
+    // Collapses to EXCLUSIVE automatically when the compute family aliases graphics.
+    // NOTE: Connect also READS frame-global exclusive resources cross-queue (TLAS, entity
+    // info, materials, bindless textures, global VB/IB, frame UBO). Spec-strictly those want
+    // ownership transfers too; they are immutable mid-frame and desktop GPUs (this engine
+    // targets NVIDIA) have coherent caches across queues, so v1 leaves them exclusive.
+    private void CreateField(int binding, ulong size, BufferUsageFlags extra = 0, bool crossQueue = false)
+    {
+        uint[]? families = crossQueue && Gfx.QueueFamilyIndices is { graphicsFamily: { } g, computeFamily: { } c }
+            ? [g, c] : null;
         Gfx.CreateBuffer(size, BufferUsageFlags.StorageBufferBit | extra,
             MemoryPropertyFlags.DeviceLocalBit,
-            out _set4Buf[binding], out _set4Alloc[binding], GpuMemoryAllocator.PriorityHigh);
+            out _set4Buf[binding], out _set4Alloc[binding], families, GpuMemoryAllocator.PriorityHigh);
+    }
 
     private void FreeSet4()
     {
@@ -651,7 +696,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _connectPso);
         BindSets(cmd, frameIndex);
         PushWavefront(cmd, bounce, 0u);   // Connect ignores argsClass, but keeps the range covered
-        Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ConnectArgsOffset(bounce));
+        // Launch from the bounce-parity connectArgs (NOT dispatchArgs); 16B stride.
+        Vk.CmdDispatchIndirect(cmd,
+            (bounce & 1u) == 0u ? ConnectArgsBuffer0 : ConnectArgsBuffer1, bounce * 16u);
     }
 
     /// <summary>Dense finalize: accumulate radiance, normalize into outColor.</summary>

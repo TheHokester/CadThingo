@@ -954,25 +954,33 @@ public sealed unsafe class GraphicsDevice : IDisposable
             if (presentSupport && !indices.presentFamily.HasValue)
                 indices.presentFamily = i;
 
-            //check for compute support
-            if (qf.QueueFlags.HasFlag(QueueFlags.ComputeBit) && !indices.computeFamily.HasValue)
+            //check for compute support -- DEDICATED compute family only (compute && !graphics):
+            //this is the async-compute engine. Regular graphics-interleaved compute runs on the
+            //graphics queue; computeFamily falls back to graphicsFamily below when the device
+            //has no dedicated family (then ComputeQueue == GraphicsQueue and QueuePlan's
+            //same-handle guard degrades async compute to single-queue + barriers).
+            if (qf.QueueFlags.HasFlag(QueueFlags.ComputeBit) && !qf.QueueFlags.HasFlag(QueueFlags.GraphicsBit))
             {
-                indices.computeFamily = i;
+                if (!indices.computeFamily.HasValue)
+                    indices.computeFamily = i;
             }
 
-            //find dedicated transfer queue
-            if (qf.QueueFlags.HasFlag(QueueFlags.TransferBit) && !qf.QueueFlags.HasFlag(QueueFlags.GraphicsBit))
+            //find dedicated transfer queue (transfer && !graphics && !compute = the DMA engine)
+            if (qf.QueueFlags.HasFlag(QueueFlags.TransferBit)
+                && !qf.QueueFlags.HasFlag(QueueFlags.GraphicsBit)
+                && !qf.QueueFlags.HasFlag(QueueFlags.ComputeBit))
             {
                 if (!indices.transferFamily.HasValue)
                     indices.transferFamily = i;
             }
-
-            //if we have found all the required queue families
-            if (indices.IsComplete() && indices.transferFamily.HasValue)
-                break;
         }
 
-        //fallback if no transfer family is found
+        //fallbacks: no dedicated family -> alias the graphics family (same-handle guards
+        //downstream detect this and treat the class as "not really there")
+        if (!indices.computeFamily.HasValue && indices.graphicsFamily.HasValue)
+        {
+            indices.computeFamily = indices.graphicsFamily;
+        }
         if (!indices.transferFamily.HasValue && indices.graphicsFamily.HasValue)
         {
             indices.transferFamily = indices.graphicsFamily;
@@ -1208,16 +1216,32 @@ public sealed unsafe class GraphicsDevice : IDisposable
 
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
         out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault)
+        => CreateBuffer(size, usage, memProps, out buffer, out alloc, null, priority);
+
+    /// <summary>Buffer creation with optional CONCURRENT sharing. Pass the distinct queue
+    /// family indices that will access the buffer (e.g. graphics + async compute) and the
+    /// buffer skips queue-family ownership transfers entirely -- the render graph's
+    /// cross-queue semaphores then cover it with no release/acquire pair. Null, a single
+    /// family, or duplicate indices fall back to EXCLUSIVE.</summary>
+    public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
+        out Buffer buffer, out SubAlloc alloc, uint[]? sharedFamilies,
+        float priority = GpuMemoryAllocator.PriorityDefault)
     {
-        BufferCreateInfo bufferInfo = new()
+        uint[] families = sharedFamilies is null ? [] : sharedFamilies.Distinct().ToArray();
+        fixed (uint* pFamilies = families)
         {
-            SType = StructureType.BufferCreateInfo,
-            Size = size,
-            Usage = usage,
-            SharingMode = SharingMode.Exclusive,
-        };
-        if (vk.CreateBuffer(device, &bufferInfo, null, out buffer) != Result.Success)
-            throw new Exception("Failed to create buffer");
+            BufferCreateInfo bufferInfo = new()
+            {
+                SType = StructureType.BufferCreateInfo,
+                Size = size,
+                Usage = usage,
+                SharingMode = families.Length > 1 ? SharingMode.Concurrent : SharingMode.Exclusive,
+                QueueFamilyIndexCount = families.Length > 1 ? (uint)families.Length : 0,
+                PQueueFamilyIndices = families.Length > 1 ? pFamilies : null,
+            };
+            if (vk.CreateBuffer(device, &bufferInfo, null, out buffer) != Result.Success)
+                throw new Exception("Failed to create buffer");
+        }
 
         // DeviceAddress flag is already baked into every buffer-bucket block by
         // the allocator — no per-call PNext chain needed. Caller still has to set

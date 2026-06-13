@@ -24,7 +24,49 @@ public unsafe class FrameGraph : IDisposable
     // Labelled DAG edges captured during Compile, purely for ToDot (allows duplicates).
     private readonly List<(int from, int to, string label, bool dashed)> _dotEdges = [];
 
-    public FrameGraph(GraphicsDevice device) => gfx = device;
+    // ---- Multi-queue submission plan (async compute) --------------------------------------
+    // When a pass declares QueueClass.AsyncCompute AND the device has a dedicated compute
+    // family (QueuePlan.HasRealAsyncCompute), Compile partitions the schedule into per-queue
+    // SUBMIT CHUNKS: contiguous runs of same-queue passes, split exactly where a cross-queue
+    // edge needs a timeline-semaphore signal (after the producer) or wait (before the
+    // consumer). Execute then records each chunk into a graph-owned command buffer and
+    // submits them itself (the host's command buffer receives nothing; host work submitted
+    // later on the graphics queue lands after the chunks by submission order). Graphs with
+    // no async passes keep the original record-into-host-cmd path untouched.
+    private QueuePlan _plan;
+    private QueueClass[] _effQueue = [];           // per pass id: declared queue collapsed to what the device has
+    private readonly List<SubmitChunk> _chunks = [];   // creation order == schedule order per queue
+    private bool _chunked;                         // true iff any live pass landed on the async queue
+    private int _gfxSignalCount, _cmpSignalCount;  // relative timeline values consumed per frame
+    private int _lastGfxChunk = -1;                // closing image barriers are appended here
+    private Silk.NET.Vulkan.Semaphore _gfxTimeline, _cmpTimeline;
+    private ulong _gfxCursor, _cmpCursor;          // monotonic absolute timeline bases across frames
+    private CommandPool _gfxChunkPool, _cmpChunkPool;
+    private CommandBuffer[][] _chunkCmds = [];     // [frameInFlight][chunkIndex], parallel to _chunks
+    // DAG retained from Compile step 1 for the chunk planner (cross-queue edge discovery).
+    private HashSet<int>[] _adj = [], _preds = [];
+
+    /// <summary>True when the device has a dedicated compute family, i.e. a pass declared
+    /// <see cref="QueueClass.AsyncCompute"/> will really run on a second queue. Modules use
+    /// this to pick between an async layout and a single-queue fallback.</summary>
+    public bool AsyncComputeAvailable => _plan.HasRealAsyncCompute;
+
+    /// <summary>One per-queue submission: the contiguous run of scheduled passes it records,
+    /// the relative timeline value it signals on its own queue's semaphore (0 = none), and
+    /// the (queue, relative value) pairs its submit waits on.</summary>
+    private sealed class SubmitChunk
+    {
+        public QueueClass Queue;
+        public readonly List<int> Order = [];                    // positions in _executionOrder
+        public ulong Signal;                                     // relative value on own timeline; 0 = none
+        public readonly List<(QueueClass q, ulong rel)> Waits = [];
+    }
+
+    public FrameGraph(GraphicsDevice device)
+    {
+        gfx = device;
+        _plan = QueuePlan.Resolve(device);
+    }
 
     private Dictionary<int, GraphResource> _resources = [];
     private List<GraphPass> _passes = [];
@@ -269,6 +311,10 @@ public unsafe class FrameGraph : IDisposable
 
         _live = live;                  // kept for ToDot
         _culledCount = n - liveCount;
+        _adj = adj; _preds = preds;    // retained for the chunk planner (cross-queue edges)
+
+        // ---- 3.5 Queue assignment + submit chunking (no-op without real async passes) -----
+        PlanChunks();
 
         // ---- 4. Transient lifetimes (first/last touch in schedule order) ---------
         // Consumed by aliasing in Phase 4; computed now so the schedule stays the single
@@ -328,6 +374,181 @@ public unsafe class FrameGraph : IDisposable
             if (order < r.FirstUse) r.FirstUse = order;
             if (order > r.LastUse)  r.LastUse  = order;
         }
+    }
+
+    // ---- Step 3.5: queue assignment + submit chunking ----------------------------
+    // Collapse declared queues onto what the device has, then split the schedule into
+    // per-queue submit chunks at the cross-queue edges. Rules:
+    //  - a graphics pass with an async producer (any RAW/WAW/WAR pred) starts a NEW chunk
+    //    whose submit waits that producer chunk's timeline value (a wait gates the whole
+    //    submit, so passes that must NOT wait stay in earlier chunks);
+    //  - a graphics pass with an async CONSUMER closes its chunk with a signal right after
+    //    it, so the consumer has something to wait on;
+    //  - every async pass is its own chunk (v1) and always signals -- graphics consumers
+    //    and next-frame transitive ordering hang off that value.
+    // Cross-queue MEMORY sync rides the semaphores (signal makes all writes available, wait
+    // makes them visible), so BakeSync skips barriers on cross-queue transitions.
+    private void PlanChunks()
+    {
+        _chunks.Clear();
+        _gfxSignalCount = _cmpSignalCount = 0;
+        _lastGfxChunk = -1;
+        _chunked = false;
+
+        _effQueue = new QueueClass[_passes.Count];
+        for (int id = 0; id < _passes.Count; id++)
+        {
+            bool isAsync = _passes[id].Queue == QueueClass.AsyncCompute && _plan.HasRealAsyncCompute;
+            _effQueue[id] = isAsync ? QueueClass.AsyncCompute : QueueClass.Graphics;
+            _chunked |= isAsync && _live[id];
+        }
+        if (!_chunked) return;
+
+        // v1 restrictions: async passes must be compute/transfer work and touch BUFFERS only.
+        // Image layouts are tracked on the graphics timeline; letting an async pass transition
+        // one would need cross-queue layout handoff (queue family ownership transfer) -- out of
+        // scope until a feature needs it.
+        foreach (int id in _executionOrder)
+        {
+            if (_effQueue[id] != QueueClass.AsyncCompute) continue;
+            var p = _passes[id];
+            if (p.Type == PassType.Graphics)
+                throw new InvalidOperationException(
+                    $"FrameGraph: pass '{p.Name}' is PassType.Graphics but declared QueueClass.AsyncCompute.");
+            foreach (var a in p.Reads)
+                if (a.IsImage) throw new InvalidOperationException(
+                    $"FrameGraph: async pass '{p.Name}' accesses image '{_resources[a.ResourceId].Name}' -- async passes may only touch buffers (v1).");
+            foreach (var a in p.Writes)
+                if (a.IsImage) throw new InvalidOperationException(
+                    $"FrameGraph: async pass '{p.Name}' accesses image '{_resources[a.ResourceId].Name}' -- async passes may only touch buffers (v1).");
+        }
+
+        var passChunk = new int[_passes.Count];
+        Array.Fill(passChunk, -1);
+        int curIdx = -1;   // open graphics chunk index, -1 = none
+
+        for (int pos = 0; pos < _executionOrder.Count; pos++)
+        {
+            int id = _executionOrder[pos];
+            if (_effQueue[id] == QueueClass.Graphics)
+            {
+                // Async producers force a fresh chunk fronted by their waits. Every async
+                // chunk signals (see below), so the producer's value always exists.
+                List<(QueueClass, ulong)>? waits = null;
+                foreach (var pred in _preds[id])
+                    if (_effQueue[pred] == QueueClass.AsyncCompute)
+                        (waits ??= []).Add((QueueClass.AsyncCompute, _chunks[passChunk[pred]].Signal));
+                if (waits != null && curIdx >= 0) curIdx = -1;   // close the open chunk, unsignalled
+                if (curIdx < 0)
+                {
+                    _chunks.Add(new SubmitChunk { Queue = QueueClass.Graphics });
+                    curIdx = _chunks.Count - 1;
+                    _lastGfxChunk = curIdx;
+                }
+                if (waits != null) MergeWaits(_chunks[curIdx], waits);
+                _chunks[curIdx].Order.Add(pos);
+                passChunk[id] = curIdx;
+
+                // An async consumer needs a value to wait on: close this chunk with a signal.
+                foreach (var succ in _adj[id])
+                    if (_effQueue[succ] == QueueClass.AsyncCompute)
+                    {
+                        _chunks[curIdx].Signal = (ulong)++_gfxSignalCount;
+                        curIdx = -1;
+                        break;
+                    }
+            }
+            else
+            {
+                var chunk = new SubmitChunk { Queue = QueueClass.AsyncCompute, Signal = (ulong)++_cmpSignalCount };
+                List<(QueueClass, ulong)>? waits = null;
+                foreach (var pred in _preds[id])
+                {
+                    var predChunk = _chunks[passChunk[pred]];
+                    // A graphics pred's chunk was closed with a signal when this pass was seen
+                    // among its successors; an async pred always signals.
+                    (waits ??= []).Add((predChunk.Queue, predChunk.Signal));
+                }
+                if (waits != null) MergeWaits(chunk, waits);
+                chunk.Order.Add(pos);
+                _chunks.Add(chunk);
+                passChunk[id] = _chunks.Count - 1;
+            }
+        }
+
+        CreateSubmitResources();
+
+        static void MergeWaits(SubmitChunk chunk, List<(QueueClass q, ulong rel)> waits)
+        {
+            // One wait per queue, at the max value (a timeline wait at V covers every <= V).
+            foreach (var (q, rel) in waits)
+            {
+                if (rel == 0) throw new InvalidOperationException(
+                    "FrameGraph: cross-queue producer chunk has no signal -- chunk planner bug.");
+                int existing = chunk.Waits.FindIndex(w => w.q == q);
+                if (existing < 0) chunk.Waits.Add((q, rel));
+                else if (chunk.Waits[existing].rel < rel) chunk.Waits[existing] = (q, rel);
+            }
+        }
+    }
+
+    /// <summary>Per-queue command pools + per-frame chunk command buffers + the two timeline
+    /// semaphores. Created once per Compile (graphs rebuild on resize); torn down in Dispose.</summary>
+    private void CreateSubmitResources()
+    {
+        var vk  = gfx.Vk;
+        var dev = gfx.Device;
+
+        CommandPool MakePool(uint family)
+        {
+            var info = new CommandPoolCreateInfo
+            {
+                SType = StructureType.CommandPoolCreateInfo,
+                Flags = CommandPoolCreateFlags.ResetCommandBufferBit,
+                QueueFamilyIndex = family,
+            };
+            if (vk.CreateCommandPool(dev, &info, null, out var pool) != Result.Success)
+                throw new Exception("FrameGraph: failed to create chunk command pool");
+            return pool;
+        }
+        _gfxChunkPool = MakePool(_plan.Graphics.Family);
+        _cmpChunkPool = MakePool(_plan.AsyncCompute!.Value.Family);
+
+        _chunkCmds = new CommandBuffer[Renderer.MAX_CONCURRENT_FRAMES][];
+        for (int f = 0; f < Renderer.MAX_CONCURRENT_FRAMES; f++)
+        {
+            _chunkCmds[f] = new CommandBuffer[_chunks.Count];
+            for (int c = 0; c < _chunks.Count; c++)
+            {
+                var alloc = new CommandBufferAllocateInfo
+                {
+                    SType = StructureType.CommandBufferAllocateInfo,
+                    CommandPool = _chunks[c].Queue == QueueClass.Graphics ? _gfxChunkPool : _cmpChunkPool,
+                    Level = CommandBufferLevel.Primary,
+                    CommandBufferCount = 1,
+                };
+                fixed (CommandBuffer* p = &_chunkCmds[f][c])
+                    if (vk.AllocateCommandBuffers(dev, &alloc, p) != Result.Success)
+                        throw new Exception("FrameGraph: failed to allocate chunk command buffer");
+            }
+        }
+
+        Silk.NET.Vulkan.Semaphore MakeTimeline()
+        {
+            var type = new SemaphoreTypeCreateInfo
+            {
+                SType = StructureType.SemaphoreTypeCreateInfo,
+                SemaphoreType = SemaphoreType.Timeline,
+                InitialValue = 0,
+            };
+            var info = new SemaphoreCreateInfo { SType = StructureType.SemaphoreCreateInfo, PNext = &type };
+            if (vk.CreateSemaphore(dev, &info, null, out var sem) != Result.Success)
+                throw new Exception("FrameGraph: failed to create timeline semaphore");
+            return sem;
+        }
+        _gfxTimeline = MakeTimeline();
+        _cmpTimeline = MakeTimeline();
+        _gfxCursor = _cmpCursor = 0;
     }
 
     // ---- Physical-handle resolution (used by PassResources during Execute) --------
@@ -449,14 +670,21 @@ public unsafe class FrameGraph : IDisposable
                     ImageLayout.Undefined, false);
         }
 
+        // Queue of each resource's last WRITER (graphics until proven otherwise). A cross-
+        // queue access derives NO barrier: the consumer chunk's timeline-semaphore wait is
+        // the execution AND memory dependency (signal = all writes available, wait = all
+        // available memory visible). Empty when the graph isn't chunked.
+        var writeQueue = new Dictionary<int, QueueClass>();
+
         foreach (var passIdx in _executionOrder)
         {
             var pass = _passes[passIdx];
+            var q = _effQueue.Length > 0 ? _effQueue[passIdx] : QueueClass.Graphics;
             var imgs = new List<ImageMemoryBarrier2>();
             var bufs = new List<BufferMemoryBarrier2>();
             var bufRes = new List<int>();
-            foreach (var a in pass.Reads)  ProcessAccess(in a, state, imgs, bufs, bufRes);
-            foreach (var a in pass.Writes) ProcessAccess(in a, state, imgs, bufs, bufRes);
+            foreach (var a in pass.Reads)  ProcessAccess(in a, q, state, writeQueue, imgs, bufs, bufRes);
+            foreach (var a in pass.Writes) ProcessAccess(in a, q, state, writeQueue, imgs, bufs, bufRes);
             pass.ImageBarriers     = imgs.ToArray();
             pass.BufferBarriers    = bufs.ToArray();
             pass.BufferBarrierRes  = bufRes.ToArray();
@@ -480,19 +708,42 @@ public unsafe class FrameGraph : IDisposable
         _closingImageBarriers = closing.ToArray();
     }
 
-    private void ProcessAccess(in ResourceAccess a, Dictionary<int, UsageInfo> state,
-        List<ImageMemoryBarrier2> imgs, List<BufferMemoryBarrier2> bufs, List<int> bufRes)
+    private void ProcessAccess(in ResourceAccess a, QueueClass q, Dictionary<int, UsageInfo> state,
+        Dictionary<int, QueueClass> writeQueue, List<ImageMemoryBarrier2> imgs,
+        List<BufferMemoryBarrier2> bufs, List<int> bufRes)
     {
         var next = UsageTable.Of(a.Usage);
         var cur  = state[a.ResourceId];
 
+        // Cross-queue access (resource last written on the OTHER queue): the chunk-level
+        // timeline wait derived from this same DAG edge is the dependency; record no barrier.
+        // A cross-queue READ also leaves the stored state untouched, so later consumers on
+        // the writer's own queue still derive their barrier against the real write (the
+        // reader's execution is tracked by the semaphore, not the state cursor). A cross-
+        // queue WRITE adopts the resource: state and owning queue move to this queue.
+        if (writeQueue.TryGetValue(a.ResourceId, out var wq) ? wq != q : q != QueueClass.Graphics)
+        {
+            if (next.IsWrite)
+            {
+                state[a.ResourceId]      = next;
+                writeQueue[a.ResourceId] = q;
+            }
+            return;
+        }
+
         bool readAfterRead = !next.IsWrite && !cur.IsWrite;
+        // Concurrent-after-concurrent: both accesses declared StorageConcurrentCompute, whose
+        // contract is "mutually safe by construction" -- skip the barrier exactly like
+        // read-after-read so the later pass can overlap the earlier on the queue. The widened
+        // state still carries IsWrite/IsConcurrent, so the eventual transition OUT of the
+        // concurrent run (an ordinary read or write) emits a barrier covering every accessor.
+        bool concurrentRepeat = next.IsConcurrent && cur.IsConcurrent;
         bool layoutChange  = a.IsImage && cur.Layout != next.Layout;
 
         // Pure read-after-read in a compatible layout needs no barrier — but widen the
         // visibility set so the eventual writer waits on EVERY prior reader, not just the
         // last (two readers on different stages would otherwise drop the first).
-        if (readAfterRead && !layoutChange)
+        if ((readAfterRead || concurrentRepeat) && !layoutChange)
         {
             state[a.ResourceId] = cur with { Stage = cur.Stage | next.Stage, Access = cur.Access | next.Access };
             return;
@@ -557,10 +808,18 @@ public unsafe class FrameGraph : IDisposable
     /// Replays the baked plan: per scheduled pass, emit its barrier batch then record its
     /// body; finally hand imported images back in their declared final layout. No
     /// per-frame analysis — <see cref="Compile"/> did it all.
+    ///
+    /// When the compiled plan contains async-compute chunks, the host's <paramref name="cmd"/>
+    /// receives NOTHING: the graph records each chunk into its own command buffers and submits
+    /// them itself (graphics chunks first, then async). Host work recorded into
+    /// <paramref name="cmd"/> and submitted later on the graphics queue executes after the
+    /// chunks by submission order, exactly as it did when the passes lived inside it.
     /// </summary>
     public void Execute(CommandBuffer cmd, in Renderer.FrameContext frame)
     {
         if (!Compiled) throw new InvalidOperationException("FrameGraph: call Compile() before Execute().");
+
+        if (_chunked) { ExecuteChunked(in frame); return; }
 
         _debug?.BeginFrame(cmd, frame.FrameIndex);
         var resources = new PassResources(this);
@@ -572,12 +831,140 @@ public unsafe class FrameGraph : IDisposable
                 pass.BufferBarriers[k].Buffer = ResolveBufferFrame(pass.BufferBarrierRes[k], frame.FrameIndex);
 
             _debug?.BeginPass(cmd, frame.FrameIndex, i);   // debug label + begin timestamp/stats
-            
+
             EmitBarriers(cmd, pass.ImageBarriers, pass.BufferBarriers);
             pass.Execute(cmd, resources, in frame);
             _debug?.EndPass(cmd, frame.FrameIndex, i);      // end timestamp/stats + pop label
         }
         EmitBarriers(cmd, _closingImageBarriers, []);
+    }
+
+    /// <summary>Record every chunk into this frame slot's command buffers, then submit each
+    /// queue's chunks in one vkQueueSubmit2 call with the baked timeline waits/signals mapped
+    /// to absolute values (base cursor + relative). Frame pacing: the last graphics chunk
+    /// transitively waits the async timeline (its passes consume async results), and the
+    /// host's own submit -- with the frame fence -- lands after it on the graphics queue, so
+    /// the existing fence covers the async queue too. Timeline waits may be submitted before
+    /// their signals (core timeline-semaphore behavior), so submission order between the two
+    /// queues is free; graphics goes first only for profiler readability.</summary>
+    private void ExecuteChunked(in Renderer.FrameContext frame)
+    {
+        uint fr = frame.FrameIndex;
+        var vk = gfx.Vk;
+        var resources = new PassResources(this);
+
+        bool firstGfx = true;
+        for (int c = 0; c < _chunks.Count; c++)
+        {
+            var chunk = _chunks[c];
+            var cb = _chunkCmds[fr][c];
+            vk.ResetCommandBuffer(cb, 0);
+            var begin = new CommandBufferBeginInfo
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+            };
+            if (vk.BeginCommandBuffer(cb, &begin) != Result.Success)
+                throw new Exception("FrameGraph: failed to begin chunk command buffer");
+
+            // Query-pool resets live in the first graphics chunk; async chunks may still
+            // write timestamps -- their submits wait on graphics values signalled after the
+            // reset, so the reset is ordered before every async write.
+            if (chunk.Queue == QueueClass.Graphics && firstGfx)
+            {
+                _debug?.BeginFrame(cb, fr);
+                firstGfx = false;
+            }
+
+            foreach (var pos in chunk.Order)
+            {
+                var pass = _passes[_executionOrder[pos]];
+                for (int k = 0; k < pass.BufferBarriers.Length; k++)
+                    pass.BufferBarriers[k].Buffer = ResolveBufferFrame(pass.BufferBarrierRes[k], fr);
+
+                _debug?.BeginPass(cb, fr, pos);
+                EmitBarriers(cb, pass.ImageBarriers, pass.BufferBarriers);
+                pass.Execute(cb, resources, in frame);
+                _debug?.EndPass(cb, fr, pos);
+            }
+
+            if (c == _lastGfxChunk) EmitBarriers(cb, _closingImageBarriers, []);
+            if (vk.EndCommandBuffer(cb) != Result.Success)
+                throw new Exception("FrameGraph: failed to end chunk command buffer");
+        }
+
+        // Map this frame's relative timeline values onto the monotonic cursors.
+        ulong gfxBase = _gfxCursor; _gfxCursor += (ulong)_gfxSignalCount;
+        ulong cmpBase = _cmpCursor; _cmpCursor += (ulong)_cmpSignalCount;
+
+        SubmitChunksFor(QueueClass.Graphics,     _plan.Graphics.Handle,            fr, gfxBase, cmpBase);
+        SubmitChunksFor(QueueClass.AsyncCompute, _plan.AsyncCompute!.Value.Handle, fr, gfxBase, cmpBase);
+    }
+
+    private void SubmitChunksFor(QueueClass q, Queue queue, uint fr, ulong gfxBase, ulong cmpBase)
+    {
+        int n = 0, totalWaits = 0, totalSignals = 0;
+        foreach (var chunk in _chunks)
+        {
+            if (chunk.Queue != q) continue;
+            n++;
+            totalWaits += chunk.Waits.Count;
+            if (chunk.Signal != 0) totalSignals++;
+        }
+        if (n == 0) return;
+
+        var submits = stackalloc SubmitInfo2[n];
+        var cmdInfos = stackalloc CommandBufferSubmitInfo[n];
+        var waitInfos = stackalloc SemaphoreSubmitInfo[Math.Max(1, totalWaits)];
+        var signalInfos = stackalloc SemaphoreSubmitInfo[Math.Max(1, totalSignals)];
+
+        int si = 0, wi = 0, gi = 0;
+        for (int c = 0; c < _chunks.Count; c++)
+        {
+            var chunk = _chunks[c];
+            if (chunk.Queue != q) continue;
+
+            cmdInfos[si] = new CommandBufferSubmitInfo
+            {
+                SType = StructureType.CommandBufferSubmitInfo,
+                CommandBuffer = _chunkCmds[fr][c],
+            };
+
+            int waitStart = wi;
+            foreach (var (wq, rel) in chunk.Waits)
+                waitInfos[wi++] = new SemaphoreSubmitInfo
+                {
+                    SType = StructureType.SemaphoreSubmitInfo,
+                    Semaphore = wq == QueueClass.Graphics ? _gfxTimeline : _cmpTimeline,
+                    Value = (wq == QueueClass.Graphics ? gfxBase : cmpBase) + rel,
+                    StageMask = PipelineStageFlags2.AllCommandsBit,
+                };
+
+            int sigStart = gi;
+            if (chunk.Signal != 0)
+                signalInfos[gi++] = new SemaphoreSubmitInfo
+                {
+                    SType = StructureType.SemaphoreSubmitInfo,
+                    Semaphore = q == QueueClass.Graphics ? _gfxTimeline : _cmpTimeline,
+                    Value = (q == QueueClass.Graphics ? gfxBase : cmpBase) + chunk.Signal,
+                    StageMask = PipelineStageFlags2.AllCommandsBit,
+                };
+
+            submits[si] = new SubmitInfo2
+            {
+                SType = StructureType.SubmitInfo2,
+                CommandBufferInfoCount = 1,
+                PCommandBufferInfos = &cmdInfos[si],
+                WaitSemaphoreInfoCount = (uint)(wi - waitStart),
+                PWaitSemaphoreInfos = wi > waitStart ? &waitInfos[waitStart] : null,
+                SignalSemaphoreInfoCount = (uint)(gi - sigStart),
+                PSignalSemaphoreInfos = gi > sigStart ? &signalInfos[sigStart] : null,
+            };
+            si++;
+        }
+
+        if (gfx.Vk.QueueSubmit2(queue, (uint)n, submits, default) != Result.Success)
+            throw new Exception($"FrameGraph: QueueSubmit2 failed for {q} chunks");
     }
 
     
@@ -622,11 +1009,17 @@ public unsafe class FrameGraph : IDisposable
         var eligible = new bool[live];
         for (int i = 0; i < live; i++)
         {
-            var pass = _passes[_executionOrder[i]];
+            int id = _executionOrder[i];
+            var pass = _passes[id];
+            var effQ = _effQueue.Length > 0 ? _effQueue[id] : QueueClass.Graphics;
             names[i]    = pass.Name;
-            queues[i]   = pass.Queue;
+            queues[i]   = effQ;   // effective (post-collapse) queue, not the declared one
             types[i]    = pass.Type;
-            eligible[i] = pass.Type != PassType.Transfer;   // pipeline stats: draw/dispatch only
+            // Pipeline stats: draw/dispatch only, and NEVER on the async queue -- the stats
+            // pool carries graphics counters (IA/VS/...) that a compute-only queue cannot
+            // begin a query for. Timestamps are still written there (reset is ordered before
+            // the async chunks via their graphics-timeline waits).
+            eligible[i] = pass.Type != PassType.Transfer && effQ != QueueClass.AsyncCompute;
         }
 
         _barrierCount = _closingImageBarriers.Length;
@@ -837,6 +1230,15 @@ public unsafe class FrameGraph : IDisposable
         _debug?.Dispose();
         var vk  = gfx.Vk;
         var dev = gfx.Device;
+
+        // Async-compute submission plan (no-ops when the graph never chunked). Pools free
+        // their command buffers; the caller guarantees idle (graphs are rebuilt under
+        // DeviceWaitIdle on resize/mode-switch, same contract as the transient images below).
+        if (_gfxChunkPool.Handle != 0) vk.DestroyCommandPool(dev, _gfxChunkPool, null);
+        if (_cmpChunkPool.Handle != 0) vk.DestroyCommandPool(dev, _cmpChunkPool, null);
+        if (_gfxTimeline.Handle  != 0) vk.DestroySemaphore(dev, _gfxTimeline, null);
+        if (_cmpTimeline.Handle  != 0) vk.DestroySemaphore(dev, _cmpTimeline, null);
+
         foreach (var res in _resources.Values)
         {
             if (res.Residency != ResidencyKind.Transient) continue;   // never free imports

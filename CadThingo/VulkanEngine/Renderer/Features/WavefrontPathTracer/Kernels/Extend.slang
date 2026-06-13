@@ -48,9 +48,14 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
 
         if(q.CommittedStatus() != COMMITTED_TRIANGLE_HIT){
             // Miss: environment, scaled by IBL intensity to match the megakernel, then
-            // firefly-clamped before it lands in the accumulator. Terminates the path.
+            // firefly-clamped. Terminates the path. The contribution is STASHED in
+            // psThroughput (xyz = clamped env contribution, w = -1 escape sentinel) instead
+            // of added to psRadiance: the path is dead so its throughput is never read
+            // again, and keeping Extend off psRadiance lets Connect(b-1) -- the only other
+            // late writer -- overlap this dispatch without a race. Finalize folds it in.
             float3 env = envCube.SampleLevel(ray.Direction, 0.0).xyz * frameUBO.scaleIBLAmbient;
-            psRadiance[p].xyz += wfFireflyClamp(psThroughput[p].xyz * env);
+            float3 thr = wfUnpackHalf4(psThroughput[p]).xyz;
+            psThroughput[p] = wfPackHalf4(float4(wfFireflyClamp(thr * env), -1.0));
         } else {
             float tHit = q.CommittedRayT();
 
@@ -58,13 +63,17 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
             // when the path is inside a participating medium. No-op in vacuum (sigmaA == 0). Applied
             // here, before Shade picks up emissive/NEE at this hit, so those are already tinted by the
             // medium. Miss paths skip this (they escaped the boundary) -- matches the megakernel.
-            float3 sigmaA = psSigmaA[p].xyz;
-            if(any(sigmaA > 0.0)) psThroughput[p].xyz *= exp(-sigmaA * tHit);
+            float3 sigmaA = wfUnpackHalf4(psSigmaA[p]).xyz;
+            if(any(sigmaA > 0.0)){
+                float4 t = wfUnpackHalf4(psThroughput[p]);
+                t.xyz *= exp(-sigmaA * tHit);
+                psThroughput[p] = wfPackHalf4(t);
+            }
 
             uint recordIndex = q.CommittedInstanceID() + q.CommittedGeometryIndex();
             hitRecPrim[p] = uint2(recordIndex, q.CommittedPrimitiveIndex());
             hitT[p]       = tHit;
-            hitBary[p]    = q.CommittedTriangleBarycentrics();
+            hitBary[p]    = wfPackHalf2(q.CommittedTriangleBarycentrics());
             psRng[p]      = rng;   // hand the advanced stream to Shade for this path
 
             // P3.3 route by shading class into a per-class bin (factors + bound-texture presence
@@ -81,7 +90,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
     }
 
     // ---- fused PrepShade(bounce): one indirect command per class + reset shadow/next ----
-    if(wfFuseTailElect(git.x, rayCount)){
+    if(wfFuseTailElect(git.x, wfGroupCount(rayCount))){
         for(uint c = 0u; c < WF_SHADE_CLASSES; c++)
             wfWriteArgs(wfShadeArgsOffset(pc.bounce, c), wfGroupCount(wfCounterLoad(SHADE_COUNT_0 + c)));
         counters[SHADOW_COUNT]   = 0u;   // Shade accumulates shadow records from zero
