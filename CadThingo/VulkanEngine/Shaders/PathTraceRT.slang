@@ -46,6 +46,9 @@ static const uint  MAX_BOUNCES         = 8u;
 static const uint  MATERIAL_LOD_BOUNCE = 2u;
 static const float FIREFLY_CLAMP       = 256.0;
 static const uint  RIS_LIGHT_SAMPLE_COUNT = 8u;
+static const float CONE_SPREAD_K       = 1.0;   // per-bounce ray-cone widening (rad), scaled by surface roughness
+static const bool  CONE_LOD            = true;  // false -> always mip 0 (pre-cone behaviour), for A/B quality compare
+static const bool  STOCH_MIP           = true;  // secondary bounces collapse trilinear -> one stochastic mip (half the texels)
 
 
 // Interpolated UV / alpha helpers (RT stages → SampleLevel, no derivatives).
@@ -184,13 +187,92 @@ EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
 }
 
 
-// Ray payload: the slimmed HitInfo (filled by closesthit / hit=false on miss),
-// plus the rng channel any-hit advances for stochastic-alpha, and the bounce
-// index closesthit reads for material LOD.
+// Compact hit record carried through the payload (40B vs HitInfo's 120B) so the
+// closesthit -> raygen handoff (and the SER Invoke continuation) moves less state.
+// closesthit packs a fillHit() result; raygen unpacks back to a full HitInfo.
+struct PackedHit {
+    float3 worldPos;    // full precision (shadow-ray origins / NEE)
+    uint   nOct;        // shading normal, oct 2x16
+    uint   ngOct;       // geometric normal, oct 2x16
+    uint   baseIor;     // baseColor.rgb unorm8 | ior unorm8 over [1,3]
+    uint   emisRG;      // emissive.rg as f16x2
+    uint   scal0;       // metallic | roughness | transmission | clearcoat (unorm8x4)
+    uint   scal1;       // clearcoatRoughness unorm8 | emissive.b f16 in bits 16..31
+    uint   matFlags;    // matidx:24 | hit:bit24 | frontFace:bit25
+};
+
+float2 octWrap(float2 v) {
+    return (1.0 - abs(v.yx)) * float2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+}
+uint packNormalOct(float3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 e = saturate(((n.z >= 0.0) ? n.xy : octWrap(n.xy)) * 0.5 + 0.5);
+    return uint(round(e.x * 65535.0)) | (uint(round(e.y * 65535.0)) << 16);
+}
+float3 unpackNormalOct(uint p) {
+    float2 e = float2(float(p & 0xFFFFu), float(p >> 16)) / 65535.0 * 2.0 - 1.0;
+    float3 n = float3(e, 1.0 - abs(e.x) - abs(e.y));
+    float t  = saturate(-n.z);
+    n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+    return normalize(n);
+}
+uint packU8x4(float a, float b, float c, float d) {
+    return uint(round(saturate(a) * 255.0))
+        | (uint(round(saturate(b) * 255.0)) << 8)
+        | (uint(round(saturate(c) * 255.0)) << 16)
+        | (uint(round(saturate(d) * 255.0)) << 24);
+}
+float unpackU8(uint p, uint shift) { return float((p >> shift) & 0xFFu) / 255.0; }
+
+PackedHit packHit(HitInfo h) {
+    PackedHit p;
+    p.worldPos = h.worldPos;
+    p.nOct     = packNormalOct(h.normal);
+    p.ngOct    = packNormalOct(h.geometricNormal);
+    uint iorU  = uint(round(saturate((h.ior - 1.0) * 0.5) * 255.0));
+    p.baseIor  = (packU8x4(h.baseColor.r, h.baseColor.g, h.baseColor.b, 0.0) & 0x00FFFFFFu) | (iorU << 24);
+    p.emisRG   = f32tof16(h.emissive.r) | (f32tof16(h.emissive.g) << 16);
+    p.scal0    = packU8x4(h.metallic, h.roughness, h.transmission, h.clearcoat);
+    p.scal1    = uint(round(saturate(h.clearcoatRoughness) * 255.0)) | (f32tof16(h.emissive.b) << 16);
+    p.matFlags = (h.matidx & 0x00FFFFFFu) | (1u << 24) | (h.frontFace ? (1u << 25) : 0u);
+    return p;
+}
+
+HitInfo unpackHit(PackedHit p, float3 rayOrigin) {
+    HitInfo h = (HitInfo)0;
+    h.hit = (p.matFlags & (1u << 24)) != 0u;
+    if (!h.hit) return h;
+    h.matidx          = p.matFlags & 0x00FFFFFFu;
+    h.frontFace       = (p.matFlags & (1u << 25)) != 0u;
+    h.worldPos        = p.worldPos;
+    h.hitT            = length(p.worldPos - rayOrigin);
+    h.normal          = unpackNormalOct(p.nOct);
+    h.geometricNormal = unpackNormalOct(p.ngOct);
+    h.clearcoatNormal = h.normal;
+    h.baseColor       = float4(unpackU8(p.baseIor, 0), unpackU8(p.baseIor, 8), unpackU8(p.baseIor, 16), 1.0);
+    float ior         = 1.0 + unpackU8(p.baseIor, 24) * 2.0;
+    h.ior             = ior;
+    float f0e         = (ior - 1.0) / (ior + 1.0);
+    h.F0              = f0e * f0e;
+    h.metallic        = unpackU8(p.scal0, 0);
+    h.roughness       = max(unpackU8(p.scal0, 8), 0.045);
+    h.transmission    = unpackU8(p.scal0, 16);
+    h.clearcoat       = unpackU8(p.scal0, 24);
+    h.clearcoatRoughness = max(unpackU8(p.scal1, 0), 0.045);
+    h.emissive        = float3(f16tof32(p.emisRG & 0xFFFFu), f16tof32(p.emisRG >> 16), f16tof32(p.scal1 >> 16));
+    return h;
+}
+
+// Payload: packed hit (closesthit fills / miss clears), the rng channel any-hit
+// advances for stochastic alpha, the bounce index closesthit reads for material
+// LOD, and the ray-cone footprint (width at the ray origin + angular spread) that
+// closesthit completes with the hit distance for texture LOD.
 struct RayPayload {
-    HitInfo hit;
-    uint    rng;
-    uint    bounce;
+    PackedHit ph;
+    uint      rng;
+    uint      bounce;
+    float     coneWidth;
+    float     coneSpread;
 };
 
 
@@ -213,7 +295,7 @@ void anyHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes attr
 
 [shader("miss")]
 void missMain(inout RayPayload pay) {
-    pay.hit.hit = false;   // raygen samples the env using its tracked ray direction
+    pay.ph.matFlags = 0u;   // hit bit clear; raygen samples env from its ray direction
 }
 
 // Object-space point → world via the full per-geometry 3x4 (rows carry the
@@ -225,15 +307,30 @@ float3 xformPoint(ShadowEntityInfo info, float3 p) {
                   dot(info.xform2.xyz, p) + info.xform2.w);
 }
 
-// Shared hit-shading prep: fetches geometry + material at the hit and returns a
-// fully-populated HitInfo. Used by the closest-hit shader (non-SER path) and,
-// under USE_SER, inline in raygen after a HitObject query — the Slang 2026.1
-// HitObject.Invoke lowering is broken, and GetRayTCurrent isn't available in
-// raygen, so the SER path queries the hit identity and shades inline here. The
-// world hit position is computed from the world-transformed triangle (not
-// ray·t), so it's identical in both paths and stage-independent.
+// Ray-cone mip for a bindless texture: adds the texture-resolution term to the
+// per-triangle/footprint base computed in fillHit. Clamped so degenerate UVs or
+// tiny cones never request a negative level. When stoch is set (secondary
+// bounces), the trilinear pair collapses to one stochastically-chosen mip - half
+// the texels, unbiased, with variance that vanishes at coarse mips.
+float texConeLod(int texIdx, float lodBase, float xi, bool stoch) {
+    if (!CONE_LOD) return 0.0;
+    uint tw, th;
+    textures[NonUniformResourceIndex(texIdx)].GetDimensions(tw, th);
+    float lod = max(lodBase + 0.5 * log2(float(tw) * float(th)), 0.0);
+    if (STOCH_MIP && stoch) {
+        float fl = floor(lod);
+        lod = fl + (xi < (lod - fl) ? 1.0 : 0.0);
+    }
+    return lod;
+}
+
+// Fetches geometry + material at the hit and returns a fully-populated HitInfo.
+// Runs in closesthit for both paths. World hit position comes from the world-
+// transformed triangle (not ray.t), so it is stage-independent. coneWidth/
+// coneSpread carry the ray-cone footprint for texture LOD.
 HitInfo fillHit(ShadowEntityInfo info, uint primIdx, float2 bary,
-                float3 rayOrigin, float3 rayDir, bool lowDetail) {
+                float3 rayOrigin, float3 rayDir, bool lowDetail,
+                float coneWidth, float coneSpread, float lodJitter, bool stochMip) {
     HitInfo h = (HitInfo)0;
     h.hit    = true;
     h.matidx = info.materialIndex;
@@ -254,60 +351,75 @@ HitInfo fillHit(ShadowEntityInfo info, uint primIdx, float2 bary,
     h.worldPos = wp0 * baryW.x + wp1 * baryW.y + wp2 * baryW.z;
     h.hitT     = length(h.worldPos - rayOrigin);
 
-    float2 uv = fetchVertexUV(globalVertices, i0) * baryW.x
-              + fetchVertexUV(globalVertices, i1) * baryW.y
-              + fetchVertexUV(globalVertices, i2) * baryW.z;
+    float2 uv0 = fetchVertexUV(globalVertices, i0);
+    float2 uv1 = fetchVertexUV(globalVertices, i1);
+    float2 uv2 = fetchVertexUV(globalVertices, i2);
+    float2 uv  = uv0 * baryW.x + uv1 * baryW.y + uv2 * baryW.z;
 
     float3 nObj = fetchVertexNormal(globalVertices, i0) * baryW.x
                 + fetchVertexNormal(globalVertices, i1) * baryW.y
                 + fetchVertexNormal(globalVertices, i2) * baryW.z;
     float3 ngObj = normalize(cross(op1 - op0, op2 - op0));
 
-    float4 t0 = fetchVertexTangent(globalVertices, i0);
-    float4 t1 = fetchVertexTangent(globalVertices, i1);
-    float4 t2 = fetchVertexTangent(globalVertices, i2);
-    float3 tObj = t0.xyz * baryW.x + t1.xyz * baryW.y + t2.xyz * baryW.z;
-    float  bitangentSign = t0.w;
-
     // Object → world for directions: 3x3 of the per-geometry transform (identity
     // instance transform can't do it — the cluster BLAS baked positions).
     float3x3 obj2worldR = entityNormalMatrix(info);
     h.normal          = normalize(mul(obj2worldR, nObj));
     h.geometricNormal = normalize(mul(obj2worldR, ngObj));
-    float3 tangent    = normalize(mul(obj2worldR, tObj));
 
     h.frontFace = dot(h.geometricNormal, rayDir) < 0.0;
     if (!h.frontFace) { h.normal = -h.normal; h.geometricNormal = -h.geometricNormal; }
+
+    // Ray-cone texture LOD base: footprint width at this hit, the triangle's
+    // world/UV area ratio (texel density), and the grazing-angle stretch. The
+    // per-texture resolution term is added in texConeLod.
+    float coneW   = coneWidth + coneSpread * h.hitT;
+    float uvCross = abs((uv1.x - uv0.x) * (uv2.y - uv0.y) - (uv1.y - uv0.y) * (uv2.x - uv0.x));
+    float wCross  = length(cross(wp1 - wp0, wp2 - wp0));
+    float cosT    = max(abs(dot(h.geometricNormal, rayDir)), 1e-4);
+    float lodBase = 0.5 * log2(max(uvCross, 1e-12) / max(wCross, 1e-12))
+                  + log2(max(coneW, 1e-8) / cosT);
 
     PbrMaterial mat = materials[h.matidx];
     SamplerState s  = samplers[0];
 
     h.baseColor = mat.baseColorFactor;
     if (mat.baseColorTex >= 0)
-        h.baseColor *= textures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(s, uv, 0);
+        h.baseColor *= textures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(s, uv, texConeLod(mat.baseColorTex, lodBase, lodJitter, stochMip));
 
     h.metallic  = mat.metallicFactor;
     h.roughness = mat.roughnessFactor;
     if (mat.physicalDescriptorTex >= 0 && !lowDetail) {
-        float2 mr = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, 0).bg;
+        float2 mr = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, texConeLod(mat.physicalDescriptorTex, lodBase, lodJitter, stochMip)).bg;
         h.metallic  *= mr.x;
         h.roughness *= mr.y;
     }
 
     h.emissive = mat.emissiveFactor;
     if (mat.emissiveTex >= 0)
-        h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].SampleLevel(s, uv, 0).rgb;
+        h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].SampleLevel(s, uv, texConeLod(mat.emissiveTex, lodBase, lodJitter, stochMip)).rgb;
 
     if (mat.normalTex >= 0 && !lowDetail) {
-        float3 nm = textures[NonUniformResourceIndex(mat.normalTex)].SampleLevel(s, uv, 0).xyz * 2.0 - 1.0;
-        float3 T  = normalize(tangent);
-        float3 B  = cross(h.normal, T) * bitangentSign;
-        h.normal  = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
+        float3 nm  = textures[NonUniformResourceIndex(mat.normalTex)].SampleLevel(s, uv, texConeLod(mat.normalTex, lodBase, lodJitter, stochMip)).xyz * 2.0 - 1.0;
+        // Tangent from UV gradients instead of a per-vertex tangent fetch: reuses
+        // the already-loaded positions/UVs, trading 48B/hit of fetch for ALU.
+        float2 d1  = uv1 - uv0, d2 = uv2 - uv0;
+        float  det = d1.x * d2.y - d1.y * d2.x;
+        if (abs(det) > 1e-12) {
+            float  r    = 1.0 / det;
+            float3 tObj = ((op1 - op0) * d2.y - (op2 - op0) * d1.y) * r;
+            float3 bObj = ((op2 - op0) * d1.x - (op1 - op0) * d2.x) * r;
+            float3 T    = normalize(mul(obj2worldR, tObj));
+            T           = normalize(T - h.normal * dot(h.normal, T));   // orthogonalize vs shading N
+            float  sgn  = dot(cross(h.normal, T), normalize(mul(obj2worldR, bObj))) < 0.0 ? -1.0 : 1.0;
+            float3 B    = cross(h.normal, T) * sgn;
+            h.normal    = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
+        }
     }
 
     h.transmission = mat.transmissionFactor;
     if (mat.transmissionTex >= 0 && !lowDetail)
-        h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].SampleLevel(s, uv, 0).r;
+        h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].SampleLevel(s, uv, texConeLod(mat.transmissionTex, lodBase, lodJitter, stochMip)).r;
     h.ior = mat.ior;
 
     float f0_eta = (mat.ior - 1.0) / (mat.ior + 1.0);
@@ -315,10 +427,10 @@ HitInfo fillHit(ShadowEntityInfo info, uint primIdx, float2 bary,
 
     h.clearcoat = mat.clearcoatFactor;
     if (mat.clearcoatTex >= 0 && !lowDetail)
-        h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].SampleLevel(s, uv, 0).r;
+        h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].SampleLevel(s, uv, texConeLod(mat.clearcoatTex, lodBase, lodJitter, stochMip)).r;
     h.clearcoatRoughness = mat.clearcoatRoughnessFactor;
     if (mat.clearcoatRoughnessTex >= 0 && !lowDetail)
-        h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].SampleLevel(s, uv, 0).g;
+        h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].SampleLevel(s, uv, texConeLod(mat.clearcoatRoughnessTex, lodBase, lodJitter, stochMip)).g;
     h.clearcoatRoughness = max(h.clearcoatRoughness, 0.045);
     h.roughness          = max(h.roughness,          0.045);
     h.clearcoatNormal    = h.normal;
@@ -329,9 +441,16 @@ HitInfo fillHit(ShadowEntityInfo info, uint primIdx, float2 bary,
 [shader("closesthit")]
 void closestHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes attr) {
     ShadowEntityInfo info = entityInfo[InstanceID() + GeometryIndex()];
-    pay.hit = fillHit(info, PrimitiveIndex(), attr.barycentrics,
-                      WorldRayOrigin(), WorldRayDirection(),
-                      pay.bounce >= MATERIAL_LOD_BOUNCE);
+    // Decorrelated mip jitter from a copy of the rng (stream left untouched so the
+    // light-transport noise is unchanged). Stochastic mip only past the primary.
+    uint jr = pay.rng;
+    float lodJitter = rand(jr);
+    HitInfo h = fillHit(info, PrimitiveIndex(), attr.barycentrics,
+                        WorldRayOrigin(), WorldRayDirection(),
+                        pay.bounce >= MATERIAL_LOD_BOUNCE,
+                        pay.coneWidth, pay.coneSpread,
+                        lodJitter, pay.bounce >= 1u);
+    pay.ph = packHit(h);
 }
 
 [shader("raygeneration")]
@@ -356,41 +475,35 @@ void rayGenMain() {
     float  prevBsdfPdf  = 0.0;
     bool   prevWasDelta = true;
 
+    // Ray-cone footprint for texture LOD: starts at the camera per-pixel spread.
+    float coneWidth  = 0.0;
+    float coneSpread = 2.0 * frameUBO.tanHalfFov / frameUBO.screenSize.y;
+
     RayPayload pay;
     uint cap = min(MAX_BOUNCES, frameUBO.bounceCap);
     for (uint b = 0u; b < cap; ++b) {
-        pay.bounce  = b;
-        pay.rng     = rngState;
-        pay.hit.hit = false;
+        pay.bounce      = b;
+        pay.rng         = rngState;
+        pay.ph.matFlags = 0u;
+        pay.coneWidth   = coneWidth;
+        pay.coneSpread  = coneSpread;
 #ifdef USE_SER
-        // Shader Execution Reordering: record the hit (runs traversal + any-hit),
-        // regroup warps by the hit so the shading lanes that follow are coherent,
-        // then query the hit identity and shade INLINE via fillHit. This is the
-        // getter-based SER pattern (HitObject.Invoke is broken in Slang 2026.1 and
-        // GetRayTCurrent isn't available in raygen). The reorder collapses the
-        // path-/material-divergence that strands ~2/3 of each warp's lanes.
-        // NV-only (Ada-class); the non-SER TraceRay variant is compiled otherwise.
+        // SER: HitObject.TraceRay records the hit (traversal + any-hit, defers
+        // closesthit/miss), ReorderThread regroups warps by material, then Invoke
+        // runs the now-coherent closesthit/miss. fillHit stays in closesthit so its
+        // transient register peak is off the raygen megakernel. Needs the explicit
+        // spvShaderInvocationReorderNV cap (Shaders.targets) for consistent NV ops.
         HitObject ho = HitObject.TraceRay(tlas, RAY_FLAG_NONE, 0xFF, 0u, 0u, 0u, ray, pay);
-        // Material-coherence hint: bucket the reorder by material in addition to
-        // hit, so warps regroup by what they're about to fetch. 8 bits = 256
-        // buckets, plenty for typical scenes. Miss → bucket 0 (harmless).
         uint matHint = ho.IsHit()
             ? entityInfo[ho.GetInstanceID() + ho.GetGeometryIndex()].materialIndex
             : 0u;
         ReorderThread(ho, matHint, 8u);
-        if (ho.IsHit()) {
-            ShadowEntityInfo info = entityInfo[ho.GetInstanceID() + ho.GetGeometryIndex()];
-            float2 bary = ho.GetAttributes<BuiltInTriangleIntersectionAttributes>().barycentrics;
-            pay.hit = fillHit(info, ho.GetPrimitiveIndex(), bary,
-                              ray.Origin, ray.Direction, b >= MATERIAL_LOD_BOUNCE);
-        } else {
-            pay.hit.hit = false;
-        }
+        HitObject.Invoke(tlas, ho, pay);
 #else
         TraceRay(tlas, RAY_FLAG_NONE, 0xFF, 0u, 0u, 0u, ray, pay);
 #endif
         rngState = pay.rng;            // any-hit advanced it (BLEND)
-        HitInfo hit = pay.hit;
+        HitInfo hit = unpackHit(pay.ph, ray.Origin);
 
         if (!hit.hit) {
             float3 env  = envCube.SampleLevel(ray.Direction, 0.0).rgb;
@@ -400,6 +513,9 @@ void rayGenMain() {
             radiance += envC;
             break;
         }
+
+        // Footprint at this hit becomes the next ray's origin cone width.
+        coneWidth += coneSpread * hit.hitT;
 
         if (any(sigmaA > 0.0)) throughput *= exp(-sigmaA * hit.hitT);
 
@@ -475,6 +591,10 @@ void rayGenMain() {
         throughput *= bs.weight;
         prevBsdfPdf  = bs.pdf;
         prevWasDelta = bs.isDelta;
+
+        // Non-delta scatter widens the cone (diffuse/glossy spread) so deeper,
+        // incoherent bounces sample coarse mips. Delta lobes keep it tight.
+        if (!bs.isDelta) coneSpread += CONE_SPREAD_K * max(hit.roughness, 0.3);
 
         if (any(isnan(throughput)) || any(isinf(throughput))) break;
 

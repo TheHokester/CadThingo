@@ -77,9 +77,14 @@
 
     <!-- Variants: same source, extra defines, distinct output. A separate item type keeps
          the base manifest one-output-per-source (no duplicate-identity batching). -->
+    <!-- spvShaderInvocationReorderNV is forced explicitly: Slang's auto-capability
+         resolution otherwise pulls in BOTH the NV and EXT shader-invocation-reorder
+         extensions and emits an OpTypeHitObjectNV with EXT-suffixed ops (HitObject.
+         TraceRay/Invoke/ReorderThread), which fails spirv-val and broke HitObject.
+         Invoke at runtime. Forcing NV keeps the hit-object type + ops consistent. -->
     <ShaderVariant Include="VulkanEngine\Shaders\PathTraceRT.slang"
                    OutputName="PathTraceRT_SER"
-                   Flags="-capability spvRayTracingKHR -DUSE_SER=1" />
+                   Flags="-capability spvRayTracingKHR -capability spvShaderInvocationReorderNV -DUSE_SER=1" />
 
     <!-- ===== Feature kernels ======================================================
          Discovered under Features/<F>/Kernels/. Output mirrors the feature folder:
