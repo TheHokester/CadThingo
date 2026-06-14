@@ -28,6 +28,34 @@ public float3 wfFireflyClamp(float3 c) {
 }
 
 
+// --- Ray-cone texture LOD (ported from PathTraceRT) --------------------------
+// resolveHit always sampled mip 0, which thrashes the texture cache on minified /
+// secondary-bounce hits -- the bulk of this tracer's L2/VRAM traffic. We instead
+// carry a ray cone per path (width at the ray origin + angular spread), grown each
+// bounce, and pick a mip from the surface footprint. The cone packs as a half2 into
+// the otherwise-unused psRayOrigin.w lane, so it adds NO working-set bytes.
+public static const float WF_CONE_SPREAD_K = 1.0;   // per-bounce widening (rad), scaled by roughness
+public static const bool  WF_CONE_LOD      = true;  // false -> always mip 0 (A/B quality compare)
+public static const bool  WF_STOCH_MIP     = true;  // secondary bounces: trilinear -> one stochastic mip
+
+// Ray-cone mip for a bindless texture: adds the texture-resolution term to the
+// per-triangle footprint base computed in resolveHit. Clamped so degenerate UVs or
+// tiny cones never request a negative level. When stoch is set (secondary bounces)
+// the trilinear pair collapses to one stochastically-chosen mip -- half the texels,
+// unbiased, variance vanishing at coarse mips.
+public float wfTexConeLod(int texIdx, float lodBase, float xi, bool stoch) {
+    if (!WF_CONE_LOD) return 0.0;
+    uint tw, th;
+    textures[NonUniformResourceIndex(texIdx)].GetDimensions(tw, th);
+    float lod = max(lodBase + 0.5 * log2(float(tw) * float(th)), 0.0);
+    if (WF_STOCH_MIP && stoch) {
+        float fl = floor(lod);
+        lod = fl + (xi < (lod - fl) ? 1.0 : 0.0);
+    }
+    return lod;
+}
+
+
 // --- P3.1 Shading-class taxonomy (material-sorted shading) -------------------
 // C = 4 routing classes, superset-ordered so DIFFUSE subset CONDUCTOR subset DIELECTRIC subset
 // FULL (lobe sets are additive). classifyShadingClass returns the MINIMAL covering class for a
@@ -87,8 +115,12 @@ public float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float
 // --- Hit resolve (off the stored compact hit; no re-trace) -------------------
 // The post-commit material/geometry block of PTCompute.slang::traceRay, run from the
 // stored recordIndex+primIdx+bary+t instead of a live RayQuery. `bounce` drives the
-// MATERIAL_LOD detail-fetch skip on deep bounces.
-public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin, float3 rayDir, uint bounce, uint lobeMask = LOBE_ALL) {
+// MATERIAL_LOD detail-fetch skip on deep bounces. coneWidth/coneSpread carry the path's
+// ray-cone footprint for texture LOD (mip 0 when zero -> the pre-cone behaviour);
+// lodJitter + stochMip drive the secondary-bounce single-mip collapse.
+public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin, float3 rayDir, uint bounce,
+                          uint lobeMask = LOBE_ALL, float coneWidth = 0.0, float coneSpread = 0.0,
+                          float lodJitter = 0.0, bool stochMip = false) {
     HitInfo h = (HitInfo)0;
     h.hit      = true;
     h.hitT     = triT;
@@ -106,9 +138,10 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
     uint i1 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 1u);
     uint i2 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 2u);
 
-    float2 uv = fetchVertexUV(globalVertices, i0) * baryW.x
-              + fetchVertexUV(globalVertices, i1) * baryW.y
-              + fetchVertexUV(globalVertices, i2) * baryW.z;
+    float2 uv0 = fetchVertexUV(globalVertices, i0);
+    float2 uv1 = fetchVertexUV(globalVertices, i1);
+    float2 uv2 = fetchVertexUV(globalVertices, i2);
+    float2 uv  = uv0 * baryW.x + uv1 * baryW.y + uv2 * baryW.z;
 
     float3 nObj = fetchVertexNormal(globalVertices, i0) * baryW.x
                 + fetchVertexNormal(globalVertices, i1) * baryW.y
@@ -117,18 +150,13 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
     float3 p0 = fetchVertexPos(globalVertices, i0);
     float3 p1 = fetchVertexPos(globalVertices, i1);
     float3 p2 = fetchVertexPos(globalVertices, i2);
-    float3 ngObj = normalize(cross(p1 - p0, p2 - p0));
-
-    float4 t0 = fetchVertexTangent(globalVertices, i0);
-    float4 t1 = fetchVertexTangent(globalVertices, i1);
-    float4 t2 = fetchVertexTangent(globalVertices, i2);
-    float3 tObj = t0.xyz * baryW.x + t1.xyz * baryW.y + t2.xyz * baryW.z;
-    float  bitangentSign = t0.w;
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 ngObj = normalize(cross(e1, e2));
 
     float3x3 obj2worldR = entityNormalMatrix(info);
     h.normal          = normalize(mul(obj2worldR, nObj));
     h.geometricNormal = normalize(mul(obj2worldR, ngObj));
-    float3 tangent    = normalize(mul(obj2worldR, tObj));
 
     h.frontFace = dot(h.geometricNormal, rayDir) < 0.0;
     if (!h.frontFace) {
@@ -136,30 +164,54 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
         h.geometricNormal = -h.geometricNormal;
     }
 
+    // Ray-cone texture LOD base: footprint width at this hit, the triangle's
+    // world/UV area ratio (texel density), and the grazing-angle stretch. The
+    // per-texture resolution term is added in wfTexConeLod. World edges come from
+    // the obj->world linear map (translation cancels in the differences).
+    float  coneW    = coneWidth + coneSpread * triT;
+    float  uvCross  = abs((uv1.x - uv0.x) * (uv2.y - uv0.y) - (uv1.y - uv0.y) * (uv2.x - uv0.x));
+    float3 we1      = mul(obj2worldR, e1);
+    float3 we2      = mul(obj2worldR, e2);
+    float  wCross   = length(cross(we1, we2));
+    float  cosT     = max(abs(dot(h.geometricNormal, rayDir)), 1e-4);
+    float  lodBase  = 0.5 * log2(max(uvCross, 1e-12) / max(wCross, 1e-12))
+                    + log2(max(coneW, 1e-8) / cosT);
+
     PbrMaterial  mat = materials[h.matidx];
     SamplerState s   = samplers[0];
 
     h.baseColor = mat.baseColorFactor;
     if (mat.baseColorTex >= 0)
-        h.baseColor *= textures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(s, uv, 0.0);
+        h.baseColor *= textures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(s, uv, wfTexConeLod(mat.baseColorTex, lodBase, lodJitter, stochMip));
 
     h.metallic  = mat.metallicFactor;
     h.roughness = mat.roughnessFactor;
     if (mat.physicalDescriptorTex >= 0 && !lowDetail) {
-        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, 0.0).bg;
+        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, wfTexConeLod(mat.physicalDescriptorTex, lodBase, lodJitter, stochMip)).bg;
         h.metallic  *= mr.x;
         h.roughness *= mr.y;
     }
 
     h.emissive = mat.emissiveFactor;
     if (mat.emissiveTex >= 0)
-        h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].SampleLevel(s, uv, 0.0).rgb;
+        h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].SampleLevel(s, uv, wfTexConeLod(mat.emissiveTex, lodBase, lodJitter, stochMip)).rgb;
 
     if (mat.normalTex >= 0 && !lowDetail) {
-        float3 nm = textures[NonUniformResourceIndex(mat.normalTex)].SampleLevel(s, uv, 0.0).xyz * 2.0 - 1.0;
-        float3 T  = normalize(tangent);
-        float3 B  = cross(h.normal, T) * bitangentSign;
-        h.normal  = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
+        float3 nm = textures[NonUniformResourceIndex(mat.normalTex)].SampleLevel(s, uv, wfTexConeLod(mat.normalTex, lodBase, lodJitter, stochMip)).xyz * 2.0 - 1.0;
+        // Tangent from UV gradients instead of a per-vertex tangent fetch: reuses
+        // the already-loaded positions/UVs, trading 48B/hit of fetch for ALU.
+        float2 d1  = uv1 - uv0, d2 = uv2 - uv0;
+        float  det = d1.x * d2.y - d1.y * d2.x;
+        if (abs(det) > 1e-12) {
+            float  r    = 1.0 / det;
+            float3 tObj = (e1 * d2.y - e2 * d1.y) * r;
+            float3 bObj = (e2 * d1.x - e1 * d2.x) * r;
+            float3 T    = normalize(mul(obj2worldR, tObj));
+            T           = normalize(T - h.normal * dot(h.normal, T));   // orthogonalize vs shading N
+            float  sgn  = dot(cross(h.normal, T), normalize(mul(obj2worldR, bObj))) < 0.0 ? -1.0 : 1.0;
+            float3 B    = cross(h.normal, T) * sgn;
+            h.normal    = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
+        }
     }
 
     // P3b: skip the transmission / clearcoat reads entirely for classes whose PSO strips those
@@ -171,7 +223,7 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
     if ((lobeMask & LOBE_TRANSMIT) != 0u) {
         h.transmission = mat.transmissionFactor;
         if (mat.transmissionTex >= 0 && !lowDetail)
-            h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].SampleLevel(s, uv, 0.0).r;
+            h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].SampleLevel(s, uv, wfTexConeLod(mat.transmissionTex, lodBase, lodJitter, stochMip)).r;
     }
     h.ior = mat.ior;
 
@@ -183,9 +235,9 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
     if ((lobeMask & LOBE_CLEARCOAT) != 0u) {
         h.clearcoat = mat.clearcoatFactor;
         if (mat.clearcoatTex >= 0 && !lowDetail)
-            h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].SampleLevel(s, uv, 0.0).r;
+            h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].SampleLevel(s, uv, wfTexConeLod(mat.clearcoatTex, lodBase, lodJitter, stochMip)).r;
         if (mat.clearcoatRoughnessTex >= 0 && !lowDetail)
-            h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].SampleLevel(s, uv, 0.0).g;
+            h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].SampleLevel(s, uv, wfTexConeLod(mat.clearcoatRoughnessTex, lodBase, lodJitter, stochMip)).g;
     }
 
     // Floor roughness so GGX D() stays evaluable (0 -> 0/0 NaN at the mirror dir).

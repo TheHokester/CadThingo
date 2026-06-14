@@ -592,6 +592,165 @@ public unsafe class Texture : IDisposable
         return new Texture(vk, device, resource, sampler);
     } 
 
+    /// <summary>True for the BC1/BC3/BC4/BC5 block formats the loader compresses material textures to.</summary>
+    public static bool IsBcFormat(Format f) => f switch
+    {
+        Format.BC1RgbUnormBlock or Format.BC1RgbSrgbBlock or Format.BC1RgbaUnormBlock or Format.BC1RgbaSrgbBlock
+            or Format.BC3UnormBlock or Format.BC3SrgbBlock or Format.BC4UnormBlock or Format.BC5UnormBlock => true,
+        _ => false,
+    };
+
+    /// <summary>The encoder mode that produces <paramref name="f"/>.</summary>
+    public static Features.TextureCompression.BcMode BcModeFor(Format f) => f switch
+    {
+        Format.BC3UnormBlock or Format.BC3SrgbBlock => Features.TextureCompression.BcMode.Bc3,
+        Format.BC5UnormBlock                        => Features.TextureCompression.BcMode.Bc5,
+        Format.BC4UnormBlock                        => Features.TextureCompression.BcMode.Bc4,
+        _                                           => Features.TextureCompression.BcMode.Bc1,
+    };
+
+    /// <summary>Uncompressed RGBA8 fallback for a BC format, used when textureCompressionBC is absent.
+    /// Preserves the sRGB-ness so colour textures still decode correctly.</summary>
+    public static Format BcFallbackFormat(Format f) => f switch
+    {
+        Format.BC1RgbSrgbBlock or Format.BC1RgbaSrgbBlock or Format.BC3SrgbBlock => Format.R8G8B8A8Srgb,
+        _                                                                        => Format.R8G8B8A8Unorm,
+    };
+
+    /// <summary>
+    /// Uploads raw RGBA pixel data, then GPU-compresses it to <paramref name="bcFormat"/> (Bc1/3/4/5)
+    /// via <see cref="Features.TextureCompression.BcEncoder"/>. Flow: stage RGBA8 -> blit-generate the
+    /// mip chain (uncompressed, as for any texture) -> compute-encode each mip into a packed buffer ->
+    /// copy the blocks into the BC image. The source is read raw-UNORM so the BC image carries the
+    /// sRGB-ness for the final sample (no double decode). Two single-time submits: the queue-idle
+    /// between them makes the mip chain visible to the encoder without a cross-stage barrier.
+    /// </summary>
+    public static Texture CreateCompressedTexture(Renderer renderer, byte* pixels,
+        uint width, uint height, Format bcFormat)
+    {
+        var vk     = Globals.vk!;
+        var device = renderer.device;
+        var mode   = BcModeFor(bcFormat);
+
+        ulong imageSize = (ulong)width * height * 4UL;
+        uint  mipLevels = (uint)Math.Floor(Math.Log2(Math.Max(width, height))) + 1;
+        var   extent    = new Extent3D(width, height, 1);
+        var   extent2D  = new Extent2D(width, height);
+
+        // ---- 1. Source RGBA8 (raw UNORM) image with a full mip chain -------------------------
+        const Format srcFormat = Format.R8G8B8A8Unorm;
+        const ImageUsageFlags srcUsage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.TransferSrcBit | ImageUsageFlags.SampledBit;
+
+        renderer.CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out var staging, out var stagingAlloc);
+        System.Buffer.MemoryCopy(pixels, renderer.memAllocator.GetMapped(stagingAlloc), (long)imageSize, (long)imageSize);
+
+        ImageCreateInfo srcInfo = new()
+        {
+            SType = StructureType.ImageCreateInfo, ImageType = ImageType.Type2D, Format = srcFormat,
+            Extent = extent, MipLevels = mipLevels, ArrayLayers = 1, Samples = SampleCountFlags.Count1Bit,
+            Tiling = ImageTiling.Optimal, Usage = srcUsage, SharingMode = SharingMode.Exclusive,
+            InitialLayout = ImageLayout.Undefined,
+        };
+        if (vk.CreateImage(device, &srcInfo, null, out var srcImage) != Result.Success)
+            throw new Exception("Failed to create BC encode source image");
+        var srcAlloc = renderer.memAllocator.AllocateForImage(srcImage, MemoryPropertyFlags.DeviceLocalBit);
+
+        var cmd1 = renderer.BeginSingleTimeCommands();
+        renderer.TransitionImageLayout(cmd1, srcImage, srcFormat, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels);
+        BufferImageCopy mip0 = new()
+        {
+            BufferOffset = 0, BufferRowLength = 0, BufferImageHeight = 0,
+            ImageSubresource = new ImageSubresourceLayers { AspectMask = ImageAspectFlags.ColorBit, MipLevel = 0, BaseArrayLayer = 0, LayerCount = 1 },
+            ImageOffset = new Offset3D(0, 0, 0), ImageExtent = extent,
+        };
+        vk.CmdCopyBufferToImage(cmd1, staging, srcImage, ImageLayout.TransferDstOptimal, 1, &mip0);
+        renderer.GenerateMipMaps(cmd1, srcImage, srcFormat, width, height, mipLevels);   // leaves ShaderReadOnlyOptimal
+        renderer.EndSingleTimeCommands(cmd1);
+        renderer.DestroyBuffer(staging, stagingAlloc);
+
+        ImageViewCreateInfo srcViewInfo = new()
+        {
+            SType = StructureType.ImageViewCreateInfo, Image = srcImage, ViewType = ImageViewType.Type2D, Format = srcFormat,
+            SubresourceRange = new ImageSubresourceRange { AspectMask = ImageAspectFlags.ColorBit, BaseMipLevel = 0, LevelCount = mipLevels, BaseArrayLayer = 0, LayerCount = 1 },
+        };
+        vk.CreateImageView(device, &srcViewInfo, null, out var srcView);
+
+        // ---- 2. BC destination image + packed block buffer -----------------------------------
+        ulong packedBytes = Features.TextureCompression.BcEncoder.PackedSize(mode, width, height, mipLevels);
+        renderer.CreateBuffer(packedBytes, BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit,
+            MemoryPropertyFlags.DeviceLocalBit, out var blockBuf, out var blockAlloc);
+
+        const ImageUsageFlags dstUsage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit;
+        ImageCreateInfo dstInfo = new()
+        {
+            SType = StructureType.ImageCreateInfo, ImageType = ImageType.Type2D, Format = bcFormat,
+            Extent = extent, MipLevels = mipLevels, ArrayLayers = 1, Samples = SampleCountFlags.Count1Bit,
+            Tiling = ImageTiling.Optimal, Usage = dstUsage, SharingMode = SharingMode.Exclusive,
+            InitialLayout = ImageLayout.Undefined,
+        };
+        if (vk.CreateImage(device, &dstInfo, null, out var bcImage) != Result.Success)
+            throw new Exception("Failed to create BC texture image");
+        var bcAlloc = renderer.memAllocator.AllocateForImage(bcImage, MemoryPropertyFlags.DeviceLocalBit);
+
+        // ---- 3. Encode each mip, then copy the blocks into the BC image ----------------------
+        var cmd2 = renderer.BeginSingleTimeCommands();
+        renderer.BcEncoder.RecordEncode(cmd2, srcView, blockBuf, mode, width, height, mipLevels);
+
+        BufferMemoryBarrier toCopy = new()
+        {
+            SType = StructureType.BufferMemoryBarrier,
+            SrcAccessMask = AccessFlags.ShaderWriteBit, DstAccessMask = AccessFlags.TransferReadBit,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored, DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Buffer = blockBuf, Offset = 0, Size = Vk.WholeSize,
+        };
+        vk.CmdPipelineBarrier(cmd2, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.TransferBit, 0, 0, null, 1, &toCopy, 0, null);
+
+        renderer.TransitionImageLayout(cmd2, bcImage, bcFormat, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels);
+        for (uint m = 0; m < mipLevels; m++)
+        {
+            uint mw = Math.Max(1u, width >> (int)m), mh = Math.Max(1u, height >> (int)m);
+            BufferImageCopy region = new()
+            {
+                BufferOffset = Features.TextureCompression.BcEncoder.MipOffset(mode, width, height, m),
+                BufferRowLength = 0, BufferImageHeight = 0,
+                ImageSubresource = new ImageSubresourceLayers { AspectMask = ImageAspectFlags.ColorBit, MipLevel = m, BaseArrayLayer = 0, LayerCount = 1 },
+                ImageOffset = new Offset3D(0, 0, 0), ImageExtent = new Extent3D(mw, mh, 1),
+            };
+            vk.CmdCopyBufferToImage(cmd2, blockBuf, bcImage, ImageLayout.TransferDstOptimal, 1, &region);
+        }
+        renderer.TransitionImageLayout(cmd2, bcImage, bcFormat, ImageLayout.TransferDstOptimal, ImageLayout.ShaderReadOnlyOptimal, mipLevels);
+        renderer.EndSingleTimeCommands(cmd2);
+
+        // ---- 4. Free the transient source + block buffer; build the sampled BC texture -------
+        renderer.DestroyBuffer(blockBuf, blockAlloc);
+        vk.DestroyImageView(device, srcView, null);
+        vk.DestroyImage(device, srcImage, null);
+        renderer.memAllocator.Free(srcAlloc);
+
+        ImageViewCreateInfo bcViewInfo = new()
+        {
+            SType = StructureType.ImageViewCreateInfo, Image = bcImage, ViewType = ImageViewType.Type2D, Format = bcFormat,
+            SubresourceRange = new ImageSubresourceRange { AspectMask = ImageAspectFlags.ColorBit, BaseMipLevel = 0, LevelCount = mipLevels, BaseArrayLayer = 0, LayerCount = 1 },
+        };
+        vk.CreateImageView(device, &bcViewInfo, null, out var bcView);
+
+        vk.GetPhysicalDeviceProperties(renderer.physicalDevice, out var props);
+        SamplerCreateInfo samplerInfo = new()
+        {
+            SType = StructureType.SamplerCreateInfo, MagFilter = Filter.Linear, MinFilter = Filter.Linear,
+            AddressModeU = SamplerAddressMode.Repeat, AddressModeV = SamplerAddressMode.Repeat, AddressModeW = SamplerAddressMode.Repeat,
+            AnisotropyEnable = true, MaxAnisotropy = props.Limits.MaxSamplerAnisotropy, BorderColor = BorderColor.FloatOpaqueBlack,
+            UnnormalizedCoordinates = false, CompareEnable = false, CompareOp = CompareOp.Always,
+            MipmapMode = SamplerMipmapMode.Linear, MinLod = 0.0f, MaxLod = Vk.LodClampNone, MipLodBias = 0.0f,
+        };
+        vk.CreateSampler(device, &samplerInfo, null, out var sampler);
+
+        var resource = new ImageResource(vk, device, "BcTexture", bcFormat, extent2D, dstUsage, bcImage, bcAlloc, bcView);
+        return new Texture(vk, device, resource, sampler);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

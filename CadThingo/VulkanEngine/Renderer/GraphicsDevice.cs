@@ -148,6 +148,9 @@ public sealed unsafe class GraphicsDevice : IDisposable
     public bool  TimestampsSupported => timestampPeriod != 0f && graphicsTimestampValidBits != 0;
     /// <summary>True iff the optional pipelineStatisticsQuery feature was enabled at device creation.</summary>
     public bool  PipelineStatisticsSupported => pipelineStatisticsEnabled;
+    /// <summary>True iff textureCompressionBC was enabled at device creation (BC1-7 sampling).
+    /// The glTF texture loader compresses material textures to BC only when this is set.</summary>
+    public bool  TextureCompressionBcEnabled { get; private set; }
 
     // Read-only handle accessor — pipelines that load their own device-extension
     // dispatch tables (e.g. RtPipeline → KhrRayTracingPipeline) need the instance
@@ -633,6 +636,15 @@ public sealed unsafe class GraphicsDevice : IDisposable
         //rayQuery shader uses indexing into a large sampled-image array.
         if (coreSupported.Features.ShaderSampledImageArrayDynamicIndexing)
             features.Features.ShaderSampledImageArrayDynamicIndexing = true;
+
+        // Block-compressed texture sampling (BC1-7). Material textures are GPU-compressed
+        // at load (BcEncoder) to cut L1Tex/L2 fill; sampling the BC images needs this core
+        // feature. Universal on desktop; the loader falls back to RGBA8 if it's ever absent.
+        if (coreSupported.Features.TextureCompressionBC)
+        {
+            features.Features.TextureCompressionBC = true;
+            TextureCompressionBcEnabled = true;
+        }
 
         // Optional: per-pass pipeline-statistics queries for the render-graph debug
         // overlay (VS/FS/compute invocations, primitives, …). Enable only if supported;

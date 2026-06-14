@@ -35,8 +35,16 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
         uint   pathCount = uint(frameUBO.screenSize.x) * uint(frameUBO.screenSize.y);
         uint   p     = shadeQueue[cls * pathCount + tid.x];   // class bin: [cls*pathCount, ...)
         uint   rng   = psRng[p];
+        float4 rayO  = psRayOrigin[p];             // xyz = origin, w = packed ray cone
         float3 inDir = psRayDir[p].xyz;            // incoming ray direction at this hit
-        HitInfo h    = resolveHit(hitRecPrim[p], hitT[p], wfUnpackHalf2(hitBary[p]), psRayOrigin[p].xyz, inDir, pc.bounce, LOBE_MASK);
+
+        // Ray cone for texture LOD: decorrelated mip jitter from a copy of the rng (the
+        // light-transport stream is untouched), stochastic single-mip past the primary.
+        float2 cone      = wfUnpackCone(rayO.w);
+        uint   jr        = rng;
+        float  lodJitter = rand(jr);
+        HitInfo h    = resolveHit(hitRecPrim[p], hitT[p], wfUnpackHalf2(hitBary[p]), rayO.xyz, inDir,
+                                  pc.bounce, LOBE_MASK, cone.x, cone.y, lodJitter, pc.bounce >= 1u);
         float3 V     = -inDir;
         float4 thr4  = wfUnpackHalf4(psThroughput[p]);
         float3 thr   = thr4.xyz;                   // throughput INTO this bounce (NEE + emissive use it)
@@ -139,9 +147,16 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
             if(bs.transmit)
                 psSigmaA[p] = wfPackHalf4(float4(h.frontFace ? mediumSigmaA(materials[h.matidx]) : float3(0.0), 0.0));
 
+            // Advance the ray cone: this hit's footprint becomes the next origin's width, and a
+            // non-delta (diffuse/glossy) scatter widens the spread by surface roughness so deeper,
+            // incoherent bounces sample coarse mips. Delta lobes keep it tight. Packed into the
+            // next origin's w lane (see Generate / resolveHit).
+            float coneWidth  = cone.x + cone.y * h.hitT;
+            float coneSpread = cone.y + (bs.isDelta ? 0.0 : WF_CONE_SPREAD_K * max(h.roughness, 0.3));
+
             // Next-bounce state + MIS state for the next Shade (psRayDir.w / psThroughput.w).
             float3 oN = bs.transmit ? -h.geometricNormal : h.geometricNormal;
-            psRayOrigin[p]  = float4(h.worldPos + oN * 1e-3f, 0);
+            psRayOrigin[p]  = float4(h.worldPos + oN * 1e-3f, wfPackCone(coneWidth, coneSpread));
             psRayDir[p]     = float4(bs.wi, bs.pdf);
             psThroughput[p] = wfPackHalf4(float4(thr, bs.isDelta ? 1.0 : 0.0));
 

@@ -72,6 +72,12 @@ public float4 wfUnpackHalf4(uint2 p) {
 public uint  wfPackHalf2(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }
 public float2 wfUnpackHalf2(uint p) { return float2(f16tof32(p & 0xFFFFu), f16tof32(p >> 16)); }
 
+// Ray-cone (coneWidth, coneSpread) <-> the float bit pattern parked in the otherwise-unused
+// psRayOrigin.w lane. Lets ray-cone texture LOD ride along the persistent ray state with no
+// added working-set bytes (see WavefrontShading::wfTexConeLod).
+public float  wfPackCone(float width, float spread) { return asfloat(wfPackHalf2(float2(width, spread))); }
+public float2 wfUnpackCone(float packed)            { return wfUnpackHalf2(asuint(packed)); }
+
 // Persistent path state — survives every bounce. Indexed by pathIdx (= pixel index).
 public [[vk::binding(0,4)]]  RWStructuredBuffer<float4> psRayOrigin;  // xyz = ray O          (w free)
 public [[vk::binding(1,4)]]  RWStructuredBuffer<float4> psRayDir;     // xyz = ray D          (w = prevBsdfPdf, P2 MIS)

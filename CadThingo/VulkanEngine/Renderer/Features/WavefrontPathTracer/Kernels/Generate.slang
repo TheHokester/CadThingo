@@ -24,8 +24,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
     RayDesc ray = transformRayToWorld(generatePrimaryRay(ndc, rng, (CameraMode)mode, frameUBO), frameUBO.invView);
     //store ray data. MIS state seeds in the w-lanes: psRayDir.w = prevBsdfPdf (0 on the
     //primary), psThroughput.w = prevWasDelta flag = 1 so a directly-visible emitter is taken
-    //at full weight (NEE had no prior chance to sample it).
-    psRayOrigin[px]=float4(ray.Origin,0);
+    //at full weight (NEE had no prior chance to sample it). psRayOrigin.w carries the packed
+    //ray cone (width 0 at the camera, spread = the per-pixel angular footprint) for texture LOD.
+    float coneSpread = 2.0 * frameUBO.tanHalfFov / frameUBO.screenSize.y;
+    psRayOrigin[px]=float4(ray.Origin, wfPackCone(0.0, coneSpread));
     psRayDir[px]=float4(ray.Direction,0);
     psThroughput[px]=wfPackHalf4(float4(1,1,1,1.0));
     psRadiance[px]=uint2(0,0);      // packed half4 zeros

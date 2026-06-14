@@ -63,16 +63,19 @@ public static unsafe class GltfTextureResource
         var pixels = new Rgba32[img.Width * img.Height];
         img.CopyPixelDataTo(pixels);
 
+        // BC formats are GPU-compressed at load to cut texture-cache (L1Tex->L2) fill; if the
+        // device lacks textureCompressionBC, fall back to the equivalent uncompressed RGBA8.
+        bool   wantBc      = Texture.IsBcFormat(format);
+        bool   canBc       = renderer.gfx.TextureCompressionBcEnabled;
+        Format uploadFmt   = wantBc && !canBc ? Texture.BcFallbackFormat(format) : format;
+
         Texture tex;
         fixed (Rgba32* p = pixels)
         {
-            tex = Texture.CreateTextureFromMemory(
-                renderer,
-                (byte*)p,
-                (uint)img.Width,
-                (uint)img.Height,
-                format,
-                new Extent3D((uint)img.Width, (uint)img.Height, 1));
+            tex = wantBc && canBc
+                ? Texture.CreateCompressedTexture(renderer, (byte*)p, (uint)img.Width, (uint)img.Height, format)
+                : Texture.CreateTextureFromMemory(renderer, (byte*)p, (uint)img.Width, (uint)img.Height, uploadFmt,
+                    new Extent3D((uint)img.Width, (uint)img.Height, 1));
         }
 
         rm.Load<TextureResource>(id, _ => new TextureResource(id, tex));

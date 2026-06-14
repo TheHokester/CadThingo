@@ -178,6 +178,11 @@ public unsafe partial class Renderer
     internal SelectionMaskPipeline selectionMaskPipeline; // ray-query coverage mask of the selected entity
     internal OutlinePipeline       outlinePipeline;       // composites the selection outline into FinalColor
 
+    // GPU block-compression encoder for material textures (lazy: created on the first compressed
+    // texture load, so it costs nothing for runs that never load a BC-formatted asset).
+    private Features.TextureCompression.BcEncoder? _bcEncoder;
+    internal Features.TextureCompression.BcEncoder BcEncoder => _bcEncoder ??= new Features.TextureCompression.BcEncoder(gfx);
+
     // Specialization-constant gate for soft (PCSS-style) ray-queried shadows.
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
     public bool softShadowsEnabled = true;
@@ -677,6 +682,7 @@ public unsafe partial class Renderer
         CleanupIblResources();
 
         // Pipelines (each pipeline disposes its own buffers, sets, layouts)
+        _bcEncoder           ?.Dispose();
         outlinePipeline      ?.Dispose();
         selectionMaskPipeline?.Dispose();
         pickPipeline       ?.Dispose();
