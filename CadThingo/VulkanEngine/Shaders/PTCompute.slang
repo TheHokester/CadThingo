@@ -214,7 +214,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     // frame matches the (possibly-flipped) shading normal. Skipped on deep
     // bounces — indirect lighting barely registers the perturbation.
     if (mat.normalTex >= 0 && !lowDetail) {
-        float3 nm = textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, uv).xyz * 2.0 - 1.0;
+        float3 nm = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, uv).rg);
         float3 T  = normalize(tangent);
         float3 B  = cross(h.normal, T) * bitangentSign;
         h.normal  = normalize(nm.x * T + nm.y * B + nm.z * h.normal);

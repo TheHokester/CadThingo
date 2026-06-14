@@ -190,16 +190,17 @@ public static class GltfMaterialResource
         return rm.RegisterBindless(tex);
     }
 
-    /// <summary>Vulkan format the channel's texture should be sampled in. Colour channels are BC-
-    /// compressed (sRGB block formats) to cut texture-cache fill -- BC3 for baseColor (keeps the
-    /// MASK/BLEND alpha), BC1 for emissive (no alpha). The loader falls back to RGBA8 when the device
-    /// lacks textureCompressionBC. Data textures (MetallicRoughness/Normal/Occlusion) stay
-    /// uncompressed for now: normals need BC5 + a reconstruct in every normal-sampling shader.</summary>
+    /// <summary>Vulkan format the channel's texture should be sampled in. BC-compressed to cut
+    /// texture-cache fill: BC3 baseColor (keeps the MASK/BLEND alpha), BC1 emissive (no alpha), and
+    /// BC5 normals (two channels; shaders reconstruct z via decodeTangentNormal). The loader falls
+    /// back to RGBA8 when the device lacks textureCompressionBC. MetallicRoughness/Occlusion stay
+    /// uncompressed for now (BC quantisation of packed data channels needs a closer quality look).</summary>
     private static Format ChannelFormat(string channelName) => channelName switch
     {
         "BaseColor" => Format.BC3SrgbBlock,
         "Emissive"  => Format.BC1RgbSrgbBlock,
-        _           => Format.R8G8B8A8Unorm, // MetallicRoughness, Normal, Occlusion are linear data textures
+        "Normal"    => Format.BC5UnormBlock,
+        _           => Format.R8G8B8A8Unorm, // MetallicRoughness, Occlusion are linear data textures
     };
 
     private static int ChannelDefaultIndex(string channelName) => channelName switch

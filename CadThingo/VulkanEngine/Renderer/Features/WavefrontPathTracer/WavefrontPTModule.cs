@@ -174,7 +174,12 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
         // then indirect-read -> storage-write; the next worker's indirect-read barrier then
         // publishes this tail's write. counters stays RW on Extend/Shade to keep the worker
         // chain linear; Connect no longer touches it (see AddConnectPass).
-        for (uint b = 0; b < MAX_BOUNCES; b++)
+        // Megakernel tail: the wavefront chain only runs bounces [0, waveBounces); a single
+        // TailMegakernel dispatch loops the rest per surviving path (see WavefrontPTPipeline.
+        // TailStartBounce). Sparse deep bounces stop paying per-bounce dispatch/arg-gen/barrier cost.
+        uint waveBounces = WavefrontPTPipeline.TailEnabled ? WavefrontPTPipeline.TailStartBounce : MAX_BOUNCES;
+
+        for (uint b = 0; b < waveBounces; b++)
         {
             uint bb = b;                       // capture for the deferred execute closures
             GraphBuffer src = (bb % 2 == 0) ? rayQ0 : rayQ1;   // ping-pong read queue
@@ -286,9 +291,33 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                 });
         }
 
-        // The last bounce's Connect: nothing follows that it could overlap, so it sits
-        // serial between the final Shade and Finalize, carrying its own barriers.
-        AddConnectPass(MAX_BOUNCES - 1u);
+        // The last wavefront bounce's Connect (its deferred NEE). With the megakernel tail this is
+        // Connect(waveBounces-1); the tail does its own NEE inline, so no further Connect follows.
+        AddConnectPass(waveBounces - 1u);
+
+        // Megakernel tail: continue the bounce-cap survivors through bounces [waveBounces, MAX_BOUNCES)
+        // in one dispatch (loops in-thread; inline NEE). Reads the survivor queue + live SoA state
+        // Shade(waveBounces-1) left, folds all remaining radiance into psRadiance for Finalize.
+        // Launched over RAY_COUNT via extend-args[waveBounces] (Shade's fused tail promoted both).
+        if (WavefrontPTPipeline.TailEnabled)
+        {
+            uint start = waveBounces;
+            GraphBuffer survivors = (start % 2 == 0) ? rayQ0 : rayQ1;   // rayQueue[start&1] = Shade(start-1)'s dst
+            scope.AddPass("TailMegakernel", PassType.Compute, QueueClass.Graphics,
+                bld =>
+                {
+                    bld.Read(survivors,    ResourceUsage.StorageReadCompute);
+                    bld.Read(psRayOrigin,  ResourceUsage.StorageReadCompute);
+                    bld.Read(psRayDir,     ResourceUsage.StorageReadCompute);
+                    bld.Read(psThroughput, ResourceUsage.StorageReadCompute);
+                    bld.Read(psSigmaA,     ResourceUsage.StorageReadCompute);
+                    bld.Read(counters,     ResourceUsage.StorageReadCompute);   // RAY_COUNT thread gate
+                    bld.Read(dispatchArgs, ResourceUsage.IndirectArg);          // extend-args[start] dims
+                    psRadiance = bld.Write(psRadiance, ResourceUsage.StorageRWCompute);   // continue accumulation
+                    psRng      = bld.Write(psRng,      ResourceUsage.StorageRWCompute);   // advances the stream
+                },
+                (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordTail(cmd, f.FrameIndex));
+        }
 
         // ---- Finalize: accumulate radiance, normalize into out-color ----
         scope.AddPass("Finalize", PassType.Compute, QueueClass.Graphics,

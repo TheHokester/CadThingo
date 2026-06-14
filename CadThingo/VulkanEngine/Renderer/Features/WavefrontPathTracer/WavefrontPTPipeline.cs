@@ -79,6 +79,14 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     // -- already covered by WavefrontPTCore's ctor / Resize.
     public const uint MaxBounces = 8u;
 
+    // Megakernel tail cutoff. The wavefront chain runs bounces [0, TailStartBounce); a single
+    // TailMegakernel dispatch then loops [TailStartBounce, MaxBounces) per surviving path, so the
+    // sparse deep bounces (mostly transmissive) stop paying per-bounce Extend/Shade/Connect +
+    // arg-gen + barrier overhead. Must satisfy 1 <= TailStartBounce <= MaxBounces; set it equal to
+    // MaxBounces to disable the tail (pure wavefront, every bounce a full chain step).
+    public const uint TailStartBounce = 3u;
+    public static bool TailEnabled => TailStartBounce < MaxBounces;
+
     // ---- dispatchArgs byte layout (PER BOUNCE) -------------------------------
     // Each VkDispatchIndirectCommand is 12 bytes (x,y,z). Each bounce b owns a contiguous block of
     // STAGES_PER_BOUNCE commands: [extend | shade[0..C-1] | connect] (P3: the shade stage fans out
@@ -100,6 +108,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private static readonly string ShadeSpv    = ShaderPaths.Kernel("WavefrontPathTracer", "Shade");
     private static readonly string ConnectSpv  = ShaderPaths.Kernel("WavefrontPathTracer", "Connect");
     private static readonly string FinalizeSpv = ShaderPaths.Kernel("WavefrontPathTracer", "Finalize");
+    private static readonly string TailSpv     = ShaderPaths.Kernel("WavefrontPathTracer", "TailMegakernel");
 
     // Generate is baked per camera mode (spec id 0); Shade is baked per material class (P3b
     // SHADING_CLASS spec id 0 -> lobe stripping); Extend/Connect/Finalize are single PSOs. (No
@@ -107,6 +116,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private readonly Pipeline[] _generatePsos = new Pipeline[4];
     private readonly Pipeline[] _shadePsos    = new Pipeline[ShadeClasses];
     private Pipeline _extendPso, _connectPso, _finalizePso;
+    private Pipeline _tailPso;   // megakernel tail (loops the deep bounces per surviving path)
 
     // Camera / DoF controls (IPathTracerCamera). Generate bakes the same four
     // CameraMode PSOs as the megakernel (spec id 0); these feed PathFrameUBO so
@@ -277,6 +287,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         _extendPso   = CreateComputePso(ExtendSpv,   null);
         _connectPso  = CreateComputePso(ConnectSpv,  null);
         _finalizePso = CreateComputePso(FinalizeSpv, null);
+        if (TailEnabled) _tailPso = CreateComputePso(TailSpv, null);
 
         // Alias mode 0 to PipelineHandle so base.Dispose destroys exactly one PSO
         // via that path; everything else is torn down in our Dispose override.
@@ -691,6 +702,18 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ShadeArgsOffset(bounce, cls));
     }
 
+    /// <summary>Megakernel tail: loop bounces [TailStartBounce, MaxBounces) for the bounce-cap
+    /// survivors in one dispatch. Launched over the survivor count via extend-args[TailStartBounce]
+    /// (the dims Shade(TailStartBounce-1)'s fused tail promoted); srcParity selects the survivor
+    /// queue. The push bounce = TailStartBounce is the loop start; maxBounces is the loop end.</summary>
+    public void RecordTail(CommandBuffer cmd, uint frameIndex)
+    {
+        Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _tailPso);
+        BindSets(cmd, frameIndex);
+        PushWavefront(cmd, TailStartBounce, 0u);
+        Vk.CmdDispatchIndirect(cmd, DispatchArgsBuffer, ExtendArgsOffset(TailStartBounce));
+    }
+
     public void RecordConnect(CommandBuffer cmd, uint frameIndex, uint bounce)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _connectPso);
@@ -755,6 +778,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         if (_extendPso.Handle   != 0) Vk.DestroyPipeline(Device, _extendPso, null);
         if (_connectPso.Handle  != 0) Vk.DestroyPipeline(Device, _connectPso, null);
         if (_finalizePso.Handle != 0) Vk.DestroyPipeline(Device, _finalizePso, null);
+        if (_tailPso.Handle     != 0) Vk.DestroyPipeline(Device, _tailPso, null);
 
         FreeSet4();
         foreach (var b in _frameUbos) Gfx.DestroyBuffer(b.buffer, b.alloc);

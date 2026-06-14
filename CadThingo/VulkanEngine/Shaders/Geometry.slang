@@ -113,7 +113,7 @@ GBufferOutput PSMain(VSOutput input)
 
     float3 N = normalize(input.Normal);
     {
-        float3 tangentNormal = textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).xyz * 2.0 - 1.0;
+        float3 tangentNormal = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).rg);
         float3 T = normalize(input.Tangent.xyz);
         float3 B = normalize(cross(N, T)) * input.Tangent.w;
         float3x3 TBN = float3x3(T, B, N);

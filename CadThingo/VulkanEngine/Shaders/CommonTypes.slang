@@ -155,3 +155,14 @@ public float4 fetchVertexTangent(ByteAddressBuffer vbuf, uint vi) {
 public uint fetchTriangleIndex(ByteAddressBuffer ibuf, uint indexOffset, uint primIdx, uint corner) {
     return ibuf.Load((indexOffset + primIdx * 3u + corner) * 4u);
 }
+
+// Decode a tangent-space normal-map sample, reconstructing z from xy. Takes the .rg of the
+// sampled texel: normal maps are BC5-compressed (two channels; z dropped) but tangent-space
+// normals are always +z-hemisphere unit vectors, so z = sqrt(1 - x^2 - y^2) is exact. Also
+// correct for the uncompressed cases (flat RGBA8 default, clearcoat-normal) -- their stored z
+// already equals the reconstructed one -- so callers need no per-format branch.
+public float3 decodeTangentNormal(float2 rg) {
+    float2 xy = rg * 2.0 - 1.0;
+    float  z  = sqrt(saturate(1.0 - dot(xy, xy)));
+    return float3(xy, z);
+}

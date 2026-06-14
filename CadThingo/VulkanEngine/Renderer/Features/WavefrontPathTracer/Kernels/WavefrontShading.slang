@@ -197,7 +197,7 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
         h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].SampleLevel(s, uv, wfTexConeLod(mat.emissiveTex, lodBase, lodJitter, stochMip)).rgb;
 
     if (mat.normalTex >= 0 && !lowDetail) {
-        float3 nm = textures[NonUniformResourceIndex(mat.normalTex)].SampleLevel(s, uv, wfTexConeLod(mat.normalTex, lodBase, lodJitter, stochMip)).xyz * 2.0 - 1.0;
+        float3 nm = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].SampleLevel(s, uv, wfTexConeLod(mat.normalTex, lodBase, lodJitter, stochMip)).rg);
         // Tangent from UV gradients instead of a per-vertex tangent fetch: reuses
         // the already-loaded positions/UVs, trading 48B/hit of fetch for ALU.
         float2 d1  = uv1 - uv0, d2 = uv2 - uv0;
