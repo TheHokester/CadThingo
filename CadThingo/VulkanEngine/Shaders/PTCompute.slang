@@ -162,14 +162,6 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     float3 p2    = fetchVertexPos(globalVertices, i2);
     float3 ngObj = normalize(cross(p1 - p0, p2 - p0));
 
-    // glTF vertex tangent: xyz = tangent, w = bitangent sign (±1).  Sign is
-    // constant across the triangle in practice; take from corner 0.
-    float4 t0   = fetchVertexTangent(globalVertices, i0);
-    float4 t1   = fetchVertexTangent(globalVertices, i1);
-    float4 t2   = fetchVertexTangent(globalVertices, i2);
-    float3 tObj = t0.xyz * baryW.x + t1.xyz * baryW.y + t2.xyz * baryW.z;
-    float bitangentSign = t0.w;
-
     // Object → world. The cluster BLAS bakes positions to world space with an
     // IDENTITY instance transform, so CommittedObjectToWorld3x4 would NOT rotate
     // these object-space normals — use the per-geometry world transform carried
@@ -179,7 +171,6 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
 
     h.normal          = normalize(mul(obj2worldR, nObj));
     h.geometricNormal = normalize(mul(obj2worldR, ngObj));
-    float3 tangent    = normalize(mul(obj2worldR, tObj));
 
     // Front-face test against the GEOMETRIC normal (shading normal can lie
     // due to interpolation / normal maps).  Flip both so downstream BSDF code
@@ -215,9 +206,23 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     // bounces — indirect lighting barely registers the perturbation.
     if (mat.normalTex >= 0 && !lowDetail) {
         float3 nm = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, uv).rg);
-        float3 T  = normalize(tangent);
-        float3 B  = cross(h.normal, T) * bitangentSign;
-        h.normal  = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
+        // Tangent from UV gradients instead of a per-vertex tangent fetch: reuses
+        // the already-loaded object-space positions, trading vertex bandwidth for ALU.
+        float2 uv0 = fetchVertexUV(globalVertices, i0);
+        float2 uv1 = fetchVertexUV(globalVertices, i1);
+        float2 uv2 = fetchVertexUV(globalVertices, i2);
+        float2 d1  = uv1 - uv0, d2 = uv2 - uv0;
+        float  det = d1.x * d2.y - d1.y * d2.x;
+        if (abs(det) > 1e-12) {
+            float  r    = 1.0 / det;
+            float3 tObj = ((p1 - p0) * d2.y - (p2 - p0) * d1.y) * r;
+            float3 bObj = ((p2 - p0) * d1.x - (p1 - p0) * d2.x) * r;
+            float3 T    = normalize(mul(obj2worldR, tObj));
+            T           = normalize(T - h.normal * dot(h.normal, T));   // orthogonalize vs shading N
+            float  sgn  = dot(cross(h.normal, T), normalize(mul(obj2worldR, bObj))) < 0.0 ? -1.0 : 1.0;
+            float3 B    = cross(h.normal, T) * sgn;
+            h.normal    = normalize(nm.x * T + nm.y * B + nm.z * h.normal);
+        }
     }
 
     // Transmission / IOR from KHR_materials_transmission + KHR_materials_ior.

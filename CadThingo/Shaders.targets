@@ -34,6 +34,12 @@
          byte-identical. In section 5.3, when the shared modules move to Shaders\Lib, repoint
          this there (and add that dir too if kernels and libs end up split). -->
     <ShaderIncludeArgs Condition="'$(ShaderIncludeArgs)' == ''">-I "$(MSBuildProjectDirectory)\VulkanEngine\Shaders"</ShaderIncludeArgs>
+
+    <!-- slangc optimization level for all shaders. -O2 ("high", aggressive-for-speed) rather
+         than -O3 ("maximal"), whose code-size / unroll tradeoffs can raise register pressure.
+         The NV driver re-optimizes SPIR-V -> SASS regardless, so this mainly shapes the SPIR-V
+         handed to it. Override with -p:ShaderOptArgs=-O3 (or -O0 to keep call boundaries). -->
+    <ShaderOptArgs Condition="'$(ShaderOptArgs)' == ''">-O2</ShaderOptArgs>
   </PropertyGroup>
 
   <!-- ===== Manifest ================================================================
@@ -140,17 +146,17 @@
          (slangc with no input, output ".spv"). The per-batch guard skips that empty run. -->
     <Message Importance="high" Condition="'%(Shader.Identity)' != ''" Text="slangc %(Shader.Identity) -> %(Shader.OutputName).spv" />
     <Exec Condition="'%(Shader.Identity)' != ''"
-          Command="&quot;$(SlangCompiler)&quot; &quot;%(Shader.FullPath)&quot; -target spirv $(ShaderIncludeArgs) %(Shader.Flags) -o &quot;$(SpvOutputDir)\%(Shader.OutputName).spv&quot;"
+          Command="&quot;$(SlangCompiler)&quot; &quot;%(Shader.FullPath)&quot; -target spirv $(ShaderOptArgs) $(ShaderIncludeArgs) %(Shader.Flags) -o &quot;$(SpvOutputDir)\%(Shader.OutputName).spv&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)" />
 
     <Message Importance="high" Condition="'%(ShaderVariant.Identity)' != ''" Text="slangc %(ShaderVariant.Identity) (variant) -> %(ShaderVariant.OutputName).spv" />
     <Exec Condition="'%(ShaderVariant.Identity)' != ''"
-          Command="&quot;$(SlangCompiler)&quot; &quot;%(ShaderVariant.FullPath)&quot; -target spirv $(ShaderIncludeArgs) %(ShaderVariant.Flags) -o &quot;$(SpvOutputDir)\%(ShaderVariant.OutputName).spv&quot;"
+          Command="&quot;$(SlangCompiler)&quot; &quot;%(ShaderVariant.FullPath)&quot; -target spirv $(ShaderOptArgs) $(ShaderIncludeArgs) %(ShaderVariant.Flags) -o &quot;$(SpvOutputDir)\%(ShaderVariant.OutputName).spv&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)" />
 
     <Message Importance="high" Condition="'%(Kernel.Identity)' != ''" Text="slangc %(Kernel.Identity) -> %(Kernel.Feature)\%(Kernel.Filename).spv" />
     <Exec Condition="'%(Kernel.Identity)' != ''"
-          Command="&quot;$(SlangCompiler)&quot; &quot;%(Kernel.FullPath)&quot; -target spirv $(ShaderIncludeArgs) %(Kernel.Flags) -o &quot;$(SpvOutputDir)\%(Kernel.Feature)\%(Kernel.Filename).spv&quot;"
+          Command="&quot;$(SlangCompiler)&quot; &quot;%(Kernel.FullPath)&quot; -target spirv $(ShaderOptArgs) $(ShaderIncludeArgs) %(Kernel.Flags) -o &quot;$(SpvOutputDir)\%(Kernel.Feature)\%(Kernel.Filename).spv&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)" />
   </Target>
 

@@ -1,13 +1,13 @@
 //combined vertex + fragment shader
 
+import CommonTypes;   // octDecodeNormal
 
 struct VertexInput{
     [[vk::location(0)]] float3 position;
-    [[vk::location(1)]] float3 normal;
+    [[vk::location(1)]] float2 normal;   // octahedral (R16G16_UNORM)
     [[vk::location(2)]] float2 uv;
-    [[vk::location(3)]] float4 tangent;
-    
-    
+
+
     //per instance data
     [[vk::location(4)]] row_major float4x4 instanceModel;//model matrix;
     //3 columns of 3x4 matrix, xyz used w unused
@@ -21,8 +21,7 @@ struct VertexOutput{
     float3 WorldPos;
     float3 Normal: NORMAL;
     float2 TexCoord: TEXCOORD0;
-    float4 Tangent: TANGENT;
-   
+
 }
 struct UniformBufferObject{
     row_major float4x4 model;
@@ -53,13 +52,13 @@ VertexOutput VSMain(VertexInput input){
     float3x3 model3x3 = (float3x3)ubo.model;
     output.WorldPos = worldPos.xyz;
     
-    float3 instanceNormal = input.instanceNormal0.xyz * input.normal.x +
-                            input.instanceNormal1.xyz * input.normal.y +
-                            input.instanceNormal2.xyz * input.normal.z;
-      
+    float3 nrm = octDecodeNormal(input.normal);
+    float3 instanceNormal = input.instanceNormal0.xyz * nrm.x +
+                            input.instanceNormal1.xyz * nrm.y +
+                            input.instanceNormal2.xyz * nrm.z;
+
     output.Normal = normalize(mul(model3x3,instanceNormal));
     output.TexCoord = input.uv;
-    output.Tangent = input.tangent;
     return output;
    
 }

@@ -506,14 +506,40 @@ public unsafe sealed class GpuMemoryAllocator : IDisposable
         throw new Exception("Block not tracked by allocator");
     }
 
-    private uint FindMemoryType(uint typeBits, MemoryPropertyFlags props)
+    private bool TryFindMemoryType(uint typeBits, MemoryPropertyFlags props, out uint index)
     {
         _vk.GetPhysicalDeviceMemoryProperties(_physical, out var memProps);
         for (uint i = 0; i < memProps.MemoryTypeCount; i++)
             if ((typeBits & (1u << (int)i)) != 0 &&
                 (memProps.MemoryTypes[(int)i].PropertyFlags & props) == props)
-                return i;
+            { index = i; return true; }
+        index = 0;
+        return false;
+    }
+
+    private uint FindMemoryType(uint typeBits, MemoryPropertyFlags props)
+    {
+        if (TryFindMemoryType(typeBits, props, out var idx)) return idx;
         throw new Exception("GpuMemoryAllocator: no memory type matches required properties");
+    }
+
+    /// <summary>
+    /// Allocates + binds, preferring <paramref name="preferred"/> memory properties but
+    /// falling back to <paramref name="fallback"/> when no memory type satisfies the
+    /// preferred set (e.g. no resizable-BAR / device-local-host-visible heap). Used to
+    /// place GPU-hot, host-written SSBOs in VRAM so shader reads stay off PCIe.
+    /// <paramref name="usedPreferred"/> reports which set won, for diagnostics.
+    /// </summary>
+    public SubAlloc AllocateForBufferPreferred(VkBuffer buffer,
+        MemoryPropertyFlags preferred, MemoryPropertyFlags fallback,
+        out bool usedPreferred, float priority = PriorityDefault)
+    {
+        _vk.GetBufferMemoryRequirements(_device, buffer, out var reqs);
+        usedPreferred = TryFindMemoryType(reqs.MemoryTypeBits, preferred, out _);
+        var props = usedPreferred ? preferred : fallback;
+        var alloc = Allocate(reqs, props, BucketKind.Buffer, priority);
+        _vk.BindBufferMemory(_device, buffer, alloc.Memory, alloc.Offset);
+        return alloc;
     }
 
     private static ulong AlignUp(ulong v, ulong a) => a <= 1 ? v : (v + a - 1) & ~(a - 1);

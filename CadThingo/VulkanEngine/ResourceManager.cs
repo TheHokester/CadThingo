@@ -234,8 +234,8 @@ public unsafe class ResourceManager
         CreateBindlessDescriptorSetLayout();
         for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            renderer.CreateMappedStorageBuffer((ulong)(Renderer.Renderer.MAX_MATERIALS * (uint)sizeof(PbrMaterial)),     ref MaterialStorageBuffers[i]);
-            renderer.CreateMappedStorageBuffer((ulong)(Renderer.Renderer.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)), ref InstanceStorageBuffers[i]);
+            renderer.CreateMappedStorageBuffer((ulong)(Renderer.Renderer.MAX_MATERIALS * (uint)sizeof(PbrMaterial)),     ref MaterialStorageBuffers[i], preferDeviceLocal: true);
+            renderer.CreateMappedStorageBuffer((ulong)(Renderer.Renderer.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)), ref InstanceStorageBuffers[i], preferDeviceLocal: true);
         }
         CreateDefaultBindlessSampler();
         CreateBindlessDescriptorSets();
@@ -912,10 +912,11 @@ public static class CubeMesh
         Vector3 normal, Vector4 tangent)
     {
         int v = faceIndex * 4;
-        vertices[v + 0] = new Vertex { Position = p0, Normal = normal, TexCoord = new Vector2(0, 0), Tangent = tangent };
-        vertices[v + 1] = new Vertex { Position = p1, Normal = normal, TexCoord = new Vector2(1, 0), Tangent = tangent };
-        vertices[v + 2] = new Vertex { Position = p2, Normal = normal, TexCoord = new Vector2(1, 1), Tangent = tangent };
-        vertices[v + 3] = new Vertex { Position = p3, Normal = normal, TexCoord = new Vector2(0, 1), Tangent = tangent };
+        uint nOct = Vertex.OctEncodeNormal(normal);
+        vertices[v + 0] = new Vertex { Position = p0, NormalOct = nOct, TexCoord = new Vector2(0, 0) };
+        vertices[v + 1] = new Vertex { Position = p1, NormalOct = nOct, TexCoord = new Vector2(1, 0) };
+        vertices[v + 2] = new Vertex { Position = p2, NormalOct = nOct, TexCoord = new Vector2(1, 1) };
+        vertices[v + 3] = new Vertex { Position = p3, NormalOct = nOct, TexCoord = new Vector2(0, 1) };
 
         int i = faceIndex * 6;
         indices[i + 0] = (uint)(v + 0);
@@ -988,7 +989,6 @@ public unsafe class ObjMeshResource : MeshResource
             {
                 var aMesh = scene->MMeshes[node->MMeshes[m]];
                 bool hasNormals  = aMesh->MNormals  != null;
-                bool hasTangents = aMesh->MTangents != null;
                 bool hasUv       = aMesh->MTextureCoords[0] != null;
 
                 for (var f = 0; f < aMesh->MNumFaces; f++)
@@ -1000,14 +1000,12 @@ public unsafe class ObjMeshResource : MeshResource
                         var p   = aMesh->MVertices[idx];
                         var n   = hasNormals  ? aMesh->MNormals[idx]          : default;
                         var uv  = hasUv       ? aMesh->MTextureCoords[0][idx] : default;
-                        var t   = hasTangents ? aMesh->MTangents[idx]         : default;
 
                         Vertex v = new()
                         {
-                            Position = new Vector3(p.X, p.Y, p.Z),
-                            Normal   = hasNormals  ? new Vector3(n.X, n.Y, n.Z) : new Vector3(0, 1, 0),
-                            TexCoord = hasUv       ? new Vector2(uv.X, uv.Y)    : new Vector2(0, 0),
-                            Tangent  = hasTangents ? new Vector4(t.X, t.Y, t.Z, 1.0f) : new Vector4(1, 0, 0, 1),
+                            Position  = new Vector3(p.X, p.Y, p.Z),
+                            NormalOct = Vertex.OctEncodeNormal(hasNormals ? new Vector3(n.X, n.Y, n.Z) : new Vector3(0, 1, 0)),
+                            TexCoord  = hasUv ? new Vector2(uv.X, uv.Y) : new Vector2(0, 0),
                         };
 
                         if (vertexMap.TryGetValue(v, out var existing))

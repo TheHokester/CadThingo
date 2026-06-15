@@ -334,7 +334,7 @@ public sealed unsafe class GpuScene : IDisposable
         {
             _gfx.CreateMappedStorageBuffer(
                 (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
-                ref _lightBuffers[i]);
+                ref _lightBuffers[i], preferDeviceLocal: true);
         }
     }
 

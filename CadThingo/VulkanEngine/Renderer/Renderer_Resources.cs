@@ -54,8 +54,9 @@ public unsafe partial class Renderer
     public void EndSingleTimeCommands(CommandBuffer cmd) => gfx.EndSingleTimeCommands(cmd);
 
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault)
-        => gfx.CreateBuffer(size, usage, memProps, out buffer, out alloc, priority);
+        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault,
+        bool preferDeviceLocal = false)
+        => gfx.CreateBuffer(size, usage, memProps, out buffer, out alloc, priority, preferDeviceLocal);
 
     public void CopyBuffer(Buffer src, Buffer dst, ulong size) => gfx.CopyBuffer(src, dst, size);
 
@@ -149,8 +150,8 @@ public unsafe partial class Renderer
     // usage bits let callers turn the same buffer into an indirect-cmd / indirect-
     // count source on top of plain storage usage.
     internal void CreateMappedStorageBuffer(ulong sizeBytes, ref UboBuffer ubo,
-        BufferUsageFlags extraUsage = 0)
-        => gfx.CreateMappedStorageBuffer(sizeBytes, ref ubo, extraUsage);
+        BufferUsageFlags extraUsage = 0, bool preferDeviceLocal = false)
+        => gfx.CreateMappedStorageBuffer(sizeBytes, ref ubo, extraUsage, preferDeviceLocal);
 
     // Lights SSBO — owned by GpuScene (L2). These forwarders keep the former
     // Renderer.GetLightStorageBuffer / Renderer.LightCount call sites (LightCull,

@@ -175,41 +175,32 @@ public static unsafe class GltfLoader
         var uvsAcc = prim.GetVertexAccessor("TEXCOORD_0");
         var uvsFound = uvsAcc != null;
 
-        var tangentsAcc = prim.GetVertexAccessor("TANGENT");
-        var tangentsFound = tangentsAcc != null;
-
-
         var positions = positionsAcc.AsVector3Array().ToArray();
         var normals = normalsAcc.AsVector3Array().ToArray();
         var uvs = uvsFound ? uvsAcc.AsVector2Array().ToArray() : new Vector2[positions.Length];
+
+        var n = positions.Length;
+        if (normals.Length != n || uvs.Length != n)
+            throw new InvalidDataException(
+                $"glTF primitive {contextLabel} has mismatched vertex-attribute counts " +
+                $"(positions={n}, normals={normals.Length}, uvs={uvs.Length}).");
+
+        var verts = new Vertex[n];
+        for (int i = 0; i < n; i++)
         {
-            //kept ones level lower as a native c# array to ensure that 
-            var tangents = tangentsFound ? tangentsAcc.AsVector4Array().ToArray() : GenerateTangentsForPrimitive(prim);
-
-            var n = positions.Length;
-            if (normals.Length != n || uvs.Length != n || tangents.Length != n)
-                throw new InvalidDataException(
-                    $"glTF primitive {contextLabel} has mismatched vertex-attribute counts " +
-                    $"(positions={n}, normals={normals.Length}, uvs={uvs.Length}, tangents={tangents.Length}).");
-
-            var verts = new Vertex[n];
-            for (int i = 0; i < n; i++)
+            verts[i] = new Vertex
             {
-                verts[i] = new Vertex
-                {
-                    Position = positions[i],
-                    Normal = normals[i],
-                    TexCoord = uvs[i], // glTF UV origin is top-left, same as Vulkan — no flip needed
-                    Tangent = tangents[i],
-                };
-            }
-
-            var indexList = prim.GetIndices();
-            var indices = new uint[indexList.Count];
-            for (int i = 0; i < indexList.Count; i++) indices[i] = indexList[i];
-
-            return (verts, indices);
+                Position = positions[i],
+                NormalOct = Vertex.OctEncodeNormal(normals[i]),
+                TexCoord = uvs[i], // glTF UV origin is top-left, same as Vulkan — no flip needed
+            };
         }
+
+        var indexList = prim.GetIndices();
+        var indices = new uint[indexList.Count];
+        for (int i = 0; i < indexList.Count; i++) indices[i] = indexList[i];
+
+        return (verts, indices);
     }
 
     public static Vector4[] GenerateTangentsForPrimitive(MeshPrimitive primitive)

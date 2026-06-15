@@ -317,7 +317,7 @@ public unsafe partial class Renderer
         ulong sizeBytes = (ulong)capacity * (ulong)sizeof(ShadowEntityInfo);
         CreateBuffer(sizeBytes, BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out shadowInfoBuffer, out shadowInfoAlloc);
+            out shadowInfoBuffer, out shadowInfoAlloc, preferDeviceLocal: true);
 
         shadowInfoMapped = memAllocator.GetMapped(shadowInfoAlloc);
         shadowInfoCapacity = capacity;
@@ -345,11 +345,11 @@ public unsafe partial class Renderer
         CreateBuffer((ulong)capacity * (ulong)sizeof(EmissiveTriGpu),
             BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out emissiveTriBuffer, out emissiveTriAlloc);
+            out emissiveTriBuffer, out emissiveTriAlloc, preferDeviceLocal: true);
         CreateBuffer((ulong)capacity * (ulong)sizeof(AliasEntryGpu),
             BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-            out emissiveAliasBuffer, out emissiveAliasAlloc);
+            out emissiveAliasBuffer, out emissiveAliasAlloc, preferDeviceLocal: true);
 
         emissiveTriMapped   = memAllocator.GetMapped(emissiveTriAlloc);
         emissiveAliasMapped = memAllocator.GetMapped(emissiveAliasAlloc);

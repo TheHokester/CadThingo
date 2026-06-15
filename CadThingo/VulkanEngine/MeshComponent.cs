@@ -290,12 +290,36 @@ public unsafe struct InstanceData
     
     
 }
+// 24-byte vertex: Position(12) + NormalOct(4, octahedral 2x unorm16) + TexCoord(8).
+// Tangents are not stored — consumers derive them (UV gradients on the RT path,
+// screen-space derivatives on the raster path). The normal attribute is exposed to
+// the rasterizer as R16G16_UNORM (the two oct components) and decoded in each VS via
+// octDecodeNormal; the byte-addressed RT path decodes the same uint. OctEncodeNormal
+// must match CommonTypes.slang::octEncodeNormal so fetched normals round-trip.
 public unsafe struct Vertex
 {
     public Vector3 Position;
-    public Vector3 Normal;
+    public uint    NormalOct;
     public Vector2 TexCoord;
-    public Vector4 Tangent;
+
+    public static uint OctEncodeNormal(Vector3 n)
+    {
+        float s = MathF.Abs(n.X) + MathF.Abs(n.Y) + MathF.Abs(n.Z);
+        if (s < 1e-12f) return 0u;
+        n /= s;
+        float ex, ey;
+        if (n.Z >= 0f) { ex = n.X; ey = n.Y; }
+        else
+        {
+            ex = (1f - MathF.Abs(n.Y)) * (n.X >= 0f ? 1f : -1f);
+            ey = (1f - MathF.Abs(n.X)) * (n.Y >= 0f ? 1f : -1f);
+        }
+        ex = Math.Clamp(ex * 0.5f + 0.5f, 0f, 1f);
+        ey = Math.Clamp(ey * 0.5f + 0.5f, 0f, 1f);
+        uint xi = (uint)MathF.Round(ex * 65535f);
+        uint yi = (uint)MathF.Round(ey * 65535f);
+        return xi | (yi << 16);
+    }
 
     public static VertexInputBindingDescription GetBindingDescription()
     {
@@ -323,8 +347,8 @@ public unsafe struct Vertex
             {
                 Binding = 0,
                 Location = 1,
-                Format = Format.R32G32B32Sfloat,
-                Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(Normal))
+                Format = Format.R16G16Unorm,
+                Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(NormalOct))
             },
             new()
             {
@@ -332,13 +356,6 @@ public unsafe struct Vertex
                 Location = 2,
                 Format = Format.R32G32Sfloat,
                 Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(TexCoord))
-            },
-            new()
-            {
-                Binding = 0,
-                Location = 3,
-                Format = Format.R32G32B32A32Sfloat,
-                Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(Tangent))
             }
         };
 

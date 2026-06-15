@@ -128,28 +128,49 @@ public float3x3 entityNormalMatrix(ShadowEntityInfo info) {
 public static const uint TILE_SIZE_PX        = 16u;
 public static const uint MAX_LIGHTS_PER_TILE = 64u;
 
+// Octahedral normal codec (2x unorm16 packed low|high in a uint). Shared by the
+// vertex stream (below) and any other normal compression. The float2 overload
+// takes the already-unpacked [0,1] pair (the form an R16G16_UNORM vertex input
+// delivers); the uint overload unpacks the byte-addressed form. octEncode must
+// match the C# encoder in MeshComponent.cs so fetched normals round-trip.
+public float2 octWrap(float2 v) {
+    return (1.0 - abs(v.yx)) * float2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+}
+public float3 octDecodeNormal(float2 e01) {
+    float2 f = e01 * 2.0 - 1.0;
+    float3 n = float3(f, 1.0 - abs(f.x) - abs(f.y));
+    float  t = saturate(-n.z);
+    n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+    return normalize(n);
+}
+public float3 octDecodeNormal(uint p) {
+    return octDecodeNormal(float2(float(p & 0xFFFFu), float(p >> 16)) / 65535.0);
+}
+public uint octEncodeNormal(float3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 e = saturate(((n.z >= 0.0) ? n.xy : octWrap(n.xy)) * 0.5 + 0.5);
+    return uint(round(e.x * 65535.0)) | (uint(round(e.y * 65535.0)) << 16);
+}
+
 // Vertex stream layout + fetch helpers
 // Must match the C# Vertex struct in MeshComponent.cs:
-//   Position(12) + Normal(12) + TexCoord(8) + Tangent(16) = 48 bytes
-// Helpers take the ByteAddressBuffer as a parameter so each shader passes its
-// own binding — the module stays binding-agnostic.
-public static const uint VERTEX_STRIDE         = 48u;
+//   Position(12) + NormalOct(4, oct 2x unorm16) + TexCoord(8) = 24 bytes
+// Tangents are not stored; consumers derive them from UV gradients (RT) or
+// screen-space derivatives (raster). Helpers take the ByteAddressBuffer as a
+// parameter so each shader passes its own binding — the module stays binding-agnostic.
+public static const uint VERTEX_STRIDE         = 24u;
 public static const uint VERTEX_POS_OFFSET     = 0u;
 public static const uint VERTEX_NORMAL_OFFSET  = 12u;   // 12 (Position)
-public static const uint VERTEX_UV_OFFSET      = 24u;   // 12 (Position) + 12 (Normal)
-public static const uint VERTEX_TANGENT_OFFSET = 32u;   // + 8 (TexCoord)
+public static const uint VERTEX_UV_OFFSET      = 16u;   // 12 (Position) + 4 (NormalOct)
 
 public float3 fetchVertexPos(ByteAddressBuffer vbuf, uint vi) {
     return asfloat(vbuf.Load3(vi * VERTEX_STRIDE + VERTEX_POS_OFFSET));
 }
 public float3 fetchVertexNormal(ByteAddressBuffer vbuf, uint vi) {
-    return asfloat(vbuf.Load3(vi * VERTEX_STRIDE + VERTEX_NORMAL_OFFSET));
+    return octDecodeNormal(vbuf.Load(vi * VERTEX_STRIDE + VERTEX_NORMAL_OFFSET));
 }
 public float2 fetchVertexUV(ByteAddressBuffer vbuf, uint vi) {
     return asfloat(vbuf.Load2(vi * VERTEX_STRIDE + VERTEX_UV_OFFSET));
-}
-public float4 fetchVertexTangent(ByteAddressBuffer vbuf, uint vi) {
-    return asfloat(vbuf.Load4(vi * VERTEX_STRIDE + VERTEX_TANGENT_OFFSET));
 }
 
 public uint fetchTriangleIndex(ByteAddressBuffer ibuf, uint indexOffset, uint primIdx, uint corner) {
@@ -165,4 +186,24 @@ public float3 decodeTangentNormal(float2 rg) {
     float2 xy = rg * 2.0 - 1.0;
     float  z  = sqrt(saturate(1.0 - dot(xy, xy)));
     return float3(xy, z);
+}
+
+// Perturb a shading normal N by a tangent-space normal-map sample, deriving the
+// tangent frame from screen-space derivatives (Schuler's cotangent frame) instead
+// of a per-vertex tangent attribute. Fragment-stage only (uses ddx/ddy). Returns N
+// unchanged where the UV gradients are degenerate.
+public float3 applyNormalMap(float3 N, float3 worldPos, float2 uv, float3 tangentNormal) {
+    float3 dp1 = ddx(worldPos);
+    float3 dp2 = ddy(worldPos);
+    float2 duv1 = ddx(uv);
+    float2 duv2 = ddy(uv);
+    float3 dp2perp = cross(dp2, N);
+    float3 dp1perp = cross(N, dp1);
+    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float  m = max(dot(T, T), dot(B, B));
+    if (m <= 1e-12) return N;
+    float  invmax = rsqrt(m);
+    float3x3 TBN = float3x3(T * invmax, B * invmax, N);
+    return normalize(mul(tangentNormal, TBN));
 }

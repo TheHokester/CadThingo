@@ -149,9 +149,8 @@ float softShadow(float3 origin, float3 L, float distanceToLight, float lightRadi
 
 struct VSInput {
     float3 Position : POSITION;
-    float3 Normal   : NORMAL;
+    float2 Normal   : NORMAL;   // octahedral (R16G16_UNORM)
     float2 UV       : TEXCOORD0;
-    float4 Tangent  : TANGENT;
 };
 
 struct VSOutput {
@@ -159,7 +158,6 @@ struct VSOutput {
     float3 WorldPos      : POSITION;
     float3 Normal        : NORMAL;
     float2 UV            : TEXCOORD0;
-    float4 Tangent       : TANGENT;
     nointerpolation uint MaterialIndex : TEXCOORD1;
 };
 
@@ -171,9 +169,8 @@ VSOutput VSMain(VSInput input)
     VSOutput output;
     output.Position      = mul(frame.proj, mul(frame.view, worldPos));
     output.WorldPos      = worldPos.xyz;
-    output.Normal        = normalize(mul((float3x3)draw.model, input.Normal));
+    output.Normal        = normalize(mul((float3x3)draw.model, octDecodeNormal(input.Normal)));
     output.UV            = input.UV;
-    output.Tangent       = input.Tangent;
     output.MaterialIndex = draw.materialIndex;
     return output;
 }
@@ -195,10 +192,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
     float3 N = normalize(input.Normal);
     {
         float3 tangentNormal = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).rg);
-        float3 T = normalize(input.Tangent.xyz);
-        float3 B = normalize(cross(N, T)) * input.Tangent.w;
-        float3x3 TBN = float3x3(T, B, N);
-        N = normalize(mul(tangentNormal, TBN));
+        N = applyNormalMap(N, input.WorldPos, input.UV, tangentNormal);
     }
 
     float3 WorldPos = input.WorldPos;

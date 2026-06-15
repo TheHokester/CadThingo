@@ -1227,8 +1227,27 @@ public sealed unsafe class GraphicsDevice : IDisposable
     }
 
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault)
-        => CreateBuffer(size, usage, memProps, out buffer, out alloc, null, priority);
+        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault,
+        bool preferDeviceLocal = false)
+        => CreateBuffer(size, usage, memProps, out buffer, out alloc, null, priority, preferDeviceLocal);
+
+    // Places a GPU-hot, host-written buffer in VRAM when possible: prefers
+    // device-local-host-visible (resizable BAR) so the GPU reads it locally instead of
+    // over PCIe every access, falling back to the requested host-visible props. Warns
+    // once if no such heap exists. baseProps must include HostVisible for the mapping.
+    private bool _warnedNoBar;
+    private SubAlloc AllocateGpuPreferred(Buffer buffer, MemoryPropertyFlags baseProps, float priority)
+    {
+        var alloc = memAllocator.AllocateForBufferPreferred(buffer,
+            baseProps | MemoryPropertyFlags.DeviceLocalBit, baseProps, out bool gpuResident, priority);
+        if (!gpuResident && !_warnedNoBar)
+        {
+            _warnedNoBar = true;
+            Console.WriteLine("[GpuMemory] No device-local-host-visible heap (resizable BAR off?); " +
+                              "GPU-hot SSBOs stay in system memory and shader reads cross PCIe.");
+        }
+        return alloc;
+    }
 
     /// <summary>Buffer creation with optional CONCURRENT sharing. Pass the distinct queue
     /// family indices that will access the buffer (e.g. graphics + async compute) and the
@@ -1237,7 +1256,7 @@ public sealed unsafe class GraphicsDevice : IDisposable
     /// family, or duplicate indices fall back to EXCLUSIVE.</summary>
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
         out Buffer buffer, out SubAlloc alloc, uint[]? sharedFamilies,
-        float priority = GpuMemoryAllocator.PriorityDefault)
+        float priority = GpuMemoryAllocator.PriorityDefault, bool preferDeviceLocal = false)
     {
         uint[] families = sharedFamilies is null ? [] : sharedFamilies.Distinct().ToArray();
         fixed (uint* pFamilies = families)
@@ -1258,7 +1277,9 @@ public sealed unsafe class GraphicsDevice : IDisposable
         // DeviceAddress flag is already baked into every buffer-bucket block by
         // the allocator — no per-call PNext chain needed. Caller still has to set
         // ShaderDeviceAddressBit in `usage` for the buffer itself, which they do.
-        alloc = memAllocator.AllocateForBuffer(buffer, memProps, priority);
+        alloc = preferDeviceLocal
+            ? AllocateGpuPreferred(buffer, memProps, priority)
+            : memAllocator.AllocateForBuffer(buffer, memProps, priority);
     }
 
     public void CopyBuffer(Buffer src, Buffer dst, ulong size)
@@ -1316,7 +1337,7 @@ public sealed unsafe class GraphicsDevice : IDisposable
     // usage bits let callers turn the same buffer into an indirect-cmd / indirect-
     // count source on top of plain storage usage.
     internal void CreateMappedStorageBuffer(ulong sizeBytes, ref UboBuffer ubo,
-        BufferUsageFlags extraUsage = 0)
+        BufferUsageFlags extraUsage = 0, bool preferDeviceLocal = false)
     {
         BufferCreateInfo bufferInfo = new()
         {
@@ -1326,8 +1347,10 @@ public sealed unsafe class GraphicsDevice : IDisposable
             SharingMode = SharingMode.Exclusive,
         };
         vk.CreateBuffer(device, &bufferInfo, null, out ubo.buffer);
-        ubo.alloc  = memAllocator.AllocateForBuffer(ubo.buffer,
-            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
+        var hostFlags = MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit;
+        ubo.alloc  = preferDeviceLocal
+            ? AllocateGpuPreferred(ubo.buffer, hostFlags, GpuMemoryAllocator.PriorityDefault)
+            : memAllocator.AllocateForBuffer(ubo.buffer, hostFlags);
         ubo.mapped = memAllocator.GetMapped(ubo.alloc);
     }
 

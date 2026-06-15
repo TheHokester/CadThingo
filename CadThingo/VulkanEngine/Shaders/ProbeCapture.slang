@@ -28,9 +28,8 @@ struct PushConst {
 
 struct VSInput {
     float3 Position : POSITION;
-    float3 Normal   : NORMAL;
+    float2 Normal   : NORMAL;   // octahedral (R16G16_UNORM)
     float2 UV       : TEXCOORD0;
-    float4 Tangent  : TANGENT;
 };
 
 struct VSOutput {
@@ -60,7 +59,7 @@ VSOutput VSMain(VSInput input, uint viewIndex : SV_ViewID)
     o.WorldPos = worldPos.xyz;
     // World-space normal — capture shader skips normal maps for cost, the
     // mesh normal is sufficient input for a prefiltered specular bake.
-    o.Normal   = normalize(mul((float3x3)pc.model, input.Normal));
+    o.Normal   = normalize(mul((float3x3)pc.model, octDecodeNormal(input.Normal)));
     o.UV       = input.UV;
     return o;
 }
