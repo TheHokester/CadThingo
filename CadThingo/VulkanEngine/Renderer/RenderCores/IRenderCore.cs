@@ -18,6 +18,14 @@ internal interface IGraphCore
     string ToDot();
     /// <summary>Runtime toggle for the graph's pipeline-statistics collection.</summary>
     bool CollectPipelineStats { get; set; }
+    /// <summary>True when the active graph has async-compute passes and Execute deferred its gfx
+    /// chunks. The host must call <see cref="SubmitGfxChunks"/> instead of its own QueueSubmit.</summary>
+    bool HasPendingGfxChunks { get; }
+    /// <summary>Submit the deferred graphics chunks plus <paramref name="hostCmd"/> in one
+    /// vkQueueSubmit2, with the frame-pacing binary semaphores and fence attached to the host
+    /// cmd's slot. Only valid when <see cref="HasPendingGfxChunks"/> is true.</summary>
+    void SubmitGfxChunks(Queue gfxQueue, SemaphoreSubmitInfo imgAvailWait,
+        SemaphoreSubmitInfo renderDoneSignal, CommandBuffer hostCmd, Fence fence);
 }
 
 /// <summary>

@@ -145,7 +145,7 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
         _pipe.RecordArgsReadback(cmd);
     }
 
-    // ---- Debug surface (read by the Stats panel) -----------------------------
+    // ---- IGraphCore surface (Stats panel + gfx-chunk submission) ------------
     public GraphStats? GraphStats => _graph?.Stats;
     public string ToDot() => _graph?.ToDot() ?? "(no wavefront frame graph)";
     public bool CollectPipelineStats
@@ -153,6 +153,10 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
         get => _graph?.CollectPipelineStats ?? false;
         set { if (_graph != null) _graph.CollectPipelineStats = value; }
     }
+    public bool HasPendingGfxChunks => _graph?.HasPendingGfxChunks ?? false;
+    public void SubmitGfxChunks(Queue gfxQueue, SemaphoreSubmitInfo imgAvailWait,
+        SemaphoreSubmitInfo renderDoneSignal, CommandBuffer hostCmd, Fence fence)
+        => _graph!.SubmitGfxChunks(gfxQueue, imgAvailWait, renderDoneSignal, hostCmd, fence);
 
     public void Dispose()
     {

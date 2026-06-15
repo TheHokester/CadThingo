@@ -21,6 +21,11 @@ namespace CadThingo.VulkanEngine.GLTF;
 /// </summary>
 public static unsafe class GltfTextureResource
 {
+    /// <summary>Optional channel repack applied to decoded pixels before upload/compression.
+    /// MetallicRoughnessRg moves glTF's roughness(G)/metallic(B) into R,G so BC5 (which keeps
+    /// only the R,G channels) preserves both; consumers then sample .rg. None leaves pixels as-is.</summary>
+    public enum PrePack { None, MetallicRoughnessRg }
+
     /// <summary>
     /// Decode <paramref name="encodedBytes"/> (PNG/JPG/WebP), upload as a Vulkan texture
     /// in the requested <paramref name="format"/> (sRGB for color, Unorm for data),
@@ -33,7 +38,8 @@ public static unsafe class GltfTextureResource
         Renderer.Renderer renderer,
         ReadOnlyMemory<byte> encodedBytes,
         string mimeType,
-        Format format)
+        Format format,
+        PrePack prePack = PrePack.None)
     {
         // Idempotent: if already loaded, surface the existing Texture so multiple materials
         // sharing the same image don't re-decode/upload.
@@ -62,6 +68,11 @@ public static unsafe class GltfTextureResource
         using var img = ImageSharp.Image.Load<Rgba32>(encodedBytes.Span);
         var pixels = new Rgba32[img.Width * img.Height];
         img.CopyPixelDataTo(pixels);
+
+        // Repack metallic(B)/roughness(G) into R,G so BC5 (R,G only) keeps both.
+        if (prePack == PrePack.MetallicRoughnessRg)
+            for (int i = 0; i < pixels.Length; i++)
+                pixels[i] = new Rgba32(pixels[i].B, pixels[i].G, (byte)0, (byte)255);
 
         // BC formats are GPU-compressed at load to cut texture-cache (L1Tex->L2) fill; if the
         // device lacks textureCompressionBC, fall back to the equivalent uncompressed RGBA8.

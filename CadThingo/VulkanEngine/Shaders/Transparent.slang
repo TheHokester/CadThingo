@@ -185,7 +185,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
     SamplerState s  = samplers[0];
 
     float4 baseColor         = textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV) * mat.baseColorFactor;
-    float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).bg;
+    float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).rg;
     float  metallic          = metallicRoughness.x * mat.metallicFactor;
     float  roughness         = metallicRoughness.y * mat.roughnessFactor;
     float  ao                = textures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;

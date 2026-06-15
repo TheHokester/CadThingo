@@ -201,7 +201,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     h.metallic  = mat.metallicFactor;
     h.roughness = mat.roughnessFactor;
     if (mat.physicalDescriptorTex >= 0 && !lowDetail) {
-        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, uv).bg;
+        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, uv).rg;
         h.metallic  *= mr.x;
         h.roughness *= mr.y;
     }

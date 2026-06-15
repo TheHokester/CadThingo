@@ -46,14 +46,22 @@ void main(uint3 tid : SV_DispatchThreadID){
         while(q.Proceed()){
             if(q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE){
                 ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
-                PbrMaterial      cmat = materials[cei.materialIndex];
-                float alpha = computeAlpha(cmat, cei.indexOffset,
-                                           q.CandidatePrimitiveIndex(),
-                                           q.CandidateTriangleBarycentrics());
-                bool accept = true;
-                if((cmat.flags & 1u) != 0u) accept = alpha >= cmat.alphaCutoff;   // MASK
-                if((cmat.flags & 4u) != 0u) accept = rand(rng) < alpha;           // BLEND
-                if(accept) q.CommitNonOpaqueTriangleHit();
+                // Transmissive candidates commit straight through off the entity-record flags -- no
+                // materials[] read (closest-hit treats glass as opaque; see Extend). Only MASK/BLEND
+                // fetch the fat material to alpha-test.
+                if((cei.flags & 5u) == 0u){          // 5 = MASK(1) | BLEND(4)
+                    q.CommitNonOpaqueTriangleHit();
+                } else {
+                    PbrMaterial cmat = materials[cei.materialIndex];
+                    float alpha = computeAlpha(cmat, cei.indexOffset,
+                                               q.CandidatePrimitiveIndex(),
+                                               q.CandidateTriangleBarycentrics(),
+                                               ALPHA_LOD_VISIBILITY);
+                    bool accept = true;
+                    if((cmat.flags & 1u) != 0u) accept = alpha >= cmat.alphaCutoff;   // MASK
+                    if((cmat.flags & 4u) != 0u) accept = rand(rng) < alpha;           // BLEND
+                    if(accept) q.CommitNonOpaqueTriangleHit();
+                }
             }
         }
 

@@ -223,10 +223,21 @@ public uint wfShadeTotalGroups(){
 // merged shade stage (all C class dispatches share the ticket, so the tail runs in whichever
 // class's group arrives last). Returns true in thread 0 of exactly that group -- that thread
 // alone may then atomically read the final counters and write the next stage's args.
+// The device fence's ONLY job is to order this group's counter ATOMICS (SHADE_COUNT[c], device-
+// coherent, committed at L2 on completion) before the COMPLETED_WG bump, so the elected last group
+// reads final counts. But it also drains the group's 64 scattered shadeQueue PLAIN stores -- which
+// the election never reads (their visibility to the next dispatch comes from the graph's pipeline
+// barrier, not this fence) -- so it over-fences, and that drain is the membar stall (~22% of Extend
+// stall samples). The GroupMemoryBarrierWithGroupSync above already orders all 64 threads' counter
+// adds before thread 0; counters are coherent atomics; so on NVIDIA this fence is believed redundant.
+// Toggle to drop it: MEASURE the membar-stall win AND soak-test the per-bounce dispatch counts
+// (StatsPanel) for consistency -- a stale count = wrong launch dims = intermittently missed shading.
+public static const bool WF_FUSE_TAIL_DEVICE_FENCE = false;
+
 public bool wfFuseTailElect(uint groupThreadId, uint numGroups){
-    GroupMemoryBarrierWithGroupSync();          // this group's global writes issued; all threads here
+    GroupMemoryBarrierWithGroupSync();          // this group's counter atomics issued; all threads here
     if(groupThreadId != 0u) return false;
-    DeviceMemoryBarrier();                       // order them device-wide before the arrival ticket
+    if(WF_FUSE_TAIL_DEVICE_FENCE) DeviceMemoryBarrier();   // order them device-wide before the arrival ticket
     uint ticket;
     InterlockedAdd(counters[COMPLETED_WG], 1u, ticket);
     if(ticket + 1u != numGroups) return false;

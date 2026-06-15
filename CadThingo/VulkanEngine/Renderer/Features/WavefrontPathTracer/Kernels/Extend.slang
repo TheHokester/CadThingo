@@ -9,6 +9,14 @@ import WavefrontShading;   // re-exports WavefrontBindings + PTUtils + CommonTyp
 // from the final hit count and zeroes the counters Shade will accumulate into (SHADOW_COUNT,
 // NEXT_RAY_COUNT). wfGroupCount clamps to >=1, so even a zero-hit bounce launches one Shade
 // group whose own tail keeps the chain's args fresh.
+// DIAGNOSTIC TOGGLE (not a kept feature): force-opaque the trace so the Proceed loop runs zero
+// body iterations -- isolates pure BVH-traversal cost from the alpha-test (MASK/BLEND) work. If
+// Extend(b>0) time barely moves with this on, the divergence is the traversal itself, not the
+// alpha path. NOT correctness-preserving: MASK/BLEND geometry becomes solid. Revert to false after
+// measuring. (RayQuery flags are part of the type, so this folds through a compile-time constant.)
+static const bool EXTEND_FORCE_OPAQUE = false;
+static const uint EXTEND_RAY_FLAGS    = EXTEND_FORCE_OPAQUE ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
+
 [shader("compute")]
 [numthreads(64,1,1)]
 void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
@@ -26,23 +34,35 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
         ray.TMin      = 0.0;
         ray.TMax      = INFINITY;
 
-        RayQuery<RAY_FLAG_NONE> q;
-        q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+        RayQuery<EXTEND_RAY_FLAGS> q;
+        q.TraceRayInline(tlas, EXTEND_RAY_FLAGS, 0xFF, ray);
 
         // Alpha-test loop. ForceNoOpaque-flagged instances (MASK / BLEND / transmissive) ride
         // through Proceed; pure-opaque hits never enter the body. MASK = hard cutoff; BLEND =
         // Bernoulli on alpha (stochastic transparency -> soft foliage edges as samples accumulate).
+        // (Under EXTEND_FORCE_OPAQUE the diagnostic forces all hits opaque, so Proceed surfaces no
+        // candidates and this body runs zero times -- leaving only the BVH traversal.)
         while(q.Proceed()){
             if(q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE){
                 ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
-                PbrMaterial      cmat = materials[cei.materialIndex];
-                float alpha = computeAlpha(cmat, cei.indexOffset,
-                                           q.CandidatePrimitiveIndex(),
-                                           q.CandidateTriangleBarycentrics());
-                bool accept = true;
-                if((cmat.flags & 1u) != 0u) accept = alpha >= cmat.alphaCutoff;   // MASK
-                if((cmat.flags & 4u) != 0u) accept = rand(rng) < alpha;           // BLEND
-                if(accept) q.CommitNonOpaqueTriangleHit();
+                // The MASK/BLEND bits live in the already-read, compact 64B entity record, so the fat
+                // ~112B PbrMaterial is fetched ONLY for the few candidates that actually alpha-test.
+                // Transmissive candidates (the bulk, with lots of glass) commit straight through with
+                // ZERO materials[] read -- that incoherent dependent fetch was the dominant loop cost.
+                // Closest-hit treats glass as opaque; refraction is resolved later in Shade's BSDF.
+                if((cei.flags & 5u) == 0u){          // 5 = MASK(1) | BLEND(4)
+                    q.CommitNonOpaqueTriangleHit();
+                } else {
+                    PbrMaterial cmat = materials[cei.materialIndex];
+                    float alpha = computeAlpha(cmat, cei.indexOffset,
+                                               q.CandidatePrimitiveIndex(),
+                                               q.CandidateTriangleBarycentrics(),
+                                               ALPHA_LOD_VISIBILITY);
+                    bool accept = true;
+                    if((cmat.flags & 1u) != 0u) accept = alpha >= cmat.alphaCutoff;   // MASK
+                    if((cmat.flags & 4u) != 0u) accept = rand(rng) < alpha;           // BLEND
+                    if(accept) q.CommitNonOpaqueTriangleHit();
+                }
             }
         }
 

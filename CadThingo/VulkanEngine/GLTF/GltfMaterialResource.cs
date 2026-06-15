@@ -46,12 +46,15 @@ public static class GltfMaterialResource
                 // Key by image identity + format — multiple materials referencing
                 // the same glTF image share one TextureResource and (via the
                 // RegisterBindless dedup) one bindless slot.
+                var prePack = channelName == "MetallicRoughness"
+                    ? GltfTextureResource.PrePack.MetallicRoughnessRg
+                    : GltfTextureResource.PrePack.None;
                 string texId = $"{idPrefix}:img:{image.LogicalIndex}:fmt{(int)format}";
                 var tex = GltfTextureResource.BuildAndRegister(
                     texId, rm, renderer,
                     image.Content.Content,
                     image.Content.MimeType,
-                    format);
+                    format, prePack);
                 texIdx[i] = rm.RegisterBindless(tex);
             }
             else
@@ -192,15 +195,17 @@ public static class GltfMaterialResource
 
     /// <summary>Vulkan format the channel's texture should be sampled in. BC-compressed to cut
     /// texture-cache fill: BC3 baseColor (keeps the MASK/BLEND alpha), BC1 emissive (no alpha), and
-    /// BC5 normals (two channels; shaders reconstruct z via decodeTangentNormal). The loader falls
-    /// back to RGBA8 when the device lacks textureCompressionBC. MetallicRoughness/Occlusion stay
-    /// uncompressed for now (BC quantisation of packed data channels needs a closer quality look).</summary>
+    /// BC5 normals + MetallicRoughness (two channels each). MetallicRoughness is repacked at load
+    /// (PrePack.MetallicRoughnessRg) so its roughness/metallic land in BC5's R,G; consumers sample
+    /// .rg. The loader falls back to RGBA8 when the device lacks textureCompressionBC. Occlusion stays
+    /// uncompressed (single channel, rarely the cache bottleneck).</summary>
     private static Format ChannelFormat(string channelName) => channelName switch
     {
-        "BaseColor" => Format.BC3SrgbBlock,
-        "Emissive"  => Format.BC1RgbSrgbBlock,
-        "Normal"    => Format.BC5UnormBlock,
-        _           => Format.R8G8B8A8Unorm, // MetallicRoughness, Occlusion are linear data textures
+        "BaseColor"         => Format.BC3SrgbBlock,
+        "Emissive"          => Format.BC1RgbSrgbBlock,
+        "Normal"            => Format.BC5UnormBlock,
+        "MetallicRoughness" => Format.BC5UnormBlock,
+        _                   => Format.R8G8B8A8Unorm, // Occlusion is linear single-channel data
     };
 
     private static int ChannelDefaultIndex(string channelName) => channelName switch

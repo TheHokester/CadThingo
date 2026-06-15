@@ -105,7 +105,7 @@ GBufferOutput PSMain(VSOutput input)
     // even if they did.
     if ((mat.flags & 1u) != 0u && baseColor.a < mat.alphaCutoff) discard;
 
-    float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).bg;
+    float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).rg;
     float metallic         = metallicRoughness.x * mat.metallicFactor;
     float roughness        = metallicRoughness.y * mat.roughnessFactor;
     float ao               = textures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;

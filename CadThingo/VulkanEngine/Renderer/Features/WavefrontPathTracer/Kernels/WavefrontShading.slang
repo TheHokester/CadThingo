@@ -104,11 +104,17 @@ public float2 computeUV(uint indexOffset, uint primIdx, float2 bary) {
     return uv0 * w0 + uv1 * bary.x + uv2 * bary.y;
 }
 
-public float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 barycentrics) {
+// Alpha-test mip policy (see PathTraceRT): visibility/shadow alpha samples a coarser,
+// cache-resident mip to cut L1TEX traffic on alpha-tested foliage. Shadow rays tolerate
+// the most blur; primary/bounce visibility stays gentle so silhouettes don't thin.
+public static const float ALPHA_LOD_VISIBILITY = 1.0;   // Extend / tail trace
+public static const float ALPHA_LOD_SHADOW     = 3.0;   // NEE shadow-ray visibility
+
+public float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 barycentrics, float lod) {
     int baseColorIdx = mat.baseColorTex;
     if (baseColorIdx < 0 || mat.flags == 0) return 1.0f;
     float2 uv = computeUV(indexOffset, primIdx, barycentrics);
-    return textures[NonUniformResourceIndex(baseColorIdx)].SampleLevel(samplers[0], uv, 0.0).a * mat.baseColorFactor.a;
+    return textures[NonUniformResourceIndex(baseColorIdx)].SampleLevel(samplers[0], uv, lod).a * mat.baseColorFactor.a;
 }
 
 
@@ -187,7 +193,7 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
     h.metallic  = mat.metallicFactor;
     h.roughness = mat.roughnessFactor;
     if (mat.physicalDescriptorTex >= 0 && !lowDetail) {
-        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, wfTexConeLod(mat.physicalDescriptorTex, lodBase, lodJitter, stochMip)).bg;
+        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, wfTexConeLod(mat.physicalDescriptorTex, lodBase, lodJitter, stochMip)).rg;
         h.metallic  *= mr.x;
         h.roughness *= mr.y;
     }
@@ -267,13 +273,14 @@ public bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngStat
             PbrMaterial      cmat = materials[cei.materialIndex];
             float alpha = computeAlpha(cmat, cei.indexOffset,
                                        q.CandidatePrimitiveIndex(),
-                                       q.CandidateTriangleBarycentrics());
+                                       q.CandidateTriangleBarycentrics(),
+                                       ALPHA_LOD_SHADOW);
 
             float transmittance = cmat.transmissionFactor;
             if (cmat.transmissionTex >= 0) {
                 float2 uv = computeUV(cei.indexOffset, q.CandidatePrimitiveIndex(),
                                       q.CandidateTriangleBarycentrics());
-                transmittance *= textures[NonUniformResourceIndex(cmat.transmissionTex)].SampleLevel(samplers[0], uv, 0.0).r;
+                transmittance *= textures[NonUniformResourceIndex(cmat.transmissionTex)].SampleLevel(samplers[0], uv, ALPHA_LOD_SHADOW).r;
             }
 
             float passAlpha = 1.0;

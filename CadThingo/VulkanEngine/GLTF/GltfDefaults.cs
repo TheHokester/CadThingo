@@ -38,8 +38,8 @@ public static unsafe class GltfDefaults
 
         // BaseColor: white sRGB so the baseColorFactor multiplier comes through unmodified.
         _baseColor         = MakeOnePixel(renderer, 255, 255, 255, 255, Format.R8G8B8A8Srgb);
-        // MetallicRoughness: Geometry.slang samples .bg → green=roughness, blue=metallic.
-        // (0,255,0,255) → roughness=1, metallic=0 (matches glTF default factors).
+        // MetallicRoughness: consumers sample .rg → red=metallic, green=roughness (matches the
+        // BC5 repack layout). (0,255,0,255) → metallic=0, roughness=1 (glTF default factors).
         _metallicRoughness = MakeOnePixel(renderer,   0, 255,   0, 255, Format.R8G8B8A8Unorm);
         // Normal: flat normal pointing +Z in tangent space, encoded (128,128,255).
         _normal            = MakeOnePixel(renderer, 128, 128, 255, 255, Format.R8G8B8A8Unorm);

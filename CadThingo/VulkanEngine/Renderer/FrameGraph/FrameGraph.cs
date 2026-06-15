@@ -43,6 +43,9 @@ public unsafe class FrameGraph : IDisposable
     private ulong _gfxCursor, _cmpCursor;          // monotonic absolute timeline bases across frames
     private CommandPool _gfxChunkPool, _cmpChunkPool;
     private CommandBuffer[][] _chunkCmds = [];     // [frameInFlight][chunkIndex], parallel to _chunks
+    // Absolute timeline bases stored by ExecuteChunked for SubmitGfxChunks (called externally).
+    private ulong _lastSubmitGfxBase, _lastSubmitCmpBase;
+    private uint  _lastSubmitFr;
     // DAG retained from Compile step 1 for the chunk planner (cross-queue edge discovery).
     private HashSet<int>[] _adj = [], _preds = [];
 
@@ -50,6 +53,13 @@ public unsafe class FrameGraph : IDisposable
     /// <see cref="QueueClass.AsyncCompute"/> will really run on a second queue. Modules use
     /// this to pick between an async layout and a single-queue fallback.</summary>
     public bool AsyncComputeAvailable => _plan.HasRealAsyncCompute;
+
+    /// <summary>True when the compiled graph has async-compute passes. In this mode
+    /// <see cref="Execute"/> self-submits only the async chunks; the caller must follow up with
+    /// <see cref="SubmitGfxChunks"/> to submit the graphics chunks together with its own host
+    /// command buffer, keeping all graphics work in one unified submission for profiler
+    /// visibility.</summary>
+    public bool HasPendingGfxChunks => _chunked;
 
     /// <summary>One per-queue submission: the contiguous run of scheduled passes it records,
     /// the relative timeline value it signals on its own queue's semaphore (0 = none), and
@@ -438,7 +448,16 @@ public unsafe class FrameGraph : IDisposable
                 foreach (var pred in _preds[id])
                     if (_effQueue[pred] == QueueClass.AsyncCompute)
                         (waits ??= []).Add((QueueClass.AsyncCompute, _chunks[passChunk[pred]].Signal));
-                if (waits != null && curIdx >= 0) curIdx = -1;   // close the open chunk, unsignalled
+                if (waits != null && curIdx >= 0)
+                {
+                    // The open chunk is about to be closed. Give it an explicit gfx timeline
+                    // signal so profilers (Nsight) can anchor it. Add the matching gfx wait to
+                    // the new chunk's waits -- redundant with same-queue ordering, but makes
+                    // every chunk reachable via the semaphore dependency graph.
+                    _chunks[curIdx].Signal = (ulong)++_gfxSignalCount;
+                    waits.Add((QueueClass.Graphics, (ulong)_gfxSignalCount));
+                    curIdx = -1;
+                }
                 if (curIdx < 0)
                 {
                     _chunks.Add(new SubmitChunk { Queue = QueueClass.Graphics });
@@ -839,14 +858,11 @@ public unsafe class FrameGraph : IDisposable
         EmitBarriers(cmd, _closingImageBarriers, []);
     }
 
-    /// <summary>Record every chunk into this frame slot's command buffers, then submit each
-    /// queue's chunks in one vkQueueSubmit2 call with the baked timeline waits/signals mapped
-    /// to absolute values (base cursor + relative). Frame pacing: the last graphics chunk
-    /// transitively waits the async timeline (its passes consume async results), and the
-    /// host's own submit -- with the frame fence -- lands after it on the graphics queue, so
-    /// the existing fence covers the async queue too. Timeline waits may be submitted before
-    /// their signals (core timeline-semaphore behavior), so submission order between the two
-    /// queues is free; graphics goes first only for profiler readability.</summary>
+    /// <summary>Record every chunk into this frame slot's command buffers. Async compute chunks
+    /// are self-submitted here. Graphics chunks are NOT submitted -- the caller must follow up
+    /// with <see cref="SubmitGfxChunks"/> to merge them with its own host command buffer into
+    /// one vkQueueSubmit2, giving profilers (Nsight, RenderDoc) a single unified gfx submission
+    /// to show all graphics passes alongside the blit and UI work.</summary>
     private void ExecuteChunked(in Renderer.FrameContext frame)
     {
         uint fr = frame.FrameIndex;
@@ -893,12 +909,119 @@ public unsafe class FrameGraph : IDisposable
                 throw new Exception("FrameGraph: failed to end chunk command buffer");
         }
 
-        // Map this frame's relative timeline values onto the monotonic cursors.
+        // Map this frame's relative timeline values onto the monotonic cursors and store them
+        // so SubmitGfxChunks can resolve the baked relative signal/wait values to absolute ones.
         ulong gfxBase = _gfxCursor; _gfxCursor += (ulong)_gfxSignalCount;
         ulong cmpBase = _cmpCursor; _cmpCursor += (ulong)_cmpSignalCount;
+        _lastSubmitGfxBase = gfxBase;
+        _lastSubmitCmpBase = cmpBase;
+        _lastSubmitFr      = fr;
 
-        SubmitChunksFor(QueueClass.Graphics,     _plan.Graphics.Handle,            fr, gfxBase, cmpBase);
+        // Async compute chunks submit immediately on the compute queue (they must go to a
+        // different queue family; nothing about their submission needs the frame fence or
+        // presentation semaphores). Timeline waits may precede their signals, so the async
+        // submit can happen before the gfx submit without correctness issues.
         SubmitChunksFor(QueueClass.AsyncCompute, _plan.AsyncCompute!.Value.Handle, fr, gfxBase, cmpBase);
+    }
+
+    /// <summary>Submit all pending graphics chunks plus the caller's <paramref name="hostCmd"/>
+    /// in one vkQueueSubmit2 call. Each graphics chunk retains its baked timeline waits/signals
+    /// (async-compute synchronisation); the host command buffer goes last with the supplied
+    /// binary frame-pacing semaphores and <paramref name="fence"/>. Call this after
+    /// <see cref="Execute"/> when <see cref="HasPendingGfxChunks"/> is true, once the host
+    /// command buffer is fully recorded and ended.</summary>
+    public unsafe void SubmitGfxChunks(
+        Queue gfxQueue,
+        SemaphoreSubmitInfo imgAvailWait,
+        SemaphoreSubmitInfo renderDoneSignal,
+        CommandBuffer hostCmd,
+        Fence fence)
+    {
+        uint  fr      = _lastSubmitFr;
+        ulong gfxBase = _lastSubmitGfxBase;
+        ulong cmpBase = _lastSubmitCmpBase;
+
+        int n = 0, totalWaits = 0, totalSignals = 0;
+        foreach (var chunk in _chunks)
+        {
+            if (chunk.Queue != QueueClass.Graphics) continue;
+            n++;
+            totalWaits   += chunk.Waits.Count;
+            if (chunk.Signal != 0) totalSignals++;
+        }
+
+        // +1 slot for the host cmd (one binary wait, one binary signal).
+        int total = n + 1;
+        var submits     = stackalloc SubmitInfo2[total];
+        var cmdInfos    = stackalloc CommandBufferSubmitInfo[total];
+        var waitInfos   = stackalloc SemaphoreSubmitInfo[Math.Max(1, totalWaits + 1)];
+        var signalInfos = stackalloc SemaphoreSubmitInfo[Math.Max(1, totalSignals + 1)];
+
+        int si = 0, wi = 0, gi = 0;
+        for (int c = 0; c < _chunks.Count; c++)
+        {
+            var chunk = _chunks[c];
+            if (chunk.Queue != QueueClass.Graphics) continue;
+
+            cmdInfos[si] = new CommandBufferSubmitInfo
+            {
+                SType = StructureType.CommandBufferSubmitInfo,
+                CommandBuffer = _chunkCmds[fr][c],
+            };
+
+            int waitStart = wi;
+            foreach (var (wq, rel) in chunk.Waits)
+                waitInfos[wi++] = new SemaphoreSubmitInfo
+                {
+                    SType     = StructureType.SemaphoreSubmitInfo,
+                    Semaphore = wq == QueueClass.Graphics ? _gfxTimeline : _cmpTimeline,
+                    Value     = (wq == QueueClass.Graphics ? gfxBase : cmpBase) + rel,
+                    StageMask = PipelineStageFlags2.AllCommandsBit,
+                };
+
+            int sigStart = gi;
+            if (chunk.Signal != 0)
+                signalInfos[gi++] = new SemaphoreSubmitInfo
+                {
+                    SType     = StructureType.SemaphoreSubmitInfo,
+                    Semaphore = _gfxTimeline,
+                    Value     = gfxBase + chunk.Signal,
+                    StageMask = PipelineStageFlags2.AllCommandsBit,
+                };
+
+            submits[si++] = new SubmitInfo2
+            {
+                SType = StructureType.SubmitInfo2,
+                CommandBufferInfoCount    = 1,
+                PCommandBufferInfos       = &cmdInfos[si - 1],
+                WaitSemaphoreInfoCount    = (uint)(wi - waitStart),
+                PWaitSemaphoreInfos       = wi > waitStart ? &waitInfos[waitStart] : null,
+                SignalSemaphoreInfoCount  = (uint)(gi - sigStart),
+                PSignalSemaphoreInfos     = gi > sigStart ? &signalInfos[sigStart] : null,
+            };
+        }
+
+        // Host cmd: binary frame-pacing wait + signal, plus the frame fence.
+        waitInfos[wi]   = imgAvailWait;
+        signalInfos[gi] = renderDoneSignal;
+        cmdInfos[si] = new CommandBufferSubmitInfo
+        {
+            SType = StructureType.CommandBufferSubmitInfo,
+            CommandBuffer = hostCmd,
+        };
+        submits[si] = new SubmitInfo2
+        {
+            SType = StructureType.SubmitInfo2,
+            CommandBufferInfoCount   = 1,
+            PCommandBufferInfos      = &cmdInfos[si],
+            WaitSemaphoreInfoCount   = 1,
+            PWaitSemaphoreInfos      = &waitInfos[wi],
+            SignalSemaphoreInfoCount = 1,
+            PSignalSemaphoreInfos    = &signalInfos[gi],
+        };
+
+        if (gfx.Vk.QueueSubmit2(gfxQueue, (uint)total, submits, fence) != Result.Success)
+            throw new Exception("FrameGraph: SubmitGfxChunks QueueSubmit2 failed");
     }
 
     private void SubmitChunksFor(QueueClass q, Queue queue, uint fr, ulong gfxBase, ulong cmpBase)

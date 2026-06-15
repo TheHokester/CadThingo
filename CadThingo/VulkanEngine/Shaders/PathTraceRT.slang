@@ -62,10 +62,18 @@ float2 computeUV(uint indexOffset, uint primIdx, float2 bary) {
          + fetchVertexUV(globalVertices, i2) * bary.y;
 }
 
-float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 bary) {
+// Alpha-test mip policy: visibility/shadow alpha doesn't need full-res texels, so
+// sample a coarser, cache-resident mip to cut L1TEX traffic on alpha-tested foliage
+// (the hot any-hit path) for near-invisible change. Shadow rays tolerate the most
+// blur; primary visibility stays gentle so silhouettes don't thin. SampleLevel
+// clamps past the coarsest mip, so small textures just average toward their mean.
+static const float ALPHA_LOD_ANYHIT = 1.0;   // primary/bounce visibility (any-hit)
+static const float ALPHA_LOD_SHADOW = 3.0;   // NEE shadow-ray visibility
+
+float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 bary, float lod) {
     if (mat.baseColorTex < 0 || mat.flags == 0) return 1.0;
     float2 uv = computeUV(indexOffset, primIdx, bary);
-    return textures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(samplers[0], uv, 0).a * mat.baseColorFactor.a;
+    return textures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(samplers[0], uv, lod).a * mat.baseColorFactor.a;
 }
 
 // Shadow ray (NEE visibility) — inline ray query, valid inside raygen.
@@ -81,12 +89,13 @@ bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngState) {
             PbrMaterial      cmat = materials[cei.materialIndex];
             float alpha = computeAlpha(cmat, cei.indexOffset,
                                        q.CandidatePrimitiveIndex(),
-                                       q.CandidateTriangleBarycentrics());
+                                       q.CandidateTriangleBarycentrics(),
+                                       ALPHA_LOD_SHADOW);
             float transmittance = cmat.transmissionFactor;
             if (cmat.transmissionTex >= 0) {
                 float2 uv = computeUV(cei.indexOffset, q.CandidatePrimitiveIndex(),
                                       q.CandidateTriangleBarycentrics());
-                transmittance *= textures[NonUniformResourceIndex(cmat.transmissionTex)].SampleLevel(samplers[0], uv, 0).r;
+                transmittance *= textures[NonUniformResourceIndex(cmat.transmissionTex)].SampleLevel(samplers[0], uv, ALPHA_LOD_SHADOW).r;
             }
             float passAlpha = 1.0;
             if ((cmat.flags & 1u) != 0u) passAlpha = (alpha >= cmat.alphaCutoff) ? 1.0 : 0.0;
@@ -286,7 +295,7 @@ void anyHitMain(inout RayPayload pay, BuiltInTriangleIntersectionAttributes attr
     bool isBlend = (mat.flags & 4u) != 0u;
     if (!isMask && !isBlend) return;
 
-    float alpha = computeAlpha(mat, info.indexOffset, PrimitiveIndex(), attr.barycentrics);
+    float alpha = computeAlpha(mat, info.indexOffset, PrimitiveIndex(), attr.barycentrics, ALPHA_LOD_ANYHIT);
     bool accept = true;
     if (isMask)  accept = alpha >= mat.alphaCutoff;          // MASK
     if (isBlend) accept = rand(pay.rng) < alpha;             // BLEND stochastic (advances payload rng)
@@ -390,7 +399,7 @@ HitInfo fillHit(ShadowEntityInfo info, uint primIdx, float2 bary,
     h.metallic  = mat.metallicFactor;
     h.roughness = mat.roughnessFactor;
     if (mat.physicalDescriptorTex >= 0 && !lowDetail) {
-        float2 mr = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, texConeLod(mat.physicalDescriptorTex, lodBase, lodJitter, stochMip)).bg;
+        float2 mr = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, texConeLod(mat.physicalDescriptorTex, lodBase, lodJitter, stochMip)).rg;
         h.metallic  *= mr.x;
         h.roughness *= mr.y;
     }

@@ -334,25 +334,51 @@ public unsafe partial class Renderer
         // 8. End command buffer
         if (vk!.EndCommandBuffer(cmd) != Result.Success)
             throw new Exception("Failed to end command buffer");
-        
-        // 9. Submit: wait imageAvailable @ Transfer (blit consumes swapchain), signal renderFinished, fence inFlight
-        var waitSem = imageAvailableSemaphores[currentFrame];
-        var sigSem = renderFinishedSemaphores[currentFrame];
-        var waitStage = PipelineStageFlags.TransferBit;
-        var submitCmd = cmd;
-        var submitInfo = new SubmitInfo
+
+        // 9. Submit: wait imageAvailable @ Transfer, signal renderFinished, fence inFlight.
+        // Always uses vkQueueSubmit2. When the active core has deferred gfx chunks (wavefront
+        // async path), SubmitGfxChunks merges them with the host cmd so all graphics work lands
+        // in one unified submission -- making every graph pass visible in Nsight's timeline bar.
+        var imgAvailWait = new SemaphoreSubmitInfo
         {
-            SType = StructureType.SubmitInfo,
-            WaitSemaphoreCount = 1,
-            PWaitSemaphores = &waitSem,
-            PWaitDstStageMask = &waitStage,
-            CommandBufferCount = 1,
-            PCommandBuffers = &submitCmd,
-            SignalSemaphoreCount = 1,
-            PSignalSemaphores = &sigSem,
+            SType     = StructureType.SemaphoreSubmitInfo,
+            Semaphore = imageAvailableSemaphores[currentFrame],
+            Value     = 0,
+            StageMask = PipelineStageFlags2.TransferBit,
         };
-        if (vk!.QueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != Result.Success)
-            throw new Exception("Queue submit failed");
+        var renderDoneSignal = new SemaphoreSubmitInfo
+        {
+            SType     = StructureType.SemaphoreSubmitInfo,
+            Semaphore = renderFinishedSemaphores[currentFrame],
+            Value     = 0,
+            StageMask = PipelineStageFlags2.AllCommandsBit,
+        };
+
+        if (ActiveGraphCore is { HasPendingGfxChunks: true } graphCore)
+        {
+            graphCore.SubmitGfxChunks(graphicsQueue, imgAvailWait, renderDoneSignal,
+                cmd, inFlightFences[currentFrame]);
+        }
+        else
+        {
+            var hostCmdInfo = new CommandBufferSubmitInfo
+            {
+                SType = StructureType.CommandBufferSubmitInfo,
+                CommandBuffer = cmd,
+            };
+            var submitInfo2 = new SubmitInfo2
+            {
+                SType                    = StructureType.SubmitInfo2,
+                WaitSemaphoreInfoCount   = 1,
+                PWaitSemaphoreInfos      = &imgAvailWait,
+                CommandBufferInfoCount   = 1,
+                PCommandBufferInfos      = &hostCmdInfo,
+                SignalSemaphoreInfoCount = 1,
+                PSignalSemaphoreInfos    = &renderDoneSignal,
+            };
+            if (vk!.QueueSubmit2(graphicsQueue, 1, &submitInfo2, inFlightFences[currentFrame]) != Result.Success)
+                throw new Exception("Queue submit failed");
+        }
 
         // 10. Present — wait on renderFinished
         swapchain.Present(presentQueue, renderFinishedSemaphores[currentFrame], imageIndex);

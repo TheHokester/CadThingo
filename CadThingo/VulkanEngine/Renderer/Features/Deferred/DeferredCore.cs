@@ -169,17 +169,19 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
         _graph!.Execute(cmd, ctx);
     }
 
-    // ---- Debug surface (read by the Stats panel, forwarded by the host) ---------------
-    /// <summary>Last-frame per-pass GPU/CPU timings + counts, or null before first compile.</summary>
+    // ---- IGraphCore surface (Stats panel + gfx-chunk submission) ---------------
     public GraphStats? GraphStats => _graph?.Stats;
-    /// <summary>Graphviz dump of the compiled deferred graph (for "Copy DOT").</summary>
     public string ToDot() => _graph?.ToDot() ?? "(no deferred frame graph)";
-    /// <summary>Runtime toggle for the deferred graph's pipeline-statistics collection.</summary>
     public bool CollectPipelineStats
     {
         get => _graph?.CollectPipelineStats ?? false;
         set { if (_graph != null) _graph.CollectPipelineStats = value; }
     }
+    // Deferred graph has no async-compute passes; gfx chunks are never deferred.
+    public bool HasPendingGfxChunks => false;
+    public void SubmitGfxChunks(Queue gfxQueue, SemaphoreSubmitInfo imgAvailWait,
+        SemaphoreSubmitInfo renderDoneSignal, CommandBuffer hostCmd, Fence fence)
+        => throw new InvalidOperationException("DeferredCore: no pending gfx chunks");
 
     public void Dispose()
     {
