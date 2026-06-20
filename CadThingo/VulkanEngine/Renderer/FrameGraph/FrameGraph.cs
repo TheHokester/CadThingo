@@ -422,9 +422,13 @@ public unsafe class FrameGraph : IDisposable
         {
             if (_effQueue[id] != QueueClass.AsyncCompute) continue;
             var p = _passes[id];
-            if (p.Type == PassType.Graphics)
+            // Only Compute (and Transfer) work can ride the async-compute queue. Graphics and
+            // RayTrace (CmdTraceRays) both require the graphics queue -- the dedicated compute
+            // family advertises neither, so declaring one AsyncCompute is an authoring error.
+            if (p.Type is PassType.Graphics or PassType.RayTrace)
                 throw new InvalidOperationException(
-                    $"FrameGraph: pass '{p.Name}' is PassType.Graphics but declared QueueClass.AsyncCompute.");
+                    $"FrameGraph: pass '{p.Name}' is PassType.{p.Type} but declared QueueClass.AsyncCompute; " +
+                    "only Compute/Transfer passes can run on the async-compute queue.");
             foreach (var a in p.Reads)
                 if (a.IsImage) throw new InvalidOperationException(
                     $"FrameGraph: async pass '{p.Name}' accesses image '{_resources[a.ResourceId].Name}' -- async passes may only touch buffers (v1).");

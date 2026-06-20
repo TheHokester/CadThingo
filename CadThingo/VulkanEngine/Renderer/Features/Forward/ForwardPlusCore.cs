@@ -10,9 +10,15 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
 /// the host post-stack stays valid). It exists so the enum -> core mapping is total without
 /// inventing behaviour; the real forward+ chain lands here later as its own module/graph.
 /// </summary>
-internal sealed class ForwardPlusCore(Renderer host) : IRenderCore
+internal sealed class ForwardPlusCore : IRenderCore
 {
-    private readonly Renderer _host = host;
+    private readonly Renderer _host;
+
+    public ForwardPlusCore(Renderer host)
+    {
+        _host = host;
+        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
+    }
 
     public string Name => "Forward+ (stub)";
     public Renderer.RenderMode Mode => Renderer.RenderMode.ForwardPlus;

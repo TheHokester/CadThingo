@@ -61,28 +61,35 @@ public static class RendererSettingsPanel
     }
 
     //  Render mode
-
-    static readonly string[] _renderModeLabels =
-    {
-        "Deferred",
-        "Forward+ (ray-queried)",
-        "Pathtracer (compute + ray query)",
-        "Pathtracer (RT pipeline) [TODO]",
-        "Pathtracer (wavefront)",
-    };
+    // Registry-driven: the combo lists the renderer's registered cores by index (construction
+    // order) using each core's Name, and hands the chosen index back via RequestCoreIndex. There
+    // is no fixed label array to maintain -- a new core (or one gated out by missing device
+    // support, which then never registers) appears/disappears here automatically.
 
     static void DrawRenderMode(Renderer.Renderer renderer)
     {
         ImGuiNET.ImGui.SeparatorText("Render Mode");
 
-        int modeIdx = (int)renderer.renderMode;
-        if (ImGuiNET.ImGui.Combo("Mode", ref modeIdx, _renderModeLabels, _renderModeLabels.Length))
+        var cores = renderer.RenderCores;
+        if (cores.Count == 0) return;
+        int current = renderer.ActiveCoreIndex;
+        if (current < 0) current = 0;
+
+        if (ImGuiNET.ImGui.BeginCombo("Mode", cores[current].Name))
         {
-            renderer.renderMode = (Renderer.Renderer.RenderMode)modeIdx;
-            // Mode switch invalidates whatever was in FinalColor — drop any in-
-            // progress PT accumulation so we don't get a frame of stale pixels
-            // when toggling back on.
-            renderer.MarkAccumulatorDirty();
+            for (int i = 0; i < cores.Count; i++)
+            {
+                bool selected = i == current;
+                if (ImGuiNET.ImGui.Selectable(cores[i].Name, selected))
+                {
+                    renderer.RequestCoreIndex(i);
+                    // Mode switch invalidates whatever was in FinalColor — drop any in-progress PT
+                    // accumulation so we don't get a frame of stale pixels when toggling back on.
+                    renderer.MarkAccumulatorDirty();
+                }
+                if (selected) ImGuiNET.ImGui.SetItemDefaultFocus();
+            }
+            ImGuiNET.ImGui.EndCombo();
         }
     }
 

@@ -23,7 +23,10 @@ namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 //
 //  Inherits RtPipeline, which owns the VK_KHR_ray_tracing_pipeline dispatch
 //  table + SBT-layout properties (loaded in its constructor from the device).
-public sealed unsafe class RTPipeline : RtPipeline
+//  Not sealed: the ReSTIR DI pipeline (Features/ReSTIR) subclasses this, overriding only
+//  ShaderPath to point at its forked tracer .spv while reusing the SBT / descriptor / dispatch
+//  machinery unchanged. Later ReSTIR phases extend it with reservoir buffers + reuse passes.
+public unsafe class RTPipeline : RtPipeline
 {
     // Matches PathTraceRT.slang / PTComputePipeline PathFrameUBO byte-for-byte.
     [StructLayout(LayoutKind.Sequential)]
@@ -91,26 +94,33 @@ public sealed unsafe class RTPipeline : RtPipeline
     public uint CurrentSampleCount => _accumSamples;
 
 
+    // Extra stage flags OR'd onto the owned RT sets (frame set 0 + geom set 1). A subclass that
+    // shares these with a compute sibling (ReSTIR's SpatialShade, which reads entityInfo on set 0 +
+    // vertices/indices on set 1 for alpha-tested shadow rays) returns ComputeBit so the same sets are
+    // bindable from both. Base returns 0 -> the megakernel RT pipeline's sets stay RT-stages-only.
+    protected virtual ShaderStageFlags Set0ExtraStages => 0;
+
     // Descriptor set layouts — identical bindings to PTComputePipeline, RT stages.
     protected override void CreateDescriptorSetLayouts()
     {
         DescriptorSetLayouts            = new DescriptorSetLayout[4];
         OwnedDescriptorSetLayoutIndices = new[] { SetFrame, SetGeom, SetIbl };
 
+        ShaderStageFlags s0 = RtAll | Set0ExtraStages;
         var set0 = stackalloc DescriptorSetLayoutBinding[8];
-        set0[0] = new() { Binding = 0, DescriptorType = DescriptorType.UniformBuffer,            DescriptorCount = 1, StageFlags = RtAll };
-        set0[1] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = RtAll };
-        set0[2] = new() { Binding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = RtAll };
-        set0[3] = new() { Binding = 3, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = RtAll };
-        set0[4] = new() { Binding = 4, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = RtAll };
-        set0[5] = new() { Binding = 5, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = RtAll };
-        set0[6] = new() { Binding = 6, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = RtAll };
-        set0[7] = new() { Binding = 7, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = RtAll };
+        set0[0] = new() { Binding = 0, DescriptorType = DescriptorType.UniformBuffer,            DescriptorCount = 1, StageFlags = s0 };
+        set0[1] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = s0 };
+        set0[2] = new() { Binding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = s0 };
+        set0[3] = new() { Binding = 3, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = s0 };
+        set0[4] = new() { Binding = 4, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = s0 };
+        set0[5] = new() { Binding = 5, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = s0 };
+        set0[6] = new() { Binding = 6, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = s0 };
+        set0[7] = new() { Binding = 7, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = s0 };
         CreateLayout(set0, 8, out DescriptorSetLayouts[SetFrame]);
 
         var set1 = stackalloc DescriptorSetLayoutBinding[2];
-        set1[0] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = RtAll };
-        set1[1] = new() { Binding = 2, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = RtAll };
+        set1[0] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = s0 };
+        set1[1] = new() { Binding = 2, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = s0 };
         CreateLayout(set1, 2, out DescriptorSetLayouts[SetGeom]);
 
         // Borrowed bindless layout (ResourceManager adds RT stage flags when
@@ -434,7 +444,7 @@ public sealed unsafe class RTPipeline : RtPipeline
     }
 
 
-    public bool UpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent)
+    public virtual bool UpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent)
     {
         bool reset = _accumDirty;
         if (reset) { _accumSamples = 0; _accumDirty = false; } else { _accumSamples++; }
@@ -482,18 +492,31 @@ public sealed unsafe class RTPipeline : RtPipeline
     /// <summary>Records the CmdTraceRays dispatch. Caller must have run
     /// UpdatePerFrame, written all external descriptors, and transitioned the
     /// accumulator/outColor images to GENERAL beforehand.</summary>
+    // Extra descriptor sets a subclass binds after the four base sets (0-3). ReSTIR appends its
+    // set 4 (reservoirs + G-buffer). Base pipeline binds none.
+    protected virtual uint ExtraSetCount => 0u;
+    protected virtual void WriteExtraSets(DescriptorSet* dst, uint frame) { }
+
+    // Push-constant upload hook, called by Record after the descriptor sets are bound and before
+    // CmdTraceRays. Base pipeline declares no push constants; ReSTIR pushes its per-frame state
+    // (prevViewProj + ping-pong parity) here. The subclass must also declare the matching range in
+    // CreateDescriptorSetLayouts (PushConstantRanges) so the pipeline layout includes it.
+    protected virtual void RecordPushConstants(CommandBuffer cmd) { }
+
     public void Record(CommandBuffer cmd, in Renderer.FrameContext ctx)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.RayTracingKhr, PipelineHandle);
 
-        var sets = stackalloc DescriptorSet[4]
-        {
-            DescriptorSets[SetFrame][ctx.FrameIndex],
-            DescriptorSets[SetGeom][0],
-            Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex),
-            DescriptorSets[SetIbl][0],
-        };
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, 0, 4, sets, 0, null);
+        uint total = 4u + ExtraSetCount;
+        var sets = stackalloc DescriptorSet[(int)total];
+        sets[0] = DescriptorSets[SetFrame][ctx.FrameIndex];
+        sets[1] = DescriptorSets[SetGeom][0];
+        sets[2] = Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex);
+        sets[3] = DescriptorSets[SetIbl][0];
+        if (ExtraSetCount > 0u) WriteExtraSets(sets + 4, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, 0, total, sets, 0, null);
+
+        RecordPushConstants(cmd);
 
         var rg = _raygenRegion; var ms = _missRegion; var ht = _hitRegion; var cl = _callableRegion;
         KhrRtPipeline!.CmdTraceRays(cmd, &rg, &ms, &ht, &cl,

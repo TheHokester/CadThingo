@@ -29,7 +29,11 @@ internal abstract unsafe class PathTraceCoreBase : IRenderCore
     // FOV doesn't move the view matrix, so it needs its own snapshot.
     private float     _lastCamFov;
 
-    protected PathTraceCoreBase(Renderer host) => _host = host;
+    protected PathTraceCoreBase(Renderer host)
+    {
+        _host = host;
+        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
+    }
 
     public abstract string Name { get; }
     public abstract Renderer.RenderMode Mode { get; }

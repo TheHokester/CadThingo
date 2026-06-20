@@ -607,7 +607,8 @@ public unsafe partial class Renderer
                 SType         = StructureType.AccelerationStructureBuildGeometryInfoKhr,
                 Type          = AccelerationStructureTypeKHR.BottomLevelKhr,
                 Mode          = BuildAccelerationStructureModeKHR.BuildKhr,
-                Flags         = BuildAccelerationStructureFlagsKHR.PreferFastTraceBitKhr,
+                Flags         = BuildAccelerationStructureFlagsKHR.PreferFastTraceBitKhr
+                              | BuildAccelerationStructureFlagsKHR.AllowCompactionBitKhr,
                 GeometryCount = (uint)geomCount,
                 PGeometries   = pGeos,
             };
@@ -652,8 +653,81 @@ public unsafe partial class Renderer
             };
             ulong devAddr = khrAccelStruct.GetAccelerationStructureDeviceAddress(device, &addrInfo);
 
-            return new BlasEntry { Handle = handle, Storage = storage, StorageAlloc = storageAlloc, DeviceAddress = devAddr };
+            var built = new BlasEntry { Handle = handle, Storage = storage, StorageAlloc = storageAlloc, DeviceAddress = devAddr };
+            return CompactBlas(built, sizes.AccelerationStructureSize);
         }
+    }
+
+    // Compacts a freshly-built BLAS (must have been built with AllowCompaction):
+    // queries the post-build compacted size, copies into a right-sized AS, and frees
+    // the original. Compaction typically ~halves the BVH footprint, so more of it
+    // stays L2-resident -> shorter BVH-node fetches, which dominate RT-core traversal
+    // stalls. Returns the source unchanged if the driver reports no useful shrink.
+    // Uses discrete single-time submits (one extra size query + copy per BLAS) -
+    // fine at edit/load time; batching belongs in the planned static/dynamic AS wrapper.
+    private BlasEntry CompactBlas(BlasEntry src, ulong originalSize)
+    {
+        var qpInfo = new QueryPoolCreateInfo
+        {
+            SType      = StructureType.QueryPoolCreateInfo,
+            QueryType  = QueryType.AccelerationStructureCompactedSizeKhr,
+            QueryCount = 1,
+        };
+        vk!.CreateQueryPool(device, &qpInfo, null, out var pool);
+
+        var srcHandle = src.Handle;
+        var qcmd = BeginSingleTimeCommands();
+        vk.CmdResetQueryPool(qcmd, pool, 0, 1);
+        khrAccelStruct!.CmdWriteAccelerationStructuresProperties(qcmd, 1, &srcHandle,
+            QueryType.AccelerationStructureCompactedSizeKhr, pool, 0);
+        EndSingleTimeCommands(qcmd);
+
+        ulong compactedSize = 0;
+        vk.GetQueryPoolResults(device, pool, 0, 1, (nuint)sizeof(ulong), &compactedSize,
+            (ulong)sizeof(ulong), QueryResultFlags.Result64Bit | QueryResultFlags.ResultWaitBit);
+        vk.DestroyQueryPool(device, pool, null);
+
+        // No useful shrink (or a driver reporting 0) — keep the original.
+        if (compactedSize == 0 || compactedSize >= originalSize)
+            return src;
+
+        CreateBufferWithDeviceAddress(compactedSize,
+            BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
+            MemoryPropertyFlags.DeviceLocalBit, out var cStorage, out var cAlloc,
+            GpuMemoryAllocator.PriorityHigh);
+
+        var createInfo = new AccelerationStructureCreateInfoKHR
+        {
+            SType  = StructureType.AccelerationStructureCreateInfoKhr,
+            Buffer = cStorage,
+            Size   = compactedSize,
+            Type   = AccelerationStructureTypeKHR.BottomLevelKhr,
+        };
+        khrAccelStruct.CreateAccelerationStructure(device, &createInfo, null, out var cHandle);
+
+        var copyInfo = new CopyAccelerationStructureInfoKHR
+        {
+            SType = StructureType.CopyAccelerationStructureInfoKhr,
+            Src   = srcHandle,
+            Dst   = cHandle,
+            Mode  = CopyAccelerationStructureModeKHR.CompactKhr,
+        };
+        var ccmd = BeginSingleTimeCommands();
+        khrAccelStruct.CmdCopyAccelerationStructure(ccmd, &copyInfo);
+        EndSingleTimeCommands(ccmd);
+
+        // Free the uncompacted source now that the compacted copy owns the geometry.
+        khrAccelStruct.DestroyAccelerationStructure(device, src.Handle, null);
+        DestroyBuffer(src.Storage, src.StorageAlloc);
+
+        var addrInfo = new AccelerationStructureDeviceAddressInfoKHR
+        {
+            SType                 = StructureType.AccelerationStructureDeviceAddressInfoKhr,
+            AccelerationStructure = cHandle,
+        };
+        ulong cAddr = khrAccelStruct.GetAccelerationStructureDeviceAddress(device, &addrInfo);
+
+        return new BlasEntry { Handle = cHandle, Storage = cStorage, StorageAlloc = cAlloc, DeviceAddress = cAddr };
     }
     //tlas previous entry count(ensures that if all are removed old tlas isnt used)
     private static uint PreviousCount = 0;
@@ -964,6 +1038,7 @@ public unsafe partial class Renderer
             ptComputePipeline?.WriteTlasDescriptor(tlas);
             wavefrontPipeline?.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
+            reStirPipeline?.WriteTlasDescriptor(tlas);
             pickPipeline?.WriteTlasDescriptor(tlas);
             selectionMaskPipeline?.WriteTlasDescriptor(tlas);
         }
@@ -974,6 +1049,7 @@ public unsafe partial class Renderer
             ptComputePipeline?.WriteShadowInfoDescriptor();
             wavefrontPipeline?.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();
+            reStirPipeline?.WriteShadowInfoDescriptor();
             pickPipeline?.WriteEntityInfoDescriptor();
             selectionMaskPipeline?.WriteEntityInfoDescriptor();
             shadowInfoBufferResized = false;
@@ -987,6 +1063,7 @@ public unsafe partial class Renderer
             ptComputePipeline?.WriteEmissiveDescriptors();
             wavefrontPipeline?.WriteEmissiveDescriptors();
             rtPipeline?.WriteEmissiveDescriptors();
+            reStirPipeline?.WriteEmissiveDescriptors();
             emissiveBuffersResized = false;
         }
     }

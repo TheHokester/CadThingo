@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Numerics;
 using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.ImGui;
@@ -7,6 +8,7 @@ using CadThingo.VulkanEngine.Renderer.Features.Deferred;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Forward;
 using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
+using CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -72,32 +74,43 @@ public unsafe partial class Renderer
         ForwardPlus = 1,
         RayCompute = 2,
         RayTrace =3,
-        RayWavefront = 4
+        RayWavefront = 4,
+        ReStirDI = 5
     }
-    public RenderMode renderMode = RenderMode.Deferred;
+    // Active technique identity, DERIVED from the active core. The few call sites that branch on
+    // the kind of renderer running (ViewportPanel fullscreen gate, the pathtracer settings panel)
+    // read this. It is no longer a selection knob -- selection is by list index (RequestCoreIndex);
+    // a device without the RT pipeline simply never registers those cores, so they can't be picked.
+    public RenderMode renderMode => _activeCore?.Mode ?? RenderMode.Deferred;
 
     // L3 render cores (renderer-refactor.md): one pluggable technique each, built eagerly (all
-    // their pipelines already exist up front). DrawFrame dispatches to _activeCore; a mode change
-    // swaps it + Activates (which rebinds tonemap's HDR input to the new core's scene-colour
-    // source -- replacing the old per-frame _lastRenderMode check). See IRenderCore.
-    private DeferredCore         deferredCore    = null!;
-    private PathtraceComputeCore ptComputeCore   = null!;
-    private PathtraceRTCore?     ptRtCore;            // null when the RT pipeline is unsupported
-    private ForwardPlusCore      forwardPlusCore = null!;
-    private WavefrontPTCore      wavefrontCore   = null!;  // graph-resident wavefront path tracer
-    private IRenderCore          _activeCore     = null!;
+    // their pipelines already exist up front). Cores register THEMSELVES into this list from their
+    // ctor (IRenderCore via RegisterCore), so adding a technique is just "construct it" -- no
+    // switch, no per-core field, no ImGui label array to keep in sync. The ImGui mode combo lists
+    // the cores by index and hands an index back (RequestCoreIndex); DrawFrame swaps _activeCore to
+    // the requested core + Activates it (rebinds tonemap's HDR input to the new core's scene-colour
+    // source). See IRenderCore. Index 0 (first registered = Deferred) is the boot default.
+    private readonly List<IRenderCore> _renderCores = new();
+    private IRenderCore                _activeCore  = null!;
+    private int                        _desiredCoreIndex;
 
-    // Maps a render mode to its core. RayTrace falls back to the deferred core when the device
-    // didn't expose the RT pipeline (ptRtCore == null), matching the old DrawFrame fallback.
-    private IRenderCore CoreFor(RenderMode mode) => mode switch
+    /// <summary>The registered render cores, in construction order. Drives the ImGui mode combo so
+    /// a new core needs no host edit beyond constructing it.</summary>
+    internal IReadOnlyList<IRenderCore> RenderCores => _renderCores;
+
+    /// <summary>List index of the currently-active core (for the ImGui combo's current selection).</summary>
+    internal int ActiveCoreIndex => _renderCores.IndexOf(_activeCore);
+
+    /// <summary>Called by an <see cref="IRenderCore"/> ctor to add itself to the registry.</summary>
+    internal void RegisterCore(IRenderCore core) => _renderCores.Add(core);
+
+    /// <summary>ImGui mode-combo entry point: request the core at list index <paramref name="i"/>
+    /// become active. The swap + Activate happen at the start of the next frame (DrawFrame step 0d),
+    /// after DeviceWaitIdle, so it is safe to call mid-frame from the UI.</summary>
+    internal void RequestCoreIndex(int i)
     {
-        RenderMode.Deferred    => deferredCore,
-        RenderMode.ForwardPlus => forwardPlusCore,
-        RenderMode.RayCompute  => ptComputeCore,
-        RenderMode.RayTrace    => (IRenderCore?)ptRtCore ?? deferredCore,
-        RenderMode.RayWavefront => wavefrontCore,
-        _                      => deferredCore,
-    };
+        if (i >= 0 && i < _renderCores.Count) _desiredCoreIndex = i;
+    }
     
     
     // Runtime reflection probes — GPU resources + CPU registry. Allocated after
@@ -174,6 +187,7 @@ public unsafe partial class Renderer
     internal PTComputePipeline    ptComputePipeline;
     internal WavefrontPTPipeline  wavefrontPipeline;     // graph-resident wavefront path tracer (RenderMode.RayWavefront)
     internal RTPipeline?          rtPipeline;            // opt-in RT-pipeline path tracer (null when unsupported)
+    internal ReStirDIPipeline?    reStirPipeline;        // opt-in ReSTIR DI tracer, RT-pipeline (null when unsupported)
     internal PickPipeline         pickPipeline;          // ray-query object picking (TLAS InstanceCustomIndex → entity)
     internal SelectionMaskPipeline selectionMaskPipeline; // ray-query coverage mask of the selected entity
     internal OutlinePipeline       outlinePipeline;       // composites the selection outline into FinalColor
@@ -358,6 +372,16 @@ public unsafe partial class Renderer
             rtPipeline.WriteGeometryDescriptors();
             rtPipeline.WriteLightsDescriptor();
             rtPipeline.WriteIblDescriptors();
+
+            // ReSTIR DI tracer (RenderMode.ReStirDI). Same RT-pipeline machinery as rtPipeline
+            // (it subclasses RTPipeline), forked only at the shader; shares the same accumulator /
+            // outColor + scene buffers. TLAS/shadow/emissive sets bound below with rtPipeline's.
+            reStirPipeline = new ReStirDIPipeline(this);
+            reStirPipeline.Initialize();
+            reStirPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
+            reStirPipeline.WriteGeometryDescriptors();
+            reStirPipeline.WriteLightsDescriptor();
+            reStirPipeline.WriteIblDescriptors();
         }
 
         // Object picking — owns only a tiny result SSBO; the TLAS is bound below
@@ -420,6 +444,7 @@ public unsafe partial class Renderer
             ptComputePipeline.WriteTlasDescriptor(tlas);
             wavefrontPipeline.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
+            reStirPipeline?.WriteTlasDescriptor(tlas);
             pickPipeline.WriteTlasDescriptor(tlas);
             selectionMaskPipeline.WriteTlasDescriptor(tlas);
             // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
@@ -429,6 +454,7 @@ public unsafe partial class Renderer
             ptComputePipeline.WriteShadowInfoDescriptor();
             wavefrontPipeline.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();
+            reStirPipeline?.WriteShadowInfoDescriptor();
             // Pick + selection resolve the hit entity through the same flat
             // ShadowEntityInfo table (per-cluster instances → entity via
             // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex).
@@ -439,22 +465,27 @@ public unsafe partial class Renderer
             ptComputePipeline.WriteEmissiveDescriptors();
             wavefrontPipeline.WriteEmissiveDescriptors();
             rtPipeline?.WriteEmissiveDescriptors();
+            reStirPipeline?.WriteEmissiveDescriptors();
         }
 
-        // Stand up the L3 render cores (eager). DeferredCore's ctor builds + compiles the deferred
-        // FrameGraph (which OWNS the g-buffers / depth / HDR transients and imports FinalColor) and
-        // rebinds the lighting g-buffer + tonemap-HDR descriptors from the fresh transient views.
-        // The PT/RT cores wrap the renderer-owned PT pipelines (RT only when the device exposed it).
-        // The active core is chosen from renderMode and Activated (binds tonemap's HDR input to its
-        // scene-colour source).
-        deferredCore    = new DeferredCore(this);
-        ptComputeCore   = new PathtraceComputeCore(this);
-        if (rtPipeline != null) ptRtCore = new PathtraceRTCore(this);
-        forwardPlusCore = new ForwardPlusCore(this);
+        // Stand up the L3 render cores (eager). Each ctor registers the core into _renderCores
+        // (RegisterCore) -- construction order IS the list/combo order, so Deferred (index 0) is
+        // the boot default + fallback. DeferredCore's ctor builds + compiles the deferred FrameGraph
+        // (which OWNS the g-buffers / depth / HDR transients and imports FinalColor) and rebinds the
+        // lighting g-buffer + tonemap-HDR descriptors from the fresh transient views. The PT/RT cores
+        // wrap the renderer-owned PT pipelines; the RT-pipeline-only cores (RayTrace, ReSTIR DI) are
+        // built only when the device exposed the feature, so they self-exclude from the combo.
+        new DeferredCore(this);
+        new PathtraceComputeCore(this);
+        if (rtPipeline != null)     new PathtraceRTCore(this);
+        new ForwardPlusCore(this);
         // Wavefront core builds + compiles its own FrameGraph in the ctor (like DeferredCore),
         // importing the pipeline-owned set-4 buffers + the PT/Final targets.
-        wavefrontCore   = new WavefrontPTCore(this);
-        _activeCore = CoreFor(renderMode);
+        new WavefrontPTCore(this);
+        if (reStirPipeline != null) new ReStirDICore(this);
+
+        // Activate the boot core (index 0 = Deferred unless RequestCoreIndex ran before init).
+        _activeCore = _renderCores[_desiredCoreIndex];
         _activeCore.Activate();
 
         initialized = true;
@@ -586,7 +617,7 @@ public unsafe partial class Renderer
         // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
         // Set 1 (g-buffer samplers) is no longer written by Initialize — the views live on the
         // deferred FrameGraph — so let DeferredCore rebind it from its cached transient views.
-        deferredCore.OnPbrPipelineRebuilt();
+        _renderCores.OfType<DeferredCore>().FirstOrDefault()?.OnPbrPipelineRebuilt();
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         PbrDeferredPipeline.WriteProbeDescriptors();
         transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
@@ -665,11 +696,7 @@ public unsafe partial class Renderer
         // Render cores: DeferredCore owns the deferred FrameGraph (g-buffer / depth / HDR
         // transients) — dispose the cores before RenderTargets, which owns FinalColor + the PT /
         // selection images the graph imports. The PT / forward cores own no GPU resources.
-        deferredCore?.Dispose();
-        ptComputeCore?.Dispose();
-        ptRtCore?.Dispose();
-        forwardPlusCore?.Dispose();
-        wavefrontCore?.Dispose();
+        foreach (var core in _renderCores) core.Dispose();
         renderTargets.Dispose();
 
         // GpuScene buffers (light SSBO today) — the GPU mirror of Scene's render data.
@@ -686,6 +713,7 @@ public unsafe partial class Renderer
         outlinePipeline      ?.Dispose();
         selectionMaskPipeline?.Dispose();
         pickPipeline       ?.Dispose();
+        reStirPipeline     ?.Dispose();
         rtPipeline         ?.Dispose();
         wavefrontPipeline  ?.Dispose();
         ptComputePipeline  ?.Dispose();

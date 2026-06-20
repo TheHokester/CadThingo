@@ -40,6 +40,7 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
     public WavefrontPTCore(Renderer host)
     {
         _host = host;
+        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
         _pipe = host.wavefrontPipeline;
         BuildGraph();
     }

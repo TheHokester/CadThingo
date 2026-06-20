@@ -5,6 +5,7 @@ using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;   // GraphStats (deferred-graph debug surface)
 using CadThingo.VulkanEngine.Renderer.RenderCores;  // IRenderCore, RenderFrame
+using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;  // WavefrontPTCore (active-core type test)
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
@@ -105,12 +106,11 @@ public unsafe partial class Renderer
         // re-binds its lighting + tonemap descriptors); the PT cores rebind their storage images
         // (which marks the accumulator dirty so the next dispatch clears fresh memory).
         renderTargets.ReallocateSizeDependent(new Extent2D(width, height));
-        deferredCore.Resize(renderExtent);
-        ptComputeCore.Resize(renderExtent);
-        ptRtCore?.Resize(renderExtent);
-        // Wavefront core reallocates its SoA working set to the new extent + rebuilds its graph
-        // (re-importing the fresh PT/Final targets); marks the accumulator dirty internally.
-        wavefrontCore.Resize(renderExtent);
+        // Every registered core rebuilds its size-dependent state: DeferredCore/WavefrontPTCore
+        // re-compile their graphs (fresh transients, re-import FinalColor, re-bind descriptors);
+        // the PT/RT cores rebind their storage images (which marks the accumulator dirty so the
+        // next dispatch clears fresh memory).
+        foreach (var core in _renderCores) core.Resize(renderExtent);
 
         // Re-point tonemap's HDR input at the ACTIVE core's fresh scene-colour source (deferred
         // HDR vs PT ptOutColor). Subsumes the old per-mode branch: DeferredCore.Resize just bound
@@ -199,7 +199,7 @@ public unsafe partial class Renderer
         //     DeviceWaitIdle ensures no in-flight frame is still using the old binding. Mode
         //     flips are user-driven (ImGui combo), so the hitch is acceptable. This replaces the
         //     old per-frame _lastRenderMode tonemap-rebind check.
-        var desiredCore = CoreFor(renderMode);
+        var desiredCore = _renderCores[_desiredCoreIndex];
         if (!ReferenceEquals(desiredCore, _activeCore))
         {
             vk!.DeviceWaitIdle(device);
@@ -242,8 +242,8 @@ public unsafe partial class Renderer
 
         // Dispatch the active render core (L3). It records its technique into cmd and leaves
         // FinalColor in ShaderReadOnlyOptimal for the host post-stack below. The core was selected
-        // + Activated from renderMode at step 0d (RayTrace falls back to the deferred core when the
-        // RT pipeline is unsupported, via CoreFor).
+        // (by list index, _renderCores[_desiredCoreIndex]) + Activated at step 0d; RT-only cores
+        // never registered on devices without the RT pipeline, so they can't be the desired core.
         _activeCore.Render(new RenderFrame { Cmd = cmd, Frame = ctx });
 
         // 6b. Selection outline. Both render modes leave FinalColor in
@@ -537,7 +537,7 @@ public unsafe partial class Renderer
     /// wavefront tracer (compaction visualization), or null when wavefront isn't the active core.
     /// ~a frame stale, best-effort. Remove with the pipeline's _argsReadback readback feature.</summary>
     public uint[]? WavefrontDispatchCounts =>
-        ReferenceEquals(_activeCore, wavefrontCore) && wavefrontPipeline != null
+        _activeCore is WavefrontPTCore && wavefrontPipeline != null
             ? wavefrontPipeline.ReadDispatchArgs() : null;
 
 

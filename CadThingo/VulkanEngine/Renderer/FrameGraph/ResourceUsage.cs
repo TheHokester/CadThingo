@@ -112,6 +112,11 @@ internal static class UsageTable
             AccessFlags2.TransferWriteBit,
             ImageLayout.TransferDstOptimal, true),
         
+        // RT-pipeline storage image/buffer, read+write in a ray-tracing shader stage (the
+        // accumulator + out-color a CmdTraceRays pass writes). Conservative RW covers write-only
+        // targets too. Read-only / sampled RT variants mirror the compute ones (StorageReadCompute
+        // / SampledCompute with RayTracingShaderBitKhr) -- add them when a multi-pass RT chain
+        // (e.g. ReSTIR reuse) needs to read a graph resource in the RT stage.
         ResourceUsage.StorageRT => new(
             PipelineStageFlags2.RayTracingShaderBitKhr,
             AccessFlags2.ShaderStorageReadBit | AccessFlags2.ShaderStorageWriteBit,

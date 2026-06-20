@@ -116,6 +116,20 @@
     <Kernel Update="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\*.slang"
             Flags="-capability spvRayQueryKHR" />
 
+    <!-- ReSTIR DI is an RT-PIPELINE shader living under a feature (not a compute kernel), so it
+         needs the ray-tracing capability instead of the generic empty Kernel flags. Outputs to
+         Assets/Shaders/ReSTIR/ReStirDI.spv via the per-feature Kernel rule; the SER variant below
+         mirrors PathTraceRT_SER (forced NV reorder cap). -->
+    <Kernel Update="VulkanEngine\Renderer\Features\ReSTIR\Kernels\ReStirDI.slang"
+            Flags="-capability spvRayTracingKHR" />
+    <ShaderVariant Include="VulkanEngine\Renderer\Features\ReSTIR\Kernels\ReStirDI.slang"
+                   OutputName="ReSTIR\ReStirDI_SER"
+                   Flags="-capability spvRayTracingKHR -capability spvShaderInvocationReorderNV -DUSE_SER=1" />
+    <!-- SpatialShade: ReSTIR spatial-reuse + deferred shade COMPUTE pass; inline ray query (opaque
+         shadow). Outputs to Assets/Shaders/ReSTIR/SpatialShade.spv via the per-feature Kernel rule. -->
+    <Kernel Update="VulkanEngine\Renderer\Features\ReSTIR\Kernels\SpatialShade.slang"
+            Flags="-capability spvRayQueryKHR" />
+
     <!-- Shared feature modules tracked as incremental inputs (editing one rebuilds its
          importing kernels) but never compiled to their own .spv. -->
     <ShaderLib Include="VulkanEngine\Renderer\Features\WavefrontPathTracer\Kernels\WavefrontBindings.slang" />

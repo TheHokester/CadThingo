@@ -56,6 +56,7 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
     public DeferredCore(Renderer host)
     {
         _host = host;
+        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
         BuildGraph();
     }
 

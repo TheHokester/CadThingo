@@ -39,6 +39,7 @@
       <Folder Include="Assets\Models\Characters\" />
       <Folder Include="Assets\Models\Environment\" />
       <Folder Include="Assets\Models\Props\" />
+      <Folder Include="Assets\Shaders\ReSTIR\" />
       <Folder Include="VulkanEngine\Renderer\Features\IBL\" />
     </ItemGroup>
 
