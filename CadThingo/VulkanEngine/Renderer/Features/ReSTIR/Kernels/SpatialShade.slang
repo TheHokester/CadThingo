@@ -179,7 +179,7 @@ ShadeSample reservoirToShade(Reservoir r, float3 worldPos, float3 N) {
     return p;
 }
 
-// Spatial reuse is the UNBIASED 1/Z combination (Bitterli 2020 Alg.6), inlined in main(): stream the
+// Spatial reuse is UNBIASED 1/Z combination (Bitterli 2020 Alg.6), inlined in main(): stream the
 // canonical + neighbour reservoirs, then normalise by the confidence Z of only the candidates whose
 // domain contains the selected sample. Kept inline so the candidate pixel indices + a single
 // reconstructed neighbour surface stay in registers (this pass is deliberately register-light).

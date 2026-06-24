@@ -235,7 +235,7 @@ public unsafe partial class Renderer
         if (vk!.BeginCommandBuffer(cmd, &beginInfo) != Result.Success)
             throw new Exception("Failed to begin command buffer");
 
-        // Open this frame's world-transform cache (L2 step 5) — one reset covers
+        // Open this frame's world-transform cache (L2 step 5) - one reset covers
         // every render mode below; the active DrawX's extract reads served from it.
         // (RebuildTlas, which runs out-of-band above, manages its own window.)
         gpuScene.BeginTransforms();
@@ -251,10 +251,10 @@ public unsafe partial class Renderer
         //     (no-op when nothing's selected) and restores that layout.
         RecordSelectionOutline(cmd);
 
-        // 7. Blit FinalColor → swapchain image
+        // 7. Blit FinalColor -> swapchain image
         var swapImage = swapChainImages[imageIndex];
 
-        // 7a. Swapchain Undefined → TransferDstOptimal
+        // 7a. Swapchain Undefined -> TransferDstOptimal
         var toTransferDst = new ImageMemoryBarrier
         {
             SType = StructureType.ImageMemoryBarrier,

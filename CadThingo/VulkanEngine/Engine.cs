@@ -61,11 +61,11 @@ public class Engine
 
         keyboard.KeyDown += (sender, e, keyCode) =>
         {
-            EventBus.PublishEvent(new KeyPressEvent(sender, (int)e));
+            EventBus.PublishEvent(new KeyPressEvent(sender, e));
         };
         keyboard.KeyUp += (sender, e, keyCode) =>
         {
-            EventBus.PublishEvent(new KeyReleaseEvent(sender, (int)e));
+            EventBus.PublishEvent(new KeyReleaseEvent(sender, e));
         };
 
         mouse.MouseMove += (sender, e) =>
@@ -97,17 +97,14 @@ public class Engine
         {
             EventBus.PublishEvent(new MouseScrollEvent(sender, e.X, e.Y));
         };
-
+        
         renderer = new( window);
         renderer.Initialize();
-
+        
         window.Closing += Shutdown;
-
+        
         // Window resize must rebuild the swapchain + render targets and tell
-        // ImGui about the new surface size. Without this, AcquireNextImage's
-        // out-of-date error is the only trigger and one frame renders into the
-        // pre-resize extent — visible as ImGui drawing into a clipped corner
-        // until the next acquire.
+        // ImGui about the new surface size.
         window.Resize += _ => renderer.RecreateSwapChain();
     }
 

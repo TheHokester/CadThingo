@@ -250,20 +250,20 @@ public class Camera : IEventListener
                 // pan the camera. Releases are always handled (below) so a
                 // press-then-defocus doesn't strand the movement flag in true.
                 if (EditorState.ViewportFocused)
-                    SetMovementKey((Key)kp.GetKeyCode, true);
+                    SetMovementKey(kp.GetKeyCode, true);
                 break;
             case KeyReleaseEvent kr:
-                SetMovementKey((Key)kr.GetKeyCode, false);
+                SetMovementKey(kr.GetKeyCode, false);
                 break;
-            case MouseKeyDownEvent mbd when mbd.GetButton == MouseButton.Right:
+            case MouseKeyDownEvent { GetButton: MouseButton.Right }:
                 // RMB-drag rotation: start only if the press began over the
                 // viewport image. Once true, rotation continues even if the
-                // mouse leaves the viewport during the drag — standard DCC
+                // mouse leaves the viewport during the drag - standard DCC
                 // convention.
                 if (EditorState.ViewportHovered)
                     _rotating = true;
                 break;
-            case MouseKeyReleaseEvent mbu when mbu.GetButton == MouseButton.Right:
+            case MouseKeyReleaseEvent { GetButton: MouseButton.Right }:
                 _rotating = false;
                 break;
             case MouseMoveEvent mm:

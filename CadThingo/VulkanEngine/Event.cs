@@ -38,16 +38,16 @@ class WindowResizeEvent : Event
 
 class KeyPressEvent : Event
 {
-    private int KeyCode;
+    private Key KeyCode;
     private bool repeat;
     private IKeyboard kb;
-    public KeyPressEvent(IKeyboard kb, int keycode)
+    public KeyPressEvent(IKeyboard kb, Key keycode)
     {
         KeyCode = keycode;
         this.kb = kb;
     }
 
-    public int GetKeyCode => KeyCode;
+    public Key GetKeyCode => KeyCode;
     public IKeyboard GetKeyboard => kb;
     public override Event Clone()
     {
@@ -58,15 +58,15 @@ class KeyPressEvent : Event
 
 class KeyReleaseEvent : Event
 {
-    private int KeyCode;
+    private Key KeyCode;
     private IKeyboard kb;
-    public KeyReleaseEvent(IKeyboard kb, int keycode)
+    public KeyReleaseEvent(IKeyboard kb, Key keycode)
     {
         KeyCode = keycode;
         this.kb = kb;
     }
     
-    public int GetKeyCode => KeyCode;
+    public Key GetKeyCode => KeyCode;
     public IKeyboard GetKeyboard => kb;
     public override Event Clone()
     {
