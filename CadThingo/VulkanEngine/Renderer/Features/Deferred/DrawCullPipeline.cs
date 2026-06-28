@@ -1,8 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 //  Draw-cull compute pass — frustum-tests scene renderables and emits
 //  VkDrawIndexedIndirectCommand[] consumed by the geometry pass.
 public sealed unsafe class DrawCullPipeline : ComputePipeline
@@ -24,7 +25,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         public uint    _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("CullDraws");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "CullDraws");
 
     // Per-frame buffers owned by this pipeline. The cull *input* (RenderableInputGpu
     // rows) now lives on GpuScene — extracted there (L2 step 4) and bound at

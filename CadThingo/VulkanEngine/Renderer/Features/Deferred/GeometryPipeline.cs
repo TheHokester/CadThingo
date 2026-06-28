@@ -1,13 +1,16 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 //
 //  Geometry pass — writes the G-buffer
 //
-public sealed unsafe class GeometryPipeline : GraphicsPipeline
+// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
+// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
+public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
 {
     struct GeometryUBO
     {
@@ -17,7 +20,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     //Per frame uniform buffers for geometry pipeline
     private UboBuffer[] GeometryUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("Geometry");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "Geometry");
     protected override Format[] ColorAttachmentFormats { get; } =
     [
         Format.R32G32B32A32Sfloat, // Position

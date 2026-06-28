@@ -41,6 +41,7 @@
       <Folder Include="Assets\Models\Props\" />
       <Folder Include="Assets\Shaders\ReSTIR\" />
       <Folder Include="Assets\Shaders\Tonemapping\" />
+      <Folder Include="Assets\Shaders\Deferred\" />
       <Folder Include="VulkanEngine\Renderer\Features\IBL\" />
     </ItemGroup>
 
