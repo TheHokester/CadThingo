@@ -1,5 +1,4 @@
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
-using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 using FrameContext = CadThingo.VulkanEngine.Renderer.Renderer.FrameContext;
 
@@ -18,7 +17,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 /// read-after-write dependency on the core's last HDR write. FinalColor is touched only here, so
 /// the module imports it directly from the host-owned <see cref="ImageResource"/>.
 ///
-/// The pipeline is injected (kernels/pipelines not migrated yet). The module is a pure graph
+/// The pipeline is injected. The module is a pure graph
 /// builder; the host resolves the HDR view post-Compile and binds tonemap's HDR-input descriptor
 /// (that view also feeds the PT&lt;-&gt;deferred flip + operator rebind, so it stays host-side).
 /// </summary>

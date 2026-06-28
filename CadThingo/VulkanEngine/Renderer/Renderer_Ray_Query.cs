@@ -34,7 +34,7 @@ public unsafe partial class Renderer
     // TryGetDeviceExtension after the logical device is created. Null when the
     // extension wasn't enabled — every method below should early-out on null.
     private KhrAccelerationStructure? khrAccelStruct;
-
+    
     // Pulled from PhysicalDeviceAccelerationStructurePropertiesKHR at startup.
     // Every scratch buffer offset passed to Cmd*BuildAccelerationStructures must be
     // a multiple of this value, otherwise validation errors with "scratchData not

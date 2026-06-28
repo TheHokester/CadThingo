@@ -40,6 +40,7 @@
       <Folder Include="Assets\Models\Environment\" />
       <Folder Include="Assets\Models\Props\" />
       <Folder Include="Assets\Shaders\ReSTIR\" />
+      <Folder Include="Assets\Shaders\Tonemapping\" />
       <Folder Include="VulkanEngine\Renderer\Features\IBL\" />
     </ItemGroup>
 

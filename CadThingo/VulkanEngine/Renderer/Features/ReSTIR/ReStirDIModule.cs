@@ -1,5 +1,6 @@
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using Silk.NET.Vulkan;
 using FrameContext = CadThingo.VulkanEngine.Renderer.Renderer.FrameContext;
 
