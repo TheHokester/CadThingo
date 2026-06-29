@@ -1,5 +1,6 @@
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
+using CadThingo.VulkanEngine.Renderer.Features.Forward;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 using HostRenderer = CadThingo.VulkanEngine.Renderer.Renderer;
@@ -8,30 +9,23 @@ using FrameContext = CadThingo.VulkanEngine.Renderer.Renderer.FrameContext;
 namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 
 /// <summary>
-/// The deferred technique as a composable graph module (render-graph.md sec 9; impl sec 1.8).
+/// The deferred render graph module.
 /// Builds the chain Cull -> LightCull -> Geometry -> Lighting -> Skybox -> Transparent into the
-/// supplied <see cref="GraphScope"/>, owning the g-buffers / depth / HDR as transients, then
-/// invokes a nested <see cref="TonemapModule"/> submodule (under the "Tonemap" child scope) that
-/// consumes the HDR handle and writes FinalColor. Module-within-module: the submodule flattens
-/// into the same graph, so the HDR read across the boundary is a derived cross-module dependency
-/// (a blue edge in ToDot, inside a nested cluster).
+/// supplied <see cref="GraphScope"/>,
+/// invokes a <see cref="TonemapModule"/> submodule that
+/// consumes the HDR handle and writes FinalColor.
 ///
-/// The pipelines + kernels are NOT migrated yet: they remain renderer-owned. The tonemap
-/// submodule is injected (it wraps the renderer's TonemapPipeline). The module is a pure graph
-/// builder -- it records no descriptor writes and mutates no renderer state. The host calls
+
+///Tonemap module is injected. host calls
 /// <see cref="Build"/>, then MarkOutput(<see cref="Outputs.Final"/>) + Compile, then does the
 /// post-compile descriptor rebind from the returned handles (those views are cached on the
 /// renderer and also feed the PT&lt;-&gt;deferred flip + tonemap-operator rebind, host-side).
 /// </summary>
 public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, DeferredModule.Outputs>
 {
-    /// <summary>External wiring: the host-owned FinalColor target (forwarded to the tonemap
-    /// submodule) and the render extent the g-buffer / depth / HDR transients are sized to.</summary>
+    
     public readonly record struct Inputs(ImageResource FinalColor, Extent2D Extent);
 
-    /// <summary>Handles the host resolves after Compile: the five g-buffers + HDR feed the
-    /// pre-baked descriptor sets (lighting samplers, tonemap HDR input); Final is the graph
-    /// output to MarkOutput.</summary>
     public readonly record struct Outputs(
         GraphImage Position, GraphImage Normal, GraphImage Albedo, GraphImage Material,
         GraphImage Emissive, GraphImage Hdr, GraphImage Final);
@@ -44,9 +38,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
     private readonly TransparentPipeline  _transparent;
     private readonly TonemapModule        _tonemap;   // nested submodule (wraps TonemapPipeline)
 
-    // Per-frame light-cull dispatch dims, read at Execute time. They are computed by the host
-    // each frame (PbrDeferredPipeline.UpdatePerFrame, before the graph executes), so the pass
-    // body pulls them through this delegate rather than capturing a stale value at Build.
+    // Per-frame light-cull dispatch dims, read at Execute time. 
     private readonly Func<(uint lightCount, uint tileCountX, uint tileCountY)> _lightCullParams;
 
     public DeferredModule(
@@ -69,10 +61,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
     {
         var ext = inputs.Extent;
 
-        // Deferred intermediates the graph OWNS as transients: it allocates their VkImages in
-        // Compile() and frees them in Dispose(). Produced and consumed entirely within the
-        // chain (geometry writes; lighting/skybox/transparent/tonemap read). Seeded Undefined
-        // each frame (a legal discard -- every producing pass fully regenerates its target).
+        // Deferred intermediates the graph OWNS as transients
         GraphImage Color(string name, Format fmt) => scope.CreateImage(new ImageDesc
         {
             Format = fmt, Extent = ext, Mips = 1, Layers = 1,
@@ -92,9 +81,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         }, "Depth");
 
         // Per-frame compute-output buffers, imported so the graph derives the cull->geometry
-        // and light-cull->lighting barriers + ordering. (The compute INPUTS -- renderables and
-        // lights -- are host-coherent mapped writes, visible on submit, so they need no graph
-        // barrier and aren't declared.) BufferDesc is unused for imports.
+        // and light-cull->lighting barriers + ordering.
         var indirectCmdF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         var indirectCountF = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         var instanceF      = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
@@ -114,10 +101,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         var tileCount     = scope.ImportBufferPerFrame(tileCountF,     default, "TileLightCount");
         var tileIndices   = scope.ImportBufferPerFrame(tileIndicesF,   default, "TileLightIndices");
 
-        // Cull (compute): frustum-tests renderables -> post-cull indirect draw commands +
-        // instance data. Its declared writes both keep it alive (writes imported buffers) and
-        // order it before geometry (RAW on the indirect + instance buffers). Record() also runs
-        // the view-dependent transparent sort consumed by TransparentPass.
+       
         scope.AddPass("CullPass", PassType.Compute, QueueClass.Graphics,
             b =>
             {
@@ -168,8 +152,8 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 _geometry.Record(cmd, f, indirectCmdBuf, indirectCountBuf, drawCount, attachments);
             });
 
-        // Lighting samples the five g-buffers (ShaderReadOnly) and writes HDRColor@v1. It does
-        // NOT bind depth -- the deferred lighting pass reconstructs position from the g-buffer,
+        // Lighting samples the five g-buffers and writes HDRColor@v1.
+        // The deferred lighting pass reconstructs position from the g-buffer,
         // so depth is left in DepthStencilAttachmentOptimal for the skybox/transparent depth
         // tests. Per-tile light lists from LightCullPass are read as StorageReadFragment -> RAW
         // edge orders lighting after light-cull.
@@ -212,9 +196,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 _transparent.Record(cmd, f, _cull.LastTransparentDraws,
                     new TransparentPipeline.Attachments(res.View(hdr), res.View(depth))));
 
-        // Tonemap is a nested submodule: it imports FinalColor and reads HDRColor@v3 (the
-        // Transparent write), writing the final image. Built under the "Tonemap" child scope so
-        // its pass nests inside this module's cluster and the HDR read is a cross-module edge.
+        // Tonemap is a nested submodule: it imports FinalColor and reads HDRColor@v3 and writes the final image.
         _tonemap.Build(scope.Child("Tonemap"),
             new TonemapModule.Input(hdr, inputs.FinalColor), out var tm);
 

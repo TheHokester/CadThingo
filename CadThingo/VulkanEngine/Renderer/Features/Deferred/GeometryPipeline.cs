@@ -52,7 +52,15 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
     {
         public readonly ImageView Position = position, Normal = normal, Albedo = albedo, Material = material, Emissive = emissive, Depth = depth;
     }
-
+    /// <summary>
+    /// Records the pass commands for the frame.
+    /// </summary>
+    /// <param name="cmd"></param>
+    /// <param name="ctx"></param>
+    /// <param name="indirectCmd"></param>
+    /// <param name="indirectCount"></param>
+    /// <param name="drawCount"></param>
+    /// <param name="attachments"></param>
     internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, Buffer indirectCmd,
         Buffer indirectCount, uint drawCount, Attachments attachments)
     {
@@ -98,11 +106,6 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
         Vk!.CmdBindIndexBuffer(cmd, ib, 0, IndexType.Uint32);
 
-        // Material SSBO upload moved to Renderer.UpdateMaterials so every
-        // rendering path (deferred / forward+ / pathtracer) sees the same
-        // per-frame snapshot. Inline upload here was deferred-only and PT mode
-        // never saw inspector edits as a result.
-        
         // The draw-cull compute pass already populated:
         //   - InstanceStorageBuffers (ResourceManager): per-visible-renderable model
         //     + materialIndex, read by the VS via SV_InstanceID.

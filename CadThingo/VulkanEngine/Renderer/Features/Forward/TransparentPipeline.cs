@@ -1,9 +1,10 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
 
 
 //
@@ -11,7 +12,9 @@ namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 //  src-alpha / one-minus-src-alpha blending, depth-tested LE against the
 //  geometry pass's depth buffer (no depth write).
 //
-public sealed unsafe class TransparentPipeline : GraphicsPipeline
+// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
+// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
+public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
 {
     // Matches Transparent.slang::FrameUBO. View+proj feed the VS; camPos +
     // tile state feed the FS.
@@ -49,7 +52,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         public uint      _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("Transparent");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Forward", "Transparent");
 
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 

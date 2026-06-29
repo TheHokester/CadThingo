@@ -65,7 +65,6 @@
     <Shader Remove="Shaders\Lib\**\*.slang" />
 
     <!-- Ray-query shaders (inline RayQuery). -->
-    <Shader Update="VulkanEngine\Shaders\Transparent.slang"   Flags="-capability spvRayQueryKHR" />
     <Shader Update="VulkanEngine\Shaders\PTCompute.slang"     Flags="-capability spvRayQueryKHR" />
     <Shader Update="VulkanEngine\Shaders\PickCompute.slang"   Flags="-capability spvRayQueryKHR" />
     <Shader Update="VulkanEngine\Shaders\SelectionMask.slang" Flags="-capability spvRayQueryKHR" />
@@ -118,6 +117,11 @@
     <!-- Deferred PBR lighting kernel uses inline ray queries (opaque + alpha shadow rays).
          Geometry / CullDraws under the same feature need no caps and ride the default glob. -->
     <Kernel Update="VulkanEngine\Renderer\Features\Deferred\Kernels\PBR.slang"
+            Flags="-capability spvRayQueryKHR" />
+
+    <!-- Forward+ transparent pass uses inline ray queries (alpha shadow rays). LightCulling
+         under the same feature needs no caps and rides the default glob. -->
+    <Kernel Update="VulkanEngine\Renderer\Features\Forward\Kernels\Transparent.slang"
             Flags="-capability spvRayQueryKHR" />
 
     <!-- ReSTIR DI is an RT-PIPELINE shader living under a feature (not a compute kernel), so it

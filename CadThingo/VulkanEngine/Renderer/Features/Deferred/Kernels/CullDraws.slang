@@ -90,7 +90,7 @@ void Main(uint3 tid : SV_DispatchThreadID)
     if (!sphereInsidePlane(params.planeN, c, radius)) return;
     if (!sphereInsidePlane(params.planeF, c, radius)) return;
 
-    // Visible — claim a slot atomically. InterlockedAdd returns the original value.
+    // Visible - claim a slot atomically. InterlockedAdd returns the original value.
     uint slot;
     InterlockedAdd(drawCount[0], 1u, slot);
 
