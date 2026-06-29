@@ -65,12 +65,8 @@
     <Shader Remove="Shaders\Lib\**\*.slang" />
 
     <!-- Ray-query shaders (inline RayQuery). -->
-    <Shader Update="VulkanEngine\Shaders\PTCompute.slang"     Flags="-capability spvRayQueryKHR" />
     <Shader Update="VulkanEngine\Shaders\PickCompute.slang"   Flags="-capability spvRayQueryKHR" />
     <Shader Update="VulkanEngine\Shaders\SelectionMask.slang" Flags="-capability spvRayQueryKHR" />
-
-    <!-- Ray-tracing-pipeline shader (base variant). -->
-    <Shader Update="VulkanEngine\Shaders\PathTraceRT.slang"   Flags="-capability spvRayTracingKHR" />
 
     <!-- Shared library modules tracked as compile *inputs* so editing one rebuilds its
          importers (incremental correctness), but never compiled to their own .spv. -->
@@ -80,15 +76,14 @@
     <ShaderLib Include="VulkanEngine\Shaders\PTUtils.slang" />
 
     <!-- Variants: same source, extra defines, distinct output. A separate item type keeps
-         the base manifest one-output-per-source (no duplicate-identity batching). -->
-    <!-- spvShaderInvocationReorderNV is forced explicitly: Slang's auto-capability
+         the base manifest one-output-per-source (no duplicate-identity batching). The
+         concrete variant items now live under their owning feature's Kernel section below
+         (PathTracer's PathTraceRT_SER, ReSTIR's ReStirDI_SER).
+         spvShaderInvocationReorderNV is forced explicitly on those: Slang's auto-capability
          resolution otherwise pulls in BOTH the NV and EXT shader-invocation-reorder
          extensions and emits an OpTypeHitObjectNV with EXT-suffixed ops (HitObject.
          TraceRay/Invoke/ReorderThread), which fails spirv-val and broke HitObject.
          Invoke at runtime. Forcing NV keeps the hit-object type + ops consistent. -->
-    <ShaderVariant Include="VulkanEngine\Shaders\PathTraceRT.slang"
-                   OutputName="PathTraceRT_SER"
-                   Flags="-capability spvRayTracingKHR -capability spvShaderInvocationReorderNV -DUSE_SER=1" />
 
     <!-- ===== Feature kernels ======================================================
          Discovered under Features/<F>/Kernels/. Output mirrors the feature folder:
@@ -123,6 +118,17 @@
          under the same feature needs no caps and rides the default glob. -->
     <Kernel Update="VulkanEngine\Renderer\Features\Forward\Kernels\Transparent.slang"
             Flags="-capability spvRayQueryKHR" />
+
+    <!-- PathTracer kernels: PTCompute is an inline-ray-query COMPUTE tracer; PathTraceRT is the
+         RT-PIPELINE tracer (base = plain TraceRay). The SER variant (forced NV reorder cap, see
+         the Variants note above) outputs PathTracer\PathTraceRT_SER.spv alongside it. -->
+    <Kernel Update="VulkanEngine\Renderer\Features\PathTracer\Kernels\PTCompute.slang"
+            Flags="-capability spvRayQueryKHR" />
+    <Kernel Update="VulkanEngine\Renderer\Features\PathTracer\Kernels\PathTraceRT.slang"
+            Flags="-capability spvRayTracingKHR" />
+    <ShaderVariant Include="VulkanEngine\Renderer\Features\PathTracer\Kernels\PathTraceRT.slang"
+                   OutputName="PathTracer\PathTraceRT_SER"
+                   Flags="-capability spvRayTracingKHR -capability spvShaderInvocationReorderNV -DUSE_SER=1" />
 
     <!-- ReSTIR DI is an RT-PIPELINE shader living under a feature (not a compute kernel), so it
          needs the ray-tracing capability instead of the generic empty Kernel flags. Outputs to

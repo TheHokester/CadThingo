@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 

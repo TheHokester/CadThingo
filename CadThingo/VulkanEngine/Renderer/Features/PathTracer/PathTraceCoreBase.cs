@@ -5,18 +5,10 @@ using Silk.NET.Vulkan;
 namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 
 /// <summary>
-/// Shared base for the two progressive path-trace cores (renderer-refactor.md L3): the compute
-/// (ray-query) path and the RT-pipeline path. The two former <c>DrawPathtraced</c> /
-/// <c>DrawRayTraced</c> methods were ~80 near-identical lines that differed only in the technique
-/// pipeline and the writer pipeline stage (compute vs ray-tracing) -- this base is the dedupe.
+/// Shared base for the two progressive path-trace cores:  the compute
+/// (ray-query) path and the RT-pipeline path.<br/><br/> 
 ///
-/// The render skeleton: camera-motion -> accumulator restart; per-frame light + material SSBO
-/// refresh; bridge the host's accumulator-dirty flag into the pipeline's reset; UpdatePerFrame;
-/// the two-image (accumulator + ptOutColor) pre-dispatch barrier; dispatch (Record); then tonemap
-/// ptOutColor -> FinalColor with the General &lt;-&gt; ShaderReadOnly layout dance, leaving FinalColor
-/// in <c>ShaderReadOnlyOptimal</c> for the host post-stack. The accumulator / ptOutColor images and
-/// FinalColor are host-owned (RenderTargets); this core owns only the camera snapshot + the
-/// orchestration. Subclasses bind the concrete pipeline via the protected hooks.
+/// Subclasses bind the concrete pipeline via the protected hooks.
 /// </summary>
 internal abstract unsafe class PathTraceCoreBase : IRenderCore
 {

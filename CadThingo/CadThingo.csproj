@@ -43,6 +43,7 @@
       <Folder Include="Assets\Shaders\Tonemapping\" />
       <Folder Include="Assets\Shaders\Deferred\" />
       <Folder Include="Assets\Shaders\Forward\" />
+      <Folder Include="Assets\Shaders\PathTracer\" />
       <Folder Include="VulkanEngine\Renderer\Features\IBL\" />
     </ItemGroup>
 

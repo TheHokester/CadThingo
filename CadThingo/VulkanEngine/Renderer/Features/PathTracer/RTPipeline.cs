@@ -1,10 +1,11 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 
 //
 //  Ray-tracing-PIPELINE path tracer (VK_KHR_ray_tracing_pipeline).
@@ -63,11 +64,11 @@ public unsafe class RTPipeline : RtPipeline
         ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.MissBitKhr |
         ShaderStageFlags.ClosestHitBitKhr | ShaderStageFlags.AnyHitBitKhr;
 
-    // SER variant (HitObject + ReorderThread raygen) when the device exposes
+    // SER variant (HitObject + ReorderThread  + Invoke raygen) when the device exposes
     // VK_NV_ray_tracing_invocation_reorder; otherwise the plain TraceRay variant.
     // Both .spv expose the same entry points, so the pipeline build is identical.
     protected override string ShaderPath =>
-        ShaderPaths.Spv(Gfx.SerSupported ? "PathTraceRT_SER" : "PathTraceRT");
+        ShaderPaths.Kernel("PathTracer", Gfx.SerSupported ? "PathTraceRT_SER" : "PathTraceRT");
 
     // SBT: one buffer holding [raygen][miss][hit] regions, each padded to the
     // device's shaderGroupBaseAlignment; CmdTraceRays reads the strided regions.
@@ -124,7 +125,7 @@ public unsafe class RTPipeline : RtPipeline
         CreateLayout(set1, 2, out DescriptorSetLayouts[SetGeom]);
 
         // Borrowed bindless layout (ResourceManager adds RT stage flags when
-        // RayTracePipelineSupported — see CreateBindlessDescriptorSetLayout).
+        // RayTracePipelineSupported - see CreateBindlessDescriptorSetLayout).
         DescriptorSetLayouts[SetBindless] = Engine.ResourceManager.GetBindlessLayout();
 
         var set3 = stackalloc DescriptorSetLayoutBinding[4];

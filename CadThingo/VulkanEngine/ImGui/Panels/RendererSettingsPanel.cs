@@ -5,6 +5,7 @@ using System.Numerics;
 using CadThingo.VulkanEngine.Renderer;
 using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
+using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using ImGuiNET;
 

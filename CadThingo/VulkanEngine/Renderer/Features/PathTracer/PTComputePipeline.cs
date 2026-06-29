@@ -1,10 +1,11 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 
 //
 //  Path-tracer compute pipeline (ray query + progressive accumulation).
@@ -44,7 +45,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
         public float     paniniDistance;
         public float     verticalCompression;
         public uint      emissiveTriCount;    // emissive area-light triangles in the alias table
-        public float     totalEmissivePower;  // Σ area·luminance(Le) — alias-table normaliser
+        public float     totalEmissivePower;  // sum( area·luminance(Le)) - alias-table normaliser
     }
 
     public enum CameraMode : uint
@@ -53,7 +54,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
         ThinLens     = 1,
         Panini       = 2,
         Fisheye      = 3,
-        Orthographic = 4,   // not yet implemented in PTUtils.slang — falls back to Pinhole PSO
+        Orthographic = 4,   // not yet implemented in PTUtils.slang - falls back to Pinhole PSO
     }
 
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
@@ -63,11 +64,11 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     private const int SetBindless = 2;
     private const int SetIbl      = 3;
 
-    private static readonly string ShaderPath = ShaderPaths.Spv("PTCompute");
+    private static readonly string ShaderPath = ShaderPaths.Kernel("PathTracer", "PTCompute");
 
-    // Multi-PSO pattern: one pipeline per camera mode, mode baked via spec
-    // constant id=3. Mode switch at Record time = `CmdBindPipeline` only, no
-    // rebuild. Indices match CameraMode values 0..3 (Orthographic re-uses 0).
+    /// <summary>Multi-PSO pattern: one pipeline per camera mode, mode baked via spec
+    ///constant id=3. Mode switch at Record time = `CmdBindPipeline` only, no
+    /// rebuild. Indices match CameraMode values 0..3 (Orthographic re-uses 0).</summary>
     private Pipeline[] _modePipelines = new Pipeline[4];
 
     //  Compile-time tunables (baked into spec constants at Initialize) 
@@ -233,7 +234,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     {
         DescriptorSets = new DescriptorSet[4][];
 
-        // Set 0 — per-frame in flight (UBO double-buffered; storage images and
+        // Set 0 - per-frame in flight (UBO double-buffered; storage images and
         // borrowed buffers are shared but written into the same set slot).
         var set0Layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) set0Layouts[i] = DescriptorSetLayouts[SetFrame];
@@ -249,7 +250,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
             if (Vk.AllocateDescriptorSets(Device, &alloc0, p) != Result.Success)
                 throw new Exception("Failed to allocate pathtracer set 0");
 
-        // Set 1 — single shared (global VB/IB are renderer-wide singletons).
+        // Set 1 - single shared (global VB/IB are renderer-wide singletons).
         var geomLayout = DescriptorSetLayouts[SetGeom];
         DescriptorSetAllocateInfo alloc1 = new()
         {
@@ -263,10 +264,10 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
             if (Vk.AllocateDescriptorSets(Device, &alloc1, p) != Result.Success)
                 throw new Exception("Failed to allocate pathtracer set 1");
 
-        // Set 2 — borrowed; no allocation here.
+        // Set 2 - borrowed; no allocation here.
         DescriptorSets[SetBindless] = null;
 
-        // Set 3 — IBL, single shared (renderer-wide images).
+        // Set 3 - IBL, single shared (renderer-wide images).
         var iblLayout = DescriptorSetLayouts[SetIbl];
         DescriptorSetAllocateInfo alloc3 = new()
         {
@@ -283,9 +284,6 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 
 
     // Only the things this pipeline owns are written from WriteDescriptors.
-    // The rest are external — each has a public Write* method the renderer
-    // calls once the producer exists (TLAS after InitRayQuery, lights after
-    // PbrDeferred, storage images after RebuildRenderTargets, etc.).
     protected override void WriteDescriptors()
     {
         WriteFrameUboDescriptors();
@@ -498,16 +496,13 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
             ? camera.GetProjectionMatrix((float)renderExtent.Width / renderExtent.Height, 0.1f, 100.0f)
             : Matrix4x4.Identity;
         // Y-flip for Vulkan NDC, matching the convention used everywhere else
-        // in the renderer. The pathtracer needs the *original* proj inverse,
-        // not the flipped one, but since invProj is used to reconstruct ray
-        // directions from NDC and we feed Y-flipped NDC into raygen helpers,
-        // keeping the flip consistent is correct.
+        // in the renderer. 
         proj.M22 *= -1;
 
         Matrix4x4.Invert(view, out var invView);
         Matrix4x4.Invert(proj, out var invProj);
 
-        // FOV comes from the camera — the single source of truth shared with the
+        // FOV comes from the camera - the single source of truth shared with the
         // raster paths (GetProjectionMatrix), so switching into PT doesn't change
         // the framing. Every projection mode (pinhole / thin-lens / panini /
         // fisheye) derives its angle from this vertical FOV.
