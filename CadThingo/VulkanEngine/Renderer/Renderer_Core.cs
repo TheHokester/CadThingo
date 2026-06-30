@@ -10,6 +10,8 @@ using CadThingo.VulkanEngine.Renderer.Features.Forward;
 using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
+using CadThingo.VulkanEngine.Renderer.Features.Selection;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;

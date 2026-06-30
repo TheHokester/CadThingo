@@ -6,6 +6,7 @@ using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;   // GraphStats (deferred-graph debug surface)
 using CadThingo.VulkanEngine.Renderer.RenderCores;  // IRenderCore, RenderFrame
 using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;  // WavefrontPTCore (active-core type test)
+using CadThingo.VulkanEngine.Renderer.Features.Selection;  // PickPipeline.PickNone
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;

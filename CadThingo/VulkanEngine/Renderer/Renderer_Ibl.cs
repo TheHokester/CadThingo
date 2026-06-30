@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer;
@@ -330,13 +331,13 @@ public unsafe partial class Renderer
     internal void CreateIblBakePipelines()
     {
         equirectToCubePipeline = new IblBakePipeline(this,
-            ShaderPaths.Spv("EquirectToCube"),     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
+            ShaderPaths.Kernel("IBL", "EquirectToCube"),     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
         irradianceConvolvePipeline = new IblBakePipeline(this,
-            ShaderPaths.Spv("IrradianceConvolve"), hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
+            ShaderPaths.Kernel("IBL", "IrradianceConvolve"), hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
         prefilterEnvPipeline = new IblBakePipeline(this,
-            ShaderPaths.Spv("PrefilterEnv"),       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
+            ShaderPaths.Kernel("IBL", "PrefilterEnv"),       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
         brdfLutGenPipeline = new IblBakePipeline(this,
-            ShaderPaths.Spv("BrdfLutGen"),         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
+            ShaderPaths.Kernel("IBL", "BrdfLutGen"),         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
 
         equirectToCubePipeline    .Initialize();
         irradianceConvolvePipeline.Initialize();
@@ -557,7 +558,7 @@ public unsafe partial class Renderer
 
         var cmd = BeginSingleTimeCommands();
 
-        // envCube: ShaderRead → General (all mips/layers). Mip 0 receives storage
+        // envCube: ShaderRead -> General (all mips/layers). Mip 0 receives storage
         // writes; mips 1..N get TransferDst during the blit chain so it's simpler
         // to push the whole image through one transition now.
         IblTransition(cmd, envCubeImage,
@@ -809,7 +810,7 @@ public unsafe partial class Renderer
             srcSize = dstSize;
         }
         // Last destination mip is still TransferSrc from the loop's tail
-        // transition — finalize it. Handles the edge case of a single-mip image
+        // transition - finalize it. Handles the edge case of a single-mip image
         // by transitioning mip 0 from its TransferSrc entry state.
         IblTransition(cmd, image, ImageLayout.TransferSrcOptimal, ImageLayout.ShaderReadOnlyOptimal,
             CubeRange(mipLevels - 1, 1));

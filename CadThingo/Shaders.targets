@@ -64,10 +64,6 @@
     <Shader Remove="VulkanEngine\Shaders\Lib\**\*.slang" />
     <Shader Remove="Shaders\Lib\**\*.slang" />
 
-    <!-- Ray-query shaders (inline RayQuery). -->
-    <Shader Update="VulkanEngine\Shaders\PickCompute.slang"   Flags="-capability spvRayQueryKHR" />
-    <Shader Update="VulkanEngine\Shaders\SelectionMask.slang" Flags="-capability spvRayQueryKHR" />
-
     <!-- Shared library modules tracked as compile *inputs* so editing one rebuilds its
          importers (incremental correctness), but never compiled to their own .spv. -->
     <ShaderLib Include="VulkanEngine\Shaders\CommonTypes.slang" />
@@ -129,6 +125,13 @@
     <ShaderVariant Include="VulkanEngine\Renderer\Features\PathTracer\Kernels\PathTraceRT.slang"
                    OutputName="PathTracer\PathTraceRT_SER"
                    Flags="-capability spvRayTracingKHR -capability spvShaderInvocationReorderNV -DUSE_SER=1" />
+
+    <!-- Selection/editor kernels: Pick + SelectionMask are inline-ray-query COMPUTE passes
+         (TLAS hit -> entity / coverage mask). Outline is a fullscreen graphics pass, no caps. -->
+    <Kernel Update="VulkanEngine\Renderer\Features\Selection\Kernels\PickCompute.slang"
+            Flags="-capability spvRayQueryKHR" />
+    <Kernel Update="VulkanEngine\Renderer\Features\Selection\Kernels\SelectionMask.slang"
+            Flags="-capability spvRayQueryKHR" />
 
     <!-- ReSTIR DI is an RT-PIPELINE shader living under a feature (not a compute kernel), so it
          needs the ray-tracing capability instead of the generic empty Kernel flags. Outputs to

@@ -2,7 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer;
+namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 
 /// <summary>
 /// Multiview graphics pipeline that renders a 6-face cubemap capture in one
@@ -54,7 +54,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
 
     // GraphicsPipeline overrides
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("ProbeCapture");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("IBL", "ProbeCapture");
 
     protected override Format[] ColorAttachmentFormats { get; } = [ Format.R16G16B16A16Sfloat ];
 

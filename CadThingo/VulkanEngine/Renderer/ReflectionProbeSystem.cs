@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer;
@@ -181,7 +182,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
 
     private void TryCreateCapturePipeline()
     {
-        string spv = ShaderPaths.Spv("ProbeCapture");
+        string spv = ShaderPaths.Kernel("IBL", "ProbeCapture");
         if (!System.IO.File.Exists(spv))
         {
             Console.WriteLine("[Probe] ProbeCapture.spv not found — capture pipeline skipped. " +

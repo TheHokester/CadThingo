@@ -1,15 +1,18 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
 
 // Selection-outline overlay. Fullscreen pass run on FinalColor (LoadOp.Load)
 // after the active render mode has composited the scene; reads the R32F
 // selection mask and draws an outer ring around the selected entity's
 // silhouette, discarding every non-edge pixel so the rest of the image is
 // untouched. Mode-agnostic because it only depends on FinalColor + the mask.
-public sealed unsafe class OutlinePipeline : GraphicsPipeline
+// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
+// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
+public sealed unsafe class OutlinePipeline : Pipelines.GraphicsPipeline
 {
     // Matches Outline.slang::OutlineParams. 32B, under the 128B minimum.
     [StructLayout(LayoutKind.Sequential)]
@@ -22,7 +25,7 @@ public sealed unsafe class OutlinePipeline : GraphicsPipeline
         public int     _pad;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("Outline");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Selection", "Outline");
 
     // Writes FinalColor (LDR), same format as the tonemap pass.
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R8G8B8A8Unorm };

@@ -2,7 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer;
+namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 
 
 //  Skybox pass — samples envCube along per-pixel view rays. Renders between
@@ -25,7 +25,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         public float     _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("Skybox");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("IBL", "Skybox");
 
     // Writes the same HDRColor as the lighting / transparent passes so it gets
     // tone-mapped with everything else.

@@ -1,6 +1,7 @@
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using CadThingo.VulkanEngine.Renderer.Features.Forward;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 using HostRenderer = CadThingo.VulkanEngine.Renderer.Renderer;

@@ -44,7 +44,8 @@
       <Folder Include="Assets\Shaders\Deferred\" />
       <Folder Include="Assets\Shaders\Forward\" />
       <Folder Include="Assets\Shaders\PathTracer\" />
-      <Folder Include="VulkanEngine\Renderer\Features\IBL\" />
+      <Folder Include="Assets\Shaders\IBL\" />
+      <Folder Include="Assets\Shaders\Selection\" />
     </ItemGroup>
 
     <!-- Directory-aware, manifest-driven Slang -> SPIR-V compile (compiles on build). -->
