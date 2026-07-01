@@ -1,5 +1,6 @@
 using System.Numerics;
 using CadThingo.VulkanEngine.Renderer;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using ImGuiNET;
 
 namespace CadThingo.VulkanEngine.ImGui.Panels;

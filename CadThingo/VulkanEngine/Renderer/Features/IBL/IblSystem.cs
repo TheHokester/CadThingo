@@ -1,9 +1,8 @@
 using System;
 using System.Runtime.InteropServices;
-using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer;
+namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 
 // Image-Based Lighting resources — split-sum approximation.
 //
@@ -12,12 +11,12 @@ namespace CadThingo.VulkanEngine.Renderer;
 //   prefilteredCube 128² × 6, 5 mips        GGX importance-sampled specular (per-roughness mip)
 //   brdfLut         512² × 1                split-sum 2D LUT (NdotV × roughness)
 //
-// Phase 1 just allocates and clears them; the compute bake passes that fill the
-// content live in Phase 2, the PBR shader that reads them lives in Phase 3.
-// The PBR pipeline binds the cube views unconditionally — black content yields
-// zero IBL contribution until an HDR is loaded.
-
-public unsafe partial class Renderer
+// Owned by the host Renderer (constructed once at init). The images are
+// allocated + cleared to black up front; the compute bake passes fill their
+// content when an HDR is loaded via LoadEnvironmentHdr. The PBR pipeline binds
+// the cube views unconditionally — black content yields zero IBL contribution
+// until an HDR is loaded.
+public unsafe sealed class IblSystem : IDisposable
 {
     // Face sizes. envCube needs to be large enough that prefilter taps don't
     // alias; 512 is the standard sweet spot. brdfLut at 512 gives plenty of
@@ -26,6 +25,10 @@ public unsafe partial class Renderer
     internal const uint IrradianceCubeFaceSize = 32;
     internal const uint PrefilteredCubeFaceSize = 128;
     internal const uint BrdfLutSize            = 512;
+
+    private readonly Renderer _renderer;
+    private readonly Vk       _vk;
+    private readonly Device   _device;
 
     // Image handles. Held as raw Vulkan handles (rather than ImageResource)
     // because ImageResource hard-codes 2D / single layer / single mip — cubemaps
@@ -54,7 +57,23 @@ public unsafe partial class Renderer
     internal Sampler        iblCubeSampler;
     internal Sampler        iblLutSampler;
 
-    internal void CreateIblResources()
+    public IblSystem(Renderer renderer)
+    {
+        _renderer = renderer;
+        _vk       = renderer.vk!;
+        _device   = renderer.device;
+
+        // IBL images allocated up-front, cleared to black. The PBR lighting set
+        // binds them unconditionally; the compute bake passes fill the content
+        // when an HDR is loaded via LoadEnvironmentHdr.
+        CreateIblResources();
+        CreateIblBakePipelines();
+        // BRDF LUT is view-independent — bake once at init and reuse for every
+        // environment that gets loaded later.
+        BakeBrdfLut();
+    }
+
+    void CreateIblResources()
     {
         envCubeMipLevels         = (uint)System.Math.Floor(System.Math.Log2(EnvCubeFaceSize)) + 1;
         prefilteredCubeMipLevels = (uint)System.Math.Floor(System.Math.Log2(PrefilteredCubeFaceSize)) + 1;
@@ -102,7 +121,7 @@ public unsafe partial class Renderer
             MaxLod           = Vk.LodClampNone,
             MipLodBias       = 0f,
         };
-        if (vk!.CreateSampler(device, &cubeSamplerInfo, null, out iblCubeSampler) != Result.Success)
+        if (_vk.CreateSampler(_device, &cubeSamplerInfo, null, out iblCubeSampler) != Result.Success)
             throw new System.Exception("Failed to create IBL cube sampler");
 
         SamplerCreateInfo lutSamplerInfo = new()
@@ -119,12 +138,12 @@ public unsafe partial class Renderer
             CompareEnable = false,
             CompareOp     = CompareOp.Always,
         };
-        if (vk!.CreateSampler(device, &lutSamplerInfo, null, out iblLutSampler) != Result.Success)
+        if (_vk.CreateSampler(_device, &lutSamplerInfo, null, out iblLutSampler) != Result.Success)
             throw new System.Exception("Failed to create IBL LUT sampler");
 
-        // Phase 1 leaves the content black so descriptor binds are well-defined
-        // even before an HDR is loaded — the PBR shader will read 0s and add 0
-        // ambient. Phase 2's compute passes overwrite this content.
+        // Content stays black so descriptor binds are well-defined even before an
+        // HDR is loaded — the PBR shader reads 0s and adds 0 ambient. The compute
+        // bake passes overwrite this content when LoadEnvironmentHdr runs.
         InitializeIblImagesBlack();
     }
 
@@ -147,10 +166,10 @@ public unsafe partial class Renderer
             InitialLayout = ImageLayout.Undefined,
             Flags         = ImageCreateFlags.CreateCubeCompatibleBit,
         };
-        if (vk!.CreateImage(device, &info, null, out image) != Result.Success)
+        if (_vk.CreateImage(_device, &info, null, out image) != Result.Success)
             throw new System.Exception("Failed to create IBL cubemap image");
 
-        alloc = memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
+        alloc = _renderer.memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
         ImageViewCreateInfo viewInfo = new()
         {
@@ -167,7 +186,7 @@ public unsafe partial class Renderer
                 LayerCount     = 6,
             },
         };
-        if (vk!.CreateImageView(device, &viewInfo, null, out cubeView) != Result.Success)
+        if (_vk.CreateImageView(_device, &viewInfo, null, out cubeView) != Result.Success)
             throw new System.Exception("Failed to create IBL cubemap view");
     }
 
@@ -189,10 +208,10 @@ public unsafe partial class Renderer
             SharingMode   = SharingMode.Exclusive,
             InitialLayout = ImageLayout.Undefined,
         };
-        if (vk!.CreateImage(device, &info, null, out image) != Result.Success)
+        if (_vk.CreateImage(_device, &info, null, out image) != Result.Success)
             throw new System.Exception("Failed to create BRDF LUT image");
 
-        alloc = memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
+        alloc = _renderer.memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
         ImageViewCreateInfo viewInfo = new()
         {
@@ -209,18 +228,18 @@ public unsafe partial class Renderer
                 LayerCount     = 1,
             },
         };
-        if (vk!.CreateImageView(device, &viewInfo, null, out view) != Result.Success)
+        if (_vk.CreateImageView(_device, &viewInfo, null, out view) != Result.Success)
             throw new System.Exception("Failed to create BRDF LUT view");
     }
 
     /// <summary>
     /// One-shot clear-to-black + transition to ShaderReadOnlyOptimal for all four
-    /// IBL images. Phase 2's compute bake passes transition individual mips back
-    /// to General as needed.
+    /// IBL images. The compute bake passes transition individual mips back to
+    /// General as needed.
     /// </summary>
     void InitializeIblImagesBlack()
     {
-        var cmd = BeginSingleTimeCommands();
+        var cmd = _renderer.BeginSingleTimeCommands();
 
         // Step 1: Undefined → TransferDstOptimal on every layer/mip.
         IblBarrierAll(cmd, envCubeImage,         envCubeMipLevels,         6, ImageLayout.Undefined, ImageLayout.TransferDstOptimal);
@@ -244,7 +263,7 @@ public unsafe partial class Renderer
         IblBarrierAll(cmd, prefilteredCubeImage, prefilteredCubeMipLevels, 6, ImageLayout.TransferDstOptimal, ImageLayout.ShaderReadOnlyOptimal);
         IblBarrierAll(cmd, brdfLutImage,         1,                        1, ImageLayout.TransferDstOptimal, ImageLayout.ShaderReadOnlyOptimal);
 
-        EndSingleTimeCommands(cmd);
+        _renderer.EndSingleTimeCommands(cmd);
     }
 
     void ClearImage(CommandBuffer cmd, VkImage image, uint mipLevels, uint layerCount, ClearColorValue color)
@@ -257,14 +276,13 @@ public unsafe partial class Renderer
             BaseArrayLayer = 0,
             LayerCount     = layerCount,
         };
-        vk!.CmdClearColorImage(cmd, image, ImageLayout.TransferDstOptimal, &color, 1, &range);
+        _vk.CmdClearColorImage(cmd, image, ImageLayout.TransferDstOptimal, &color, 1, &range);
     }
 
     /// <summary>
     /// Pipeline barrier covering every mip and every layer of an image. Used for
     /// the bulk Undefined→TransferDst and TransferDst→ShaderRead transitions on
-    /// the four IBL images. Phase 2 will need a per-mip variant for the
-    /// envCube blit chain and the per-mip prefilter writes.
+    /// the four IBL images.
     /// </summary>
     void IblBarrierAll(CommandBuffer cmd, VkImage image, uint mipLevels, uint layerCount,
         ImageLayout oldLayout, ImageLayout newLayout)
@@ -298,14 +316,14 @@ public unsafe partial class Renderer
         {
             throw new System.Exception($"IblBarrierAll: unsupported transition {oldLayout} → {newLayout}");
         }
-        vk!.CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
+        _vk.CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
     }
 
     // Bake pipelines
-    // Created once at engine init; live for the lifetime of the renderer. The
-    // BRDF LUT bake runs immediately after construction (the result is view-
-    // independent — same LUT for every environment). The other three pipelines
-    // sit idle until LoadEnvironmentHdr is invoked.
+    // Created once at construction; live for the lifetime of the renderer. The
+    // BRDF LUT bake runs immediately (the result is view-independent — same LUT
+    // for every environment). The other three pipelines sit idle until
+    // LoadEnvironmentHdr is invoked.
 
     internal IblBakePipeline equirectToCubePipeline    = null!;
     internal IblBakePipeline irradianceConvolvePipeline = null!;
@@ -328,15 +346,15 @@ public unsafe partial class Renderer
     [StructLayout(LayoutKind.Sequential)]
     struct PcLutSize { public uint lutSize; }
 
-    internal void CreateIblBakePipelines()
+    void CreateIblBakePipelines()
     {
-        equirectToCubePipeline = new IblBakePipeline(this,
+        equirectToCubePipeline = new IblBakePipeline(_renderer,
             ShaderPaths.Kernel("IBL", "EquirectToCube"),     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
-        irradianceConvolvePipeline = new IblBakePipeline(this,
+        irradianceConvolvePipeline = new IblBakePipeline(_renderer,
             ShaderPaths.Kernel("IBL", "IrradianceConvolve"), hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
-        prefilterEnvPipeline = new IblBakePipeline(this,
+        prefilterEnvPipeline = new IblBakePipeline(_renderer,
             ShaderPaths.Kernel("IBL", "PrefilterEnv"),       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
-        brdfLutGenPipeline = new IblBakePipeline(this,
+        brdfLutGenPipeline = new IblBakePipeline(_renderer,
             ShaderPaths.Kernel("IBL", "BrdfLutGen"),         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
 
         equirectToCubePipeline    .Initialize();
@@ -354,9 +372,9 @@ public unsafe partial class Renderer
     }
 
     // Storage-image views
-    // The cube ImageViews from Phase 1 are sample-only (ViewType.Cube). Storage
-    // writes need a 2D-array view at a specific mip level. Created on demand
-    // during a bake, destroyed immediately after.
+    // The cube ImageViews are sample-only (ViewType.Cube). Storage writes need a
+    // 2D-array view at a specific mip level. Created on demand during a bake,
+    // destroyed immediately after.
 
     ImageView CreateCubeStorageView(VkImage image, Format format, uint mipLevel)
     {
@@ -375,7 +393,7 @@ public unsafe partial class Renderer
                 LayerCount     = 6,
             },
         };
-        if (vk!.CreateImageView(device, &info, null, out var view) != Result.Success)
+        if (_vk.CreateImageView(_device, &info, null, out var view) != Result.Success)
             throw new Exception("Failed to create IBL cube storage view");
         return view;
     }
@@ -397,13 +415,13 @@ public unsafe partial class Renderer
                 LayerCount     = 1,
             },
         };
-        if (vk!.CreateImageView(device, &info, null, out var view) != Result.Success)
+        if (_vk.CreateImageView(_device, &info, null, out var view) != Result.Success)
             throw new Exception("Failed to create IBL LUT storage view");
         return view;
     }
 
     // Layout transitions
-    // Phase 2 dispatches mix sampling (ShaderRead) and storage writes (General)
+    // The bake dispatches mix sampling (ShaderRead) and storage writes (General)
     // on the same image, sometimes per-mip. This helper takes an explicit
     // subresource range and chooses access/stage masks from old→new layout.
 
@@ -425,7 +443,7 @@ public unsafe partial class Renderer
             Image               = image,
             SubresourceRange    = range,
         };
-        vk!.CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
+        _vk.CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
     }
 
     static (AccessFlags access, PipelineStageFlags stage) LayoutToSrc(ImageLayout l) => l switch
@@ -466,13 +484,13 @@ public unsafe partial class Renderer
     };
 
     // BRDF LUT bake
-    // Runs once at engine init. The split-sum integral is view-independent so
+    // Runs once at construction. The split-sum integral is view-independent so
     // we never need to re-bake it. ~262k integration runs, milliseconds on any
     // modern GPU.
 
     public void BakeBrdfLut()
     {
-        var cmd = BeginSingleTimeCommands();
+        var cmd = _renderer.BeginSingleTimeCommands();
         IblTransition(cmd, brdfLutImage,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General, Lut2DRange());
 
@@ -480,23 +498,23 @@ public unsafe partial class Renderer
         var set  = brdfLutGenPipeline.AllocateDescriptorSet();
         brdfLutGenPipeline.WriteDescriptors(set, view, default, default);
 
-        vk!.CmdBindPipeline(cmd, PipelineBindPoint.Compute, brdfLutGenPipeline.Handle);
-        vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, brdfLutGenPipeline.Layout,
+        _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, brdfLutGenPipeline.Handle);
+        _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, brdfLutGenPipeline.Layout,
             0, 1, &set, 0, null);
 
         var pc = new PcLutSize { lutSize = BrdfLutSize };
-        vk!.CmdPushConstants(cmd, brdfLutGenPipeline.Layout,
+        _vk.CmdPushConstants(cmd, brdfLutGenPipeline.Layout,
             ShaderStageFlags.ComputeBit, 0, (uint)sizeof(PcLutSize), &pc);
 
         uint groups = (BrdfLutSize + 15) / 16;
-        vk!.CmdDispatch(cmd, groups, groups, 1);
+        _vk.CmdDispatch(cmd, groups, groups, 1);
 
         IblTransition(cmd, brdfLutImage,
             ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal, Lut2DRange());
 
-        EndSingleTimeCommands(cmd);
+        _renderer.EndSingleTimeCommands(cmd);
 
-        vk!.DestroyImageView(device, view, null);
+        _vk.DestroyImageView(_device, view, null);
         brdfLutGenPipeline.FreeDescriptorSet(set);
     }
 
@@ -545,7 +563,7 @@ public unsafe partial class Renderer
     public void LoadEnvironmentHdr(string path)
     {
         var img = HdrLoader.Load(path);
-        vk!.DeviceWaitIdle(device);
+        _vk.DeviceWaitIdle(_device);
         CurrentEnvironmentPath = path;
 
         // 1. Upload equirect as a 2D RGBA16F sampled image
@@ -556,7 +574,7 @@ public unsafe partial class Renderer
         var eqCubeSet    = equirectToCubePipeline.AllocateDescriptorSet();
         equirectToCubePipeline.WriteDescriptors(eqCubeSet, cubeMip0View, eqView, eqSampler);
 
-        var cmd = BeginSingleTimeCommands();
+        var cmd = _renderer.BeginSingleTimeCommands();
 
         // envCube: ShaderRead -> General (all mips/layers). Mip 0 receives storage
         // writes; mips 1..N get TransferDst during the blit chain so it's simpler
@@ -564,14 +582,14 @@ public unsafe partial class Renderer
         IblTransition(cmd, envCubeImage,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General, CubeRange(0, envCubeMipLevels));
 
-        vk!.CmdBindPipeline(cmd, PipelineBindPoint.Compute, equirectToCubePipeline.Handle);
-        vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, equirectToCubePipeline.Layout,
+        _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, equirectToCubePipeline.Handle);
+        _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, equirectToCubePipeline.Layout,
             0, 1, &eqCubeSet, 0, null);
         var pcFace = new PcFaceSize { faceSize = EnvCubeFaceSize };
-        vk!.CmdPushConstants(cmd, equirectToCubePipeline.Layout,
+        _vk.CmdPushConstants(cmd, equirectToCubePipeline.Layout,
             ShaderStageFlags.ComputeBit, 0, (uint)sizeof(PcFaceSize), &pcFace);
         uint cubeGroups = (EnvCubeFaceSize + 15) / 16;
-        vk!.CmdDispatch(cmd, cubeGroups, cubeGroups, 6);
+        _vk.CmdDispatch(cmd, cubeGroups, cubeGroups, 6);
 
         // 3. envCube mip chain via vkCmdBlitImage
         // mip 0 was just written via storage → needs General→TransferSrc.
@@ -595,14 +613,14 @@ public unsafe partial class Renderer
         IblTransition(cmd, irradianceCubeImage, ImageLayout.ShaderReadOnlyOptimal,
             ImageLayout.General, CubeRange(0, 1));
 
-        vk!.CmdBindPipeline(cmd, PipelineBindPoint.Compute, irradianceConvolvePipeline.Handle);
-        vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, irradianceConvolvePipeline.Layout,
+        _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, irradianceConvolvePipeline.Handle);
+        _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, irradianceConvolvePipeline.Layout,
             0, 1, &irrSet, 0, null);
         var pcIrr = new PcFaceSize { faceSize = IrradianceCubeFaceSize };
-        vk!.CmdPushConstants(cmd, irradianceConvolvePipeline.Layout,
+        _vk.CmdPushConstants(cmd, irradianceConvolvePipeline.Layout,
             ShaderStageFlags.ComputeBit, 0, (uint)sizeof(PcFaceSize), &pcIrr);
         uint irrGroups = (IrradianceCubeFaceSize + 15) / 16;
-        vk!.CmdDispatch(cmd, irrGroups, irrGroups, 6);
+        _vk.CmdDispatch(cmd, irrGroups, irrGroups, 6);
 
         IblTransition(cmd, irradianceCubeImage, ImageLayout.General,
             ImageLayout.ShaderReadOnlyOptimal, CubeRange(0, 1));
@@ -614,7 +632,7 @@ public unsafe partial class Renderer
         IblTransition(cmd, prefilteredCubeImage, ImageLayout.ShaderReadOnlyOptimal,
             ImageLayout.General, CubeRange(0, prefilteredCubeMipLevels));
 
-        vk!.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilterEnvPipeline.Handle);
+        _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilterEnvPipeline.Handle);
         for (uint m = 0; m < prefilteredCubeMipLevels; m++)
         {
             uint mipSize = System.Math.Max(1u, PrefilteredCubeFaceSize >> (int)m);
@@ -627,7 +645,7 @@ public unsafe partial class Renderer
             prefilterEnvPipeline.WriteDescriptors(prefilterSets[m], prefilterMipViews[m], envCubeView, iblCubeSampler);
 
             var set = prefilterSets[m];
-            vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, prefilterEnvPipeline.Layout,
+            _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, prefilterEnvPipeline.Layout,
                 0, 1, &set, 0, null);
             var pcPre = new PcPrefilter
             {
@@ -635,32 +653,32 @@ public unsafe partial class Renderer
                 mipFaceSize = mipSize,
                 envCubeSize = EnvCubeFaceSize,
             };
-            vk!.CmdPushConstants(cmd, prefilterEnvPipeline.Layout,
+            _vk.CmdPushConstants(cmd, prefilterEnvPipeline.Layout,
                 ShaderStageFlags.ComputeBit, 0, (uint)sizeof(PcPrefilter), &pcPre);
             uint mipGroups = (mipSize + 15) / 16;
-            vk!.CmdDispatch(cmd, mipGroups, mipGroups, 6);
+            _vk.CmdDispatch(cmd, mipGroups, mipGroups, 6);
         }
 
         IblTransition(cmd, prefilteredCubeImage, ImageLayout.General,
             ImageLayout.ShaderReadOnlyOptimal, CubeRange(0, prefilteredCubeMipLevels));
 
-        EndSingleTimeCommands(cmd);
+        _renderer.EndSingleTimeCommands(cmd);
 
         // 6. Cleanup transient bake resources
-        vk!.DestroyImageView(device, cubeMip0View, null);
-        vk!.DestroyImageView(device, irrView, null);
+        _vk.DestroyImageView(_device, cubeMip0View, null);
+        _vk.DestroyImageView(_device, irrView, null);
         for (int m = 0; m < prefilterMipViews.Length; m++)
-            vk!.DestroyImageView(device, prefilterMipViews[m], null);
+            _vk.DestroyImageView(_device, prefilterMipViews[m], null);
 
         equirectToCubePipeline.FreeDescriptorSet(eqCubeSet);
         irradianceConvolvePipeline.FreeDescriptorSet(irrSet);
         for (int m = 0; m < prefilterSets.Length; m++)
             prefilterEnvPipeline.FreeDescriptorSet(prefilterSets[m]);
 
-        vk!.DestroySampler(device, eqSampler, null);
-        vk!.DestroyImageView(device, eqView, null);
-        vk!.DestroyImage(device, eqImage, null);
-        memAllocator.Free(eqAlloc);
+        _vk.DestroySampler(_device, eqSampler, null);
+        _vk.DestroyImageView(_device, eqView, null);
+        _vk.DestroyImage(_device, eqImage, null);
+        _renderer.memAllocator.Free(eqAlloc);
     }
 
     /// <summary>
@@ -677,11 +695,11 @@ public unsafe partial class Renderer
 
         // CPU-side float32 → float16 conversion. System.Half is a value type; the
         // unsafe block writes straight into the mapped staging buffer.
-        CreateBuffer(byteSize, BufferUsageFlags.TransferSrcBit,
+        _renderer.CreateBuffer(byteSize, BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out var staging, out var stagingAlloc);
 
-        void* mapped = memAllocator.GetMapped(stagingAlloc);
+        void* mapped = _renderer.memAllocator.GetMapped(stagingAlloc);
         var halfSpan = new Span<Half>(mapped, texelCount * 4);
         for (int i = 0; i < texelCount * 4; i++) halfSpan[i] = (Half)img.Pixels[i];
 
@@ -699,12 +717,12 @@ public unsafe partial class Renderer
             SharingMode   = SharingMode.Exclusive,
             InitialLayout = ImageLayout.Undefined,
         };
-        if (vk!.CreateImage(device, &info, null, out image) != Result.Success)
+        if (_vk.CreateImage(_device, &info, null, out image) != Result.Success)
             throw new Exception("Failed to create equirect upload image");
 
-        alloc = memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
+        alloc = _renderer.memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
-        var cmd = BeginSingleTimeCommands();
+        var cmd = _renderer.BeginSingleTimeCommands();
         IblTransition(cmd, image, ImageLayout.Undefined, ImageLayout.TransferDstOptimal,
             Lut2DRange());
         BufferImageCopy region = new()
@@ -722,12 +740,12 @@ public unsafe partial class Renderer
             ImageOffset = new Offset3D(0, 0, 0),
             ImageExtent = new Extent3D((uint)img.Width, (uint)img.Height, 1),
         };
-        vk!.CmdCopyBufferToImage(cmd, staging, image, ImageLayout.TransferDstOptimal, 1, &region);
+        _vk.CmdCopyBufferToImage(cmd, staging, image, ImageLayout.TransferDstOptimal, 1, &region);
         IblTransition(cmd, image, ImageLayout.TransferDstOptimal,
             ImageLayout.ShaderReadOnlyOptimal, Lut2DRange());
-        EndSingleTimeCommands(cmd);
+        _renderer.EndSingleTimeCommands(cmd);
 
-        DestroyBuffer(staging, stagingAlloc);
+        _renderer.DestroyBuffer(staging, stagingAlloc);
 
         ImageViewCreateInfo viewInfo = new()
         {
@@ -744,7 +762,7 @@ public unsafe partial class Renderer
                 LayerCount     = 1,
             },
         };
-        if (vk!.CreateImageView(device, &viewInfo, null, out view) != Result.Success)
+        if (_vk.CreateImageView(_device, &viewInfo, null, out view) != Result.Success)
             throw new Exception("Failed to create equirect upload view");
 
         SamplerCreateInfo samplerInfo = new()
@@ -760,7 +778,7 @@ public unsafe partial class Renderer
             MaxLod        = 0f,
             CompareEnable = false,
         };
-        if (vk!.CreateSampler(device, &samplerInfo, null, out sampler) != Result.Success)
+        if (_vk.CreateSampler(_device, &samplerInfo, null, out sampler) != Result.Success)
             throw new Exception("Failed to create equirect sampler");
     }
 
@@ -795,7 +813,7 @@ public unsafe partial class Renderer
                 },
             };
 
-            vk!.CmdBlitImage(cmd,
+            _vk.CmdBlitImage(cmd,
                 image, ImageLayout.TransferSrcOptimal,
                 image, ImageLayout.TransferDstOptimal,
                 1, &blit, Filter.Linear);
@@ -816,27 +834,27 @@ public unsafe partial class Renderer
             CubeRange(mipLevels - 1, 1));
     }
 
-    void CleanupIblResources()
+    public void Dispose()
     {
         DisposeIblBakePipelines();
 
-        if (iblLutSampler.Handle != 0)         vk!.DestroySampler(device, iblLutSampler, null);
-        if (iblCubeSampler.Handle != 0)        vk!.DestroySampler(device, iblCubeSampler, null);
+        if (iblLutSampler.Handle != 0)         _vk.DestroySampler(_device, iblLutSampler, null);
+        if (iblCubeSampler.Handle != 0)        _vk.DestroySampler(_device, iblCubeSampler, null);
 
-        if (brdfLutView.Handle != 0)           vk!.DestroyImageView(device, brdfLutView, null);
-        if (brdfLutImage.Handle != 0)          vk!.DestroyImage(device, brdfLutImage, null);
-        memAllocator.Free(brdfLutAlloc);
+        if (brdfLutView.Handle != 0)           _vk.DestroyImageView(_device, brdfLutView, null);
+        if (brdfLutImage.Handle != 0)          _vk.DestroyImage(_device, brdfLutImage, null);
+        _renderer.memAllocator.Free(brdfLutAlloc);
 
-        if (prefilteredCubeView.Handle != 0)   vk!.DestroyImageView(device, prefilteredCubeView, null);
-        if (prefilteredCubeImage.Handle != 0)  vk!.DestroyImage(device, prefilteredCubeImage, null);
-        memAllocator.Free(prefilteredCubeAlloc);
+        if (prefilteredCubeView.Handle != 0)   _vk.DestroyImageView(_device, prefilteredCubeView, null);
+        if (prefilteredCubeImage.Handle != 0)  _vk.DestroyImage(_device, prefilteredCubeImage, null);
+        _renderer.memAllocator.Free(prefilteredCubeAlloc);
 
-        if (irradianceCubeView.Handle != 0)    vk!.DestroyImageView(device, irradianceCubeView, null);
-        if (irradianceCubeImage.Handle != 0)   vk!.DestroyImage(device, irradianceCubeImage, null);
-        memAllocator.Free(irradianceCubeAlloc);
+        if (irradianceCubeView.Handle != 0)    _vk.DestroyImageView(_device, irradianceCubeView, null);
+        if (irradianceCubeImage.Handle != 0)   _vk.DestroyImage(_device, irradianceCubeImage, null);
+        _renderer.memAllocator.Free(irradianceCubeAlloc);
 
-        if (envCubeView.Handle != 0)           vk!.DestroyImageView(device, envCubeView, null);
-        if (envCubeImage.Handle != 0)          vk!.DestroyImage(device, envCubeImage, null);
-        memAllocator.Free(envCubeAlloc);
+        if (envCubeView.Handle != 0)           _vk.DestroyImageView(_device, envCubeView, null);
+        if (envCubeImage.Handle != 0)          _vk.DestroyImage(_device, envCubeImage, null);
+        _renderer.memAllocator.Free(envCubeAlloc);
     }
 }

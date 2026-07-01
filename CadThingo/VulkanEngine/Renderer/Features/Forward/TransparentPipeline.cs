@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;   // ReflectionProbeSystem, ProbeGpuRecord
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
@@ -30,7 +31,7 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         public uint    _pad0;
         public Vector2 screenSize;
         // Repurposed from former trailing 8B pad — matches LightingFrameUBO IBL
-        // params byte-for-byte so the same Renderer.prefilteredCubeMipLevels +
+        // params byte-for-byte so the same Renderer.Ibl.prefilteredCubeMipLevels +
         // scaleIBLAmbient story applies on the transparent pass.
         public float   prefilteredCubeMipLevels;
         public float   scaleIBLAmbient;
@@ -350,9 +351,9 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
     {
         var imageInfos = stackalloc DescriptorImageInfo[3]
         {
-            new() { ImageView = Renderer.irradianceCubeView,  Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.prefilteredCubeView, Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.brdfLutView,         Sampler = Renderer.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.Ibl.irradianceCubeView,  Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.Ibl.prefilteredCubeView, Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.Ibl.brdfLutView,         Sampler = Renderer.Ibl.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
         };
 
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
@@ -492,7 +493,7 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         ubo.tileCountX = tileCountX;
         ubo.tileCountY = tileCountY;
         ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
-        ubo.prefilteredCubeMipLevels = Renderer.prefilteredCubeMipLevels;
+        ubo.prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels;
         ubo.scaleIBLAmbient          = EditorState.IblIntensity;
 
         // Probe cluster dims — built once per frame by ReflectionProbeSystem.

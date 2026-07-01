@@ -6,6 +6,7 @@ using CadThingo.VulkanEngine.Renderer;
 using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using ImGuiNET;
 
@@ -345,14 +346,14 @@ public static class RendererSettingsPanel
             ImGuiNET.ImGui.SameLine();
             if (ImGuiNET.ImGui.Button("Load") && _hdrSelected >= 0 && _hdrSelected < _hdrFiles.Length)
             {
-                try { renderer.LoadEnvironmentHdr(_hdrFiles[_hdrSelected]); }
+                try { renderer.Ibl.LoadEnvironmentHdr(_hdrFiles[_hdrSelected]); }
                 catch (Exception e) { Console.WriteLine($"LoadEnvironmentHdr failed: {e.Message}"); }
             }
             ImGuiNET.ImGui.SameLine();
             if (ImGuiNET.ImGui.Button("Refresh")) RefreshHdrList(renderer);
         }
 
-        var current = renderer.CurrentEnvironmentPath;
+        var current = renderer.Ibl.CurrentEnvironmentPath;
         ImGuiNET.ImGui.TextDisabled($"Loaded: {(string.IsNullOrEmpty(current) ? "(none)" : Path.GetFileName(current))}");
 
         ImGuiNET.ImGui.Spacing();
@@ -385,11 +386,11 @@ public static class RendererSettingsPanel
 
         // Pre-select whatever's currently loaded, if it's still on the list.
         _hdrSelected = -1;
-        if (!string.IsNullOrEmpty(renderer.CurrentEnvironmentPath))
+        if (!string.IsNullOrEmpty(renderer.Ibl.CurrentEnvironmentPath))
         {
             for (int i = 0; i < _hdrFiles.Length; i++)
             {
-                if (string.Equals(_hdrFiles[i], renderer.CurrentEnvironmentPath, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(_hdrFiles[i], renderer.Ibl.CurrentEnvironmentPath, StringComparison.OrdinalIgnoreCase))
                 {
                     _hdrSelected = i;
                     break;

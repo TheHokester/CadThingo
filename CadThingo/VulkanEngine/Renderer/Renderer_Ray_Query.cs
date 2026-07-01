@@ -92,6 +92,11 @@ public unsafe partial class Renderer
     // Single scene-wide TLAS. Rebuild on entity-set / transform changes; flag
     // tlasDirty so DrawFrame can pick it up at the top of a frame.
     private AccelerationStructureKHR tlas;
+
+    // True when the full ray-query stack is usable for this frame: the device
+    // supports it, the extension loaded, and a TLAS has been built. SelectionSystem
+    // (pick + outline) gates on this before touching the acceleration structure.
+    internal bool RayInfraReady => RayShadowsSupported && khrAccelStruct != null && tlas.Handle != 0;
     private Buffer    tlasStorage;
     private SubAlloc  tlasStorageAlloc;
 
@@ -1039,8 +1044,7 @@ public unsafe partial class Renderer
             wavefrontPipeline?.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
             reStirPipeline?.WriteTlasDescriptor(tlas);
-            pickPipeline?.WriteTlasDescriptor(tlas);
-            selectionMaskPipeline?.WriteTlasDescriptor(tlas);
+            selection?.WriteTlasDescriptor(tlas);
         }
 
         if (shadowInfoBufferResized)
@@ -1050,8 +1054,7 @@ public unsafe partial class Renderer
             wavefrontPipeline?.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();
             reStirPipeline?.WriteShadowInfoDescriptor();
-            pickPipeline?.WriteEntityInfoDescriptor();
-            selectionMaskPipeline?.WriteEntityInfoDescriptor();
+            selection?.WriteEntityInfoDescriptor();
             shadowInfoBufferResized = false;
         }
 

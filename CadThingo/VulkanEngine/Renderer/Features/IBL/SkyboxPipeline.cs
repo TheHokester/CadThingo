@@ -181,8 +181,8 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
     {
         var envInfo = new DescriptorImageInfo
         {
-            ImageView   = Renderer.envCubeView,
-            Sampler     = Renderer.iblCubeSampler,
+            ImageView   = Renderer.Ibl.envCubeView,
+            Sampler     = Renderer.Ibl.iblCubeSampler,
             ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
         };
 

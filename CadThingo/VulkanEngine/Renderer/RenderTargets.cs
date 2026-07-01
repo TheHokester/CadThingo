@@ -156,10 +156,6 @@ public sealed unsafe class RenderTargets : IDisposable
 
     /// <summary>
     /// Allocates the R32F selection-coverage mask used by the outline overlay.
-    /// Storage (compute write) + sampled (outline fragment read). Left in
-    /// ShaderReadOnly between frames — RecordSelectionOutline flips it to General
-    /// and back each active frame, and that flip doubles as the cross-frame
-    /// write-after-read guard on the single shared image.
     /// </summary>
     private void CreateSelectionResources()
     {
