@@ -123,9 +123,7 @@ bool shadowAlphaPasses(uint recordIndex, uint primIdx, float2 bary)
     return alpha >= mat.alphaCutoff;
 }
 
-// Self-shadow bias — pushes the shadow ray origin off the surface along N so
-// floating-point error in the gbuffer position doesn't make the surface
-// shadow itself. Tune up if you see acne, down if you see "peter-panning."
+// Self-shadow bias - moves the ray start pos along N to prevent self shadowing from floating point error. 
 static const float SHADOW_RAY_EPS = 0.002;
 
 // Distance-to-occluder soft shadow tunables.
@@ -316,8 +314,7 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
 
     // === DIRECT LIGHTING LOOP ===
     // Map the pixel to its 16×16 tile and walk only the lights the cull pass
-    // assigned to this tile. Pixels off the tile grid (shouldn't normally happen)
-    // fall back to zero lights — Lo stays 0 for them.
+    // assigned to this tile. 
     uint tileX    = (uint)input.Position.x / TILE_SIZE_PX;
     uint tileY    = (uint)input.Position.y / TILE_SIZE_PX;
     uint tileIdx  = tileY * ubo.tileCountX + tileX;
@@ -341,8 +338,6 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
 
         if (type == LIGHT_TYPE_DIRECTIONAL) {
             // Directional: light direction is the field; distance is "infinite"
-            // for shadow ray purposes — use a large finite tMax instead of FLT_MAX
-            // so traversal still terminates cleanly when nothing is hit.
             L            = normalize(-lt.directionType.xyz);
             distance     = 1e6;
             attenuation  = 1.0;
@@ -376,7 +371,7 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
         // Shadow ray: WorldPos -> light, with self-shadow bias along N.
         // Spec-constant gate picks soft (multi-tap penumbra) vs hard (1-ray binary).
         // The branch on SOFT_SHADOWS is resolved at pipeline-build time, so the
-        // unused arm is compiled out entirely — no per-pixel cost for the toggle.
+        // unused arm is compiled out entirely 
         bool castShadows = lt.spotCones.z > 0.5;
         if (castShadows) {
             float3 shadowOrigin = WorldPos + N * SHADOW_RAY_EPS;
@@ -420,8 +415,6 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     // Combine all lighting contributions
     float3 color = ambient + Lo + emissive;
 
-    // Output linear scene-referred HDR — the dedicated tone-map pass downstream
-    // applies exposure, Reinhard, and inverse gamma before writing the LDR
-    // FinalColor target.
+    // Output linear scene-referred HDR
     return float4(color, 1.0);
 }

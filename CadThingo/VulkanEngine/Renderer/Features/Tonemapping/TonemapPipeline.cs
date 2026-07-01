@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 
 // Matches the TONEMAP_OPERATOR spec constant in Tonemap.slang. Read once at
 // pipeline build; changing the operator requires Dispose + rebuild.
@@ -13,7 +13,10 @@ public enum TonemapOperator : uint
 
 // 
 //  Tone-map / post pass — samples HDRColor, writes FinalColor (LDR)
-public sealed unsafe class TonemapPipeline : GraphicsPipeline
+// Base type is namespace-qualified: the dead VulkanTut `CadThingo.GraphicsPipeline`
+// namespace would otherwise shadow the `GraphicsPipeline` base from an enclosing-namespace
+// lookup here under Features.
+public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
 {
     // Push constants — fragment-only, 8 bytes total, well under the 128B
     // guaranteed minimum. Kept off the per-frame UBO because exposure/gamma
@@ -25,7 +28,7 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
         public float Gamma;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("Tonemap");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Tonemapping", "Tonemap");
 
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R8G8B8A8Unorm };
 

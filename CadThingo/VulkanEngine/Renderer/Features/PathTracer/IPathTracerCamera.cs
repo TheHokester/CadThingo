@@ -1,4 +1,4 @@
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 
 /// <summary>
 /// The camera / depth-of-field controls shared by every path-tracer pipeline

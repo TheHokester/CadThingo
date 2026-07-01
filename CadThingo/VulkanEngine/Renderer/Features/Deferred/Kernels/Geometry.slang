@@ -89,17 +89,10 @@ GBufferOutput PSMain(VSOutput input)
     // Sampler 0 is the shared linear-repeat default. All bindless textures use it for now.
     SamplerState s = samplers[0];
 
-    // NonUniformResourceIndex is required for descriptor-array indices that may vary
-    // across a wave (different primitives in the same wave can carry different material
-    // indices). Without it, Vulkan leaves the result undefined and most drivers sample
-    // the first lane's texture for the whole wave — i.e. neighbouring prims/models
-    // appear to share textures.
+    
     float4 baseColor       = textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV) * mat.baseColorFactor;
 
-    // MASK alpha test (bit 0 of flags). BLEND materials (bit 2) route to the dedicated
-    // transparent pass and shouldn't reach the geometry pass after the partition lands —
-    // but their glTF alphaCutoff defaults to 0 so this discard wouldn't fire for them
-    // even if they did.
+    // MASK alpha test (bit 0 of flags). discards if geometry that should be opaque is transparent. 
     if ((mat.flags & 1u) != 0u && baseColor.a < mat.alphaCutoff) discard;
 
     float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).rg;
@@ -113,7 +106,7 @@ GBufferOutput PSMain(VSOutput input)
         float3 tangentNormal = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).rg);
         N = applyNormalMap(N, input.WorldPos, input.UV, tangentNormal);
     }
-
+    //writes gbuffer
     GBufferOutput output;
     output.Position = float4(input.WorldPos, 1.0);
     output.Normal   = float4(N, 0.0);

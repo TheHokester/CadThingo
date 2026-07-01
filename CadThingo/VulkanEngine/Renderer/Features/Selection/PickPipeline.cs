@@ -1,8 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
 
 // Object-picking compute pipeline. Casts one ray-query through the clicked
 // pixel against the scene TLAS; the committed hit's InstanceCustomIndex (==
@@ -30,7 +31,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
         public uint      PixelY;        //  4
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("PickCompute");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Selection", "PickCompute");
 
     // 4B result (entity index or PickNone). Host-visible + coherent so the
     // single-time submit's QueueWaitIdle is all the synchronisation the readback

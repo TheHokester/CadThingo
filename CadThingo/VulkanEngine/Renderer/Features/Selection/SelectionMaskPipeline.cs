@@ -1,8 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
 
 // Selection-mask compute pipeline. Full-screen ray-query against the TLAS that
 // writes a binary coverage mask of the selected entity into an R32F storage
@@ -24,7 +25,7 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
         public uint      _pad;           //  4
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("SelectionMask");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Selection", "SelectionMask");
 
     public SelectionMaskPipeline(Renderer renderer) : base(renderer)
     {

@@ -1,7 +1,7 @@
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer;
+namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 
 // One generic compute pipeline used by every IBL bake step. The four bake
 // shaders share an almost-identical descriptor layout — set 0 binding 0 is an

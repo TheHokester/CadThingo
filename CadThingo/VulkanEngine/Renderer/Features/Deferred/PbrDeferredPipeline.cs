@@ -1,13 +1,18 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Features.Forward;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;   // ReflectionProbeSystem, ProbeGpuRecord
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 
 //  PBR deferred lighting pass — fullscreen triangle, samples G-buffer +
 //  per-tile light list, optional ray-queried shadows.
-public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
+// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
+// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
+public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
 {
     // Matches PbrShader.slang's LightingFrameUBO (binding 0 of set 0).
     [StructLayout(LayoutKind.Sequential)]
@@ -32,7 +37,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         public float probeMipLevels;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("PBR");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "PBR");
 
     // Lighting writes linear HDR scene-referred color; tone-map + gamma run in
     // the separate TonemapPipeline pass that consumes this attachment.
@@ -481,9 +486,9 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     {
         var imageInfos = stackalloc DescriptorImageInfo[3]
         {
-            new() { ImageView = Renderer.irradianceCubeView,  Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.prefilteredCubeView, Sampler = Renderer.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.brdfLutView,         Sampler = Renderer.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.Ibl.irradianceCubeView,  Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.Ibl.prefilteredCubeView, Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
+            new() { ImageView = Renderer.Ibl.brdfLutView,         Sampler = Renderer.Ibl.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
         };
 
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
@@ -813,9 +818,9 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
         // Used by PbrShader.slang to scale roughness into the prefiltered mip chain.
-        // Renderer.prefilteredCubeMipLevels is set in CreateIblResources and never
-        // changes — IBL bakes overwrite content, not metadata.
-        ubo.prefilteredCubeMipLevels = Renderer.prefilteredCubeMipLevels;
+        // Renderer.Ibl.prefilteredCubeMipLevels is set when IblSystem is constructed
+        // and never changes - IBL bakes overwrite content, not metadata.
+        ubo.prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels;
         ubo.scaleIBLAmbient = EditorState.IblIntensity;
         ubo.lightCount = count;
         ubo.tileCountX = tileX;

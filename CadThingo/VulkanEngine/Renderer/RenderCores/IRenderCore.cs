@@ -45,7 +45,7 @@ internal readonly ref struct RenderFrame
 /// owns the shared resources + the frame skeleton (acquire -> extract -> [core] -> outline -> blit
 /// -> present); a core owns exactly one technique and records it into <see cref="RenderFrame.Cmd"/>,
 /// leaving FinalColor in <c>ShaderReadOnlyOptimal</c> -- the layout the host post-stack
-/// (RecordSelectionOutline + swapchain blit + ImGui viewport sampler) already assumes from every
+/// (SelectionSystem.RecordOutline + swapchain blit + ImGui viewport sampler) already assumes from every
 /// path today.
 ///
 /// This replaces the four parallel <c>DrawX</c> methods + the <c>switch(renderMode)</c> in

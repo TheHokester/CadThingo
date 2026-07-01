@@ -40,7 +40,12 @@
       <Folder Include="Assets\Models\Environment\" />
       <Folder Include="Assets\Models\Props\" />
       <Folder Include="Assets\Shaders\ReSTIR\" />
-      <Folder Include="VulkanEngine\Renderer\Features\IBL\" />
+      <Folder Include="Assets\Shaders\Tonemapping\" />
+      <Folder Include="Assets\Shaders\Deferred\" />
+      <Folder Include="Assets\Shaders\Forward\" />
+      <Folder Include="Assets\Shaders\PathTracer\" />
+      <Folder Include="Assets\Shaders\IBL\" />
+      <Folder Include="Assets\Shaders\Selection\" />
     </ItemGroup>
 
     <!-- Directory-aware, manifest-driven Slang -> SPIR-V compile (compiles on build). -->

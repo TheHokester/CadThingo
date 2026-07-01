@@ -117,16 +117,15 @@ public unsafe partial class Renderer
         // tonemap to the new deferred HDR, so in a PT mode we must override it back to ptOutColor.
         _activeCore.Activate();
 
-        // FinalColor ImageView is fresh — re-bind it for the ImGui viewport panel.
+        // FinalColor ImageView is fresh - re-bind it for the ImGui viewport panel.
         imGuiUtils?.WriteViewportDescriptor(renderTargets.FinalColor.ImageView);
 
-        // Selection mask view is fresh — re-bind it on both the compute (storage
+        // Selection mask view is fresh - re-bind it on both the compute (storage
         // image) and outline (sampled image) sides.
-        selectionMaskPipeline?.WriteMaskImageDescriptor(selectionMask.ImageView);
-        outlinePipeline?.WriteMaskDescriptor(selectionMask.ImageView);
+        selection?.RebindMask();
 
         // Diagnostic: sample allocator occupancy now that old targets are freed and
-        // new ones allocated — the steady post-resize state for the history plot.
+        // new ones allocated - the steady post-resize state for the history plot.
         RecordMemorySample();
     }
 
@@ -151,6 +150,9 @@ public unsafe partial class Renderer
         public readonly Extent2D RenderExtent { get; init;}
         // bindless descriptor set, current view/proj/inv matrices precomputed, etc.
     }
+    /// <summary>
+    /// Core function called within the Render loop
+    /// </summary>
     public void DrawFrame()
     {
         
@@ -192,7 +194,7 @@ public unsafe partial class Renderer
         //     a one-ray compute dispatch against the (now up-to-date) TLAS,
         //     setting EditorState.SelectedEntity. Out-of-band single-time submit,
         //     so it sits here before the per-frame command buffer is recorded.
-        ProcessPickRequest();
+        selection.ProcessPickRequest();
 
         // 0d. Render-mode change: swap the active core. Its Activate() rebinds tonemap's HDR
         //     input to the core's scene-colour source (deferred HDR vs PT ptOutColor).
@@ -221,7 +223,7 @@ public unsafe partial class Renderer
         var acquireResult = swapchain.AcquireNextImage(imageAvailableSemaphores[currentFrame], out uint imageIndex);
         if (acquireResult == Result.ErrorOutOfDateKhr) { RecreateSwapChain(); return; }
 
-        // 3. Reset fence — we're about to submit work that will signal it
+        // 3. Reset fence - about to submit work that will signal it
         vk!.ResetFences(device, 1, ref inFlightFences[currentFrame]);
 
         // 4. Reset + begin command buffer
@@ -235,21 +237,17 @@ public unsafe partial class Renderer
         if (vk!.BeginCommandBuffer(cmd, &beginInfo) != Result.Success)
             throw new Exception("Failed to begin command buffer");
 
-        // Open this frame's world-transform cache (L2 step 5) - one reset covers
+        // Open this frame's world-transform cache  - one reset covers
         // every render mode below; the active DrawX's extract reads served from it.
         // (RebuildTlas, which runs out-of-band above, manages its own window.)
         gpuScene.BeginTransforms();
 
-        // Dispatch the active render core (L3). It records its technique into cmd and leaves
-        // FinalColor in ShaderReadOnlyOptimal for the host post-stack below. The core was selected
-        // (by list index, _renderCores[_desiredCoreIndex]) + Activated at step 0d; RT-only cores
-        // never registered on devices without the RT pipeline, so they can't be the desired core.
+        // Dispatch the active render core. It records its technique into cmd and leaves
+        // FinalColor in ShaderReadOnlyOptimal for upcoming commands. 
         _activeCore.Render(new RenderFrame { Cmd = cmd, Frame = ctx });
 
-        // 6b. Selection outline. Both render modes leave FinalColor in
-        //     ShaderReadOnly here; this composites the outline overlay in place
-        //     (no-op when nothing's selected) and restores that layout.
-        RecordSelectionOutline(cmd);
+        // 6b. Selection outline.
+        selection.RecordOutline(cmd);
 
         // 7. Blit FinalColor -> swapchain image
         var swapImage = swapChainImages[imageIndex];
@@ -272,7 +270,7 @@ public unsafe partial class Renderer
             PipelineStageFlags.TransferBit,
             0, 0, null, 0, null, 1, &toTransferDst);
 
-        // 7b. Blit FinalColor → swapchain.
+        // 7b. Blit FinalColor -> swapchain.
         // FinalColor's graph-declared finalLayout is now ShaderReadOnlyOptimal (so the
         // viewport panel can sample it), so we dance it through TransferSrcOptimal
         // here and back to ShaderReadOnlyOptimal after the blit. The graph's layout
@@ -386,100 +384,6 @@ public unsafe partial class Renderer
         // Advance to the next frame-in-flight slot + bump the monotonic counter.
         frameRing.Advance();
     }
-    /// <summary>
-    /// Consumes a pending viewport pick (posted by ViewportPanel as a render-
-    /// target pixel) and resolves it to an entity by casting one ray through the
-    /// TLAS in a compute dispatch. The pick pass returns the hit's
-    /// ShadowEntityInfo.EntityIndex — a stable RenderableHandle slot (see
-    /// RebuildTlas) — which <see cref="GpuScene.ResolveSlot"/> maps back to the
-    /// entity. Runs as a self-contained single-time submit (QueueWaitIdle), so the
-    /// host-visible result is ready immediately. No-op unless ray queries are
-    /// supported and a TLAS exists.
-    /// </summary>
-    private void ProcessPickRequest()
-    {
-        var req = ImGui.EditorState.RequestedPick;
-        if (!req.HasValue) return;
-        ImGui.EditorState.RequestedPick = null;
-
-        if (!RayShadowsSupported || khrAccelStruct == null || tlas.Handle == 0 || pickPipeline == null)
-            return;
-
-        uint px = req.Value.x;
-        uint py = req.Value.y;
-        if (px >= renderExtent.Width || py >= renderExtent.Height) return;
-
-        // Same Y-flipped projection the geometry / lighting / light-cull passes
-        // use, so the pick ray lines up with the rasterized image (and the PT
-        // image, which flips the same way).
-        Matrix4x4 view = camera.GetViewMatrix();
-        Matrix4x4 proj = camera.GetProjectionMatrix(
-            (float)renderExtent.Width / renderExtent.Height, 0.1f, 100.0f);
-        proj.M22 *= -1f;
-        if (!Matrix4x4.Invert(view * proj, out Matrix4x4 invVP)) return;
-
-        var cmd = BeginSingleTimeCommands();
-        pickPipeline.Record(cmd, invVP, camera.GetPosition(),
-            new Vector2(renderExtent.Width, renderExtent.Height), px, py);
-        EndSingleTimeCommands(cmd);   // QueueWaitIdle — result buffer is now valid
-
-        uint idx = pickPipeline.ReadResult();
-        ImGui.EditorState.SelectedEntity =
-            idx == PickPipeline.PickNone ? null : gpuScene.ResolveSlot(idx);
-    }
-
-    /// <summary>
-    /// Composites the selection outline into FinalColor. Runs after the active
-    /// render mode has produced FinalColor (left in ShaderReadOnly by both the
-    /// deferred and PT paths) and before the swapchain blit, so one insertion
-    /// point covers every mode. Ray-queries the TLAS into the coverage mask,
-    /// then draws an outer ring around the selected entity's silhouette. No-op
-    /// unless a mesh-bearing entity is selected and ray queries are available;
-    /// leaves FinalColor in ShaderReadOnly exactly as it found it.
-    /// </summary>
-    private void RecordSelectionOutline(CommandBuffer cmd)
-    {
-        if (ImGui.EditorState.SelectedEntity == null) return;
-        if (!RayShadowsSupported || khrAccelStruct == null || tlas.Handle == 0) return;
-        if (selectionMaskPipeline == null || outlinePipeline == null) return;
-
-        // Resolve the selection to its RenderableHandle slot — the same token the
-        // mask shader compares against ShadowEntityInfo.EntityIndex (L2 step 6). No
-        // handle ⇒ not a renderable (e.g. a light picked in the outliner) ⇒ no
-        // outline, which is correct.
-        if (!gpuScene.TryGetHandle(ImGui.EditorState.SelectedEntity, out var selHandle)) return;
-        uint idx = selHandle.Index;
-
-        Matrix4x4 view = camera.GetViewMatrix();
-        Matrix4x4 proj = camera.GetProjectionMatrix(
-            (float)renderExtent.Width / renderExtent.Height, 0.1f, 100.0f);
-        proj.M22 *= -1f;
-        if (!Matrix4x4.Invert(view * proj, out Matrix4x4 invVP)) return;
-
-        // Mask sits in ShaderReadOnly between frames. Flip to General before the
-        // compute write; this fragment-read→compute-write barrier also serializes
-        // the previous frame's outline read against this frame's overwrite.
-        TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
-            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
-
-        selectionMaskPipeline.Record(cmd, invVP, camera.GetPosition(), renderExtent, idx);
-
-        // compute write → outline fragment read
-        TransitionImageLayout(cmd, selectionMask.Image, selectionMask._format,
-            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
-
-        var finalColor = renderTargets.FinalColor;
-        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
-            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
-
-        outlinePipeline.Record(cmd, renderExtent, finalColor.ImageView);
-
-        // Back to ShaderReadOnly — exactly where the swapchain blit (step 7) and
-        // the ImGui viewport sampler expect FinalColor to be.
-        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
-            ImageLayout.ColorAttachmentOptimal, ImageLayout.ShaderReadOnlyOptimal);
-    }
-
 
     // ---- Active-core FrameGraph debug surface (read by the Stats panel) ----------------------
     // The graph is owned by whichever core is active (DeferredCore, WavefrontPTCore, ...), so these

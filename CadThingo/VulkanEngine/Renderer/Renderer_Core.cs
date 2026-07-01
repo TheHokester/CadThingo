@@ -9,6 +9,9 @@ using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Forward;
 using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
+using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
+using CadThingo.VulkanEngine.Renderer.Features.Selection;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -113,6 +116,10 @@ public unsafe partial class Renderer
     }
     
     
+    // Image-based lighting — env/irradiance/prefiltered cubes + BRDF LUT + bake
+    // pipelines. Host-owned; pipelines and cores read its views/samplers.
+    internal IblSystem Ibl = null!;
+
     // Runtime reflection probes — GPU resources + CPU registry. Allocated after
     // the IBL cubemaps because it reuses the same prefilter pipeline. Phase 2
     // stops at resource allocation; capture / shader integration come later.
@@ -188,9 +195,7 @@ public unsafe partial class Renderer
     internal WavefrontPTPipeline  wavefrontPipeline;     // graph-resident wavefront path tracer (RenderMode.RayWavefront)
     internal RTPipeline?          rtPipeline;            // opt-in RT-pipeline path tracer (null when unsupported)
     internal ReStirDIPipeline?    reStirPipeline;        // opt-in ReSTIR DI tracer, RT-pipeline (null when unsupported)
-    internal PickPipeline         pickPipeline;          // ray-query object picking (TLAS InstanceCustomIndex → entity)
-    internal SelectionMaskPipeline selectionMaskPipeline; // ray-query coverage mask of the selected entity
-    internal OutlinePipeline       outlinePipeline;       // composites the selection outline into FinalColor
+    internal SelectionSystem      selection = null!;     // host-owned editor selection: pick + coverage mask + outline
 
     // GPU block-compression encoder for material textures (lazy: created on the first compressed
     // texture load, so it costs nothing for runs that never load a BC-formatted asset).
@@ -228,11 +233,11 @@ public unsafe partial class Renderer
     Camera camera;
     public Camera Camera => camera;
     
-    //Sampler for gbuffers, pathtracing ImageResources and selection mask
+    //Sampler for gbuffers and pathtracing ImageResources (the selection mask is
+    //owned by RenderTargets and reached through SelectionSystem)
     internal Sampler       gBufferSampler     => renderTargets.GBufferSampler;
     private  ImageResource ptAccumulator      => renderTargets.PtAccumulator;
     private  ImageResource ptOutColor         => renderTargets.PtOutColor;
-    private  ImageResource selectionMask      => renderTargets.SelectionMask;
 
     //Path-tracing accumulation state (the images live on RenderTargets; this is the
     //CPU-side dirty/restart bookkeeping that drives progressive integration).
@@ -290,16 +295,13 @@ public unsafe partial class Renderer
 
         // IBL images allocated up-front, cleared to black. The PBR lighting set
         // binds them unconditionally; the compute bake passes fill the content
-        // when an HDR is loaded via LoadEnvironmentHdr.
-        CreateIblResources();
-        CreateIblBakePipelines();
-        // BRDF LUT is view-independent — bake once at init and reuse for every
-        // environment that gets loaded later.
-        BakeBrdfLut();
+        // when an HDR is loaded via Ibl.LoadEnvironmentHdr. The ctor also bakes
+        // the view-independent BRDF LUT once.
+        Ibl = new IblSystem(this);
 
         // Reflection-probe GPU resources (cubemap array + per-probe SSBO).
         // Reuses the IBL prefilter pipeline at capture time, so it has to be
-        // constructed after CreateIblBakePipelines.
+        // constructed after the IblSystem.
         reflectionProbeSystem = new ReflectionProbeSystem(this);
 
         // Pipelines that don't depend on allocated g-buffer image views 
@@ -384,22 +386,11 @@ public unsafe partial class Renderer
             reStirPipeline.WriteIblDescriptors();
         }
 
-        // Object picking — owns only a tiny result SSBO; the TLAS is bound below
-        // after InitRayQuery. No-op at runtime when ray queries aren't supported
-        // (ProcessPickRequest gates on RayShadowsSupported + a valid TLAS).
-        pickPipeline = new PickPipeline(this);
-        pickPipeline.Initialize();
-
-        // Selection outline (mode-agnostic, ray-query driven). Mask pipeline
-        // borrows the TLAS (bound below) + the renderer-owned mask image; the
-        // outline pass reads that mask and draws into FinalColor.
-        selectionMaskPipeline = new SelectionMaskPipeline(this);
-        selectionMaskPipeline.Initialize();
-        selectionMaskPipeline.WriteMaskImageDescriptor(selectionMask.ImageView);
-
-        outlinePipeline = new OutlinePipeline(this);
-        outlinePipeline.Initialize();
-        outlinePipeline.WriteMaskDescriptor(selectionMask.ImageView);
+        // Editor selection - object picking + ray-query coverage mask + outline
+        // composite. Host-owned; the TLAS / entity-info descriptors are bound
+        // below after InitRayQuery. No-op at runtime when ray queries aren't
+        // supported (ProcessPickRequest / RecordOutline gate on a valid TLAS).
+        selection = new SelectionSystem(this);
 
         // Tone-map / post pass - reads the FrameGraph's HDRColor transient, writes the LDR
         // FinalColor that the swapchain blit sources. Its HDR-input descriptor is bound from the
@@ -445,8 +436,7 @@ public unsafe partial class Renderer
             wavefrontPipeline.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
             reStirPipeline?.WriteTlasDescriptor(tlas);
-            pickPipeline.WriteTlasDescriptor(tlas);
-            selectionMaskPipeline.WriteTlasDescriptor(tlas);
+            selection.WriteTlasDescriptor(tlas);
             // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
             // path in the PBR lighting shadow rays. Has to happen after
             // InitRayQuery because the SSBO is allocated inside RebuildTlas.
@@ -458,8 +448,7 @@ public unsafe partial class Renderer
             // Pick + selection resolve the hit entity through the same flat
             // ShadowEntityInfo table (per-cluster instances → entity via
             // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex).
-            pickPipeline.WriteEntityInfoDescriptor();
-            selectionMaskPipeline.WriteEntityInfoDescriptor();
+            selection.WriteEntityInfoDescriptor();
             // Emissive area-light buffers (built inside RebuildTlas, always
             // allocated with ≥1 slot so the binding is valid even with no emitters).
             ptComputePipeline.WriteEmissiveDescriptors();
@@ -497,7 +486,7 @@ public unsafe partial class Renderer
         // already placed in Assets/Textures. The Renderer Settings panel can
         // load a different file at any time. No HDR present → cubes stay black
         // and the scene runs with direct lighting only.
-        TryAutoLoadEnvironment();
+        Ibl.TryAutoLoadEnvironment();
 
         // Scene loads are driven by FileBrowserPanel (File → Open). Lights and
         // the test probe stay here because they aren't tied to a glTF import.
@@ -705,14 +694,14 @@ public unsafe partial class Renderer
         // Reflection probes
         reflectionProbeSystem?.Dispose();
 
-        // IBL images + samplers
-        CleanupIblResources();
+        // IBL images + samplers + bake pipelines
+        Ibl?.Dispose();
+
+        // Editor selection pipelines (pick + coverage mask + outline)
+        selection?.Dispose();
 
         // Pipelines (each pipeline disposes its own buffers, sets, layouts)
         _bcEncoder           ?.Dispose();
-        outlinePipeline      ?.Dispose();
-        selectionMaskPipeline?.Dispose();
-        pickPipeline       ?.Dispose();
         reStirPipeline     ?.Dispose();
         rtPipeline         ?.Dispose();
         wavefrontPipeline  ?.Dispose();

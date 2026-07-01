@@ -1,8 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
 
 
 public sealed unsafe class LightCullPipeline : ComputePipeline
@@ -23,7 +24,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         public uint      _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("LightCulling");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Forward", "LightCulling");
 
     // Tile-cull per-frame outputs owned by this pipeline. TileLightCount[tileIdx]
     // is the number of lights overlapping each tile; TileLightIndices[tileIdx*MAX + slot]
@@ -120,7 +121,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
     /// <summary>
     /// Rewrites just binding 0 (the lights SSBO that PbrDeferredPipeline owns).
-    /// Called by RebuildPbrPipelines — when PBR is disposed + recreated the old
+    /// Called by RebuildPbrPipelines - when PBR is disposed + recreated the old
     /// VkBuffer this descriptor pointed at is gone, so the consumer side has to
     /// re-bind to the fresh handle.
     /// </summary>

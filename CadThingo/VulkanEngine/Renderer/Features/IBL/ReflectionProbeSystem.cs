@@ -2,7 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer;
+namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 
 // GPU-side per-probe record. std430-compatible (32B, 16B aligned). Layout must
 // stay in lock-step with the PBR shader's `ReflectionProbe` struct when Phase 7
@@ -17,9 +17,8 @@ public struct ProbeGpuRecord
     public uint _pad2;
 }
 
-// Layout-identical to the PcPrefilter struct embedded in Renderer_Ibl.cs.
-// Mirrored locally so the probe system doesn't have to reach across partial-
-// class private types.
+// Layout-identical to the PcPrefilter struct inside IblSystem. Mirrored locally
+// so the probe system doesn't have to reach across its private types.
 [StructLayout(LayoutKind.Sequential)]
 internal struct PcProbePrefilter
 {
@@ -144,9 +143,9 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     /// </summary>
     private void CreatePrefilterDescriptors()
     {
-        var bake = _renderer.prefilterEnvPipeline;
+        var bake = _renderer.Ibl.prefilterEnvPipeline;
         var inputView = captureCubeSampleView;
-        var inputSampler = _renderer.iblCubeSampler;
+        var inputSampler = _renderer.Ibl.iblCubeSampler;
 
         _prefilterStorageViews = new ImageView[MaxProbes, ProbeMipLevels];
         _prefilterSets         = new DescriptorSet[MaxProbes, ProbeMipLevels];
@@ -181,7 +180,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
 
     private void TryCreateCapturePipeline()
     {
-        string spv = ShaderPaths.Spv("ProbeCapture");
+        string spv = ShaderPaths.Kernel("IBL", "ProbeCapture");
         if (!System.IO.File.Exists(spv))
         {
             Console.WriteLine("[Probe] ProbeCapture.spv not found — capture pipeline skipped. " +
@@ -197,7 +196,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     /// <summary>
     /// Assigns <paramref name="probe"/> a cube-array slot and marks it dirty
     /// for first capture. Silently no-ops if the probe is already registered.
-    /// Returns false when the slot pool is exhausted — caller should warn the
+    /// Returns false when the slot pool is exhausted  caller should warn the
     /// user; the probe still works as an entity, it just won't render.
     /// </summary>
     public bool Register(ReflectionProbeComponent probe)
@@ -725,7 +724,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
             0, 0, null, 0, null, 2, postBarriers);
 
         // Prefilter dispatch: per-mip GGX importance sample into the slot
-        var prefilter = _renderer.prefilterEnvPipeline;
+        var prefilter = _renderer.Ibl.prefilterEnvPipeline;
         _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilter.Handle);
         uint slot = (uint)probe.CubeArraySlot;
         for (uint m = 0; m < ProbeMipLevels; m++)

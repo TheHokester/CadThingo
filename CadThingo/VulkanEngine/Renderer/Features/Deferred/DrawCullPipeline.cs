@@ -1,8 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 //  Draw-cull compute pass — frustum-tests scene renderables and emits
 //  VkDrawIndexedIndirectCommand[] consumed by the geometry pass.
 public sealed unsafe class DrawCullPipeline : ComputePipeline
@@ -24,13 +25,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         public uint    _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("CullDraws");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "CullDraws");
 
-    // Per-frame buffers owned by this pipeline. The cull *input* (RenderableInputGpu
-    // rows) now lives on GpuScene — extracted there (L2 step 4) and bound at
-    // binding 0. IndirectCmd holds the post-cull VkDrawIndexedIndirectCommand array;
-    // IndirectCount holds one uint the cull shader InterlockedAdds into and the
-    // rasterizer reads via vkCmdDrawIndexedIndirectCount.
+    // Per-frame buffers owned by this pipeline. .
     private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
     private UboBuffer[] IndirectCountBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
@@ -72,9 +69,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Four storage buffers — all writable except binding 0 (input renderables).
-        // We mark them all StorageBuffer with no UpdateAfterBind — the sets are
-        // written once at startup (the buffers themselves are persistently mapped).
+        //4 storage buffers used
         var bindings = stackalloc DescriptorSetLayoutBinding[4];
         for (uint b = 0; b < 4; b++)
         {
@@ -186,20 +181,14 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         }
     }
 
-    // CPU side of the cull pass. Extraction (the scene walk + opaque/blend
-    // classification) now happens in GpuScene.ExtractRenderables, called once per
-    // frame before this. Here we only: apply the view-dependent back-to-front sort
-    // to the BLEND candidates, read the opaque count, and record the frustum-cull
-    // dispatch + barriers. Returns the opaque count (cached as LastRenderableCount
-    // for the geometry pass).
+    /// <summary>CPU side of the cull pass.
+    ///apply the view-dependent back-to-front sort
+    /// to the BLEND candidates, read the opaque count, and record the frustum-cull
+    /// dispatch + barriers.</summary> 
+    /// <returns>The opaque count as a uint</returns>
     public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam)
     {
-        // View-dependent transparent sort — far (lowest view-space Z) first.
-        // System.Numerics row-vector convention: Vector.Transform(v, m) = v * m.
-        // CreateLookAt produces -Z-forward view space, so farther entities have
-        // more-negative Z; sort ascending for back-to-front order. The candidate
-        // list (model + material + index range) was extracted by GpuScene; only the
-        // camera-dependent depth key + sort live here.
+        // View-dependent transparent sort
         _transparentDraws.Clear();
         Matrix4x4 viewMat = cam != null ? cam.GetViewMatrix() : Matrix4x4.Identity;
         foreach (var c in Renderer.gpuScene.TransparentCandidates)

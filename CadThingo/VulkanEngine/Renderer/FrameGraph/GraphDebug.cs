@@ -56,7 +56,7 @@ internal sealed unsafe class GraphDebug : IDisposable
       | QueryPipelineStatisticFlags.ComputeShaderInvocationsBit;
     private const int StatsValues = 4;
 
-    /// <summary>Runtime toggle for pipeline-statistics collection — the pool still exists,
+    /// <summary>Runtime toggle for pipeline-statistics collection - the pool still exists,
     /// this only gates the per-frame Begin/EndQuery. Default on when supported; flip off if
     /// a driver rejects a stats query spanning a dynamic-rendering region.</summary>
     public bool CollectPipelineStats = true;

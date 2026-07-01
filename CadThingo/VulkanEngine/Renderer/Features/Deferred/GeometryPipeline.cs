@@ -1,13 +1,16 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Pipelines;
+namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 //
 //  Geometry pass — writes the G-buffer
 //
-public sealed unsafe class GeometryPipeline : GraphicsPipeline
+// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
+// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
+public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
 {
     struct GeometryUBO
     {
@@ -17,7 +20,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     //Per frame uniform buffers for geometry pipeline
     private UboBuffer[] GeometryUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
-    protected override string ShaderPath { get; } = ShaderPaths.Spv("Geometry");
+    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "Geometry");
     protected override Format[] ColorAttachmentFormats { get; } =
     [
         Format.R32G32B32A32Sfloat, // Position
@@ -49,7 +52,15 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     {
         public readonly ImageView Position = position, Normal = normal, Albedo = albedo, Material = material, Emissive = emissive, Depth = depth;
     }
-
+    /// <summary>
+    /// Records the pass commands for the frame.
+    /// </summary>
+    /// <param name="cmd"></param>
+    /// <param name="ctx"></param>
+    /// <param name="indirectCmd"></param>
+    /// <param name="indirectCount"></param>
+    /// <param name="drawCount"></param>
+    /// <param name="attachments"></param>
     internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, Buffer indirectCmd,
         Buffer indirectCount, uint drawCount, Attachments attachments)
     {
@@ -95,11 +106,6 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         Vk!.CmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
         Vk!.CmdBindIndexBuffer(cmd, ib, 0, IndexType.Uint32);
 
-        // Material SSBO upload moved to Renderer.UpdateMaterials so every
-        // rendering path (deferred / forward+ / pathtracer) sees the same
-        // per-frame snapshot. Inline upload here was deferred-only and PT mode
-        // never saw inspector edits as a result.
-        
         // The draw-cull compute pass already populated:
         //   - InstanceStorageBuffers (ResourceManager): per-visible-renderable model
         //     + materialIndex, read by the VS via SV_InstanceID.
