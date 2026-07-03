@@ -37,7 +37,7 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
     public const uint MaxProbesPerCluster  = 8;
     public const uint MaxLinks             = MaxClusters * MaxProbesPerCluster;
 
-    private readonly Renderer _renderer;
+    private readonly GraphicsDevice _gfx;
 
     // Per-frame-in-flight rings so the CPU can overwrite this frame's data
     // while the GPU still consumes the previous frame's. Host-visible mapped.
@@ -54,16 +54,16 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
     private readonly List<int>[] _scratchPerCluster;
     private readonly List<(Vector3 Min, Vector3 Max)> _scratchBounds = new();
 
-    public ProbeClusterGrid(Renderer renderer)
+    public ProbeClusterGrid(GraphicsDevice gfx)
     {
-        _renderer = renderer;
+        _gfx = gfx;
         _scratchPerCluster = new List<int>[MaxClusters];
         for (int i = 0; i < MaxClusters; i++) _scratchPerCluster[i] = new List<int>((int)MaxProbesPerCluster);
 
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            _renderer.CreateMappedStorageBuffer(MaxClusters * (ulong)sizeof(ClusterRange), ref clusterRangeBuffers[i]);
-            _renderer.CreateMappedStorageBuffer(MaxLinks    * sizeof(uint),                 ref probeIndexBuffers[i]);
+            _gfx.CreateMappedStorageBuffer(MaxClusters * (ulong)sizeof(ClusterRange), ref clusterRangeBuffers[i]);
+            _gfx.CreateMappedStorageBuffer(MaxLinks    * sizeof(uint),                 ref probeIndexBuffers[i]);
         }
     }
 
@@ -203,8 +203,8 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
     {
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
-            _renderer.DestroyBuffer(clusterRangeBuffers[i].buffer, clusterRangeBuffers[i].alloc);
-            _renderer.DestroyBuffer(probeIndexBuffers  [i].buffer, probeIndexBuffers  [i].alloc);
+            _gfx.DestroyBuffer(clusterRangeBuffers[i].buffer, clusterRangeBuffers[i].alloc);
+            _gfx.DestroyBuffer(probeIndexBuffers  [i].buffer, probeIndexBuffers  [i].alloc);
         }
     }
 }

@@ -33,7 +33,7 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
 
     public GeometryPipeline(Renderer renderer) : base(renderer)
     {
-        DepthAttachmentFormat = renderer.FindDepthFormat();
+        DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
 
     public override void Dispose()

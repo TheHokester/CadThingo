@@ -66,7 +66,7 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
 
     public TransparentPipeline(Renderer renderer) : base(renderer)
     {
-        DepthAttachmentFormat = renderer.FindDepthFormat();
+        DepthAttachmentFormat = Gfx.FindDepthFormat();
         PushConstantRanges = new[]
         {
             new PushConstantRange

@@ -33,7 +33,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
 
     public SkyboxPipeline(Renderer renderer) : base(renderer)
     {
-        DepthAttachmentFormat = renderer.FindDepthFormat();
+        DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
 
     private UboBuffer[] FrameUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];

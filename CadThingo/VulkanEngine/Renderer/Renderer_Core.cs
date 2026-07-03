@@ -66,8 +66,8 @@ public unsafe partial class Renderer
     internal bool descriptorIndexEnabled => gfx.DescriptorIndexingEnabled;
     internal bool multiviewEnabled       => gfx.MultiviewEnabled;
 
-    // Read-only handle accessor — pipelines that load their own device-extension
-    // dispatch tables (e.g. RtPipeline → KhrRayTracingPipeline) need the instance
+    // Read-only handle accessor - pipelines that load their own device-extension
+    // dispatch tables (e.g. RtPipeline -> KhrRayTracingPipeline) need the instance
     // for vk.TryGetDeviceExtension. Generic, not tied to any one extension.
     internal Instance GetVkInstance() => gfx.GetVkInstance();
 
@@ -120,7 +120,7 @@ public unsafe partial class Renderer
     // pipelines. Host-owned; pipelines and cores read its views/samplers.
     internal IblSystem Ibl = null!;
 
-    // Runtime reflection probes — GPU resources + CPU registry. Allocated after
+    // Runtime reflection probes - GPU resources + CPU registry. Allocated after
     // the IBL cubemaps because it reuses the same prefilter pipeline. Phase 2
     // stops at resource allocation; capture / shader integration come later.
     internal ReflectionProbeSystem reflectionProbeSystem = null!;
@@ -290,7 +290,7 @@ public unsafe partial class Renderer
         // binds the lights buffer, and before the first per-frame Extract.
         gpuScene = new GpuScene(gfx);
         gpuScene.CreateLightBuffers();
-        // Cull-input SSBO — must exist before DrawCullPipeline binds it (binding 0).
+        // Cull-input SSBO - must exist before DrawCullPipeline binds it (binding 0).
         gpuScene.CreateRenderableBuffers();
 
         // IBL images allocated up-front, cleared to black. The PBR lighting set
@@ -302,7 +302,7 @@ public unsafe partial class Renderer
         // Reflection-probe GPU resources (cubemap array + per-probe SSBO).
         // Reuses the IBL prefilter pipeline at capture time, so it has to be
         // constructed after the IblSystem.
-        reflectionProbeSystem = new ReflectionProbeSystem(this);
+        reflectionProbeSystem = new ReflectionProbeSystem(this, Ibl);
 
         // Pipelines that don't depend on allocated g-buffer image views 
         // Render-graph pass closures (registered in SetupDeferredRenderer) read

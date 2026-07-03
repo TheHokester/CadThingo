@@ -545,7 +545,7 @@ void rayGenMain() {
 
         float3 V = -ray.Direction;
 
-        // NEE — combined analytic + emissive, single shadow ray (see PTCompute).
+        // NEE - combined analytic + emissive, single shadow ray (see PTCompute).
         if (ENABLE_NEE) {
             bool haveAnalytic = frameUBO.lightCount > 0u;
             bool haveEmissive = frameUBO.emissiveTriCount > 0u;
