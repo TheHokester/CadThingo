@@ -43,9 +43,47 @@ internal static unsafe class SlangNative
     [DllImport(Dll)]
     internal static extern int slang_createGlobalSession(long apiVersion, void** outGlobalSession);
 
-    // TODO(reflection phase, after compilation works): every reflection query is a flat C export;
-    // the slang.h reflection "classes" are inline wrappers over them, e.g.
-    //     SLANG_API unsigned spReflection_getParameterCount(SlangReflection* reflection);
-    //     SLANG_API char const* spReflectionVariableLayout_GetName(SlangReflectionVariableLayout*);
-    // Pattern: opaque reflection pointers become void*, copy the signature, done. No vtables here.
+    // ---- reflection exports -------------------------------------------------------------
+    // Flat C ABI beneath slang.h's inline reflection wrappers; no vtables. All reflection
+    // pointers are opaque void*: program layout (from IComponentType::getLayout), variable
+    // layout, variable, type layout, type, entry point. Signature key: SlangInt/SlangUInt =
+    // long/ulong (8 bytes), size_t = nuint, enums/unsigned = uint, char* = byte* (UTF-8).
+    // Casing is mixed in the ABI (Get vs get) and must match exactly.
+
+    // program layout
+    [DllImport(Dll)] internal static extern uint  spReflection_GetParameterCount(void* layout);
+    [DllImport(Dll)] internal static extern void* spReflection_GetParameterByIndex(void* layout, uint index);
+    [DllImport(Dll)] internal static extern ulong spReflection_getEntryPointCount(void* layout);
+    [DllImport(Dll)] internal static extern void* spReflection_getEntryPointByIndex(void* layout, ulong index);
+
+    // variable layout
+    [DllImport(Dll)] internal static extern void* spReflectionVariableLayout_GetVariable(void* varLayout);
+    [DllImport(Dll)] internal static extern void* spReflectionVariableLayout_GetTypeLayout(void* varLayout);
+    [DllImport(Dll)] internal static extern nuint spReflectionVariableLayout_GetOffset(void* varLayout, uint category);
+    [DllImport(Dll)] internal static extern nuint spReflectionVariableLayout_GetSpace(void* varLayout, uint category);
+
+    // variable
+    [DllImport(Dll)] internal static extern byte* spReflectionVariable_GetName(void* variable);
+
+    // type layout
+    [DllImport(Dll)] internal static extern void* spReflectionTypeLayout_GetType(void* typeLayout);
+    [DllImport(Dll)] internal static extern uint  spReflectionTypeLayout_GetParameterCategory(void* typeLayout);
+    [DllImport(Dll)] internal static extern nuint spReflectionTypeLayout_GetSize(void* typeLayout, uint category);
+    [DllImport(Dll)] internal static extern void* spReflectionTypeLayout_GetElementTypeLayout(void* typeLayout);
+    [DllImport(Dll)] internal static extern long  spReflectionTypeLayout_getBindingRangeCount(void* typeLayout);
+    [DllImport(Dll)] internal static extern uint  spReflectionTypeLayout_getBindingRangeType(void* typeLayout, long index);
+    [DllImport(Dll)] internal static extern long  spReflectionTypeLayout_getBindingRangeBindingCount(void* typeLayout, long index);
+    [DllImport(Dll)] internal static extern long  spReflectionTypeLayout_getBindingRangeIndexOffset(void* typeLayout, long index);
+    [DllImport(Dll)] internal static extern long  spReflectionTypeLayout_getBindingRangeSpaceOffset(void* typeLayout, long index);
+    [DllImport(Dll)] internal static extern void* spReflectionTypeLayout_getBindingRangeLeafTypeLayout(void* typeLayout, long index);
+    [DllImport(Dll)] internal static extern void* spReflectionTypeLayout_getBindingRangeLeafVariable(void* typeLayout, long index);
+
+    // type
+    [DllImport(Dll)] internal static extern uint  spReflectionType_GetKind(void* type);
+    [DllImport(Dll)] internal static extern nuint spReflectionType_GetElementCount(void* type);
+
+    // entry point
+    [DllImport(Dll)] internal static extern byte* spReflectionEntryPoint_getName(void* entryPoint);
+    [DllImport(Dll)] internal static extern uint  spReflectionEntryPoint_getStage(void* entryPoint);
+    [DllImport(Dll)] internal static extern void  spReflectionEntryPoint_getComputeThreadGroupSize(void* entryPoint, ulong axisCount, ulong* outSizes);
 }

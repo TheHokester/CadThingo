@@ -1,3 +1,5 @@
+using Silk.NET.Vulkan;
+
 namespace CadThingo.VulkanEngine.Renderer.Shaders;
 
 // Startup smoke test for the interop : compiles a tiny
@@ -6,12 +8,27 @@ namespace CadThingo.VulkanEngine.Renderer.Shaders;
 // version-pin gate for ShaderLibrary later.
 public static unsafe class SlangSmokeTest
 {
+    // Resources are module-scope globals (how all engine shaders declare them - the walker
+    // reads global params, not entry-point params). Coverage: implicit binding (outBuf ->
+    // set 0 binding 0), explicit [[vk::binding]] round-trip (inBuf), unbounded array
+    // (textures, count 0), and a push constant (size path through the element type layout).
     private const string Source = """
+        RWStructuredBuffer<float> outBuf;
+
+        [[vk::binding(1, 2)]]
+        StructuredBuffer<float> inBuf;
+
+        [[vk::binding(0, 3)]]
+        Texture2D textures[];
+
+        struct SmokeParams { float scale; }
+        [[vk::push_constant]] ConstantBuffer<SmokeParams> params;
+
         [shader("compute")]
         [numthreads(8, 8, 1)]
-        void main(uint3 tid: SV_DispatchThreadID, RWStructuredBuffer<float> outBuf)
+        void main(uint3 tid: SV_DispatchThreadID)
         {
-            outBuf[tid.x] = float(tid.x) * 2.0;
+            outBuf[tid.x] = inBuf[tid.x] * params.scale + textures[0].Load(int3(0, 0, 0)).x;
         }
         """;
 
@@ -56,8 +73,47 @@ public static unsafe class SlangSmokeTest
         {
             Console.WriteLine("[slang] SPIR-V test, length OK");
         }
-        
-        //step 7: release unmanaged resources
+
+        // step 7: walk reflection off the linked program (must happen BEFORE linked is
+        // released - the layout is owned by the component) and assert what the shader declares.
+        var refl = SlangReflectionWalker.Walk(linked.GetLayout());
+        foreach (var b in refl.Bindings)
+            Console.WriteLine($"[slang] binding '{b.Name}' set={b.Set} binding={b.Binding} type={b.Type} count={b.Count}");
+        foreach (var p in refl.PushConstants)
+            Console.WriteLine($"[slang] push '{p.Name}' size={p.Size}");
+        foreach (var sc in refl.SpecConstants)
+            Console.WriteLine($"[slang] spec '{sc.Name}' id={sc.ConstantId}");
+        foreach (var ep in refl.EntryPoints)
+            Console.WriteLine($"[slang] entry '{ep.Name}' stage={ep.Stage} group={ep.GroupSizeX}x{ep.GroupSizeY}x{ep.GroupSizeZ}");
+
+        Check(refl.Bindings.Length == 3, "expected 3 bindings");
+        var outBuf = refl.Bindings.Single(b => b.Name == "outBuf");
+        Check(outBuf is { Set: 0, Binding: 0, Type: DescriptorType.StorageBuffer, Count: 1 },
+            $"outBuf reflected wrong: {outBuf}");
+        var inBuf = refl.Bindings.Single(b => b.Name == "inBuf");
+        Check(inBuf is { Set: 2, Binding: 1, Type: DescriptorType.StorageBuffer, Count: 1 },
+            $"inBuf reflected wrong: {inBuf}");
+        var textures = refl.Bindings.Single(b => b.Name == "textures");
+        Check(textures is { Set: 3, Binding: 0, Type: DescriptorType.SampledImage, Count: 0 },
+            $"textures reflected wrong (Count 0 = unbounded): {textures}");
+        var push = refl.PushConstants.Single();
+        Check(push is { Name: "params", Size: 4 }, $"push constant reflected wrong: {push}");
+        var main = refl.EntryPoints.Single(e => e.Name == "main");
+        Check(main is { Stage: ShaderStageFlags.ComputeBit, GroupSizeX: 8, GroupSizeY: 8, GroupSizeZ: 1 },
+            $"entry point reflected wrong: {main}");
+        Console.WriteLine("[slang] reflection test OK");
+
+        // step 8: release unmanaged resources
+        linked.Release();
+        composite.Release();
+        entryPoint.Release();
+        module.Release();
+        session.Release();
         global.Release();
+    }
+
+    private static void Check(bool condition, string message)
+    {
+        if (!condition) throw new Exception($"[slang] smoke test failed: {message}");
     }
 }
