@@ -19,7 +19,8 @@ public readonly record struct ShaderCompileRequest(
 
 public sealed class ShaderCompileResult
 {
-    public required byte[][] SpirvPerEntryPoint { get; init; }
+    public required byte[][] SpirvPerEntryPoint { get; init; } // parallel to request.EntryPoints; empty for module-only reflection
+    public required ShaderReflectionData Reflection { get; init; }
     public required string[] Dependencies { get; init; } // transitive source files, for the cache dep manifest
     public string Diagnostics { get; init; } = "";       // warnings when compilation succeeded
 }

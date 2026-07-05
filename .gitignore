@@ -9,3 +9,5 @@ obj/
 *.sln.docstates
 .claude/
 CLAUDE.md
+# Runtime shader cache (rebuilt from source hashes)
+CadThingo/Assets/ShaderCache/

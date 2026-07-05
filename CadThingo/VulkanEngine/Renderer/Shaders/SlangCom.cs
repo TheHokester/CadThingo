@@ -13,9 +13,14 @@ namespace CadThingo.VulkanEngine.Renderer.Shaders;
 // continue after the base's last slot. RECOUNT ON SDK UPGRADE - a wrong slot is a crash at
 // best and silent garbage at worst. Verify with the smoke test before trusting anything.
 //
-// Lifetime: everything created from a global session is refcounted; call Release() when done.
-// Blobs returned via out-params arrive with a reference you own; diagnostics blobs can be
-// non-null even on success (warnings), so they are always drained via TakeDiagnostics.
+// Lifetime: objects received via OUT-PARAMS (sessions, entry points, composites, linked
+// components, blobs) arrive with a reference you own - call Release() when done. Objects
+// received as RETURN VALUES are borrowed: loadModule* returns a session-owned IModule
+// ("code loaded within a session is owned by the session"), and getLayout returns a
+// component-owned ProgramLayout. Releasing a borrowed pointer underflows its refcount and
+// corrupts the heap - the crash surfaces later, and only reliably OUTSIDE the debugger
+// (the debug heap masks it). Diagnostics blobs can be non-null even on success (warnings),
+// so they are always drained via TakeDiagnostics.
 
 // Unmanaged UTF-8 copy of a string, valid until Dispose. A stackalloc inside a helper method
 // dies with that method's frame, hence heap allocation here.
@@ -329,5 +334,6 @@ internal readonly unsafe struct SlangModule(void* ptr)
         return files;
     }
 
-    public void Release() => ((delegate* unmanaged[MemberFunction]<void*, uint>)Vtbl[2])(Ptr);
+    // No Release: modules are BORROWED from the session (loadModule* returns a
+    // session-owned pointer); the session releases them.
 }

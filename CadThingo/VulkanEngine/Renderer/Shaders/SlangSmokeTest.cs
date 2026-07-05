@@ -103,13 +103,46 @@ public static unsafe class SlangSmokeTest
             $"entry point reflected wrong: {main}");
         Console.WriteLine("[slang] reflection test OK");
 
-        // step 8: release unmanaged resources
+        // step 8: release unmanaged resources - out-param objects only. The module is
+        // session-owned (borrowed); releasing it underflows the refcount and corrupts the
+        // heap in ways only visible OUTSIDE the debugger.
         linked.Release();
         composite.Release();
         entryPoint.Release();
-        module.Release();
         session.Release();
         global.Release();
+
+        // step 9: ShaderLibrary + disk cache round-trip, self-contained in a temp dir:
+        // library A compiles cold and stores; library B must hit the disk cache without
+        // compiling (FromCache) and hand back byte-identical SPIR-V.
+        string tempRoot = Path.Combine(Path.GetTempPath(), "CadThingoSlangSmoke");
+        Directory.CreateDirectory(tempRoot);
+        File.WriteAllText(Path.Combine(tempRoot, "Smoke.slang"), Source);
+        string cacheDir = Path.Combine(tempRoot, "ShaderCache");
+        if (Directory.Exists(cacheDir)) Directory.Delete(cacheDir, recursive: true);
+
+        var request = new ShaderCompileRequest("Smoke", ["main"], [], []);
+        using (var libA = new ShaderLibrary(tempRoot, tempRoot, cacheDir))
+        {
+            var cold = libA.GetProgram(request);
+            Check(!cold.FromCache, "first GetProgram should compile, not hit the cache");
+            Check(cold.Reflection.Bindings.Length == 3, "library compile reflected wrong binding count");
+            Check(BitConverter.ToUInt32(cold.Spirv(0).Span) == 0x07230203, "library compile produced bad SPIR-V");
+            Check(ReferenceEquals(cold, libA.GetProgram(request)), "same library should memoize the program");
+
+            using var libB = new ShaderLibrary(tempRoot, tempRoot, cacheDir);
+            var warm = libB.GetProgram(request);
+            Check(warm.FromCache, "second library should load from the disk cache");
+            Check(warm.Spirv(0).Span.SequenceEqual(cold.Spirv(0).Span), "cached SPIR-V differs from compiled");
+            Check(warm.Reflection.PushConstants.Single() == cold.Reflection.PushConstants.Single(),
+                "cached reflection differs from compiled");
+
+            // touching a dependency must invalidate: append a comment, expect a recompile
+            File.AppendAllText(Path.Combine(tempRoot, "Smoke.slang"), "\n// cache-buster\n");
+            using var libC = new ShaderLibrary(tempRoot, tempRoot, cacheDir);
+            Check(!libC.GetProgram(request).FromCache, "edited source should miss the cache");
+        }
+        Console.WriteLine("[slang] shader library + disk cache OK");
     }
 
     private static void Check(bool condition, string message)
