@@ -143,6 +143,53 @@ public static unsafe class SlangSmokeTest
             Check(!libC.GetProgram(request).FromCache, "edited source should miss the cache");
         }
         Console.WriteLine("[slang] shader library + disk cache OK");
+
+        // step 10: SceneBindings foundations (Phase B). Sandbox library: the real
+        // SceneBindings module copied to the temp lib dir; its imports (CommonTypes,
+        // PTUtils) resolve via the real shader dir as an extra include path.
+        string engineShaders = Path.Combine(AppContext.BaseDirectory, "VulkanEngine", "Shaders");
+        if (!Directory.Exists(engineShaders))
+            engineShaders = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\VulkanEngine\Shaders";
+        File.Copy(Path.Combine(engineShaders, "SceneBindings.slang"),
+                  Path.Combine(tempRoot, "SceneBindings.slang"), overwrite: true);
+        File.WriteAllText(Path.Combine(tempRoot, "DeadStripProbe.slang"), """
+            import SceneBindings;
+
+            [[vk::binding(0, 1)]]
+            RWStructuredBuffer<uint> probeOut;
+
+            [shader("compute")]
+            [numthreads(64, 1, 1)]
+            void main(uint3 tid : SV_DispatchThreadID)
+            {
+                probeOut[tid.x] = sceneVertices.Load(tid.x * 4) + sceneIndices.Load(tid.x * 4);
+            }
+            """);
+        using var libScene = new ShaderLibrary(tempRoot, tempRoot, cacheDir, [engineShaders]);
+
+        // 10a: module-only reflection - the canonical scene layout source.
+        var scene = SortByBinding(libScene.ReflectModule("SceneBindings").Bindings);
+        Check(scene.Length == 11, $"SceneBindings expected 11 bindings, got {scene.Length}");
+        Check(scene.All(b => b.Set == 0 && b.Binding != 0), "SceneBindings must sit in set 0 with binding 0 reserved");
+        Check(scene[^1] is { Name: "sceneTextures", Binding: 11, Type: DescriptorType.SampledImage, Count: 0 },
+            $"sceneTextures reflected wrong: {scene[^1]}");
+        Check(scene.Single(b => b.Name == "sceneSamplers") is { Binding: 10, Count: 16 }, "sceneSamplers reflected wrong");
+        Check(scene.Single(b => b.Name == "sceneTlas").Type == DescriptorType.AccelerationStructureKhr, "sceneTlas reflected wrong");
+
+        // 10b: THE dead-strip probe (design-doc risk): a shader importing SceneBindings -
+        // which declares a TLAS - compiled WITHOUT any ray capability must still compile.
+        var probe = libScene.GetProgram(new ShaderCompileRequest("DeadStripProbe", ["main"], [], []));
+        Check(BitConverter.ToUInt32(probe.Spirv(0).Span) == 0x07230203, "dead-strip probe produced bad SPIR-V");
+        Check(probe.Reflection.Bindings.Any(b => b is { Name: "probeOut", Set: 1, Binding: 0 }),
+            "probe's own pass-local binding missing from reflection");
+        Console.WriteLine("[slang] SceneBindings reflection + dead-strip probe OK");
+    }
+
+    private static BindingDesc[] SortByBinding(BindingDesc[] bindings)
+    {
+        var sorted = (BindingDesc[])bindings.Clone();
+        Array.Sort(sorted, (a, b) => a.Binding.CompareTo(b.Binding));
+        return sorted;
     }
 
     private static void Check(bool condition, string message)

@@ -9,7 +9,7 @@ namespace CadThingo.VulkanEngine.Renderer.Shaders;
 // Module name resolution ("Deferred/PBR" -> Features/Deferred/Kernels/PBR.slang, "PbrUtils"
 // -> the shared lib dir) mirrors the on-disk layout; imports resolve through session search
 // paths covering the lib dir plus every feature Kernels dir.
-public sealed unsafe class SlangShaderCompiler(string libDir, string featuresDir) : IShaderCompiler
+public sealed unsafe class SlangShaderCompiler(string libDir, string featuresDir, string[]? extraIncludeDirs = null) : IShaderCompiler
 {
     private SlangGlobalSession _global;
     private bool _globalCreated;
@@ -128,6 +128,7 @@ public sealed unsafe class SlangShaderCompiler(string libDir, string featuresDir
     private SlangSession CreateSession(string[] defines, string[] capabilities)
     {
         var searchPaths = new List<string> { libDir };
+        if (extraIncludeDirs != null) searchPaths.AddRange(extraIncludeDirs);
         if (Directory.Exists(featuresDir))
             foreach (var featureDir in Directory.GetDirectories(featuresDir))
             {

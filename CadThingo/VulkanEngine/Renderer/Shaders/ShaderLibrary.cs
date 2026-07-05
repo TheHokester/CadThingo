@@ -8,14 +8,16 @@ public sealed class ShaderLibrary : IDisposable
 {
     private readonly string _libDir;
     private readonly string _featuresDir;
+    private readonly string[]? _extraIncludeDirs;
     private readonly ShaderCache _cache;
     private readonly Dictionary<string, ShaderProgram> _programs = new(); // memo by request key
     private IShaderCompiler? _compiler;
 
-    public ShaderLibrary(string libDir, string featuresDir, string cacheDir)
+    public ShaderLibrary(string libDir, string featuresDir, string cacheDir, string[]? extraIncludeDirs = null)
     {
         _libDir = libDir;
         _featuresDir = featuresDir;
+        _extraIncludeDirs = extraIncludeDirs;
         _cache = new ShaderCache(cacheDir);
     }
 
@@ -49,7 +51,7 @@ public sealed class ShaderLibrary : IDisposable
         }
         else
         {
-            _compiler ??= new SlangShaderCompiler(_libDir, _featuresDir);
+            _compiler ??= new SlangShaderCompiler(_libDir, _featuresDir, _extraIncludeDirs);
             var compiled = _compiler.Compile(request);
             _cache.Store(request, key, compiled);
             program = new ShaderProgram(request, compiled, fromCache: false);
