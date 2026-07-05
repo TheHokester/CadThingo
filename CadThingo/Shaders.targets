@@ -61,6 +61,7 @@
     <Shader Remove="VulkanEngine\Shaders\PbrUtils.slang" />
     <Shader Remove="VulkanEngine\Shaders\IblCommon.slang" />
     <Shader Remove="VulkanEngine\Shaders\PTUtils.slang" />
+    <Shader Remove="VulkanEngine\Shaders\SceneBindings.slang" />
     <Shader Remove="VulkanEngine\Shaders\Lib\**\*.slang" />
     <Shader Remove="Shaders\Lib\**\*.slang" />
 
@@ -70,6 +71,7 @@
     <ShaderLib Include="VulkanEngine\Shaders\PbrUtils.slang" />
     <ShaderLib Include="VulkanEngine\Shaders\IblCommon.slang" />
     <ShaderLib Include="VulkanEngine\Shaders\PTUtils.slang" />
+    <ShaderLib Include="VulkanEngine\Shaders\SceneBindings.slang" />
 
     <!-- Variants: same source, extra defines, distinct output. A separate item type keeps
          the base manifest one-output-per-source (no duplicate-identity batching). The

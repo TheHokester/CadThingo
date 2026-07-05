@@ -219,6 +219,10 @@ public unsafe partial class Renderer
         // 1. CPU/GPU sync for this slot
         vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
 
+        // This frame's scene set is provably idle now: apply queued registry rewrites and
+        // reset its constant-arena slice.
+        descriptorRegistry.BeginFrame(currentFrame);
+
         // 2. Acquire swapchain image
         var acquireResult = swapchain.AcquireNextImage(imageAvailableSemaphores[currentFrame], out uint imageIndex);
         if (acquireResult == Result.ErrorOutOfDateKhr) { RecreateSwapChain(); return; }

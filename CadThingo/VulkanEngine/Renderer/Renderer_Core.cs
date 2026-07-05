@@ -166,6 +166,12 @@ public unsafe partial class Renderer
     // AS buffers + the scene descriptor set fold in over the later L2 steps.
     internal GpuScene gpuScene = null!;
 
+    // Descriptor-system track (docs/descriptor-system.md): runtime shader compile+cache
+    // (Phase A) and the unified scene set + constant arena (Phase B). Pipelines migrate
+    // onto these shader-by-shader; until then the registry's sets are written but unbound.
+    internal Shaders.ShaderLibrary shaderLibrary = null!;
+    internal Descriptors.DescriptorRegistry descriptorRegistry = null!;
+
     // Render target extent — the size at which the deferred chain (gbuffers,
     // HDRColor, FinalColor) and the lighting tile grid are sized. Distinct from
     // swapChainExtent because the editor's viewport panel can be smaller than
@@ -279,6 +285,14 @@ public unsafe partial class Renderer
         SetupDynamicRendering();
 
         CreateDescriptorPool();
+
+        // Reflects SceneBindings.slang into the canonical scene set layout and allocates
+        // the per-frame set instances. The dump lists which bindings still lack providers
+        // (all of them until owners Register* during the Phase B migration).
+        shaderLibrary = Shaders.ShaderLibrary.CreateDefault();
+        descriptorRegistry = new Descriptors.DescriptorRegistry(gfx, shaderLibrary, MAX_CONCURRENT_FRAMES);
+        Console.WriteLine(descriptorRegistry.DumpBindings());
+
         Engine.ResourceManager.Initialize(this);
 
         // Depth + g-buffers are ImageResource objects only — the render graph allocates
@@ -663,6 +677,10 @@ public unsafe partial class Renderer
 
         //  Frame sync + per-frame command buffers
         frameRing.Dispose();
+
+        //  Scene set + constant arena, then the shader library (drops slang.dll if loaded)
+        descriptorRegistry.Dispose();
+        shaderLibrary.Dispose();
 
         if (testEntity != null)
         {

@@ -499,13 +499,16 @@ a scene-set `frameConstants` binding without any design change.
   update-after-bind onto every binding (feature-bit sprawl) and still could not express
   "frame f reads buffer f". Two sets plus the §5.2 frame-start rewrite queue is simpler and
   matches `MAX_CONCURRENT_FRAMES = 2`.
-- **Texture array** (`sceneTextures[]`, binding 11):
-  `UpdateAfterBindBit | PartiallyBoundBit | VariableDescriptorCountBit`, allocated at
-  `MAX_BINDLESS_TEXTURES`; layout and pool carry the UpdateAfterBind flags. Slot writes go
-  to both frame sets immediately (as today) - safe because a newly registered slot is
-  unreferenced by any in-flight frame (materials pointing at it upload with the next
-  frame's material SSBO), and unregistration parks a fallback texture in freed slots before
-  reuse.
+- **Texture array** (`sceneTextures[]`, binding 11): `PartiallyBoundBit` only, fixed count
+  `MAX_BINDLESS_TEXTURES`. (Implementation correction, 2026-07-05: the original
+  UpdateAfterBind + VariableDescriptorCount plan is off the table - Vulkan forbids dynamic
+  UBOs, i.e. the (0,0) arena slot, in an UPDATE_AFTER_BIND_POOL layout
+  (VUID-VkDescriptorSetLayoutCreateInfo-descriptorType-03001), and the
+  VariableDescriptorCount device feature is not enabled.) Slot writes therefore ride the
+  same fence-safe frame-start queue as everything else: a fresh slot becomes visible when
+  the frame slot rewrites, which is also when material rows referencing it upload.
+  Unregistration parks a fallback texture in freed slots before reuse; callers keep a
+  replaced view alive for MAX_CONCURRENT_FRAMES.
 - **Samplers** (binding 10): fixed array of 16, written once. Immutable samplers in the DSL
   are a possible later refinement, not required.
 - Reflection maps an unbounded array (`count == 0` in `.refl`) to the variable-count
