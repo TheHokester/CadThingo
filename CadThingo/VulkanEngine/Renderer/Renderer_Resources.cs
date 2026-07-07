@@ -192,6 +192,10 @@ public unsafe partial class Renderer
         if (index < 0 || index >= MAX_BINDLESS_TEXTURES)
             throw new ArgumentOutOfRangeException(nameof(index), $"bindless texture index {index} out of [0, {MAX_BINDLESS_TEXTURES}).");
 
+        // Mirror into the unified scene set's texture table at the same slot index, so
+        // material rows resolve identically once shaders migrate to SceneBindings.
+        descriptorRegistry?.SetBindlessSlot(index, texture.View);
+
         DescriptorImageInfo imgInfo = new()
         {
             ImageView = texture.View,

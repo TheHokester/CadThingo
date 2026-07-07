@@ -403,6 +403,7 @@ public unsafe class ResourceManager
     }
     public DescriptorSetLayout GetBindlessLayout() => MaterialBindlessLayout;
     public DescriptorSet GetBindlessSet(uint frameIndex) => bindlessDescriptorSets[frameIndex];
+    internal Sampler DefaultSampler => defaultBindlessSampler;
     public Buffer GetMaterialBuffer(int frameIndex) => MaterialStorageBuffers[frameIndex].buffer;
     public Buffer GetInstanceBuffer(uint frameIndex) => InstanceStorageBuffers[frameIndex].buffer;
     public void* GetMaterialMapped(uint frameIndex) => MaterialStorageBuffers[frameIndex].mapped;

@@ -28,7 +28,7 @@ public sealed unsafe class PassConstantArena : IDisposable
         _alignment = Math.Max(1, (uint)props.Limits.MinUniformBufferOffsetAlignment);
     }
 
-    internal Silk.NET.Vulkan.Buffer Buffer(uint frame) => _buffers[frame].buffer;
+    internal Buffer Buffer(uint frame) => _buffers[frame].buffer;
 
     /// Copies the pass constants into this frame's arena and returns the dynamic offset to
     /// supply when binding the scene set. Only valid until Reset(frame).

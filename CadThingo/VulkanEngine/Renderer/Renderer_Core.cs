@@ -287,11 +287,10 @@ public unsafe partial class Renderer
         CreateDescriptorPool();
 
         // Reflects SceneBindings.slang into the canonical scene set layout and allocates
-        // the per-frame set instances. The dump lists which bindings still lack providers
-        // (all of them until owners Register* during the Phase B migration).
+        // the per-frame set instances. Providers register at the end of Initialize
+        // (RegisterSceneBindings) once they exist.
         shaderLibrary = Shaders.ShaderLibrary.CreateDefault();
         descriptorRegistry = new Descriptors.DescriptorRegistry(gfx, shaderLibrary, MAX_CONCURRENT_FRAMES);
-        Console.WriteLine(descriptorRegistry.DumpBindings());
 
         Engine.ResourceManager.Initialize(this);
 
@@ -470,6 +469,12 @@ public unsafe partial class Renderer
             rtPipeline?.WriteEmissiveDescriptors();
             reStirPipeline?.WriteEmissiveDescriptors();
         }
+
+        // Scene-set registrations: every provider that exists
+        // at init, matched by SceneBindings parameter name. Runtime handle changes
+        // re-register at their rebuild sites; the dump shows any remaining holes.
+        RegisterSceneBindings();
+        Console.WriteLine(descriptorRegistry.DumpBindings());
 
         // Stand up the L3 render cores (eager). Each ctor registers the core into _renderCores
         // (RegisterCore) -- construction order IS the list/combo order, so Deferred (index 0) is
@@ -660,6 +665,39 @@ public unsafe partial class Renderer
     {
 
         DrawFrame();
+    }
+
+    // Registers the current owners' handles into the unified scene set by SceneBindings
+    // parameter name. Idempotent (registrations are queued, fence-safe rewrites); runtime
+    // handle changes re-register just the changed name at their rebuild sites.
+    private void RegisterSceneBindings()
+    {
+        var rm = Engine.ResourceManager;
+        var materials = new Buffer[MAX_CONCURRENT_FRAMES];
+        var instances = new Buffer[MAX_CONCURRENT_FRAMES];
+        var lights = new Buffer[MAX_CONCURRENT_FRAMES];
+        for (uint i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            materials[i] = rm.GetMaterialBuffer((int)i);
+            instances[i] = rm.GetInstanceBuffer(i);
+            lights[i] = gpuScene.GetLightStorageBuffer(i);
+        }
+        descriptorRegistry.RegisterBufferPerFrame("sceneMaterials", materials);
+        descriptorRegistry.RegisterBufferPerFrame("sceneInstances", instances);
+        descriptorRegistry.RegisterBufferPerFrame("sceneLights", lights);
+        descriptorRegistry.RegisterBuffer("sceneVertices", rm.GlobalVertexBuffer);
+        descriptorRegistry.RegisterBuffer("sceneIndices", rm.GlobalIndexBuffer);
+        // Engine shaders only ever index samplers[0]; fill the whole array with the default
+        // sampler anyway so no element of the (non-PartiallyBound) binding is left invalid.
+        for (int s = 0; s < 16; s++)
+            descriptorRegistry.RegisterSampler("sceneSamplers", rm.DefaultSampler, s);
+        if (tlas.Handle != 0)
+        {
+            descriptorRegistry.RegisterTlas("sceneTlas", tlas);
+            descriptorRegistry.RegisterBuffer("sceneEntityInfo", ShadowInfoBuffer);
+            descriptorRegistry.RegisterBuffer("sceneEmissiveTris", EmissiveTriBuffer);
+            descriptorRegistry.RegisterBuffer("sceneEmissiveAlias", EmissiveAliasBuffer);
+        }
     }
 
     // Centralized teardown (L1.6). Each lifetime-scoped owner (FrameRing, RenderTargets,

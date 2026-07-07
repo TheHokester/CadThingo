@@ -299,6 +299,16 @@ public sealed unsafe class DescriptorRegistry : IDisposable
         _freeBindlessSlots.Push(slot);
     }
 
+    /// Mirrors an externally-allocated bindless slot. ResourceManager owns slot indices
+    /// today (material rows store them), so during migration the registry table follows
+    /// its allocator instead of using RegisterBindlessTexture's.
+    public void SetBindlessSlot(int slot, ImageView view, ImageLayout layout = ImageLayout.ShaderReadOnlyOptimal)
+    {
+        if (slot < 0 || slot >= ResourceManager.MAX_BINDLESS_TEXTURES)
+            throw new ArgumentOutOfRangeException(nameof(slot));
+        QueueBindlessWrite(slot, view, layout);
+    }
+
     private void QueueBindlessWrite(int slot, ImageView view, ImageLayout layout)
     {
         foreach (var pending in _pendingBindless) pending.Add((slot, view, layout));
