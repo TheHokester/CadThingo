@@ -439,11 +439,11 @@ public unsafe partial class Renderer
         // Build BLAS / TLAS for ray-traced shadows. Gated on RayShadowsSupported
         // inside InitRayQuery — safe to call even when ray queries aren't available.
         InitRayQuery();
-        // Bind the TLAS into the lighting descriptor sets — both the deferred lighting
-        // pass and the forward+ transparent pass walk it for ray-traced shadows.
+        // Bind the TLAS into the lighting descriptor sets — the forward+
+        // transparent pass and the tracers walk it for ray-traced shadows.
+        // The deferred lighting pass reads it from the scene set (registry).
         if (tlas.Handle != 0)
         {
-            PbrDeferredPipeline.WriteTlasDescriptor(tlas);
             transparentPipeline.WriteTlasDescriptor(tlas);
             ptComputePipeline.WriteTlasDescriptor(tlas);
             wavefrontPipeline.WriteTlasDescriptor(tlas);
@@ -451,9 +451,8 @@ public unsafe partial class Renderer
             reStirPipeline?.WriteTlasDescriptor(tlas);
             selection.WriteTlasDescriptor(tlas);
             // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
-            // path in the PBR lighting shadow rays. Has to happen after
-            // InitRayQuery because the SSBO is allocated inside RebuildTlas.
-            PbrDeferredPipeline.WriteShadowAlphaDescriptors();
+            // shadow-ray path. Has to happen after InitRayQuery because the
+            // SSBO is allocated inside RebuildTlas.
             ptComputePipeline.WriteShadowInfoDescriptor();
             wavefrontPipeline.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();
@@ -605,8 +604,9 @@ public unsafe partial class Renderer
     /// Rebuild the deferred + transparent PBR pipelines. Use this after toggling
     /// softShadowsEnabled — that flag is a fragment-stage specialization constant
     /// so changes don't apply to a live pipeline. Cross-pipeline descriptor
-    /// writes (TLAS, tile buffers, shadow-alpha, IBL) are re-issued because the
-    /// new VkPipeline owns brand-new descriptor sets.
+    /// writes (tile buffers, IBL, probes, transparent's TLAS) are re-issued
+    /// because the new VkPipeline owns brand-new descriptor sets; scene-set
+    /// bindings live on the registry and need no rewire.
     /// </summary>
     public void RebuildPbrPipelines()
     {
@@ -634,11 +634,11 @@ public unsafe partial class Renderer
         // LightCullPipeline survives the rebuild but its set 0 binding 0 still
         // points at the freed PBR light SSBO — fix it up.
         lightCullPipeline.RewriteLightsBinding();
+        // PbrDeferredPipeline's TLAS / shadow-alpha / lights bindings live on the
+        // registry-owned scene set, which survives the pipeline rebuild untouched.
         if (tlas.Handle != 0)
         {
-            PbrDeferredPipeline.WriteTlasDescriptor(tlas);
             transparentPipeline.WriteTlasDescriptor(tlas);
-            PbrDeferredPipeline.WriteShadowAlphaDescriptors();
         }
     }
 

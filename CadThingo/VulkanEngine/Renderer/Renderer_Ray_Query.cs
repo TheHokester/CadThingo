@@ -1038,7 +1038,6 @@ public unsafe partial class Renderer
         // descriptor set even when the shadow-info buffer didn't grow.
         if (tlas.Handle != 0)
         {
-            PbrDeferredPipeline?.WriteTlasDescriptor(tlas);
             transparentPipeline?.WriteTlasDescriptor(tlas);
             ptComputePipeline?.WriteTlasDescriptor(tlas);
             wavefrontPipeline?.WriteTlasDescriptor(tlas);
@@ -1052,7 +1051,6 @@ public unsafe partial class Renderer
 
         if (shadowInfoBufferResized)
         {
-            PbrDeferredPipeline?.WriteShadowAlphaDescriptors();
             ptComputePipeline?.WriteShadowInfoDescriptor();
             wavefrontPipeline?.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();

@@ -1,4 +1,5 @@
-import PbrUtils;   // BRDF/light/IBL math + re-exported CommonTypes (types, consts, vertex helpers)
+import PbrUtils;      // BRDF/light/IBL math + re-exported CommonTypes (types, consts, vertex helpers)
+import SceneBindings; // scene set 0: lights/TLAS/entity-info/vb+ib/materials/textures/samplers
 
 // Output from vertex shader / Input to fragment shader - Interpolated data
 struct LightingVSOutput {
@@ -33,27 +34,11 @@ struct LightingFrameUBO {
 // ProbeRecord, ProbeClusterRange, TILE_SIZE_PX, MAX_LIGHTS_PER_TILE now come
 // from CommonTypes (via `import PbrUtils`).
 
-// Resource bindings - Connect CPU resources to GPU shader registers
+// Per-pass constants in the reserved (0,0) dynamic slot; everything else in
+// set 0 comes from the imported SceneBindings module (sceneLights, sceneTlas,
+// sceneEntityInfo, sceneVertices/sceneIndices, sceneMaterials/sceneTextures/
+// sceneSamplers).
 [[vk::binding(0, 0)]] ConstantBuffer<LightingFrameUBO>      ubo;
-[[vk::binding(1, 0)]] StructuredBuffer<PbrLight>            lights;
-[[vk::binding(2, 0)]] RaytracingAccelerationStructure       tlas;   // scene TLAS for ray-traced shadows
-[[vk::binding(3, 0)]] StructuredBuffer<uint>                tileLightCount;
-[[vk::binding(4, 0)]] StructuredBuffer<uint>                tileLightIndices;
-// IBL split-sum: irradianceCube + prefilteredCube give diffuse and per-roughness
-// specular environment contribution; brdfLut is the view-independent F0 fit.
-// Cubes are baked from .hdr; black-cleared until LoadEnvironmentHdr runs, which
-// gives a zero IBL contribution until then.
-[[vk::binding(5, 0)]] SamplerCube                           irradianceCube;
-[[vk::binding(6, 0)]] SamplerCube                           prefilteredCube;
-[[vk::binding(7, 0)]] Sampler2D                             brdfLut;
-
-// Reflection-probe bindings. Empty / zero-probe scenes still bind well-defined
-// resources — empty clusterRange.count makes the loop a no-op and the global
-// IBL fallback takes over.
-[[vk::binding(8,  0)]] SamplerCubeArray                     probeCubeArray;
-[[vk::binding(9,  0)]] StructuredBuffer<ProbeRecord>        probes;
-[[vk::binding(10, 0)]] StructuredBuffer<ProbeClusterRange>  probeClusterRange;
-[[vk::binding(11, 0)]] StructuredBuffer<uint>               probeIndexList;
 
 // Specialization constants — picked up via VkSpecializationInfo at pipeline build.
 // SOFT_SHADOWS off (default) → single-ray binary occlusion (the original path).
@@ -61,34 +46,31 @@ struct LightingFrameUBO {
 // Flip CadThingo's Renderer.softShadowsEnabled and rebuild the PBR pipeline.
 [[vk::constant_id(0)]] const bool SOFT_SHADOWS = false;
 
-// GBuffer inputs — Set 1 in your descriptor layout
+// GBuffer inputs — pass-local set 1
 [[vk::binding(0, 1)]] Sampler2D gBufferPositionSampler;
 [[vk::binding(1, 1)]] Sampler2D gBufferNormalSampler;
 [[vk::binding(2, 1)]] Sampler2D gBufferAlbedoSampler;
 [[vk::binding(3, 1)]] Sampler2D gBufferMaterialSampler;
 [[vk::binding(4, 1)]] Sampler2D gBufferEmissiveSampler;
 
-// Set 2: shadow-alpha plumbing
-// ShadowEntityInfo[i] = info for the entity whose TLAS InstanceCustomIndex == i.
-// Filled CPU-side in Renderer_Ray_Query.cs::RebuildTlas. Read in the shadow-ray
-// Proceed loop when the candidate is non-opaque (CPU sets ForceNoOpaqueBit on
-// MASK + BLEND TLAS instances; opaque geometry never enters the Proceed loop).
-// ShadowEntityInfo layout lives in CommonTypes.
-[[vk::binding(0, 2)]] StructuredBuffer<ShadowEntityInfo> entityShadowInfo;
-[[vk::binding(1, 2)]] ByteAddressBuffer                  globalIndices;
-[[vk::binding(2, 2)]] ByteAddressBuffer                  globalVertices;
+// Set 2: lighting inputs local to this pass — tile-cull outputs, then the
+// global IBL split-sum (irradiance + prefiltered cubes give diffuse and
+// per-roughness specular, brdfLut the view-independent F0 fit; black-cleared
+// until LoadEnvironmentHdr runs, giving zero IBL contribution), then the
+// reflection probes (empty clusterRange.count makes the probe loop a no-op
+// and the global IBL fallback takes over).
+[[vk::binding(0, 2)]] StructuredBuffer<uint>                tileLightCount;
+[[vk::binding(1, 2)]] StructuredBuffer<uint>                tileLightIndices;
+[[vk::binding(2, 2)]] SamplerCube                           irradianceCube;
+[[vk::binding(3, 2)]] SamplerCube                           prefilteredCube;
+[[vk::binding(4, 2)]] Sampler2D                             brdfLut;
+[[vk::binding(5, 2)]] SamplerCubeArray                     probeCubeArray;
+[[vk::binding(6, 2)]] StructuredBuffer<ProbeRecord>        probes;
+[[vk::binding(7, 2)]] StructuredBuffer<ProbeClusterRange>  probeClusterRange;
+[[vk::binding(8, 2)]] StructuredBuffer<uint>               probeIndexList;
 
-// Set 3: bindless materials/instances/textures/samplers
-// Layout shared with the geometry pass (owned by ResourceManager). Only the
-// alpha-test path reads materials + textures + samplers; instances[] is
-// layout parity only.
-[[vk::binding(0, 3)]] StructuredBuffer<PbrMaterial>      materials;
-[[vk::binding(1, 3)]] StructuredBuffer<InstanceData>     instances;     // unused here
-[[vk::binding(2, 3)]] Texture2D                          textures[];
-[[vk::binding(3, 3)]] SamplerState                       samplers[];
-
-// Vertex stride / fetch helpers now live in CommonTypes; they take the
-// ByteAddressBuffer as a parameter (globalVertices / globalIndices below).
+// Vertex stride / fetch helpers live in CommonTypes; they take the
+// ByteAddressBuffer as a parameter (sceneVertices / sceneIndices).
 
 // Decides whether a candidate non-opaque hit should occlude the shadow ray.
 //   BLEND  → false (light passes through unattenuated).
@@ -99,25 +81,25 @@ bool shadowAlphaPasses(uint recordIndex, uint primIdx, float2 bary)
 {
     // recordIndex is the flat per-geometry slot: the candidate instance's custom
     // index (cluster geometry-block base) + the candidate geometry index.
-    ShadowEntityInfo info = entityShadowInfo[recordIndex];
+    ShadowEntityInfo info = sceneEntityInfo[recordIndex];
     if ((info.flags & 4u) != 0u) return false;   // BLEND → no shadow
     if ((info.flags & 1u) == 0u) return true;    // not MASK → commit (defensive)
 
-    PbrMaterial mat = materials[info.materialIndex];
-    
+    PbrMaterial mat = sceneMaterials[info.materialIndex];
+
     if(mat.alphaCutoff == 0.0f) return true;
 
-    uint i0 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 2u);
-    float2 uv0 = fetchVertexUV(globalVertices, i0);
-    float2 uv1 = fetchVertexUV(globalVertices, i1);
-    float2 uv2 = fetchVertexUV(globalVertices, i2);
+    uint i0 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 2u);
+    float2 uv0 = fetchVertexUV(sceneVertices, i0);
+    float2 uv1 = fetchVertexUV(sceneVertices, i1);
+    float2 uv2 = fetchVertexUV(sceneVertices, i2);
     float  w0  = 1.0 - bary.x - bary.y;
     float2 uv  = uv0 * w0 + uv1 * bary.x + uv2 * bary.y;
 
-    float alpha = textures[NonUniformResourceIndex(mat.baseColorTex)]
-                    .SampleLevel(samplers[0], uv, 0).a
+    float alpha = sceneTextures[NonUniformResourceIndex(mat.baseColorTex)]
+                    .SampleLevel(sceneSamplers[0], uv, 0).a
                 * mat.baseColorFactor.a;
 
     return alpha >= mat.alphaCutoff;
@@ -150,7 +132,7 @@ bool isOccluded(float3 origin, float3 dir, float tMax)
     ray.TMax      = tMax;
 
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
+    q.TraceRayInline(sceneTlas,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
     while (q.Proceed())
     {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
@@ -180,7 +162,7 @@ float blockerSearch(float3 origin, float3 dir, float tMax)
     ray.TMax      = tMax;
 
     RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    q.TraceRayInline(sceneTlas,RAY_FLAG_NONE, 0xFF, ray);
     while (q.Proceed())
     {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
@@ -323,7 +305,7 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
 
     for (uint t = 0u; t < perTile; t++) {
         uint     lightIdx = tileLightIndices[tileIdx * MAX_LIGHTS_PER_TILE + t];
-        PbrLight lt       = lights[lightIdx];
+        PbrLight lt       = sceneLights[lightIdx];
 
         uint  type      = (uint)lt.directionType.w;
         float3 lColor   = lt.colorIntensity.rgb;
