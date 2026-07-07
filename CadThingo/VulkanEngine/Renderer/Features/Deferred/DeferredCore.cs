@@ -122,7 +122,8 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
         // Per-frame material SSBO snapshot
         _host.UpdateMaterials(currentFrame, scene);
 
-        _host.geometryPipeline.UpdateUbo(currentFrame, camera);
+        // Geometry's view+proj now rides the scene set's (0,0) arena slot, pushed inside
+        // its Record call - no per-frame UBO update needed here anymore.
         var (lightCount, tileCountX, tileCountY) =
             _host.PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
         _host.transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);

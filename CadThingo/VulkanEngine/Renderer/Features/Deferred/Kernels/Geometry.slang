@@ -1,6 +1,7 @@
-import CommonTypes;   // PbrMaterial, InstanceData
+import SceneBindings; // scene set 0 (materials/instances/textures/samplers); exports CommonTypes
 
-// Per-frame view+proj. Model matrix lives in the per-instance SSBO (CommonTypes::InstanceData).
+// Per-pass constants in the reserved (0,0) dynamic slot (descriptor-system section 7).
+// Model matrix lives in the per-instance SSBO (CommonTypes::InstanceData).
 struct FrameUBO {
     float4x4 view;
     float4x4 proj;
@@ -28,14 +29,7 @@ struct GBufferOutput {
     float4 Emissive : SV_TARGET4;
 }
 
-// Set 0: per-frame UBO (view+proj). Bound once per frame.
 [[vk::binding(0,0)]] ConstantBuffer<FrameUBO> frame;
-
-// Set 1: bindless material/instance/texture/sampler arrays. Bound once per frame.
-[[vk::binding(0,1)]] StructuredBuffer<PbrMaterial>  materials;
-[[vk::binding(1,1)]] StructuredBuffer<InstanceData> instances;
-[[vk::binding(2,1)]] Texture2D                      textures[];
-[[vk::binding(3,1)]] SamplerState                   samplers[];
 
                 // SV_InstanceID is the *relative* instance id within a draw call (HLSL
                 // semantic). Slang lowers it to gl_InstanceIndex - gl_BaseInstance, which
@@ -47,7 +41,7 @@ VSOutput VSMain(VSInput input,
                 uint instanceIndex : SV_InstanceID,
                 uint baseInstance  : SV_StartInstanceLocation)
 {
-    InstanceData inst = instances[instanceIndex + baseInstance];
+    InstanceData inst = sceneInstances[instanceIndex + baseInstance];
 
     float4 worldPos = mul(inst.model, float4(input.Position, 1.0));
 
@@ -84,26 +78,26 @@ GBufferOutput PSMain(VSOutput input)
     return dbg;
 #endif
 
-    PbrMaterial mat = materials[input.MaterialIndex];
+    PbrMaterial mat = sceneMaterials[input.MaterialIndex];
 
     // Sampler 0 is the shared linear-repeat default. All bindless textures use it for now.
-    SamplerState s = samplers[0];
+    SamplerState s = sceneSamplers[0];
 
-    
-    float4 baseColor       = textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV) * mat.baseColorFactor;
+
+    float4 baseColor       = sceneTextures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV) * mat.baseColorFactor;
 
     // MASK alpha test (bit 0 of flags). discards if geometry that should be opaque is transparent. 
     if ((mat.flags & 1u) != 0u && baseColor.a < mat.alphaCutoff) discard;
 
-    float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).rg;
+    float2 metallicRoughness = sceneTextures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).rg;
     float metallic         = metallicRoughness.x * mat.metallicFactor;
     float roughness        = metallicRoughness.y * mat.roughnessFactor;
-    float ao               = textures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;
-    float3 emissive        = textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb * mat.emissiveFactor;
+    float ao               = sceneTextures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;
+    float3 emissive        = sceneTextures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb * mat.emissiveFactor;
 
     float3 N = normalize(input.Normal);
     {
-        float3 tangentNormal = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).rg);
+        float3 tangentNormal = decodeTangentNormal(sceneTextures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).rg);
         N = applyNormalMap(N, input.WorldPos, input.UV, tangentNormal);
     }
     //writes gbuffer

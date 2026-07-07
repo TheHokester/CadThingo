@@ -17,8 +17,6 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
         public Matrix4x4 view;
         public Matrix4x4 proj;
     }
-    //Per frame uniform buffers for geometry pipeline
-    private UboBuffer[] GeometryUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
     protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "Geometry");
     protected override Format[] ColorAttachmentFormats { get; } =
@@ -34,12 +32,6 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
     public GeometryPipeline(Renderer renderer) : base(renderer)
     {
         DepthAttachmentFormat = Gfx.FindDepthFormat();
-    }
-
-    public override void Dispose()
-    {
-        foreach (var ubo in GeometryUniformBuffers) Gfx.DestroyBuffer(ubo.buffer, ubo.alloc);
-        base.Dispose();
     }
 
     public readonly ref struct Attachments(
@@ -90,14 +82,14 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdSetViewport(cmd, 0, 1, &vp);
         Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
 
-        // Set 0 (FrameUBO) + Set 1 (bindless: materials/instances/textures/samplers)
-        // bound once. The whole geometry pass issues zero per-draw rebinds and zero
-        // push constants — model + materialIndex live in the per-instance SSBO.
-        var frameSet = GetDescriptorSet(0, ctx.FrameIndex);
-        var bindlessSet = Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex);
-        var geomSets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
+        // First SceneBindings consumer: the unified scene set carries the bindless
+        // materials/instances/textures/samplers, and the per-pass view+proj rides the
+        // (0,0) dynamic slot as an arena push. One set, one bind, zero per-draw rebinds.
+        var registry = Renderer.descriptorRegistry;
+        uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, BuildFrameUbo(ctx.Camera));
+        var sceneSet = registry.SceneSet(ctx.FrameIndex);
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, 0, 2, geomSets, 0, null);
+            Layout, 0, 1, &sceneSet, 1, &frameConstants);
 
         // Bind global VB/IB once — every mesh is packed into these
         var vb = Engine.ResourceManager.GlobalVertexBuffer;
@@ -127,66 +119,10 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
     }
     protected override void CreateDescriptorSetLayouts()
     {
-        CreateFrameDescriptorSetLayout(out var frameDSL);
-        // Slot 0 is OWNED here; slot 1 is borrowed from ResourceManager (don't destroy on Dispose).
-        DescriptorSetLayouts = new[] { frameDSL,  Engine.ResourceManager.GetBindlessLayout()};
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
-    }
-
-    protected override void CreateResources()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            Gfx.CreateMappedUniformBuffer(sizeof(GeometryUBO), ref GeometryUniformBuffers[i]);
-        }
-    }
-
-    protected override void CreateDescriptorSets()
-    {
-        // Per-frame "frame" descriptor sets (set 0): only binding 0 = FrameUBO (view+proj).
-        // Set 1 (bindless materials/instances/textures/samplers) is owned and bound by
-        // ResourceManager.
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
-
-        DescriptorSetAllocateInfo allocateInfo = new()
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts = layouts
-        };
-        DescriptorSets = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* pDS = DescriptorSets[0])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &allocateInfo, pDS) != Result.Success)
-                throw new Exception("Failed to allocate descriptor sets using layout 0 for geometry pipeline");
-        }
-    }
-
-    protected override void WriteDescriptors()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo bufferInfo = new()
-            {
-                Buffer = GeometryUniformBuffers[i].buffer,
-                Offset = 0,
-                Range = (ulong)sizeof(GeometryUBO),
-            };
-            WriteDescriptorSet descriptorWrite = new()
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = DescriptorSets[0][i],
-                DstBinding = 0,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.UniformBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &bufferInfo
-            };
-            Vk.UpdateDescriptorSets(Device, 1, &descriptorWrite, 0, null);
-        }
+        // Scene set only, borrowed from the registry (never destroyed here). The pipeline
+        // owns no descriptor sets, layouts, or UBO buffers anymore.
+        DescriptorSetLayouts = [Renderer.descriptorRegistry.SceneSetLayout];
+        OwnedDescriptorSetLayoutIndices = [];
     }
 
     protected override VertexInputBindingDescription[] GetVertexInputBindings()
@@ -200,50 +136,9 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
     }
 
 
-    // Set 0 of the geometry pipeline. One binding (the per-frame FrameUBO with view+proj),
-    // bound once at the start of the geometry pass and reused for every draw.
-    private void CreateFrameDescriptorSetLayout(out DescriptorSetLayout layout)
-    {
-        var binding = new DescriptorSetLayoutBinding
-        {
-            Binding = 0,
-            DescriptorType = DescriptorType.UniformBuffer,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.VertexBit,
-            PImmutableSamplers = null,
-        };
-
-        DescriptorSetLayoutBindingFlagsCreateInfo flagsCreateInfo = new()
-            { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
-        var flag = DescriptorBindingFlags.UpdateAfterBindBit |
-                   DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-
-        if (Gfx.DescriptorIndexingEnabled)
-        {
-            flagsCreateInfo.BindingCount = 1;
-            flagsCreateInfo.PBindingFlags = &flag;
-        }
-
-        DescriptorSetLayoutCreateInfo layoutInfo = new()
-        {
-            SType = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 1,
-            PBindings = &binding,
-        };
-        if (Gfx.DescriptorIndexingEnabled)
-        {
-            layoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
-            layoutInfo.PNext = &flagsCreateInfo;
-        }
-
-        if (Vk.CreateDescriptorSetLayout(Device, &layoutInfo, null, out layout) !=
-            Result.Success)
-            throw new Exception("Failed to create geometry frame descriptor set layout");
-    }
-
-    // Writes the per-frame view+proj into GeometryUniformBuffers[frameIndex].
-    // Called once per frame in DrawFrame; per-draw model matrix lives in the instance SSBO.
-    public void UpdateUbo(uint frameIndex, Camera camera)
+    // Per-pass view+proj for the (0,0) arena slot; pushed by Record each frame.
+    // Per-draw model matrix lives in the instance SSBO.
+    private GeometryUBO BuildFrameUbo(Camera? camera)
     {
         GeometryUBO ubo = new();
         if (camera != null)
@@ -259,8 +154,6 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
                 (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
             ubo.proj.M22 *= -1; // flip Y for Vulkan clip space
         }
-
-        void* data = GeometryUniformBuffers[frameIndex].mapped;
-        new Span<GeometryUBO>(data, 1).Fill(ubo);
+        return ubo;
     }
 }
