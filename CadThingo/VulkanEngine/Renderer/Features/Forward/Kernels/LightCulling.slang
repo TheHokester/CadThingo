@@ -3,22 +3,8 @@
 // touching lights into a per-tile slot list. The lighting fragment shader
 // then reads the per-tile list keyed by gl_FragCoord / 16.
 
-// Must match Renderer_Resources.cs constants.
-static const uint TILE_SIZE           = 16u;
-static const uint MAX_LIGHTS_PER_TILE = 64u;
-
-// Mirrors PbrUtils.slang::PbrLight (kept self-contained so this shader doesn't
-// inherit the rest of the PBR utility include).
-struct PbrLight {
-    float4 positionRange;     // xyz pos, w range (-1 sentinel = directional)
-    float4 colorIntensity;    // rgb color, a intensity
-    float4 directionType;     // xyz dir, w type (0=Dir, 1=Point, 2=Spot) as float
-    float4 spotCones;         // x innerCos, y outerCos, z castShadows, w pad
-};
-
-static const uint LIGHT_TYPE_DIRECTIONAL = 0u;
-static const uint LIGHT_TYPE_POINT       = 1u;
-static const uint LIGHT_TYPE_SPOT        = 2u;
+import SceneBindings; // scene set 0 (sceneLights); exports CommonTypes
+                      // (PbrLight, LIGHT_TYPE_*, TILE_SIZE_PX, MAX_LIGHTS_PER_TILE)
 
 struct CullParams {
     float4x4 invViewProj;     // un-projects NDC -> world for tile corner rays
@@ -33,9 +19,10 @@ struct CullParams {
 
 [[vk::push_constant]] CullParams params;
 
-[[vk::binding(0, 0)]] StructuredBuffer<PbrLight>     lights;
-[[vk::binding(1, 0)]] RWStructuredBuffer<uint>       tileLightCount;
-[[vk::binding(2, 0)]] RWStructuredBuffer<uint>       tileLightIndices;
+// Pass-local outputs (set 1) — this pass produces the tile lists the lighting
+// passes consume; the light list itself is read from the scene set.
+[[vk::binding(0, 1)]] RWStructuredBuffer<uint>       tileLightCount;
+[[vk::binding(1, 1)]] RWStructuredBuffer<uint>       tileLightIndices;
 
 // Per-tile workspace: shared between the 256 threads in this group.
 groupshared uint  sharedCount;
@@ -82,8 +69,8 @@ void Main(uint3 gid : SV_GroupID, uint flatIdx : SV_GroupIndex)
         sharedCount = 0u;
 
         // Pixel-space tile bounds.
-        float2 tileMin = float2(tx * TILE_SIZE, ty * TILE_SIZE);
-        float2 tileMax = tileMin + float2(TILE_SIZE, TILE_SIZE);
+        float2 tileMin = float2(tx * TILE_SIZE_PX, ty * TILE_SIZE_PX);
+        float2 tileMax = tileMin + float2(TILE_SIZE_PX, TILE_SIZE_PX);
 
         // Convert pixel-space bounds to NDC. Vulkan NDC y goes downward in our
         // screen convention (we Y-flip the projection matrix in the renderer),
@@ -118,7 +105,7 @@ void Main(uint3 gid : SV_GroupID, uint flatIdx : SV_GroupIndex)
     // lights at indices flatIdx, 256+flatIdx, 512+flatIdx, ...
     for (uint li = flatIdx; li < params.lightCount; li += 256u)
     {
-        PbrLight L = lights[li];
+        PbrLight L = sceneLights[li];
         uint type   = (uint)L.directionType.w;
         bool inside;
 

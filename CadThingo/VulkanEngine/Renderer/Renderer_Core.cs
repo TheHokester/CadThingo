@@ -413,11 +413,11 @@ public unsafe partial class Renderer
         tonemapPipeline.Initialize();
 
         // Transparent forward+ pass — renders BLEND-mode materials between the lighting
-        // pass and the tonemap pass. Shares the lights SSBO + TLAS + tile cull buffers
-        // with PbrDeferredPipeline; shares the bindless set with GeometryPipeline.
+        // pass and the tonemap pass. Lights / TLAS / bindless come from the scene set;
+        // the tile cull buffers are wired from LightCullPipeline below.
         transparentPipeline = new TransparentPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
         transparentPipeline.Initialize();
-        transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
+        transparentPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         // IBL bindings live on Renderer-owned VkImages that exist before any
         // pipeline initializes; write them straight after Initialize.
         transparentPipeline.WriteIblDescriptors();
@@ -439,12 +439,11 @@ public unsafe partial class Renderer
         // Build BLAS / TLAS for ray-traced shadows. Gated on RayShadowsSupported
         // inside InitRayQuery — safe to call even when ray queries aren't available.
         InitRayQuery();
-        // Bind the TLAS into the lighting descriptor sets — the forward+
-        // transparent pass and the tracers walk it for ray-traced shadows.
-        // The deferred lighting pass reads it from the scene set (registry).
+        // Bind the TLAS into the tracers' descriptor sets — they walk it for
+        // ray-traced work. The deferred lighting + transparent passes read it
+        // from the scene set (registry).
         if (tlas.Handle != 0)
         {
-            transparentPipeline.WriteTlasDescriptor(tlas);
             ptComputePipeline.WriteTlasDescriptor(tlas);
             wavefrontPipeline.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
@@ -628,18 +627,11 @@ public unsafe partial class Renderer
         _renderCores.OfType<DeferredCore>().FirstOrDefault()?.OnPbrPipelineRebuilt();
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         PbrDeferredPipeline.WriteProbeDescriptors();
-        transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
+        transparentPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         transparentPipeline.WriteIblDescriptors();
         transparentPipeline.WriteProbeDescriptors();
-        // LightCullPipeline survives the rebuild but its set 0 binding 0 still
-        // points at the freed PBR light SSBO — fix it up.
-        lightCullPipeline.RewriteLightsBinding();
-        // PbrDeferredPipeline's TLAS / shadow-alpha / lights bindings live on the
-        // registry-owned scene set, which survives the pipeline rebuild untouched.
-        if (tlas.Handle != 0)
-        {
-            transparentPipeline.WriteTlasDescriptor(tlas);
-        }
+        // TLAS / shadow-alpha / lights bindings for both PBR pipelines live on
+        // the registry-owned scene set, which survives the rebuild untouched.
     }
 
     /// <summary>
