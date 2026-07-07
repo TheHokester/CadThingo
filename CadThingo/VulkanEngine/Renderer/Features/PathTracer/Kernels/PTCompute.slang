@@ -1,43 +1,23 @@
-﻿import PTUtils;   // pathtracer math; re-exports PbrUtils + CommonTypes
+﻿import PTUtils;       // pathtracer math; re-exports PbrUtils + CommonTypes
+import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
+                      // sceneVertices+sceneIndices/sceneEmissiveTris+Alias/
+                      // sceneMaterials/sceneTextures/sceneSamplers
 
-
-
-//set 0 per-frame IO
-//RGBA32F intentionally, R16F starves dark regions after ~64 samples
+// Per-pass constants in the reserved (0,0) dynamic slot.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
-[[vk::binding(1, 0)]] StructuredBuffer<PbrLight>         lights;
-[[vk::binding(2, 0)]] RaytracingAccelerationStructure    tlas;
-[[vk::binding(3, 0)]] StructuredBuffer<ShadowEntityInfo> entityInfo;//indexes into buffer stored in tlas
-[[vk::binding(4, 0)]] RWTexture2D<float4> accumulator;
-[[vk::binding(5, 0)]] RWTexture2D<float4> outColor;
 
-// Emissive area lights. One record per world-space emissive triangle, built on
-// the CPU in RebuildTlas. `emissiveAlias` is a Vose alias table over the same
-// indices, weighted by area·luminance(Le), for O(1) power-proportional picks.
-// EmissiveTri / AliasEntry layouts live in PTUtils (mirror EmissiveTriGpu /
-// AliasEntryGpu in Renderer_Ray_Query.cs).
-[[vk::binding(6, 0)]] StructuredBuffer<EmissiveTri> emissiveTris;
-[[vk::binding(7, 0)]] StructuredBuffer<AliasEntry>  emissiveAlias;
+// Set 1: pass-local IO.
+// RGBA32F intentionally, R16F starves dark regions after ~64 samples.
+[[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
+[[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
 
-//Set 1 scene — ShadowEntityInfo layout lives in CommonTypes.
-//primitives
-[[vk::binding(1, 1)]] ByteAddressBuffer                  globalVertices;
-[[vk::binding(2, 1)]] ByteAddressBuffer                  globalIndices;
-
-//Set 2 bindless textures + materials matches resource material dsl in resource manager
-[[vk::binding(0, 2)]] StructuredBuffer<PbrMaterial>      materials;
-[[vk::binding(1, 2)]] StructuredBuffer<InstanceData>     instances; //unused 
-[[vk::binding(2, 2)]] Texture2D textures[];
-[[vk::binding(3, 2)]] SamplerState samplers[];
-
-//Set 3 IBL + Lights
-//Sampled on miss  (sky contribution) and clamped fallback
-[[vk::binding(0, 3)]] SamplerCube irradianceCube;
-[[vk::binding(1, 3)]] SamplerCube prefilteredCube;
-[[vk::binding(2, 3)]] Sampler2D brdfLUT;
+// Set 2: IBL. Sampled on miss (sky contribution) and clamped fallback.
 // Full-res environment (512²); prefilteredCube is 128² GGX-convolved, so use
 // envCube for sharp miss-ray background sampling.
-[[vk::binding(3, 3)]] SamplerCube envCube;
+[[vk::binding(0, 2)]] SamplerCube irradianceCube;
+[[vk::binding(1, 2)]] SamplerCube prefilteredCube;
+[[vk::binding(2, 2)]] Sampler2D brdfLUT;
+[[vk::binding(3, 2)]] SamplerCube envCube;
 
 
 //Specialization constants
@@ -57,17 +37,17 @@ static const uint MATERIAL_LOD_BOUNCE = 2u;
 
 // Vertex layout + fetch helpers (VERTEX_STRIDE, fetchVertexPos/Normal/UV/Tangent,
 // fetchTriangleIndex) live in CommonTypes and take the ByteAddressBuffer as a
-// parameter — call sites below pass globalVertices / globalIndices.
+// parameter — call sites below pass sceneVertices / sceneIndices.
 
 
 
 float2 computeUV(uint indexOffset, uint primIdx, float2 bary) {
-    uint i0 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 2u);
-    float2 uv0 = fetchVertexUV(globalVertices, i0);
-    float2 uv1 = fetchVertexUV(globalVertices, i1);
-    float2 uv2 = fetchVertexUV(globalVertices, i2);
+    uint i0 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 2u);
+    float2 uv0 = fetchVertexUV(sceneVertices, i0);
+    float2 uv1 = fetchVertexUV(sceneVertices, i1);
+    float2 uv2 = fetchVertexUV(sceneVertices, i2);
     float  w0  = 1.0 - bary.x - bary.y;
     float2 uv  = uv0 * w0 + uv1 * bary.x + uv2 * bary.y;
     return uv;
@@ -77,7 +57,7 @@ float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 baryc
     int baseColorIdx = mat.baseColorTex;
     if (baseColorIdx < 0 || mat.flags == 0) { return 1.0f; }
     float2 uv = computeUV(indexOffset, primIdx, barycentrics);
-    return textures[NonUniformResourceIndex(baseColorIdx)].Sample(samplers[0], uv).a * mat.baseColorFactor.a;
+    return sceneTextures[NonUniformResourceIndex(baseColorIdx)].Sample(sceneSamplers[0], uv).a * mat.baseColorFactor.a;
 }
 
 
@@ -95,7 +75,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     bool lowDetail = bounce >= MATERIAL_LOD_BOUNCE;
 
     RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    q.TraceRayInline(sceneTlas,RAY_FLAG_NONE, 0xFF, ray);
 
     // Alpha-test loop.  TLAS instances flagged ForceNoOpaque (MASK / BLEND /
     // KHR_materials_transmission > 0, set on the CPU side in RebuildTlas)
@@ -106,8 +86,8 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             // Flat per-geometry record: instance custom index is the cluster's
             // geometry-block base, geometry index selects the primitive within it.
-            ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
-            PbrMaterial      cmat = materials[cei.materialIndex];
+            ShadowEntityInfo cei = sceneEntityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
+            PbrMaterial      cmat = sceneMaterials[cei.materialIndex];
             float alpha = computeAlpha(cmat, cei.indexOffset,
                                        q.CandidatePrimitiveIndex(),
                                        q.CandidateTriangleBarycentrics());
@@ -138,28 +118,28 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     // Flat per-geometry record index (cluster block base + geometry within it).
     // Local — only needed to fetch material/geometry below, not after traceRay.
     uint recordIndex      = q.CommittedInstanceID() + q.CommittedGeometryIndex();
-    ShadowEntityInfo info = entityInfo[recordIndex];
+    ShadowEntityInfo info = sceneEntityInfo[recordIndex];
     h.matidx              = info.materialIndex;
 
-    // Triangle vertex indices into globalVertices.
-    uint i0 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 2u);
+    // Triangle vertex indices into sceneVertices.
+    uint i0 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 2u);
 
     // UV is needed for every material sample below, so do it first. Local — the
     // bounce loop never reads it (sampleEmissive recomputes its own UV).
-    float2 uv = fetchVertexUV(globalVertices, i0) * baryW.x
-              + fetchVertexUV(globalVertices, i1) * baryW.y
-              + fetchVertexUV(globalVertices, i2) * baryW.z;
+    float2 uv = fetchVertexUV(sceneVertices, i0) * baryW.x
+              + fetchVertexUV(sceneVertices, i1) * baryW.y
+              + fetchVertexUV(sceneVertices, i2) * baryW.z;
 
     // Object-space normals (smooth) + positions (for the flat / geometric N).
-    float3 nObj  = fetchVertexNormal(globalVertices, i0) * baryW.x
-                 + fetchVertexNormal(globalVertices, i1) * baryW.y
-                 + fetchVertexNormal(globalVertices, i2) * baryW.z;
+    float3 nObj  = fetchVertexNormal(sceneVertices, i0) * baryW.x
+                 + fetchVertexNormal(sceneVertices, i1) * baryW.y
+                 + fetchVertexNormal(sceneVertices, i2) * baryW.z;
 
-    float3 p0    = fetchVertexPos(globalVertices, i0);
-    float3 p1    = fetchVertexPos(globalVertices, i1);
-    float3 p2    = fetchVertexPos(globalVertices, i2);
+    float3 p0    = fetchVertexPos(sceneVertices, i0);
+    float3 p1    = fetchVertexPos(sceneVertices, i1);
+    float3 p2    = fetchVertexPos(sceneVertices, i2);
     float3 ngObj = normalize(cross(p1 - p0, p2 - p0));
 
     // Object → world. The cluster BLAS bakes positions to world space with an
@@ -182,35 +162,35 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     }
 
     // Material sample.
-    PbrMaterial  mat = materials[h.matidx];
-    SamplerState s   = samplers[0];
+    PbrMaterial  mat = sceneMaterials[h.matidx];
+    SamplerState s   = sceneSamplers[0];
 
     h.baseColor = mat.baseColorFactor;
     if (mat.baseColorTex >= 0)
-        h.baseColor *= textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, uv);
+        h.baseColor *= sceneTextures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, uv);
 
     h.metallic  = mat.metallicFactor;
     h.roughness = mat.roughnessFactor;
     if (mat.physicalDescriptorTex >= 0 && !lowDetail) {
-        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, uv).rg;
+        float2 mr   = sceneTextures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, uv).rg;
         h.metallic  *= mr.x;
         h.roughness *= mr.y;
     }
 
     h.emissive = mat.emissiveFactor;
     if (mat.emissiveTex >= 0)
-        h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, uv).rgb;
+        h.emissive *= sceneTextures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, uv).rgb;
 
     // Normal-map perturbation.  Done AFTER the front-face flip so the TBN
     // frame matches the (possibly-flipped) shading normal. Skipped on deep
     // bounces — indirect lighting barely registers the perturbation.
     if (mat.normalTex >= 0 && !lowDetail) {
-        float3 nm = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, uv).rg);
+        float3 nm = decodeTangentNormal(sceneTextures[NonUniformResourceIndex(mat.normalTex)].Sample(s, uv).rg);
         // Tangent from UV gradients instead of a per-vertex tangent fetch: reuses
         // the already-loaded object-space positions, trading vertex bandwidth for ALU.
-        float2 uv0 = fetchVertexUV(globalVertices, i0);
-        float2 uv1 = fetchVertexUV(globalVertices, i1);
-        float2 uv2 = fetchVertexUV(globalVertices, i2);
+        float2 uv0 = fetchVertexUV(sceneVertices, i0);
+        float2 uv1 = fetchVertexUV(sceneVertices, i1);
+        float2 uv2 = fetchVertexUV(sceneVertices, i2);
         float2 d1  = uv1 - uv0, d2 = uv2 - uv0;
         float  det = d1.x * d2.y - d1.y * d2.x;
         if (abs(det) > 1e-12) {
@@ -230,7 +210,7 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     // PBR = factor 0 (the default).
     h.transmission = mat.transmissionFactor;
     if (mat.transmissionTex >= 0 && !lowDetail) {
-        h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].Sample(s, uv).r;
+        h.transmission *= sceneTextures[NonUniformResourceIndex(mat.transmissionTex)].Sample(s, uv).r;
     }
     h.ior     = mat.ior;
 
@@ -246,11 +226,11 @@ HitInfo traceRay(RayDesc ray, inout uint rngState, uint bounce) {
     // glTF: clearcoatTexture uses R channel, clearcoatRoughnessTexture uses G.
     h.clearcoat = mat.clearcoatFactor;
     if (mat.clearcoatTex >= 0 && !lowDetail) {
-        h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].Sample(s, uv).r;
+        h.clearcoat *= sceneTextures[NonUniformResourceIndex(mat.clearcoatTex)].Sample(s, uv).r;
     }
     h.clearcoatRoughness = mat.clearcoatRoughnessFactor;
     if (mat.clearcoatRoughnessTex >= 0 && !lowDetail) {
-        h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].Sample(s, uv).g;
+        h.clearcoatRoughness *= sceneTextures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].Sample(s, uv).g;
     }
     // Clamp roughness to a small floor — GGX D(roughness=0) is 0 everywhere
     // except the mirror direction where it's 0/0 = NaN, so a literal zero
@@ -283,13 +263,13 @@ bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngState) {
     r.TMax      = tMax;
 
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, r);
+    q.TraceRayInline(sceneTlas,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, r);
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             // Flat per-geometry record: instance custom index is the cluster's
             // geometry-block base, geometry index selects the primitive within it.
-            ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
-            PbrMaterial      cmat = materials[cei.materialIndex];
+            ShadowEntityInfo cei = sceneEntityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
+            PbrMaterial      cmat = sceneMaterials[cei.materialIndex];
             float alpha = computeAlpha(cmat, cei.indexOffset,
                                        q.CandidatePrimitiveIndex(),
                                        q.CandidateTriangleBarycentrics());
@@ -306,7 +286,7 @@ bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngState) {
                 float2 uv = computeUV(cei.indexOffset,
                                       q.CandidatePrimitiveIndex(),
                                       q.CandidateTriangleBarycentrics());
-                transmittance *= textures[NonUniformResourceIndex(cmat.transmissionTex)].Sample(samplers[0], uv).r;
+                transmittance *= sceneTextures[NonUniformResourceIndex(cmat.transmissionTex)].Sample(sceneSamplers[0], uv).r;
             }
 
             float passAlpha = 1.0;
@@ -360,7 +340,7 @@ LightPick sampleLightRIS(inout uint rngState, float3 worldPos, float3 N) {
     for (uint i = 0u; i < M; ++i) {
         uint idx = min(frameUBO.lightCount - 1u,
                        uint(rand(rngState) * float(frameUBO.lightCount)));
-        PbrLight cand = lights[idx];
+        PbrLight cand = sceneLights[idx];
 
         LightSample ls;
         if (!evaluateLight(cand, worldPos, ls)) continue;
@@ -426,10 +406,10 @@ EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
 
     // Alias pick: bucket i, keep with prob, else jump to its alias.
     uint i = min(n - 1u, uint(rand(rng) * float(n)));
-    AliasEntry a = emissiveAlias[i];
+    AliasEntry a = sceneEmissiveAlias[i];
     uint idx = (rand(rng) < a.prob) ? i : a.alias;
 
-    EmissiveTri t = emissiveTris[idx];
+    EmissiveTri t = sceneEmissiveTris[idx];
     float3 p0 = t.p0Area.xyz;
     float3 e1 = t.e1LeR.xyz;
     float3 e2 = t.e2LeG.xyz;
@@ -465,13 +445,13 @@ EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
     if (t.meta.z >= 0) {
         uint io  = (uint)t.meta.x;
         uint pi  = (uint)t.meta.y;
-        uint vi0 = fetchTriangleIndex(globalIndices, io, pi, 0u);
-        uint vi1 = fetchTriangleIndex(globalIndices, io, pi, 1u);
-        uint vi2 = fetchTriangleIndex(globalIndices, io, pi, 2u);
-        float2 uv = fetchVertexUV(globalVertices, vi0) * (1.0 - b1 - b2)
-                  + fetchVertexUV(globalVertices, vi1) * b1
-                  + fetchVertexUV(globalVertices, vi2) * b2;
-        radiance *= textures[NonUniformResourceIndex(t.meta.z)].SampleLevel(samplers[0], uv, 0.0).rgb;
+        uint vi0 = fetchTriangleIndex(sceneIndices, io, pi, 0u);
+        uint vi1 = fetchTriangleIndex(sceneIndices, io, pi, 1u);
+        uint vi2 = fetchTriangleIndex(sceneIndices, io, pi, 2u);
+        float2 uv = fetchVertexUV(sceneVertices, vi0) * (1.0 - b1 - b2)
+                  + fetchVertexUV(sceneVertices, vi1) * b1
+                  + fetchVertexUV(sceneVertices, vi2) * b2;
+        radiance *= sceneTextures[NonUniformResourceIndex(t.meta.z)].SampleLevel(sceneSamplers[0], uv, 0.0).rgb;
     }
 
     es.L        = L;
@@ -574,7 +554,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
         // or on the primary ray.
         float misEm = 1.0;
         if (!prevWasDelta && frameUBO.emissiveTriCount > 0u && frameUBO.totalEmissivePower > 0.0) {
-            float lumLe = luminance(materials[hit.matidx].emissiveFactor);
+            float lumLe = luminance(sceneMaterials[hit.matidx].emissiveFactor);
             float cosL  = abs(dot(hit.geometricNormal, ray.Direction));
             if (lumLe > 0.0 && cosL > 1e-4) {
                 float pLight = lumLe * hit.hitT * hit.hitT / (frameUBO.totalEmissivePower * cosL);
@@ -690,7 +670,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 dim : SV_GroupThreadID){
         // vacuum. TIR keeps bs.transmit == false, so sigmaA is preserved and
         // the trapped ray keeps absorbing as it bounces inside the solid.
         if (bs.transmit) {
-            sigmaA = hit.frontFace ? mediumSigmaA(materials[hit.matidx]) : float3(0.0);
+            sigmaA = hit.frontFace ? mediumSigmaA(sceneMaterials[hit.matidx]) : float3(0.0);
         }
 
         // Set up the next bounce. Refraction needs the origin on the *other*

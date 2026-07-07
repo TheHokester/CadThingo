@@ -1038,7 +1038,6 @@ public unsafe partial class Renderer
         // descriptor set even when the shadow-info buffer didn't grow.
         if (tlas.Handle != 0)
         {
-            ptComputePipeline?.WriteTlasDescriptor(tlas);
             wavefrontPipeline?.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
             reStirPipeline?.WriteTlasDescriptor(tlas);
@@ -1050,7 +1049,6 @@ public unsafe partial class Renderer
 
         if (shadowInfoBufferResized)
         {
-            ptComputePipeline?.WriteShadowInfoDescriptor();
             wavefrontPipeline?.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();
             reStirPipeline?.WriteShadowInfoDescriptor();
@@ -1064,7 +1062,6 @@ public unsafe partial class Renderer
         // re-write is only needed on resize.
         if (emissiveBuffersResized)
         {
-            ptComputePipeline?.WriteEmissiveDescriptors();
             wavefrontPipeline?.WriteEmissiveDescriptors();
             rtPipeline?.WriteEmissiveDescriptors();
             reStirPipeline?.WriteEmissiveDescriptors();

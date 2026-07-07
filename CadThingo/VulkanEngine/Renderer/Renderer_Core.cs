@@ -356,13 +356,13 @@ public unsafe partial class Renderer
         PbrDeferredPipeline.WriteProbeDescriptors();
         
         
+        // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless)
+        // come from the scene set; only the storage-image IO + IBL sets are wired here.
         ptComputePipeline = new PTComputePipeline(this);
         ptComputePipeline.Initialize();
         ptComputePipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-        ptComputePipeline.WriteGeometryDescriptors();
-        ptComputePipeline.WriteLightsDescriptor();
         // Same as the transparent / deferred pipelines: IBL images are Renderer-
-        // owned and stable across rebakes, so set 3 only needs writing once.
+        // owned and stable across rebakes, so the IBL set only needs writing once.
         ptComputePipeline.WriteIblDescriptors();
 
         // Wavefront path tracer (RenderMode.RayWavefront). Shares the same accumulator /
@@ -444,7 +444,6 @@ public unsafe partial class Renderer
         // from the scene set (registry).
         if (tlas.Handle != 0)
         {
-            ptComputePipeline.WriteTlasDescriptor(tlas);
             wavefrontPipeline.WriteTlasDescriptor(tlas);
             rtPipeline?.WriteTlasDescriptor(tlas);
             reStirPipeline?.WriteTlasDescriptor(tlas);
@@ -452,7 +451,6 @@ public unsafe partial class Renderer
             // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
             // shadow-ray path. Has to happen after InitRayQuery because the
             // SSBO is allocated inside RebuildTlas.
-            ptComputePipeline.WriteShadowInfoDescriptor();
             wavefrontPipeline.WriteShadowInfoDescriptor();
             rtPipeline?.WriteShadowInfoDescriptor();
             reStirPipeline?.WriteShadowInfoDescriptor();
@@ -462,7 +460,6 @@ public unsafe partial class Renderer
             selection.WriteEntityInfoDescriptor();
             // Emissive area-light buffers (built inside RebuildTlas, always
             // allocated with ≥1 slot so the binding is valid even with no emitters).
-            ptComputePipeline.WriteEmissiveDescriptors();
             wavefrontPipeline.WriteEmissiveDescriptors();
             rtPipeline?.WriteEmissiveDescriptors();
             reStirPipeline?.WriteEmissiveDescriptors();
