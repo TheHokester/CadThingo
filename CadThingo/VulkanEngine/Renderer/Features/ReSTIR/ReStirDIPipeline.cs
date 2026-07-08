@@ -25,7 +25,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 //
 internal sealed unsafe class ReStirDIPipeline : RTPipeline
 {
-    private const int SetReStir = 4;
+    // Appended after the base RTPipeline sets (scene 0, IO 1, IBL 2).
+    private const int SetReStir = 3;
 
     // Per-pixel byte strides -- MUST match the Slang StructuredBuffer element STRIDE, which is
     // std430, NOT the tight field-sum: a float3 has 16-byte alignment and rounds the struct up to a
@@ -72,14 +73,16 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     protected override string ShaderPath =>
         ShaderPaths.Kernel("ReSTIR", Gfx.SerSupported ? "ReStirDI_SER" : "ReStirDI");
 
-    // Set 0 is shared with the SpatialShade compute pipeline -> needs ComputeBit.
-    protected override ShaderStageFlags Set0ExtraStages => ShaderStageFlags.ComputeBit;
+    // The IO set (accumulator/outColor) is shared with the SpatialShade compute pipeline (it folds
+    // the analytic direct into the accumulator) -> needs ComputeBit. The scene set is already
+    // All-stages via the registry, so it needs no override.
+    protected override ShaderStageFlags OwnedSetExtraStages => ShaderStageFlags.ComputeBit;
 
 
-    // ---- Set 4 layout + push-constant range, appended onto the base RTPipeline sets (0-3) -------
+    // ---- Set 3 layout + push-constant range, appended onto the base RTPipeline sets (scene/IO/IBL) -
     protected override void CreateDescriptorSetLayouts()
     {
-        base.CreateDescriptorSetLayouts();   // sets 0-3 (set 0 now Raygen|...|Compute)
+        base.CreateDescriptorSetLayouts();   // sets 0-2 (IO set now Raygen|...|Compute)
 
         const ShaderStageFlags s4 = ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.ComputeBit;
         System.Array.Resize(ref DescriptorSetLayouts, SetReStir + 1);
@@ -149,7 +152,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
 
     protected override void CreateDescriptorSets()
     {
-        base.CreateDescriptorSets();   // sets 0/1/3 (2 = borrowed bindless)
+        base.CreateDescriptorSets();   // sets 1 (IO) + 2 (IBL); set 0 (scene) is registry-owned
 
         System.Array.Resize(ref DescriptorSets, SetReStir + 1);
         var layout = DescriptorSetLayouts[SetReStir];
@@ -262,20 +265,22 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     public void RecordSpatialShade(CommandBuffer cmd, in Renderer.FrameContext ctx)
         => RecordComputePass(cmd, ctx, _spatialPipeline);
 
-    // Binds the SAME descriptor sets (0-4) the Trace pass uses on the shared layout, pushes the
+    // Binds the SAME descriptor sets (0-3) the Trace pass uses on the shared layout, pushes the
     // per-frame ReSTIR state, and dispatches a full-screen 8x8 grid. Both ReSTIR compute passes share
-    // this; which buffers each actually touches is decided by its shader's declared bindings.
+    // this; which buffers each actually touches is decided by its shader's declared bindings. The
+    // scene set carries the frame-UBO arena slot, so its bind supplies the same dynamic offset the RT
+    // Trace pass uses.
     private void RecordComputePass(CommandBuffer cmd, in Renderer.FrameContext ctx, Pipeline pipeline)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
 
-        var sets = stackalloc DescriptorSet[5];
-        sets[0] = DescriptorSets[0][ctx.FrameIndex];                       // frame / lights / tlas / entityInfo / emissive
-        sets[1] = DescriptorSets[1][0];                                    // geom (vertices / indices)
-        sets[2] = Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex);  // bindless materials / textures
-        sets[3] = DescriptorSets[3][0];                                    // ibl (unused by compute)
-        sets[4] = DescriptorSets[SetReStir][0];                           // reservoirs / gbuffers / sceneRadiance
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 5, sets, 0, null);
+        uint frameConstants = PushFrameConstants(ctx.FrameIndex);
+        var sets = stackalloc DescriptorSet[4];
+        sets[0] = Renderer.descriptorRegistry.SceneSet(ctx.FrameIndex);  // frame UBO + lights / tlas / entityInfo / vb+ib / emissive / bindless
+        sets[1] = DescriptorSets[SetIO][0];                             // accumulator / outColor
+        sets[2] = DescriptorSets[SetIbl][0];                            // ibl (unused by compute)
+        sets[3] = DescriptorSets[SetReStir][0];                         // reservoirs / gbuffers / sceneRadiance
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 4, sets, 1, &frameConstants);
 
         var p = _push;
         Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.ComputeBit, 0, (uint)sizeof(ReStirPush), &p);
@@ -284,7 +289,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     }
 
 
-    // ---- Bind set 4 after the base sets (RTPipeline.Record, RT path) -----------------------------
+    // ---- Bind set 3 after the base sets (RTPipeline.Record, RT path) -----------------------------
     protected override uint ExtraSetCount => 1u;
     protected override void WriteExtraSets(DescriptorSet* dst, uint frame)
     {

@@ -45,7 +45,7 @@ public unsafe partial class Renderer
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private bool enableValidationLayers = false; 
+    private bool enableValidationLayers = false;
     private IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------
@@ -381,21 +381,19 @@ public unsafe partial class Renderer
         // are bound below after InitRayQuery, mirroring the compute pipeline.
         if (RayTracePipelineSupported)
         {
+            // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come
+            // from the scene set; only the storage-image IO + IBL sets are wired here.
             rtPipeline = new RTPipeline(this);
             rtPipeline.Initialize();
             rtPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-            rtPipeline.WriteGeometryDescriptors();
-            rtPipeline.WriteLightsDescriptor();
             rtPipeline.WriteIblDescriptors();
 
             // ReSTIR DI tracer (RenderMode.ReStirDI). Same RT-pipeline machinery as rtPipeline
             // (it subclasses RTPipeline), forked only at the shader; shares the same accumulator /
-            // outColor + scene buffers. TLAS/shadow/emissive sets bound below with rtPipeline's.
+            // outColor + scene set.
             reStirPipeline = new ReStirDIPipeline(this);
             reStirPipeline.Initialize();
             reStirPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-            reStirPipeline.WriteGeometryDescriptors();
-            reStirPipeline.WriteLightsDescriptor();
             reStirPipeline.WriteIblDescriptors();
         }
 
@@ -445,15 +443,11 @@ public unsafe partial class Renderer
         if (tlas.Handle != 0)
         {
             wavefrontPipeline.WriteTlasDescriptor(tlas);
-            rtPipeline?.WriteTlasDescriptor(tlas);
-            reStirPipeline?.WriteTlasDescriptor(tlas);
             selection.WriteTlasDescriptor(tlas);
             // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
             // shadow-ray path. Has to happen after InitRayQuery because the
             // SSBO is allocated inside RebuildTlas.
             wavefrontPipeline.WriteShadowInfoDescriptor();
-            rtPipeline?.WriteShadowInfoDescriptor();
-            reStirPipeline?.WriteShadowInfoDescriptor();
             // Pick + selection resolve the hit entity through the same flat
             // ShadowEntityInfo table (per-cluster instances → entity via
             // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex).
@@ -461,8 +455,8 @@ public unsafe partial class Renderer
             // Emissive area-light buffers (built inside RebuildTlas, always
             // allocated with ≥1 slot so the binding is valid even with no emitters).
             wavefrontPipeline.WriteEmissiveDescriptors();
-            rtPipeline?.WriteEmissiveDescriptors();
-            reStirPipeline?.WriteEmissiveDescriptors();
+            // rtPipeline / reStirPipeline read TLAS / shadow-info / emissive from the
+            // registry-owned scene set — no per-pipeline fan-out needed.
         }
 
         // Scene-set registrations: every provider that exists

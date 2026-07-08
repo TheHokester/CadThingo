@@ -12,7 +12,8 @@
 //
 // Helpers mirror ReStirDI.slang / SpatialShade.slang (hand-synced; small + stable).
 
-import PTUtils;   // BRDF/light eval, emissive structs, HitInfo, rand/initRNG, fetchVertex*
+import PTUtils;       // BRDF/light eval, emissive structs, HitInfo, rand/initRNG, fetchVertex*
+import SceneBindings; // scene set 0: sceneLights/sceneEmissiveTris+Alias/sceneVertices+sceneIndices/sceneTextures+sceneSamplers
 
 // ---- Shared types (mirror ReStirDI.slang) --------------------------------------------------------
 struct Reservoir {
@@ -70,21 +71,16 @@ HitInfo unpackHit(PackedHit p, float3 rayOrigin) {
     return h;
 }
 
-// ---- Bindings (set 0 frame/lights/emissive, set 1 geom, set 2 bindless, set 4 ReSTIR working) -----
+// ---- Bindings -------------------------------------------------------------------------------------
+// Scene set 0 (sceneLights / sceneEmissiveTris+Alias / sceneVertices+sceneIndices /
+// sceneTextures+sceneSamplers) comes from the imported SceneBindings module; only the
+// per-pass constants and the set-3 ReSTIR working buffers are declared here.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO>  frameUBO;
-[[vk::binding(1, 0)]] StructuredBuffer<PbrLight>    lights;
-[[vk::binding(6, 0)]] StructuredBuffer<EmissiveTri> emissiveTris;
-[[vk::binding(7, 0)]] StructuredBuffer<AliasEntry>  emissiveAlias;
 
-[[vk::binding(1, 1)]] ByteAddressBuffer globalVertices;
-[[vk::binding(2, 1)]] ByteAddressBuffer globalIndices;
-[[vk::binding(2, 2)]] Texture2D    textures[];
-[[vk::binding(3, 2)]] SamplerState samplers[];
-
-[[vk::binding(0, 4)]] RWStructuredBuffer<Reservoir> reservoirA;
-[[vk::binding(1, 4)]] RWStructuredBuffer<Reservoir> reservoirB;
-[[vk::binding(2, 4)]] RWStructuredBuffer<PackedHit> gbufferA;
-[[vk::binding(3, 4)]] RWStructuredBuffer<PackedHit> gbufferB;
+[[vk::binding(0, 3)]] RWStructuredBuffer<Reservoir> reservoirA;
+[[vk::binding(1, 3)]] RWStructuredBuffer<Reservoir> reservoirB;
+[[vk::binding(2, 3)]] RWStructuredBuffer<PackedHit> gbufferA;
+[[vk::binding(3, 3)]] RWStructuredBuffer<PackedHit> gbufferB;
 
 struct ReStirPush { float4x4 prevViewProj; uint frameParity; uint hasHistory; uint pad0, pad1; };
 [[vk::push_constant]] ReStirPush rpc;
@@ -113,7 +109,7 @@ float diTarget(HitInfo hit, float3 V, float3 L, float3 radiance) {
 float targetAtSurface(Reservoir r, HitInfo hit, float3 V) {
     if (r.sampleType == SAMPLE_ANALYTIC) {
         LightSample ls;
-        if (!evaluateLight(lights[r.index], hit.worldPos, ls)) return 0.0;
+        if (!evaluateLight(sceneLights[r.index], hit.worldPos, ls)) return 0.0;
         return diTarget(hit, V, ls.L, ls.radiance);
     }
     if (r.sampleType == SAMPLE_EMISSIVE) {
@@ -173,10 +169,10 @@ EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
     if (n == 0u || frameUBO.totalEmissivePower <= 0.0) return es;
 
     uint i = min(n - 1u, uint(rand(rng) * float(n)));
-    AliasEntry a = emissiveAlias[i];
+    AliasEntry a = sceneEmissiveAlias[i];
     uint idx = (rand(rng) < a.prob) ? i : a.alias;
 
-    EmissiveTri t = emissiveTris[idx];
+    EmissiveTri t = sceneEmissiveTris[idx];
     float3 p0 = t.p0Area.xyz;
     float3 e1 = t.e1LeR.xyz;
     float3 e2 = t.e2LeG.xyz;
@@ -199,13 +195,13 @@ EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
     float3 radiance = Le;
     if (t.meta.z >= 0) {
         uint io = (uint)t.meta.x, pi = (uint)t.meta.y;
-        uint vi0 = fetchTriangleIndex(globalIndices, io, pi, 0u);
-        uint vi1 = fetchTriangleIndex(globalIndices, io, pi, 1u);
-        uint vi2 = fetchTriangleIndex(globalIndices, io, pi, 2u);
-        float2 uv = fetchVertexUV(globalVertices, vi0) * (1.0 - b1 - b2)
-                  + fetchVertexUV(globalVertices, vi1) * b1
-                  + fetchVertexUV(globalVertices, vi2) * b2;
-        radiance *= textures[NonUniformResourceIndex(t.meta.z)].SampleLevel(samplers[0], uv, 0.0).rgb;
+        uint vi0 = fetchTriangleIndex(sceneIndices, io, pi, 0u);
+        uint vi1 = fetchTriangleIndex(sceneIndices, io, pi, 1u);
+        uint vi2 = fetchTriangleIndex(sceneIndices, io, pi, 2u);
+        float2 uv = fetchVertexUV(sceneVertices, vi0) * (1.0 - b1 - b2)
+                  + fetchVertexUV(sceneVertices, vi1) * b1
+                  + fetchVertexUV(sceneVertices, vi2) * b2;
+        radiance *= sceneTextures[NonUniformResourceIndex(t.meta.z)].SampleLevel(sceneSamplers[0], uv, 0.0).rgb;
     }
 
     es.L = L; es.radiance = radiance; es.dist = dist;
@@ -230,7 +226,7 @@ Reservoir buildUnifiedReservoir(inout uint rngState, HitInfo hit, float3 V) {
         if (rand(rngState) < pAnalytic) {
             uint idx = min(frameUBO.lightCount - 1u, uint(rand(rngState) * float(frameUBO.lightCount)));
             LightSample ls;
-            if (!evaluateLight(lights[idx], worldPos, ls)) continue;
+            if (!evaluateLight(sceneLights[idx], worldPos, ls)) continue;
             float pHat   = diTarget(hit, V, ls.L, ls.radiance);
             if (pHat <= 0.0) continue;
             float srcPdf = pAnalytic / float(frameUBO.lightCount);

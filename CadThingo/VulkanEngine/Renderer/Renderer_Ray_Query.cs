@@ -1039,19 +1039,15 @@ public unsafe partial class Renderer
         if (tlas.Handle != 0)
         {
             wavefrontPipeline?.WriteTlasDescriptor(tlas);
-            rtPipeline?.WriteTlasDescriptor(tlas);
-            reStirPipeline?.WriteTlasDescriptor(tlas);
             selection?.WriteTlasDescriptor(tlas);
-            // Scene set: same handle change, one call (replaces the fan-out above once
-            // consumers migrate to SceneBindings).
+            // Scene set: same handle change, one call — covers the deferred/transparent
+            // passes and the RT-pipeline / ReSTIR tracers (all read TLAS from the scene set).
             descriptorRegistry.RegisterTlas("sceneTlas", tlas);
         }
 
         if (shadowInfoBufferResized)
         {
             wavefrontPipeline?.WriteShadowInfoDescriptor();
-            rtPipeline?.WriteShadowInfoDescriptor();
-            reStirPipeline?.WriteShadowInfoDescriptor();
             selection?.WriteEntityInfoDescriptor();
             descriptorRegistry.RegisterBuffer("sceneEntityInfo", shadowInfoBuffer);
             shadowInfoBufferResized = false;
@@ -1063,8 +1059,6 @@ public unsafe partial class Renderer
         if (emissiveBuffersResized)
         {
             wavefrontPipeline?.WriteEmissiveDescriptors();
-            rtPipeline?.WriteEmissiveDescriptors();
-            reStirPipeline?.WriteEmissiveDescriptors();
             descriptorRegistry.RegisterBuffer("sceneEmissiveTris", emissiveTriBuffer);
             descriptorRegistry.RegisterBuffer("sceneEmissiveAlias", emissiveAliasBuffer);
             emissiveBuffersResized = false;
