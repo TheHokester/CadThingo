@@ -57,7 +57,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
         bool  prevWasDelta = thr4.w > 0.5;
         float misEm = 1.0;
         if(!prevWasDelta && frameUBO.emissiveTriCount > 0u && frameUBO.totalEmissivePower > 0.0){
-            float lumLe = luminance(materials[h.matidx].emissiveFactor);
+            float lumLe = luminance(sceneMaterials[h.matidx].emissiveFactor);
             float cosL  = abs(dot(h.geometricNormal, inDir));
             if(lumLe > 0.0 && cosL > 1e-4){
                 float pLight = lumLe * h.hitT * h.hitT / (frameUBO.totalEmissivePower * cosL);
@@ -84,7 +84,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
             bool   valid     = false;
 
             if(rand(rng) < pAnalytic){
-                // Analytic-light RIS. No BSDF MIS (the BSDF sampler can't hit punctual lights).
+                // Analytic-light RIS. No BSDF MIS (the BSDF sampler can't hit punctual sceneLights).
                 LightPick pick = sampleLightRIS(rng, h.worldPos, h.normal);
                 if(pick.valid){
                     float NdotL = max(dot(h.normal, pick.sample.L), 0.0);
@@ -145,7 +145,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
             // (reflect / diffuse / TIR) leaves psSigmaA untouched, so a ray trapped in a solid keeps
             // absorbing.
             if(bs.transmit)
-                psSigmaA[p] = wfPackHalf4(float4(h.frontFace ? mediumSigmaA(materials[h.matidx]) : float3(0.0), 0.0));
+                psSigmaA[p] = wfPackHalf4(float4(h.frontFace ? mediumSigmaA(sceneMaterials[h.matidx]) : float3(0.0), 0.0));
 
             // Advance the ray cone: this hit's footprint becomes the next origin's width, and a
             // non-delta (diffuse/glossy) scatter widens the spread by surface roughness so deeper,

@@ -46,7 +46,7 @@ public static const bool  WF_STOCH_MIP     = true;  // secondary bounces: trilin
 public float wfTexConeLod(int texIdx, float lodBase, float xi, bool stoch) {
     if (!WF_CONE_LOD) return 0.0;
     uint tw, th;
-    textures[NonUniformResourceIndex(texIdx)].GetDimensions(tw, th);
+    sceneTextures[NonUniformResourceIndex(texIdx)].GetDimensions(tw, th);
     float lod = max(lodBase + 0.5 * log2(float(tw) * float(th)), 0.0);
     if (WF_STOCH_MIP && stoch) {
         float fl = floor(lod);
@@ -80,8 +80,8 @@ public uint classLobeMask(uint shadingClass) {
 
 public uint classifyShadingClass(PbrMaterial m) {
     // Classify on FACTORS ONLY. This engine leaves UNSET texture slots pointing at shared
-    // GltfDefaults textures -- valid bindless indices (>= 0), NOT -1 -- so a `tex >= 0` presence
-    // test is ~always true and would dump every material into FULL (the first branch). And textures
+    // GltfDefaults sceneTextures -- valid bindless indices (>= 0), NOT -1 -- so a `tex >= 0` presence
+    // test is ~always true and would dump every material into FULL (the first branch). And sceneTextures
     // compose MULTIPLICATIVELY here (metallic = metallicFactor * tex, transmission/clearcoat likewise,
     // per resolveHit), so a zero factor kills its lobe regardless of the bound texture -- making
     // factors alone both correct and conservative. Order matters: widest lobe set first (supersets win).
@@ -94,12 +94,12 @@ public uint classifyShadingClass(PbrMaterial m) {
 
 // --- UV / alpha --------------------------------------------------------------
 public float2 computeUV(uint indexOffset, uint primIdx, float2 bary) {
-    uint i0 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 2u);
-    float2 uv0 = fetchVertexUV(globalVertices, i0);
-    float2 uv1 = fetchVertexUV(globalVertices, i1);
-    float2 uv2 = fetchVertexUV(globalVertices, i2);
+    uint i0 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 2u);
+    float2 uv0 = fetchVertexUV(sceneVertices, i0);
+    float2 uv1 = fetchVertexUV(sceneVertices, i1);
+    float2 uv2 = fetchVertexUV(sceneVertices, i2);
     float  w0  = 1.0 - bary.x - bary.y;
     return uv0 * w0 + uv1 * bary.x + uv2 * bary.y;
 }
@@ -114,7 +114,7 @@ public float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float
     int baseColorIdx = mat.baseColorTex;
     if (baseColorIdx < 0 || mat.flags == 0) return 1.0f;
     float2 uv = computeUV(indexOffset, primIdx, barycentrics);
-    return textures[NonUniformResourceIndex(baseColorIdx)].SampleLevel(samplers[0], uv, lod).a * mat.baseColorFactor.a;
+    return sceneTextures[NonUniformResourceIndex(baseColorIdx)].SampleLevel(sceneSamplers[0], uv, lod).a * mat.baseColorFactor.a;
 }
 
 
@@ -137,25 +137,25 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
     uint   primIdx     = prim.y;
     float3 baryW       = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
-    ShadowEntityInfo info = entityInfo[recordIndex];
+    ShadowEntityInfo info = sceneEntityInfo[recordIndex];
     h.matidx = info.materialIndex;
 
-    uint i0 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(globalIndices, info.indexOffset, primIdx, 2u);
+    uint i0 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(sceneIndices, info.indexOffset, primIdx, 2u);
 
-    float2 uv0 = fetchVertexUV(globalVertices, i0);
-    float2 uv1 = fetchVertexUV(globalVertices, i1);
-    float2 uv2 = fetchVertexUV(globalVertices, i2);
+    float2 uv0 = fetchVertexUV(sceneVertices, i0);
+    float2 uv1 = fetchVertexUV(sceneVertices, i1);
+    float2 uv2 = fetchVertexUV(sceneVertices, i2);
     float2 uv  = uv0 * baryW.x + uv1 * baryW.y + uv2 * baryW.z;
 
-    float3 nObj = fetchVertexNormal(globalVertices, i0) * baryW.x
-                + fetchVertexNormal(globalVertices, i1) * baryW.y
-                + fetchVertexNormal(globalVertices, i2) * baryW.z;
+    float3 nObj = fetchVertexNormal(sceneVertices, i0) * baryW.x
+                + fetchVertexNormal(sceneVertices, i1) * baryW.y
+                + fetchVertexNormal(sceneVertices, i2) * baryW.z;
 
-    float3 p0 = fetchVertexPos(globalVertices, i0);
-    float3 p1 = fetchVertexPos(globalVertices, i1);
-    float3 p2 = fetchVertexPos(globalVertices, i2);
+    float3 p0 = fetchVertexPos(sceneVertices, i0);
+    float3 p1 = fetchVertexPos(sceneVertices, i1);
+    float3 p2 = fetchVertexPos(sceneVertices, i2);
     float3 e1 = p1 - p0;
     float3 e2 = p2 - p0;
     float3 ngObj = normalize(cross(e1, e2));
@@ -183,27 +183,27 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
     float  lodBase  = 0.5 * log2(max(uvCross, 1e-12) / max(wCross, 1e-12))
                     + log2(max(coneW, 1e-8) / cosT);
 
-    PbrMaterial  mat = materials[h.matidx];
-    SamplerState s   = samplers[0];
+    PbrMaterial  mat = sceneMaterials[h.matidx];
+    SamplerState s   = sceneSamplers[0];
 
     h.baseColor = mat.baseColorFactor;
     if (mat.baseColorTex >= 0)
-        h.baseColor *= textures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(s, uv, wfTexConeLod(mat.baseColorTex, lodBase, lodJitter, stochMip));
+        h.baseColor *= sceneTextures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(s, uv, wfTexConeLod(mat.baseColorTex, lodBase, lodJitter, stochMip));
 
     h.metallic  = mat.metallicFactor;
     h.roughness = mat.roughnessFactor;
     if (mat.physicalDescriptorTex >= 0 && !lowDetail) {
-        float2 mr   = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, wfTexConeLod(mat.physicalDescriptorTex, lodBase, lodJitter, stochMip)).rg;
+        float2 mr   = sceneTextures[NonUniformResourceIndex(mat.physicalDescriptorTex)].SampleLevel(s, uv, wfTexConeLod(mat.physicalDescriptorTex, lodBase, lodJitter, stochMip)).rg;
         h.metallic  *= mr.x;
         h.roughness *= mr.y;
     }
 
     h.emissive = mat.emissiveFactor;
     if (mat.emissiveTex >= 0)
-        h.emissive *= textures[NonUniformResourceIndex(mat.emissiveTex)].SampleLevel(s, uv, wfTexConeLod(mat.emissiveTex, lodBase, lodJitter, stochMip)).rgb;
+        h.emissive *= sceneTextures[NonUniformResourceIndex(mat.emissiveTex)].SampleLevel(s, uv, wfTexConeLod(mat.emissiveTex, lodBase, lodJitter, stochMip)).rgb;
 
     if (mat.normalTex >= 0 && !lowDetail) {
-        float3 nm = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].SampleLevel(s, uv, wfTexConeLod(mat.normalTex, lodBase, lodJitter, stochMip)).rg);
+        float3 nm = decodeTangentNormal(sceneTextures[NonUniformResourceIndex(mat.normalTex)].SampleLevel(s, uv, wfTexConeLod(mat.normalTex, lodBase, lodJitter, stochMip)).rg);
         // Tangent from UV gradients instead of a per-vertex tangent fetch: reuses
         // the already-loaded positions/UVs, trading 48B/hit of fetch for ALU.
         float2 d1  = uv1 - uv0, d2 = uv2 - uv0;
@@ -222,14 +222,14 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
 
     // P3b: skip the transmission / clearcoat reads entirely for classes whose PSO strips those
     // lobes. The factors live in the already-loaded material struct (cheap), but the texel fetches
-    // are real memory traffic -- and since unset tex slots point at valid GltfDefaults textures
+    // are real memory traffic -- and since unset tex slots point at valid GltfDefaults sceneTextures
     // (tex >= 0 is ~always true here), they would otherwise ALWAYS fire on bounces 0-1. Gated on
     // the spec-folded lobeMask so the SampleLevel calls dead-strip for opaque classes.
     h.transmission = 0.0;
     if ((lobeMask & LOBE_TRANSMIT) != 0u) {
         h.transmission = mat.transmissionFactor;
         if (mat.transmissionTex >= 0 && !lowDetail)
-            h.transmission *= textures[NonUniformResourceIndex(mat.transmissionTex)].SampleLevel(s, uv, wfTexConeLod(mat.transmissionTex, lodBase, lodJitter, stochMip)).r;
+            h.transmission *= sceneTextures[NonUniformResourceIndex(mat.transmissionTex)].SampleLevel(s, uv, wfTexConeLod(mat.transmissionTex, lodBase, lodJitter, stochMip)).r;
     }
     h.ior = mat.ior;
 
@@ -241,9 +241,9 @@ public HitInfo resolveHit(uint2 prim, float triT, float2 bary, float3 rayOrigin,
     if ((lobeMask & LOBE_CLEARCOAT) != 0u) {
         h.clearcoat = mat.clearcoatFactor;
         if (mat.clearcoatTex >= 0 && !lowDetail)
-            h.clearcoat *= textures[NonUniformResourceIndex(mat.clearcoatTex)].SampleLevel(s, uv, wfTexConeLod(mat.clearcoatTex, lodBase, lodJitter, stochMip)).r;
+            h.clearcoat *= sceneTextures[NonUniformResourceIndex(mat.clearcoatTex)].SampleLevel(s, uv, wfTexConeLod(mat.clearcoatTex, lodBase, lodJitter, stochMip)).r;
         if (mat.clearcoatRoughnessTex >= 0 && !lowDetail)
-            h.clearcoatRoughness *= textures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].SampleLevel(s, uv, wfTexConeLod(mat.clearcoatRoughnessTex, lodBase, lodJitter, stochMip)).g;
+            h.clearcoatRoughness *= sceneTextures[NonUniformResourceIndex(mat.clearcoatRoughnessTex)].SampleLevel(s, uv, wfTexConeLod(mat.clearcoatRoughnessTex, lodBase, lodJitter, stochMip)).g;
     }
 
     // Floor roughness so GGX D() stays evaluable (0 -> 0/0 NaN at the mirror dir).
@@ -266,11 +266,11 @@ public bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngStat
     r.TMax      = tMax;
 
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, r);
+    q.TraceRayInline(sceneTlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, r);
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
-            ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
-            PbrMaterial      cmat = materials[cei.materialIndex];
+            ShadowEntityInfo cei = sceneEntityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
+            PbrMaterial      cmat = sceneMaterials[cei.materialIndex];
             float alpha = computeAlpha(cmat, cei.indexOffset,
                                        q.CandidatePrimitiveIndex(),
                                        q.CandidateTriangleBarycentrics(),
@@ -280,7 +280,7 @@ public bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngStat
             if (cmat.transmissionTex >= 0) {
                 float2 uv = computeUV(cei.indexOffset, q.CandidatePrimitiveIndex(),
                                       q.CandidateTriangleBarycentrics());
-                transmittance *= textures[NonUniformResourceIndex(cmat.transmissionTex)].SampleLevel(samplers[0], uv, ALPHA_LOD_SHADOW).r;
+                transmittance *= sceneTextures[NonUniformResourceIndex(cmat.transmissionTex)].SampleLevel(sceneSamplers[0], uv, ALPHA_LOD_SHADOW).r;
             }
 
             float passAlpha = 1.0;
@@ -328,7 +328,7 @@ public LightPick sampleLightRIS(inout uint rngState, float3 worldPos, float3 N) 
     for (uint i = 0u; i < M; ++i) {
         uint idx = min(frameUBO.lightCount - 1u,
                        uint(rand(rngState) * float(frameUBO.lightCount)));
-        PbrLight cand = lights[idx];
+        PbrLight cand = sceneLights[idx];
 
         LightSample ls;
         if (!evaluateLight(cand, worldPos, ls)) continue;
@@ -372,10 +372,10 @@ public EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
     if (n == 0u || frameUBO.totalEmissivePower <= 0.0) return es;
 
     uint i = min(n - 1u, uint(rand(rng) * float(n)));
-    AliasEntry a = emissiveAlias[i];
+    AliasEntry a = sceneEmissiveAlias[i];
     uint idx = (rand(rng) < a.prob) ? i : a.alias;
 
-    EmissiveTri t = emissiveTris[idx];
+    EmissiveTri t = sceneEmissiveTris[idx];
     float3 p0 = t.p0Area.xyz;
     float3 e1 = t.e1LeR.xyz;
     float3 e2 = t.e2LeG.xyz;
@@ -401,13 +401,13 @@ public EmissiveLightSample sampleEmissive(inout uint rng, float3 P) {
     if (t.meta.z >= 0) {
         uint io  = (uint)t.meta.x;
         uint pi  = (uint)t.meta.y;
-        uint vi0 = fetchTriangleIndex(globalIndices, io, pi, 0u);
-        uint vi1 = fetchTriangleIndex(globalIndices, io, pi, 1u);
-        uint vi2 = fetchTriangleIndex(globalIndices, io, pi, 2u);
-        float2 uv = fetchVertexUV(globalVertices, vi0) * (1.0 - b1 - b2)
-                  + fetchVertexUV(globalVertices, vi1) * b1
-                  + fetchVertexUV(globalVertices, vi2) * b2;
-        radiance *= textures[NonUniformResourceIndex(t.meta.z)].SampleLevel(samplers[0], uv, 0.0).rgb;
+        uint vi0 = fetchTriangleIndex(sceneIndices, io, pi, 0u);
+        uint vi1 = fetchTriangleIndex(sceneIndices, io, pi, 1u);
+        uint vi2 = fetchTriangleIndex(sceneIndices, io, pi, 2u);
+        float2 uv = fetchVertexUV(sceneVertices, vi0) * (1.0 - b1 - b2)
+                  + fetchVertexUV(sceneVertices, vi1) * b1
+                  + fetchVertexUV(sceneVertices, vi2) * b2;
+        radiance *= sceneTextures[NonUniformResourceIndex(t.meta.z)].SampleLevel(sceneSamplers[0], uv, 0.0).rgb;
     }
 
     es.L        = L;

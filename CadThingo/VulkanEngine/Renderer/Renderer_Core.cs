@@ -366,13 +366,12 @@ public unsafe partial class Renderer
         ptComputePipeline.WriteIblDescriptors();
 
         // Wavefront path tracer (RenderMode.RayWavefront). Shares the same accumulator /
-        // out-color images + scene buffers as the megakernel; the set-4 SoA working set is
-        // pipeline-owned. Set 1 / set 4 / frame UBO are written by Initialize; storage images +
-        // lights + IBL here, and TLAS / shadow / emissive below after InitRayQuery.
+        // out-color images as the megakernel; scene buffers (TLAS / lights / shadow info /
+        // vb+ib / emissive / bindless) come from the scene set. The SoA working set is
+        // pipeline-owned. Only the storage-image IO + IBL sets are wired here.
         wavefrontPipeline = new WavefrontPTPipeline(this);
         wavefrontPipeline.Initialize();
         wavefrontPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-        wavefrontPipeline.WriteLightsDescriptor();
         wavefrontPipeline.WriteIblDescriptors();
 
         // Opt-in RT-pipeline path tracer (RenderMode.RayTrace). Shares the same
@@ -442,21 +441,13 @@ public unsafe partial class Renderer
         // from the scene set (registry).
         if (tlas.Handle != 0)
         {
-            wavefrontPipeline.WriteTlasDescriptor(tlas);
             selection.WriteTlasDescriptor(tlas);
-            // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
-            // shadow-ray path. Has to happen after InitRayQuery because the
-            // SSBO is allocated inside RebuildTlas.
-            wavefrontPipeline.WriteShadowInfoDescriptor();
             // Pick + selection resolve the hit entity through the same flat
             // ShadowEntityInfo table (per-cluster instances → entity via
             // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex).
             selection.WriteEntityInfoDescriptor();
-            // Emissive area-light buffers (built inside RebuildTlas, always
-            // allocated with ≥1 slot so the binding is valid even with no emitters).
-            wavefrontPipeline.WriteEmissiveDescriptors();
-            // rtPipeline / reStirPipeline read TLAS / shadow-info / emissive from the
-            // registry-owned scene set — no per-pipeline fan-out needed.
+            // wavefront / rtPipeline / reStirPipeline read TLAS / shadow-info / emissive
+            // from the registry-owned scene set — no per-pipeline fan-out needed.
         }
 
         // Scene-set registrations: every provider that exists

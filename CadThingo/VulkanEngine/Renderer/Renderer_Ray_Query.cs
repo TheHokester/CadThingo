@@ -1038,16 +1038,15 @@ public unsafe partial class Renderer
         // descriptor set even when the shadow-info buffer didn't grow.
         if (tlas.Handle != 0)
         {
-            wavefrontPipeline?.WriteTlasDescriptor(tlas);
             selection?.WriteTlasDescriptor(tlas);
             // Scene set: same handle change, one call — covers the deferred/transparent
-            // passes and the RT-pipeline / ReSTIR tracers (all read TLAS from the scene set).
+            // passes and the wavefront / RT-pipeline / ReSTIR tracers (all read TLAS from
+            // the scene set).
             descriptorRegistry.RegisterTlas("sceneTlas", tlas);
         }
 
         if (shadowInfoBufferResized)
         {
-            wavefrontPipeline?.WriteShadowInfoDescriptor();
             selection?.WriteEntityInfoDescriptor();
             descriptorRegistry.RegisterBuffer("sceneEntityInfo", shadowInfoBuffer);
             shadowInfoBufferResized = false;
@@ -1058,7 +1057,6 @@ public unsafe partial class Renderer
         // re-write is only needed on resize.
         if (emissiveBuffersResized)
         {
-            wavefrontPipeline?.WriteEmissiveDescriptors();
             descriptorRegistry.RegisterBuffer("sceneEmissiveTris", emissiveTriBuffer);
             descriptorRegistry.RegisterBuffer("sceneEmissiveAlias", emissiveAliasBuffer);
             emissiveBuffersResized = false;

@@ -11,18 +11,17 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 //
 //  Wavefront path-tracer pipeline (graph-resident, dispatchIndirect, SoA).
 //
-//  Owns:    PathFrameUBO per frame; 9 compute PSOs (Generate x4 by camera-mode
-//           spec id 0, plus Extend / Shade / Connect / Finalize / PrepareArgs);
-//           the descriptor-set-4 SoA working-set buffers (device-local, single-
-//           buffered, sized to the render extent); sets 0/1/3/4 layouts.
-//  Borrows: sets 0-3 contents -- TLAS, lights SSBO, ShadowEntityInfo, global
-//           VB/IB, IBL cubes, bindless materials/textures -- written verbatim
-//           from the same renderer-owned sources the megakernel uses.
+//  Owns:    9 compute PSOs (Generate x4 by camera-mode spec id 0, plus Extend /
+//           Shade / Connect / Finalize / Tail); the set-3 SoA working-set buffers
+//           (device-local, single-buffered, sized to the render extent); sets 1/2/3
+//           layouts. PathFrameUBO is staged per frame and pushed into the scene set's
+//           (0,0) constant-arena slot at record.
+//  Borrows: the scene set (set 0, registry-owned) -- TLAS, lights, ShadowEntityInfo,
+//           global VB/IB, emissive tables, bindless materials/textures/samplers.
 //
 //  Inherits PipelineBase (not ComputePipeline) for full control over the multi-
 //  PSO build, exactly like PTComputePipeline. All 9 PSOs share one pipeline
-//  layout (5 sets + a single 16-byte ComputeBit push-constant range that covers
-//  both WavefrontPush (workers) and ArgsPc (PrepareArgs)).
+//  layout (4 sets + a single 16-byte ComputeBit push-constant range for WavefrontPush).
 public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 {
     // Matches WavefrontBindings / PTUtils PathFrameUBO byte-for-byte (same as
@@ -57,11 +56,12 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
 
-    private const int SetFrame     = 0;
-    private const int SetGeom      = 1;
-    private const int SetBindless  = 2;
-    private const int SetIbl       = 3;
-    private const int SetWavefront = 4;
+    // Set 0 borrowed from DescriptorRegistry (scene resources + the (0,0) constant-arena slot
+    // carrying PathFrameUBO); sets 1 (IO) / 2 (IBL) / 3 (SoA working set) are pipeline-owned.
+    private const int SetScene     = 0;
+    private const int SetIO        = 1;
+    private const int SetIbl       = 2;
+    private const int SetWavefront = 3;
 
     // ---- Material-sorted shading (P3): C routing classes (must match WavefrontBindings.WF_SHADE_CLASSES) -
     public const uint ShadeClasses = 4u;
@@ -175,7 +175,10 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     public Buffer ConnectArgsBuffer0 => _set4Buf[B_CONNECT_ARGS0];
     public Buffer ConnectArgsBuffer1 => _set4Buf[B_CONNECT_ARGS1];
 
-    private UboBuffer[] _frameUbos = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    // Frame constants staged by UpdatePerFrame, pushed once per frame into the scene set's
+    // (0,0) constant arena; the returned dynamic offset is cached for every BindSets this frame.
+    private PathFrameUBO _frameUbo;
+    private uint         _frameConstants;
 
     // ---- TEMP/debug: per-bounce indirect-args readback (compaction visualization) -----------
     // dispatchArgs is copied here (host-visible, mapped) each frame so the Stats panel can show
@@ -207,42 +210,28 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
 
-    // ---- Descriptor-set layouts (sets 0-3 verbatim from PTComputePipeline) ----
+    // ---- Descriptor-set layouts. Set 0 borrowed from the registry; sets 1-3 owned. ----
     protected override void CreateDescriptorSetLayouts()
     {
-        DescriptorSetLayouts            = new DescriptorSetLayout[5];
-        OwnedDescriptorSetLayoutIndices = new[] { SetFrame, SetGeom, SetIbl, SetWavefront };
+        DescriptorSetLayouts            = new DescriptorSetLayout[4];
+        OwnedDescriptorSetLayoutIndices = new[] { SetIO, SetIbl, SetWavefront };
+        DescriptorSetLayouts[SetScene]  = Renderer.descriptorRegistry.SceneSetLayout;
 
-        // Set 0: UBO + lights + TLAS + shadow info + accumulator + outColor + emissive tris + alias.
-        var set0 = stackalloc DescriptorSetLayoutBinding[8];
-        set0[0] = Binding(0, DescriptorType.UniformBuffer);
-        set0[1] = Binding(1, DescriptorType.StorageBuffer);
-        set0[2] = Binding(2, DescriptorType.AccelerationStructureKhr);
-        set0[3] = Binding(3, DescriptorType.StorageBuffer);
-        set0[4] = Binding(4, DescriptorType.StorageImage);
-        set0[5] = Binding(5, DescriptorType.StorageImage);
-        set0[6] = Binding(6, DescriptorType.StorageBuffer);
-        set0[7] = Binding(7, DescriptorType.StorageBuffer);
-        CreateLayout(set0, 8, out DescriptorSetLayouts[SetFrame]);
-
-        // Set 1: globalVertices (1) + globalIndices (2). Binding 0 intentionally unused.
+        // Set 1: accumulator + outColor storage images.
         var set1 = stackalloc DescriptorSetLayoutBinding[2];
-        set1[0] = Binding(1, DescriptorType.StorageBuffer);
-        set1[1] = Binding(2, DescriptorType.StorageBuffer);
-        CreateLayout(set1, 2, out DescriptorSetLayouts[SetGeom]);
+        set1[0] = Binding(0, DescriptorType.StorageImage);
+        set1[1] = Binding(1, DescriptorType.StorageImage);
+        CreateLayout(set1, 2, out DescriptorSetLayouts[SetIO]);
 
-        // Set 2: borrowed bindless layout.
-        DescriptorSetLayouts[SetBindless] = Engine.ResourceManager.GetBindlessLayout();
+        // Set 2: IBL cubes + BRDF LUT + full-res envCube (4 combined image samplers; only envCube read).
+        var set2 = stackalloc DescriptorSetLayoutBinding[4];
+        for (uint b = 0; b < 4; b++) set2[b] = Binding(b, DescriptorType.CombinedImageSampler);
+        CreateLayout(set2, 4, out DescriptorSetLayouts[SetIbl]);
 
-        // Set 3: IBL cubes + BRDF LUT + full-res envCube (4 combined image samplers).
-        var set3 = stackalloc DescriptorSetLayoutBinding[4];
-        for (uint b = 0; b < 4; b++) set3[b] = Binding(b, DescriptorType.CombinedImageSampler);
-        CreateLayout(set3, 4, out DescriptorSetLayouts[SetIbl]);
-
-        // Set 4: 18 storage buffers (the SoA working set).
-        var set4 = stackalloc DescriptorSetLayoutBinding[Set4BindingCount];
-        for (uint b = 0; b < Set4BindingCount; b++) set4[b] = Binding(b, DescriptorType.StorageBuffer);
-        CreateLayout(set4, Set4BindingCount, out DescriptorSetLayouts[SetWavefront]);
+        // Set 3: the SoA working set (25 storage buffers).
+        var set3 = stackalloc DescriptorSetLayoutBinding[Set4BindingCount];
+        for (uint b = 0; b < Set4BindingCount; b++) set3[b] = Binding(b, DescriptorType.StorageBuffer);
+        CreateLayout(set3, Set4BindingCount, out DescriptorSetLayouts[SetWavefront]);
     }
 
     private static DescriptorSetLayoutBinding Binding(uint binding, DescriptorType type) => new()
@@ -322,12 +311,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
 
-    // ---- Owned resources: per-frame UBO + the set-4 SoA buffers ---------------
+    // ---- Owned resources: the set-3 SoA buffers (frame UBO rides the scene arena) -----
     protected override void CreateResources()
     {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Gfx.CreateMappedUniformBuffer(sizeof(PathFrameUBO), ref _frameUbos[i]);
-
         AllocSet4(PathCount(Renderer.RenderExtent));
 
         // TEMP/debug compaction readback staging (host-visible, mapped). See _argsReadback.
@@ -427,13 +413,12 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     // ---- Descriptor-set allocation -------------------------------------------
     protected override void CreateDescriptorSets()
     {
-        DescriptorSets = new DescriptorSet[5][];
+        DescriptorSets = new DescriptorSet[4][];
 
-        // Set 0 — per frame-in-flight.
-        DescriptorSets[SetFrame] = AllocSets(SetFrame, Renderer.MAX_CONCURRENT_FRAMES);
-        // Sets 1 / 3 / 4 — single shared (handles are renderer/pipeline-wide singletons).
-        DescriptorSets[SetGeom]      = AllocSets(SetGeom, 1);
-        DescriptorSets[SetBindless]  = null;   // borrowed
+        // Set 0 — registry-owned; Record binds Renderer.descriptorRegistry.SceneSet(frame).
+        DescriptorSets[SetScene] = null;
+        // Sets 1 / 2 / 3 — single shared (handles are renderer/pipeline-wide singletons).
+        DescriptorSets[SetIO]        = AllocSets(SetIO, 1);
         DescriptorSets[SetIbl]       = AllocSets(SetIbl, 1);
         DescriptorSets[SetWavefront] = AllocSets(SetWavefront, 1);
     }
@@ -455,29 +440,13 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
 
-    // Owned writes at init; everything external has a public Write* the renderer calls.
+    // Owned writes at init; the storage-image + IBL sets are wired externally by the renderer.
     protected override void WriteDescriptors()
     {
-        WriteFrameUboDescriptors();
-        WriteGeometryDescriptors();
         WriteSet4Descriptors();
     }
 
-    private void WriteFrameUboDescriptors()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo info = new() { Buffer = _frameUbos[i].buffer, Offset = 0, Range = (ulong)sizeof(PathFrameUBO) };
-            var write = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 0,
-                DescriptorType = DescriptorType.UniformBuffer, DescriptorCount = 1, PBufferInfo = &info,
-            };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    /// <summary>Set 4 bindings 0-17: the SoA working set. Stable pipeline-owned handles,
+    /// <summary>Set 3 (the SoA working set). Stable pipeline-owned handles,
     /// so write once at init + after a resize realloc.</summary>
     public void WriteSet4Descriptors()
     {
@@ -496,100 +465,20 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         Vk.UpdateDescriptorSets(Device, Set4BindingCount, writes, 0, null);
     }
 
-    /// <summary>Set 1 bindings 1/2: globalVertices + globalIndices. Renderer-wide singletons.</summary>
-    public void WriteGeometryDescriptors()
-    {
-        var rm = Engine.ResourceManager;
-        DescriptorBufferInfo vbInfo = new() { Buffer = rm.GlobalVertexBuffer, Offset = 0, Range = Vk.WholeSize };
-        DescriptorBufferInfo ibInfo = new() { Buffer = rm.GlobalIndexBuffer,  Offset = 0, Range = Vk.WholeSize };
-        var writes = stackalloc WriteDescriptorSet[2];
-        writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetGeom][0], DstBinding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &vbInfo };
-        writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetGeom][0], DstBinding = 2, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &ibInfo };
-        Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-    }
-
-    /// <summary>Set 0 binding 1: PbrLight SSBO. Borrowed from Renderer.</summary>
-    public void WriteLightsDescriptor()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo info = new()
-            {
-                Buffer = Renderer.GetLightStorageBuffer((uint)i), Offset = 0,
-                Range = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
-            };
-            var write = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &info };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    /// <summary>Set 0 binding 2: TLAS. Call after InitRayQuery + every TLAS rebuild.</summary>
-    public void WriteTlasDescriptor(AccelerationStructureKHR tlas)
-    {
-        if (tlas.Handle == 0) return;
-        var tlasH = tlas;
-        var asWrite = new WriteDescriptorSetAccelerationStructureKHR
-        {
-            SType = StructureType.WriteDescriptorSetAccelerationStructureKhr,
-            AccelerationStructureCount = 1, PAccelerationStructures = &tlasH,
-        };
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            var write = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, PNext = &asWrite, DstSet = DescriptorSets[SetFrame][i],
-                DstBinding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1,
-            };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    /// <summary>Set 0 binding 3: ShadowEntityInfo SSBO. Re-call on every reallocation.</summary>
-    public void WriteShadowInfoDescriptor()
-    {
-        var buf = Renderer.ShadowInfoBuffer;
-        if (buf.Handle == 0) return;
-        DescriptorBufferInfo info = new() { Buffer = buf, Offset = 0, Range = Renderer.ShadowInfoBufferSize };
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            var write = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 3, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &info };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    /// <summary>Set 0 bindings 6/7: emissive-triangle SSBO + alias table. Borrowed from Renderer.</summary>
-    public void WriteEmissiveDescriptors()
-    {
-        var triBuf   = Renderer.EmissiveTriBuffer;
-        var aliasBuf = Renderer.EmissiveAliasBuffer;
-        if (triBuf.Handle == 0 || aliasBuf.Handle == 0) return;
-        DescriptorBufferInfo triInfo   = new() { Buffer = triBuf,   Offset = 0, Range = Renderer.EmissiveTriBufferSize };
-        DescriptorBufferInfo aliasInfo = new() { Buffer = aliasBuf, Offset = 0, Range = Renderer.EmissiveAliasBufferSize };
-        var writes = stackalloc WriteDescriptorSet[2];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 6, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &triInfo };
-            writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 7, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &aliasInfo };
-            Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-        }
-    }
-
-    /// <summary>Set 0 bindings 4/5: accumulator + outColor storage images (both in General).</summary>
+    /// <summary>Set 1 bindings 0/1: accumulator + outColor storage images (both in General).
+    /// Single shared set (both frames dispatch into the same images).</summary>
     public void WriteStorageImageDescriptors(ImageView accumView, ImageView outColorView)
     {
         DescriptorImageInfo accumInfo = new() { ImageView = accumView,    ImageLayout = ImageLayout.General };
         DescriptorImageInfo outInfo   = new() { ImageView = outColorView, ImageLayout = ImageLayout.General };
         var writes = stackalloc WriteDescriptorSet[2];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 4, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &accumInfo };
-            writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 5, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &outInfo };
-            Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-        }
+        writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 0, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &accumInfo };
+        writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 1, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &outInfo };
+        Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
         MarkAccumulatorDirty();
     }
 
-    /// <summary>Set 3 bindings 0/1/2/3: irradiance + prefiltered + BRDF LUT + full-res envCube.</summary>
+    /// <summary>Set 2 bindings 0/1/2/3: irradiance + prefiltered + BRDF LUT + full-res envCube.</summary>
     public void WriteIblDescriptors()
     {
         var imageInfos = stackalloc DescriptorImageInfo[4]
@@ -626,7 +515,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         float fovRad     = fovDeg * (float)(Math.PI / 180.0);
         float tanHalfFov = MathF.Tan(fovRad * 0.5f);
 
-        PathFrameUBO ubo = new()
+        _frameUbo = new PathFrameUBO
         {
             invView                  = invView,
             invProj                  = invProj,
@@ -647,8 +536,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
             emissiveTriCount         = Renderer.EmissiveTriangleCount,
             totalEmissivePower       = Renderer.TotalEmissivePower,
         };
-        void* data = _frameUbos[frameIndex].mapped;
-        new Span<PathFrameUBO>(data, 1).Fill(ubo);
+        // Push once per frame; every BindSets this frame reuses the returned dynamic offset.
+        // Safe here: the registry reset this frame's arena slice in BeginFrame, before Render.
+        _frameConstants = Renderer.descriptorRegistry.ConstantArena.Push(frameIndex, _frameUbo);
         return reset;
     }
 
@@ -656,15 +546,15 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     // ---- Record helpers (the module's pass bodies call these) -----------------
     private void BindSets(CommandBuffer cmd, uint frameIndex)
     {
-        var sets = stackalloc DescriptorSet[5]
+        uint frameConstants = _frameConstants;
+        var sets = stackalloc DescriptorSet[4]
         {
-            DescriptorSets[SetFrame][frameIndex],
-            DescriptorSets[SetGeom][0],
-            Engine.ResourceManager.GetBindlessSet(frameIndex),
+            Renderer.descriptorRegistry.SceneSet(frameIndex),
+            DescriptorSets[SetIO][0],
             DescriptorSets[SetIbl][0],
             DescriptorSets[SetWavefront][0],
         };
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 5, sets, 0, null);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 4, sets, 1, &frameConstants);
     }
 
     private void PushWavefront(CommandBuffer cmd, uint bounce, uint argsClass)
@@ -782,7 +672,6 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         if (_tailPso.Handle     != 0) Vk.DestroyPipeline(Device, _tailPso, null);
 
         FreeSet4();
-        foreach (var b in _frameUbos) Gfx.DestroyBuffer(b.buffer, b.alloc);
         Gfx.DestroyBuffer(_argsReadback.buffer, _argsReadback.alloc);   // TEMP/debug readback staging
         base.Dispose();   // destroys mode-0 PSO (= PipelineHandle), layout, owned DSLs, cache
     }
