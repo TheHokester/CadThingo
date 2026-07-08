@@ -40,31 +40,37 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
         };
     }
 
+    // Set 0 borrowed from the registry (sceneTlas + sceneEntityInfo); set 1 owns the mask image.
+    private const int SetScene = 0;
+    private const int SetMask  = 1;
+
     protected override void CreateDescriptorSetLayouts()
     {
-        // Binding 2: entityInfo SSBO — the hit resolves to an entity via
-        // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex now that
-        // instances are per-cluster (custom index is no longer the entity).
-        var bindings = stackalloc DescriptorSetLayoutBinding[3];
-        bindings[0] = new() { Binding = 0, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        bindings[1] = new() { Binding = 1, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        bindings[2] = new() { Binding = 2, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-
+        // Set 1 binding 0: the R32F coverage mask. TLAS + entityInfo now resolve
+        // through the scene set (sceneTlas / sceneEntityInfo).
+        var binding = new DescriptorSetLayoutBinding
+        {
+            Binding = 0, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit,
+        };
         DescriptorSetLayoutCreateInfo info = new()
         {
             SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 3,
-            PBindings    = bindings,
+            BindingCount = 1,
+            PBindings    = &binding,
         };
         if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
             throw new Exception("Failed to create selection-mask descriptor set layout");
-        DescriptorSetLayouts            = new[] { layout };
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
+
+        DescriptorSetLayouts            = new DescriptorSetLayout[2];
+        DescriptorSetLayouts[SetScene]  = Renderer.descriptorRegistry.SceneSetLayout;
+        DescriptorSetLayouts[SetMask]   = layout;
+        OwnedDescriptorSetLayoutIndices = new[] { SetMask };
     }
 
     protected override void CreateDescriptorSets()
     {
-        var layout = DescriptorSetLayouts[0];
+        // Set 0 is registry-owned; Record binds descriptorRegistry.SceneSet(frame).
+        var layout = DescriptorSetLayouts[SetMask];
         DescriptorSetAllocateInfo alloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
@@ -72,60 +78,19 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
             DescriptorSetCount = 1,
             PSetLayouts        = &layout,
         };
-        DescriptorSets    = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[0])
+        DescriptorSets           = new DescriptorSet[2][];
+        DescriptorSets[SetScene] = null;
+        DescriptorSets[SetMask]  = new DescriptorSet[1];
+        fixed (DescriptorSet* p = DescriptorSets[SetMask])
             if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
                 throw new Exception("Failed to allocate selection-mask descriptor set");
     }
 
-    // Both descriptors target external resources (TLAS / mask image) whose
-    // handles change on rebuild / resize, so they're written explicitly.
+    // The mask image is the only owned resource; its handle changes on resize, so it's
+    // written explicitly. TLAS + entityInfo ride the scene set.
     protected override void WriteDescriptors() { }
 
-    /// <summary>Binding 0: TLAS. Call after InitRayQuery and on every rebuild.</summary>
-    public void WriteTlasDescriptor(AccelerationStructureKHR tlas)
-    {
-        if (tlas.Handle == 0) return;
-        var tlasH = tlas;
-        var asWrite = new WriteDescriptorSetAccelerationStructureKHR
-        {
-            SType                      = StructureType.WriteDescriptorSetAccelerationStructureKhr,
-            AccelerationStructureCount = 1,
-            PAccelerationStructures    = &tlasH,
-        };
-        var write = new WriteDescriptorSet
-        {
-            SType           = StructureType.WriteDescriptorSet,
-            PNext           = &asWrite,
-            DstSet          = DescriptorSets[0][0],
-            DstBinding      = 0,
-            DescriptorType  = DescriptorType.AccelerationStructureKhr,
-            DescriptorCount = 1,
-        };
-        Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-    }
-
-    /// <summary>Binding 2: the renderer-owned ShadowEntityInfo SSBO. Call after
-    /// InitRayQuery and whenever the buffer reallocates (resize).</summary>
-    public void WriteEntityInfoDescriptor()
-    {
-        var buf = Renderer.ShadowInfoBuffer;
-        if (buf.Handle == 0) return;
-        DescriptorBufferInfo info = new() { Buffer = buf, Offset = 0, Range = Renderer.ShadowInfoBufferSize };
-        var write = new WriteDescriptorSet
-        {
-            SType           = StructureType.WriteDescriptorSet,
-            DstSet          = DescriptorSets[0][0],
-            DstBinding      = 2,
-            DescriptorType  = DescriptorType.StorageBuffer,
-            DescriptorCount = 1,
-            PBufferInfo     = &info,
-        };
-        Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-    }
-
-    /// <summary>Binding 1: the R32F mask storage image (GENERAL layout). Call at
+    /// <summary>Set 1 binding 0: the R32F mask storage image (GENERAL layout). Call at
     /// init and on every render-target resize.</summary>
     public void WriteMaskImageDescriptor(ImageView maskView)
     {
@@ -133,8 +98,8 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
         var write = new WriteDescriptorSet
         {
             SType           = StructureType.WriteDescriptorSet,
-            DstSet          = DescriptorSets[0][0],
-            DstBinding      = 1,
+            DstSet          = DescriptorSets[SetMask][0],
+            DstBinding      = 0,
             DescriptorType  = DescriptorType.StorageImage,
             DescriptorCount = 1,
             PImageInfo      = &info,
@@ -143,13 +108,22 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
     }
 
     /// <summary>Records the full-screen mask dispatch (8×8 threads/group, matching
-    /// [numthreads(8,8,1)]). The mask image must be in GENERAL before this call.</summary>
+    /// [numthreads(8,8,1)]). The mask image must be in GENERAL before this call. Runs in
+    /// the per-frame command buffer after BeginFrame, so the current frame's scene set is
+    /// fresh.</summary>
     public void Record(CommandBuffer cmd, in Matrix4x4 invViewProj, Vector3 camPos,
                        Extent2D extent, uint selectedIndex)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, PipelineHandle);
-        var dset = DescriptorSets[0][0];
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, PipelineLayoutHandle, 0, 1, &dset, 0, null);
+
+        // Scene set (zero dynamic offset: mask params stay push constants) + owned mask set.
+        uint zeroOffset = 0;
+        var sets = stackalloc DescriptorSet[2]
+        {
+            Renderer.descriptorRegistry.SceneSet(Renderer.currentFrame),
+            DescriptorSets[SetMask][0],
+        };
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);
 
         var push = new MaskPushConstants
         {

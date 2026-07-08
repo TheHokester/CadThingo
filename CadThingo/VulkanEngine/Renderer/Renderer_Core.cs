@@ -436,19 +436,7 @@ public unsafe partial class Renderer
         // Build BLAS / TLAS for ray-traced shadows. Gated on RayShadowsSupported
         // inside InitRayQuery — safe to call even when ray queries aren't available.
         InitRayQuery();
-        // Bind the TLAS into the tracers' descriptor sets — they walk it for
-        // ray-traced work. The deferred lighting + transparent passes read it
-        // from the scene set (registry).
-        if (tlas.Handle != 0)
-        {
-            selection.WriteTlasDescriptor(tlas);
-            // Pick + selection resolve the hit entity through the same flat
-            // ShadowEntityInfo table (per-cluster instances → entity via
-            // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex).
-            selection.WriteEntityInfoDescriptor();
-            // wavefront / rtPipeline / reStirPipeline read TLAS / shadow-info / emissive
-            // from the registry-owned scene set — no per-pipeline fan-out needed.
-        }
+        
 
         // Scene-set registrations: every provider that exists
         // at init, matched by SceneBindings parameter name. Runtime handle changes

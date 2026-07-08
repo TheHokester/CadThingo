@@ -1034,20 +1034,13 @@ public unsafe partial class Renderer
         // BLASes, so newly-joined meshes are picked up automatically.
         RebuildTlas();
 
-        // TLAS handle changes on every rebuild — re-bind it on every consumer
-        // descriptor set even when the shadow-info buffer didn't grow.
+        // TLAS handle changes on every rebuild - one scene-set re-register covers every
+        // consumer 
         if (tlas.Handle != 0)
-        {
-            selection?.WriteTlasDescriptor(tlas);
-            // Scene set: same handle change, one call — covers the deferred/transparent
-            // passes and the wavefront / RT-pipeline / ReSTIR tracers (all read TLAS from
-            // the scene set).
             descriptorRegistry.RegisterTlas("sceneTlas", tlas);
-        }
 
         if (shadowInfoBufferResized)
         {
-            selection?.WriteEntityInfoDescriptor();
             descriptorRegistry.RegisterBuffer("sceneEntityInfo", shadowInfoBuffer);
             shadowInfoBufferResized = false;
         }

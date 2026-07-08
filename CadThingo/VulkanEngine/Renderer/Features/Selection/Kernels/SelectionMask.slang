@@ -9,7 +9,7 @@
 // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex — a RenderableHandle
 // slot; the CPU passes the selected entity's slot in params.selectedIndex.
 
-import CommonTypes;   // ShadowEntityInfo
+import SceneBindings;   // scene set 0: sceneTlas + sceneEntityInfo
 
 struct MaskParams {
     float4x4 invViewProj;   // un-projects NDC -> world (matches the raster image)
@@ -21,9 +21,8 @@ struct MaskParams {
 
 [[vk::push_constant]] MaskParams params;
 
-[[vk::binding(0, 0)]] RaytracingAccelerationStructure tlas;
-[[vk::binding(1, 0)]] RWTexture2D<float>             mask;
-[[vk::binding(2, 0)]] StructuredBuffer<ShadowEntityInfo> entityInfo;
+// Set 1 - pass-local coverage mask output. TLAS + entityInfo come from the scene set.
+[[vk::binding(0, 1)]] RWTexture2D<float> mask;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -43,13 +42,13 @@ void main(uint3 gid : SV_DispatchThreadID) {
     ray.TMax      = 1e30;
 
     RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    q.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xFF, ray);
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
             q.CommitNonOpaqueTriangleHit();
     }
 
     bool hitSelected = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT &&
-                       entityInfo[q.CommittedInstanceID() + q.CommittedGeometryIndex()].entityIndex == params.selectedIndex;
+                       sceneEntityInfo[q.CommittedInstanceID() + q.CommittedGeometryIndex()].entityIndex == params.selectedIndex;
     mask[px] = hitSelected ? 1.0 : 0.0;
 }

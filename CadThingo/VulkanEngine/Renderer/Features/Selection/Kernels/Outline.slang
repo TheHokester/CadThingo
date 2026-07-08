@@ -54,6 +54,6 @@ float4 PSMain(VSOutput input) : SV_TARGET {
         }
     }
 
-    if (maxN < 0.5) discard;   // not adjacent to the selection — leave pixel untouched
+    if (maxN < 0.5) discard;   // not adjacent to the selection - leave pixel untouched
     return float4(params.color.rgb, 1.0);
 }

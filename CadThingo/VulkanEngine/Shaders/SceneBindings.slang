@@ -1,14 +1,12 @@
-// Canonical scene descriptor set (set 0) - the single source of truth for the unified
-// scene layout (docs/descriptor-system.md section 5). Shaders import this module instead
+// scene descriptor set (set 0). Shaders import this module instead
 // of declaring their own scene resources; DescriptorRegistry reflects it once to build
-// the canonical VkDescriptorSetLayout and owns the per-frame set instances.
+// the VkDescriptorSetLayout and owns the per-frame set instances.
 //
 // Binding 0 is deliberately NOT declared here: it is the reserved per-pass constant slot.
 // An entry shader declares its own
 //     [[vk::binding(0, 0)]] ConstantBuffer<MyPassParams> gPass;
-// and the canonical layout carries binding 0 as UNIFORM_BUFFER_DYNAMIC pointing into the
-// per-frame constant arena (SPIR-V does not encode dynamic-ness, so the shader's plain
-// ConstantBuffer stays layout-compatible).
+// and the layout carries binding 0 as UNIFORM_BUFFER_DYNAMIC pointing into the
+// per-frame constant arena 
 //
 // The unbounded texture array must stay the HIGHEST binding (variable-count rule).
 module SceneBindings;
