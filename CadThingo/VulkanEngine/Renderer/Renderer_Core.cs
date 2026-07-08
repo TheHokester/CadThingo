@@ -444,13 +444,9 @@ public unsafe partial class Renderer
         RegisterSceneBindings();
         Console.WriteLine(descriptorRegistry.DumpBindings());
 
-        // Stand up the L3 render cores (eager). Each ctor registers the core into _renderCores
+        // Stand up the render cores. Each ctor registers the core into _renderCores
         // (RegisterCore) -- construction order IS the list/combo order, so Deferred (index 0) is
-        // the boot default + fallback. DeferredCore's ctor builds + compiles the deferred FrameGraph
-        // (which OWNS the g-buffers / depth / HDR transients and imports FinalColor) and rebinds the
-        // lighting g-buffer + tonemap-HDR descriptors from the fresh transient views. The PT/RT cores
-        // wrap the renderer-owned PT pipelines; the RT-pipeline-only cores (RayTrace, ReSTIR DI) are
-        // built only when the device exposed the feature, so they self-exclude from the combo.
+        // the boot default + fallback. 
         new DeferredCore(this);
         new PathtraceComputeCore(this);
         if (rtPipeline != null)     new PathtraceRTCore(this);
@@ -481,7 +477,7 @@ public unsafe partial class Renderer
         SpawnTestProbe();
     }
 
-    // Phase 3 smoke test — a single reflection probe at the scene origin. Once
+    // Reflection probe test - a single reflection probe at the scene origin. Once
     // Phase 4 lands its capture shader, this probe will start producing actual
     // prefiltered cubemap content. Until then the registration / scheduler path
     // is what gets exercised.
@@ -662,11 +658,11 @@ public unsafe partial class Renderer
         }
     }
 
-    // Centralized teardown (L1.6). Each lifetime-scoped owner (FrameRing, RenderTargets,
+    // Centralized teardown. Each lifetime-scoped owner (FrameRing, RenderTargets,
     // Swapchain, GraphicsDevice) frees only what it owns; the orchestrator owns the
-    // *order*. The one hard rule: GraphicsDevice.Dispose() runs strictly last — it frees
+    // *order*. The one hard rule: GraphicsDevice.Dispose() runs strictly last - it frees
     // every VkDeviceMemory block + the device itself, so everything that allocated
-    // through it must already be gone. Globals.vk is a process-wide singleton — never
+    // through it must already be gone. Globals.vk is a process-wide singleton - never
     // disposed here. The window is owned by Engine and disposed by Engine.Shutdown.
     public void Cleanup()
     {
@@ -735,7 +731,7 @@ public unsafe partial class Renderer
         // Swap chain + image views
         swapchain.Dispose();
 
-        // RHI context — strictly last. GraphicsDevice.Dispose() destroys the
+        // RHI context - strictly last. GraphicsDevice.Dispose() destroys the
         // descriptor pool, command pool, frees every VkDeviceMemory block, then
         // tears down device → debug → surface → instance in order. Every resource
         // freed above allocated through it, so it has to outlive them all.
