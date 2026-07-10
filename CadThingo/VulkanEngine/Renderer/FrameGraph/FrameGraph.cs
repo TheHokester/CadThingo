@@ -418,18 +418,18 @@ public unsafe class FrameGraph : IDisposable
         }
     }
 
-    // ---- Step 3.5: queue assignment + submit chunking ----------------------------
-    // Collapse declared queues onto what the device has, then split the schedule into
-    // per-queue submit chunks at the cross-queue edges. Rules:
-    //  - a graphics pass with an async producer (any RAW/WAW/WAR pred) starts a NEW chunk
-    //    whose submit waits that producer chunk's timeline value (a wait gates the whole
-    //    submit, so passes that must NOT wait stay in earlier chunks);
-    //  - a graphics pass with an async CONSUMER closes its chunk with a signal right after
-    //    it, so the consumer has something to wait on;
-    //  - every async pass is its own chunk (v1) and always signals -- graphics consumers
-    //    and next-frame transitive ordering hang off that value.
-    // Cross-queue MEMORY sync rides the semaphores (signal makes all writes available, wait
-    // makes them visible), so BakeSync skips barriers on cross-queue transitions.
+    /// ---- Step 3.5: queue assignment + submit chunking ----------------------------
+    /// Collapse declared queues onto what the device has, then split the schedule into
+    /// per-queue submit chunks at the cross-queue edges. Rules:
+    ///  - a graphics pass with an async producer (any RAW/WAW/WAR pred) starts a NEW chunk
+    ///    whose submit waits that producer chunk's timeline value (a wait gates the whole
+    ///    submit, so passes that must NOT wait stay in earlier chunks);
+    ///  - a graphics pass with an async CONSUMER closes its chunk with a signal right after
+    ///    it, so the consumer has something to wait on;
+    ///  - every async pass is its own chunk (v1) and always signals -- graphics consumers
+    ///    and next-frame transitive ordering hang off that value.
+    /// Cross-queue MEMORY sync rides the semaphores (signal makes all writes available, wait
+    /// makes them visible), so BakeSync skips barriers on cross-queue transitions.
     private void PlanChunks()
     {
         _chunks.Clear();
@@ -606,9 +606,9 @@ public unsafe class FrameGraph : IDisposable
         _gfxCursor = _cmpCursor = 0;
     }
 
-    // ---- Physical-handle resolution (used by PassResources during Execute) --------
-    // Valid only after Compile()'s step 5 has populated the phys handles; until then
-    // these throw, which is the correct signal that Execute ran before allocation.
+    /// ---- Physical-handle resolution (used by PassResources during Execute) --------
+    /// Valid only after Compile()'s step 5 has populated the phys handles; until then
+    /// these throw, which is the correct signal that Execute ran before allocation.
     internal ImageView ResolveView(GraphImage h) =>
         _resources[h.resourceId].PhysView ?? throw new InvalidOperationException(
             $"FrameGraph: image '{_resources[h.resourceId].Name}' has no view (not allocated/imported).");
@@ -947,9 +947,10 @@ public unsafe class FrameGraph : IDisposable
 
     // Writes one binding of a baked pass set for frame f. Image layout is derived from the
     // access usage (the same UsageTable entry that baked the barrier), so the descriptor
-    // layout and the barrier's target layout can never drift. Combined-image-samplers are out
-    // of scope -- pass sets carry SampledImage/StorageImage/StorageBuffer/UniformBuffer only;
-    // sampled images pair with a scene-set sampler.
+    // layout and the barrier's target layout can never drift. A CombinedImageSampler binding
+    // gets its sampler from the pipeline-owned layout's IMMUTABLE sampler (the write's sampler
+    // field is then ignored by Vulkan) -- so every image case writes just view + layout and the
+    // graph never has to own or plumb a sampler.
     private void WritePassBinding(DescriptorSet set, in PassSetSpec spec, in ResourceAccess a, uint frame)
     {
         var b   = FindBinding(spec, a.Bind!);
@@ -965,10 +966,6 @@ public unsafe class FrameGraph : IDisposable
 
         if (a.IsImage)
         {
-            if (b.Type == DescriptorType.CombinedImageSampler)
-                throw new InvalidOperationException(
-                    $"FrameGraph: pass-set binding '{a.Bind}' is a combined image sampler; graph-baked pass " +
-                    "sets support SampledImage/StorageImage only (pair a sampled image with a scene-set sampler).");
             var info = new DescriptorImageInfo
             {
                 ImageView = res.PhysView ?? throw new InvalidOperationException(

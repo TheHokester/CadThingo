@@ -33,10 +33,6 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
     // Cached view of the graph's HDR transient, rebuilt on every graph rebuild
     private ImageView _hdrView;
 
-    // Cached views of the graph's 5 g-buffer transients (pos/normal/albedo/material/emissive),
-    // refreshed on every BuildGraph. 
-    private readonly ImageView[] _gBufferViews = new ImageView[5];
-
     // Per-frame light-cull dispatch dims, written by Render (from PbrDeferredPipeline.UpdatePerFrame)
     // before Execute and pulled by the module's LightCullPass delegate at Execute time.
     private uint _frameLightCount;
@@ -80,15 +76,9 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
         fg.Compile();
         _graph = fg;
 
-        // Compile() just (re)allocated the g-buffer + HDR transients. (Re)bind the only graph
-        // resources read through a PRE-BAKED descriptor set rather than a per-pass res.View: t
-        _gBufferViews[0] = fg.ResolveView(o.Position);
-        _gBufferViews[1] = fg.ResolveView(o.Normal);
-        _gBufferViews[2] = fg.ResolveView(o.Albedo);
-        _gBufferViews[3] = fg.ResolveView(o.Material);
-        _gBufferViews[4] = fg.ResolveView(o.Emissive);
-        _host.PbrDeferredPipeline.WriteGBufferDescriptors(
-            _gBufferViews[0], _gBufferViews[1], _gBufferViews[2], _gBufferViews[3], _gBufferViews[4]);
+        // Compile() baked the g-buffer set (set 1) into the graph from the fresh transients, so
+        // no g-buffer rebind is needed here. Tonemap's HDR input is still a shared pipeline-owned
+        // descriptor, so (re)point it at this build's HDR transient.
         _hdrView = fg.ResolveView(o.Hdr);
         _host.tonemapPipeline.WriteHdrInputDescriptor(_hdrView, _host.gBufferSampler);
     }
@@ -99,12 +89,11 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
     public void Activate() =>
         _host.tonemapPipeline.WriteHdrInputDescriptor(_hdrView, _host.gBufferSampler);
 
-    /// <summary>Re-issues the lighting pass's g-buffer descriptor writes from the cached transient
-    /// views onto the rebuilt PBR pipeline's fresh descriptor set. The host calls this inside
-    /// RebuildPbrPipelines (the only deferred-specific part of that cross-pipeline rewire).</summary>
-    public void OnPbrPipelineRebuilt() =>
-        _host.PbrDeferredPipeline.WriteGBufferDescriptors(
-            _gBufferViews[0], _gBufferViews[1], _gBufferViews[2], _gBufferViews[3], _gBufferViews[4]);
+    /// <summary>Rebuilds the deferred graph after an in-place PBR pipeline rebuild. Rebuild()
+    /// recreates the pipeline's set-1 layout (new handle), so the graph's baked g-buffer set -
+    /// allocated from the old layout - must be re-baked against the new one. The host calls this
+    /// inside RebuildPbrPipelines, which has already idled the device.</summary>
+    public void OnPbrPipelineRebuilt() => BuildGraph();
 
     public void Resize(Extent2D extent) => BuildGraph();
 

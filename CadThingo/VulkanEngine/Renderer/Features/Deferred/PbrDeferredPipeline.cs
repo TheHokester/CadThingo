@@ -1,7 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.Forward;
 using CadThingo.VulkanEngine.Renderer.Features.IBL;   // ReflectionProbeSystem, ProbeGpuRecord
 using Silk.NET.Vulkan;
@@ -55,6 +57,20 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
     private const int SetGBuffer        = 1;
     private const int SetLightingInputs = 2;
 
+    // Graph-baked pass set (set 1): the five g-buffer transients, filled by the deferred
+    // FrameGraph. Names match the LightingPass Read binds; the sampler is immutable in the
+    // layout (see CreateDescriptorSetLayouts), so only the views are written.
+    private static readonly BindingDesc[] _gBufferBindings =
+    {
+        new("gPosition", SetGBuffer, 0, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
+        new("gNormal",   SetGBuffer, 1, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
+        new("gAlbedo",   SetGBuffer, 2, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
+        new("gMaterial", SetGBuffer, 3, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
+        new("gEmissive", SetGBuffer, 4, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
+    };
+
+    public PassSetSpec PassSet => new(SetIndex: SetGBuffer, DescriptorSetLayouts[SetGBuffer], _gBufferBindings);
+
     // Frame constants staged by UpdatePerFrame, pushed into the constant arena
     // by Record (which runs later the same frame inside the graph).
     private LightingFrameUBO _frameUbo;
@@ -66,7 +82,7 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
 
     public PbrDeferredPipeline(Renderer renderer) : base(renderer) { }
 
-    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, ImageView HdrTarget)
+    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, ImageView HdrTarget, DescriptorSet gBufferSet)
     {
         //configure single color output for final lighting result
 
@@ -91,7 +107,7 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
         var sets = stackalloc DescriptorSet[3]
         {
             registry.SceneSet(ctx.FrameIndex),
-            GetDescriptorSet(SetGBuffer, 0),
+            gBufferSet,                               // graph-baked (set 1)
             GetDescriptorSet(SetLightingInputs, ctx.FrameIndex),
         };
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
@@ -162,8 +178,12 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
         OwnedDescriptorSetLayoutIndices = new[] { SetGBuffer, SetLightingInputs };
         DescriptorSetLayouts[SetScene] = Renderer.descriptorRegistry.SceneSetLayout;
 
-        // Set 1: G-Buffer inputs
-        // Five samplers written by the geometry pass, read here for lighting.
+        // Set 1: G-Buffer inputs. Five combined-image-samplers reading the geometry pass's
+        // g-buffer transients. The g-buffer sampler is baked in as an IMMUTABLE sampler so the
+        // deferred FrameGraph (which owns + writes this set - see PassSet) only writes the views,
+        // no sampler plumbing and no update-after-bind. The pipeline owns the LAYOUT; the graph
+        // owns the SETS allocated from it.
+        Sampler gSampler = Renderer.gBufferSampler;
         var set1Bindings = new DescriptorSetLayoutBinding[5];
         for (uint b = 0; b < 5; b++)
         {
@@ -173,7 +193,7 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
                 DescriptorType     = DescriptorType.CombinedImageSampler,
                 DescriptorCount    = 1,
                 StageFlags         = ShaderStageFlags.FragmentBit,
-                PImmutableSamplers = null,
+                PImmutableSamplers = &gSampler,
             };
         }
 
@@ -208,32 +228,17 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
             };
         }
 
-        DescriptorSetLayoutBindingFlagsCreateInfo set1FlagsInfo = new()
-            { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
-        var set1Flags = stackalloc DescriptorBindingFlags[set1Bindings.Length];
-
         fixed (DescriptorSetLayoutBinding* pSet1 = set1Bindings)
         fixed (DescriptorSetLayoutBinding* pSet2 = set2Bindings)
         {
+            // No update-after-bind: the graph writes this set once per Compile (init/resize),
+            // both under device-idle, and only the views change (sampler is immutable).
             DescriptorSetLayoutCreateInfo set1LayoutInfo = new()
             {
                 SType        = StructureType.DescriptorSetLayoutCreateInfo,
                 BindingCount = (uint)set1Bindings.Length,
                 PBindings    = pSet1,
             };
-            if (Gfx.DescriptorIndexingEnabled)
-            {
-                // The g-buffer views are rewired from freshly-allocated graph
-                // transients on every resize; keep them update-after-bind.
-                var updateFlags = DescriptorBindingFlags.UpdateAfterBindBit |
-                                  DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-                for (int i = 0; i < set1Bindings.Length; i++) set1Flags[i] = updateFlags;
-                set1FlagsInfo.BindingCount  = (uint)set1Bindings.Length;
-                set1FlagsInfo.PBindingFlags = set1Flags;
-
-                set1LayoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
-                set1LayoutInfo.PNext = &set1FlagsInfo;
-            }
             if (Vk.CreateDescriptorSetLayout(Device, &set1LayoutInfo, null, out DescriptorSetLayouts[SetGBuffer]) != Result.Success)
                 throw new Exception("Failed to create PBR set 1 (GBuffer) descriptor set layout");
 
@@ -252,27 +257,15 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
     {
         DescriptorSets = new DescriptorSet[3][];
 
-        // Set 0 — scene set is owned by DescriptorRegistry; Record binds
+        // Set 0 - scene set is owned by DescriptorRegistry; Record binds
         // Renderer.descriptorRegistry.SceneSet(frame) directly.
         DescriptorSets[SetScene] = null;
 
-        // Set 1 — shared g-buffer set, one allocation reused by every frame.
-        var gBufLayout = DescriptorSetLayouts[SetGBuffer];
-        DescriptorSetAllocateInfo gBufAlloc = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts        = &gBufLayout,
-        };
-        DescriptorSets[SetGBuffer] = new DescriptorSet[1];
-        fixed (DescriptorSet* pSet = DescriptorSets[SetGBuffer])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &gBufAlloc, pSet) != Result.Success)
-                throw new Exception("Failed to allocate PBR g-buffer descriptor set");
-        }
+        // Set 1 - g-buffer set is owned by the deferred FrameGraph (graph-baked, allocated from
+        // this pipeline's layout). Record binds the set the graph hands it.
+        DescriptorSets[SetGBuffer] = null;
 
-        // Set 2 — per-frame: the tile-cull and probe buffers it points at are
+        // Set 2 - per-frame: the tile-cull and probe buffers it points at are
         // per-frame allocations.
         var inputLayouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
@@ -300,9 +293,9 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
     //   - WriteDescriptors (auto from Initialize): IBL bindings of set 2.
     //   - WriteTileBufferDescriptors(lightCull):   bindings 0,1 of set 2.
     //   - WriteProbeDescriptors():                 bindings 5-8 of set 2.
-    // Set 1 (the g-buffer samplers) is written by WriteGBufferDescriptors from the deferred
-    // FrameGraph's freshly-allocated transient views - initial build + every resize. The
-    // views don't exist at Initialize time, so it is NOT called from here.
+    // Set 1 (the g-buffer) is graph-baked: the deferred FrameGraph allocates it from this
+    // pipeline's layout and writes the transient views (initial build + every resize), so no
+    // g-buffer write lives here.
 
     protected override void WriteDescriptors()
     {
@@ -458,39 +451,6 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
             };
             Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
         }
-    }
-
-    /// <summary>Re-writes the 5 g-buffer sampler bindings on set 1 from the deferred
-    /// FrameGraph's transient g-buffer views. Called from DeferredCore (after its graph Compile,
-    /// on initial build + every resize, and on PBR pipeline rebuild), since those views are
-    /// freshly allocated each Compile and don't exist when the pipeline first initializes.</summary>
-    public void WriteGBufferDescriptors(ImageView position, ImageView normal,
-        ImageView albedo, ImageView material, ImageView emissive)
-    {
-        var sampler = Renderer.gBufferSampler;
-        var imageInfos = stackalloc DescriptorImageInfo[5]
-        {
-            new() { ImageView = position, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = normal,   Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = albedo,   Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = material, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = emissive, Sampler = sampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-        };
-        var writes = stackalloc WriteDescriptorSet[5];
-        for (uint i = 0; i < 5; i++)
-        {
-            writes[i] = new WriteDescriptorSet
-            {
-                SType           = StructureType.WriteDescriptorSet,
-                DstSet          = DescriptorSets[SetGBuffer][0],
-                DstBinding      = i,
-                DstArrayElement = 0,
-                DescriptorType  = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
-                PImageInfo      = &imageInfos[i],
-            };
-        }
-        Vk.UpdateDescriptorSets(Device, 5, writes, 0, null);
     }
 
     // Per-frame upload

@@ -2,6 +2,7 @@ using System.Linq;
 using System.Numerics;
 using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.RenderCores;
 using CadThingo.VulkanEngine.Renderer.Features.Deferred;
@@ -12,6 +13,7 @@ using CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Features.Selection;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -169,8 +171,8 @@ public unsafe partial class Renderer
     // Descriptor-system track (docs/descriptor-system.md): runtime shader compile+cache
     // (Phase A) and the unified scene set + constant arena (Phase B). Pipelines migrate
     // onto these shader-by-shader; until then the registry's sets are written but unbound.
-    internal Shaders.ShaderLibrary shaderLibrary = null!;
-    internal Descriptors.DescriptorRegistry descriptorRegistry = null!;
+    internal ShaderLibrary shaderLibrary = null!;
+    internal DescriptorRegistry descriptorRegistry = null!;
 
     // Render target extent — the size at which the deferred chain (gbuffers,
     // HDRColor, FinalColor) and the lighting tile grid are sized. Distinct from
@@ -578,8 +580,9 @@ public unsafe partial class Renderer
         if (!initialized) return;
         vk!.DeviceWaitIdle(device);
 
-        // In-place rebuild: same pipeline objects, fresh GPU handles -- so the DeferredModule
-        // (and any other holder of these refs) stays valid without rebuilding the graph.
+        // In-place rebuild: same pipeline objects, fresh GPU handles. Pipeline-ref holders stay
+        // valid, but Rebuild recreates the set-1 layout handle, so the deferred graph's baked
+        // g-buffer set must be re-baked (OnPbrPipelineRebuilt below rebuilds the graph).
         // SoftShadowsEnabled is a spec constant, read by Rebuild's Initialize.
         PbrDeferredPipeline.SoftShadowsEnabled = softShadowsEnabled;
         PbrDeferredPipeline.Rebuild();
@@ -587,9 +590,9 @@ public unsafe partial class Renderer
         transparentPipeline.SoftShadowsEnabled = softShadowsEnabled;
         transparentPipeline.Rebuild();
 
-        // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
-        // Set 1 (g-buffer samplers) is no longer written by Initialize — the views live on the
-        // deferred FrameGraph — so let DeferredCore rebind it from its cached transient views.
+        // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets. The
+        // g-buffer set (set 1) is graph-owned now, so DeferredCore re-bakes it by rebuilding
+        // the deferred graph against PBR's new layout.
         _renderCores.OfType<DeferredCore>().FirstOrDefault()?.OnPbrPipelineRebuilt();
         PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         PbrDeferredPipeline.WriteProbeDescriptors();

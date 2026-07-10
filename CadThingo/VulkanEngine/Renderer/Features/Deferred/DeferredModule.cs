@@ -170,17 +170,20 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         scope.AddPass("LightingPass", PassType.Graphics, QueueClass.Graphics,
             b =>
             {
-                b.Read(pos,      ResourceUsage.SampledFragment);
-                b.Read(normal,   ResourceUsage.SampledFragment);
-                b.Read(albedo,   ResourceUsage.SampledFragment);
-                b.Read(material, ResourceUsage.SampledFragment);
-                b.Read(emissive, ResourceUsage.SampledFragment);
+                // G-buffer set (set 1) is graph-baked; names match PbrDeferredPipeline.PassSet.
+                b.UsePassSet(_pbrDeferred.PassSet);
+                b.Read(pos,      ResourceUsage.SampledFragment, "gPosition");
+                b.Read(normal,   ResourceUsage.SampledFragment, "gNormal");
+                b.Read(albedo,   ResourceUsage.SampledFragment, "gAlbedo");
+                b.Read(material, ResourceUsage.SampledFragment, "gMaterial");
+                b.Read(emissive, ResourceUsage.SampledFragment, "gEmissive");
+                // Tile-cull outputs stay on the pipeline-owned set 2 (shared with IBL/probes).
                 b.Read(tileCount,   ResourceUsage.StorageReadFragment);
                 b.Read(tileIndices, ResourceUsage.StorageReadFragment);
                 hdr = b.Write(hdr, ResourceUsage.ColorAttachment);
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                _pbrDeferred.Record(cmd, f, res.View(hdr)));
+                _pbrDeferred.Record(cmd, f, res.View(hdr), res.PassSet));
 
         // Skybox / Transparent both LOAD HDRColor and depth-test (DepthWriteEnable=false)
         // against the geometry depth. Their CmdBeginRendering binds depth as a
