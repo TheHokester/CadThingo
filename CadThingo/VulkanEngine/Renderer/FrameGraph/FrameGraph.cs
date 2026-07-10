@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 
@@ -187,6 +188,33 @@ public unsafe class FrameGraph : IDisposable
         _passes.Add(pass);
         CurrentPassIndex = _passes.Count - 1;
         setup(new GraphBuilder(this, pass)); //Read/Write mutate version ledger + pass lists
+        ValidatePassBindings(pass);
+    }
+
+    // Fail-loud at authoring time: a named Read/Write must have a matching UsePassSet binding.
+    // Order-independent (UsePassSet may follow the named accesses in the setup lambda).
+    private static void ValidatePassBindings(GraphPass pass)
+    {
+        bool anyNamed = false;
+        foreach (var a in pass.Reads)  anyNamed |= a.Bind != null;
+        foreach (var a in pass.Writes) anyNamed |= a.Bind != null;
+        if (!anyNamed) return;
+
+        if (pass.PassSet is null)
+            throw new InvalidOperationException(
+                $"FrameGraph: pass '{pass.Name}' names a pass-set binding but never called UsePassSet.");
+
+        var spec = pass.PassSet.Value;
+        void Check(string? bind)
+        {
+            if (bind is null) return;
+            foreach (var b in spec.Bindings) if (b.Name == bind) return;
+            throw new InvalidOperationException(
+                $"FrameGraph: pass '{pass.Name}' binds '{bind}' but its pass set has no such parameter " +
+                $"(known: {string.Join(", ", spec.Bindings.Select(b => b.Name))}).");
+        }
+        foreach (var a in pass.Reads)  Check(a.Bind);
+        foreach (var a in pass.Writes) Check(a.Bind);
     }
 
     /// <summary>
@@ -344,6 +372,10 @@ public unsafe class FrameGraph : IDisposable
         // _executionOrder + the baked per-pass barriers + the resolved physical handles
         // are now the frozen plan; Execute() replays them with no per-frame analysis.
         BakeSync();
+
+        // ---- Graph-baked pass descriptor sets (opt-in via UsePassSet) ------------
+        // Allocate + fill each opting pass's per-frame set from the now-resolved handles.
+        BakePassSets();
 
         // ---- Debug instrumentation: query pools, labels, object names ------------
         SetupDebug();
@@ -827,6 +859,136 @@ public unsafe class FrameGraph : IDisposable
         f is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16Unorm
           or Format.D32SfloatS8Uint or Format.D16UnormS8Uint;
 
+    // ---- Graph-baked pass descriptor sets  ---------
+    // Owns the pass sets because their lifetime IS the graph's: allocated here at Compile
+    // (which runs under device-idle on init/resize) and freed in Dispose. Each opting pass
+    // gets one set per frame-in-flight from its pipeline-owned layout; every binding a named
+    // Read/Write referenced is written NOW with that frame's resolved handle. No per-frame
+    // rewrite is needed -- the sets are never mutated in flight (a resize rebuilds the whole
+    // graph), so Execute only hands the right frame's set to the pass body. The scene set (a
+    // frame-lifetime, in-flight-mutated set) stays with DescriptorRegistry; these do not.
+    private DescriptorPool _passSetPool;
+
+    private void BakePassSets()
+    {
+        uint frames = Renderer.MAX_CONCURRENT_FRAMES;
+
+        var opting = new List<GraphPass>();
+        foreach (var idx in _executionOrder)
+            if (_passes[idx].PassSet is not null) opting.Add(_passes[idx]);
+        if (opting.Count == 0) return;
+
+        // Pool sized to the exact per-type descriptor demand across every opting pass * frames.
+        var poolSizes = new Dictionary<DescriptorType, uint>();
+        uint maxSets = 0;
+        foreach (var pass in opting)
+        {
+            var spec = pass.PassSet!.Value;
+            maxSets += frames;
+            foreach (var a in NamedAccesses(pass))
+            {
+                var b = FindBinding(spec, a.Bind!);
+                poolSizes[b.Type] = poolSizes.GetValueOrDefault(b.Type) + frames;
+            }
+        }
+
+        var sizes = poolSizes.Select(kv => new DescriptorPoolSize { Type = kv.Key, DescriptorCount = kv.Value }).ToArray();
+        fixed (DescriptorPoolSize* pSizes = sizes)
+        {
+            var poolInfo = new DescriptorPoolCreateInfo
+            {
+                SType = StructureType.DescriptorPoolCreateInfo,
+                PoolSizeCount = (uint)sizes.Length,
+                PPoolSizes = pSizes,
+                MaxSets = maxSets,
+            };
+            if (gfx.Vk.CreateDescriptorPool(gfx.Device, &poolInfo, null, out _passSetPool) != Result.Success)
+                throw new Exception("FrameGraph: failed to create pass-set descriptor pool");
+        }
+
+        // One layout-array scratch reused per pass (every set in a pass shares its layout).
+        var layouts = stackalloc DescriptorSetLayout[(int)frames];
+        foreach (var pass in opting)
+        {
+            var spec = pass.PassSet!.Value;
+
+            for (int f = 0; f < frames; f++) layouts[f] = spec.Layout;
+            var alloc = new DescriptorSetAllocateInfo
+            {
+                SType = StructureType.DescriptorSetAllocateInfo,
+                DescriptorPool = _passSetPool,
+                DescriptorSetCount = frames,
+                PSetLayouts = layouts,
+            };
+            var sets = new DescriptorSet[frames];
+            fixed (DescriptorSet* pSets = sets)
+                if (gfx.Vk.AllocateDescriptorSets(gfx.Device, &alloc, pSets) != Result.Success)
+                    throw new Exception($"FrameGraph: failed to allocate pass set for '{pass.Name}'");
+            pass.PassSets = sets;
+
+            foreach (var a in NamedAccesses(pass))
+                for (uint f = 0; f < frames; f++)
+                    WritePassBinding(sets[f], spec, in a, f);
+        }
+    }
+
+    // The named (pass-set) accesses of a pass, reads then writes.
+    private static IEnumerable<ResourceAccess> NamedAccesses(GraphPass pass)
+    {
+        foreach (var a in pass.Reads)  if (a.Bind != null) yield return a;
+        foreach (var a in pass.Writes) if (a.Bind != null) yield return a;
+    }
+
+    private static BindingDesc FindBinding(in PassSetSpec spec, string name)
+    {
+        foreach (var b in spec.Bindings) if (b.Name == name) return b;
+        throw new InvalidOperationException($"FrameGraph: pass set has no binding named '{name}'.");
+    }
+
+    // Writes one binding of a baked pass set for frame f. Image layout is derived from the
+    // access usage (the same UsageTable entry that baked the barrier), so the descriptor
+    // layout and the barrier's target layout can never drift. Combined-image-samplers are out
+    // of scope -- pass sets carry SampledImage/StorageImage/StorageBuffer/UniformBuffer only;
+    // sampled images pair with a scene-set sampler.
+    private void WritePassBinding(DescriptorSet set, in PassSetSpec spec, in ResourceAccess a, uint frame)
+    {
+        var b   = FindBinding(spec, a.Bind!);
+        var res = _resources[a.ResourceId];
+        var write = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = set,
+            DstBinding = b.Binding,
+            DescriptorType = b.Type,
+            DescriptorCount = 1,
+        };
+
+        if (a.IsImage)
+        {
+            if (b.Type == DescriptorType.CombinedImageSampler)
+                throw new InvalidOperationException(
+                    $"FrameGraph: pass-set binding '{a.Bind}' is a combined image sampler; graph-baked pass " +
+                    "sets support SampledImage/StorageImage only (pair a sampled image with a scene-set sampler).");
+            var info = new DescriptorImageInfo
+            {
+                ImageView = res.PhysView ?? throw new InvalidOperationException(
+                    $"FrameGraph: pass-set image '{res.Name}' has no view."),
+                ImageLayout = UsageTable.Of(a.Usage).Layout,
+            };
+            write.PImageInfo = &info;
+            gfx.Vk.UpdateDescriptorSets(gfx.Device, 1, &write, 0, null);
+        }
+        else
+        {
+            var buf = res.PhysBufferFrames is { } fr ? fr[frame]
+                    : res.PhysBuffer ?? throw new InvalidOperationException(
+                        $"FrameGraph: pass-set buffer '{res.Name}' not allocated.");
+            var info = new DescriptorBufferInfo { Buffer = buf, Offset = 0, Range = Vk.WholeSize };
+            write.PBufferInfo = &info;
+            gfx.Vk.UpdateDescriptorSets(gfx.Device, 1, &write, 0, null);
+        }
+    }
+
     /// <summary>
     /// Replays the baked plan: per scheduled pass, emit its barrier batch then record its
     /// body; finally hand imported images back in their declared final layout. No
@@ -845,7 +1007,6 @@ public unsafe class FrameGraph : IDisposable
         if (_chunked) { ExecuteChunked(in frame); return; }
 
         _debug?.BeginFrame(cmd, frame.FrameIndex);
-        var resources = new PassResources(this);
         for (int i = 0; i < _executionOrder.Count; i++)
         {
             var pass = _passes[_executionOrder[i]];
@@ -856,6 +1017,8 @@ public unsafe class FrameGraph : IDisposable
             _debug?.BeginPass(cmd, frame.FrameIndex, i);   // debug label + begin timestamp/stats
 
             EmitBarriers(cmd, pass.ImageBarriers, pass.BufferBarriers);
+            var resources = new PassResources(this,
+                pass.PassSets.Length > 0 ? pass.PassSets[frame.FrameIndex] : default);
             pass.Execute(cmd, resources, in frame);
             _debug?.EndPass(cmd, frame.FrameIndex, i);      // end timestamp/stats + pop label
         }
@@ -871,7 +1034,6 @@ public unsafe class FrameGraph : IDisposable
     {
         uint fr = frame.FrameIndex;
         var vk = gfx.Vk;
-        var resources = new PassResources(this);
 
         bool firstGfx = true;
         for (int c = 0; c < _chunks.Count; c++)
@@ -904,6 +1066,8 @@ public unsafe class FrameGraph : IDisposable
 
                 _debug?.BeginPass(cb, fr, pos);
                 EmitBarriers(cb, pass.ImageBarriers, pass.BufferBarriers);
+                var resources = new PassResources(this,
+                    pass.PassSets.Length > 0 ? pass.PassSets[fr] : default);
                 pass.Execute(cb, resources, in frame);
                 _debug?.EndPass(cb, fr, pos);
             }
@@ -1365,6 +1529,9 @@ public unsafe class FrameGraph : IDisposable
         if (_cmpChunkPool.Handle != 0) vk.DestroyCommandPool(dev, _cmpChunkPool, null);
         if (_gfxTimeline.Handle  != 0) vk.DestroySemaphore(dev, _gfxTimeline, null);
         if (_cmpTimeline.Handle  != 0) vk.DestroySemaphore(dev, _cmpTimeline, null);
+
+        // Graph-baked pass sets: freed with their pool (sets need no individual free).
+        if (_passSetPool.Handle != 0) vk.DestroyDescriptorPool(dev, _passSetPool, null);
 
         foreach (var res in _resources.Values)
         {
