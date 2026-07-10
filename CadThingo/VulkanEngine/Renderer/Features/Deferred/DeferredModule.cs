@@ -82,7 +82,9 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         }, "Depth");
 
         // Per-frame compute-output buffers, imported so the graph derives the cull->geometry
-        // and light-cull->lighting barriers + ordering.
+        // and light-cull->lighting barriers + ordering. Renderables is the cull INPUT, imported
+        // too so it can fill the cull pass set's binding 0 (matched by name below).
+        var renderablesF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         var indirectCmdF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         var indirectCountF = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         var instanceF      = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
@@ -90,12 +92,14 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         var tileIndicesF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         for (uint i = 0; i < HostRenderer.MAX_CONCURRENT_FRAMES; i++)
         {
+            renderablesF[i]   = _cull.GetRenderablesBuffer(i);
             indirectCmdF[i]   = _cull.GetIndirectCmdBuffer(i);
             indirectCountF[i] = _cull.GetIndirectCountBuffer(i);
             instanceF[i]      = Engine.ResourceManager.GetInstanceBuffer(i);
             tileCountF[i]     = _lightCull.GetTileLightCountBuffer(i);
             tileIndicesF[i]   = _lightCull.GetTileLightIndicesBuffer(i);
         }
+        var renderables   = scope.ImportBufferPerFrame(renderablesF,   default, "Renderables");
         var indirectCmd   = scope.ImportBufferPerFrame(indirectCmdF,   default, "IndirectCmd");
         var indirectCount = scope.ImportBufferPerFrame(indirectCountF, default, "IndirectCount");
         var instance      = scope.ImportBufferPerFrame(instanceF,      default, "InstanceData");
@@ -103,15 +107,20 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         var tileIndices   = scope.ImportBufferPerFrame(tileIndicesF,   default, "TileLightIndices");
 
        
+        // Cull is the first graph-baked pass set (descriptor-system.md phase C): its four storage
+        // buffers are all graph resources, so the graph fills the set by name and the pipeline
+        // owns only the layout. Names match DrawCullPipeline.PassSet.
         scope.AddPass("CullPass", PassType.Compute, QueueClass.Graphics,
             b =>
             {
-                indirectCmd   = b.Write(indirectCmd,   ResourceUsage.StorageWriteCompute);
-                indirectCount = b.Write(indirectCount, ResourceUsage.StorageWriteCompute);
-                instance      = b.Write(instance,      ResourceUsage.StorageWriteCompute);
+                b.UsePassSet(_cull.PassSet);
+                b.Read(renderables, ResourceUsage.StorageReadCompute, "renderables");
+                indirectCmd   = b.Write(indirectCmd,   ResourceUsage.StorageWriteCompute, "indirectCmd");
+                instance      = b.Write(instance,      ResourceUsage.StorageWriteCompute, "instanceData");
+                indirectCount = b.Write(indirectCount, ResourceUsage.StorageWriteCompute, "indirectCount");
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                _cull.Record(cmd, f.FrameIndex, f.Camera));
+                _cull.Record(cmd, f.FrameIndex, f.Camera, res.PassSet));
 
         // Light-cull (compute): bins lights into the per-tile lists the lighting FS reads.
         // Tile/light counts are computed in DeferredCore.Render and read back via _lightCullParams.
