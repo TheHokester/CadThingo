@@ -74,17 +74,9 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore
             _host.renderTargets.PtAccumulator.ImageView, _host.renderTargets.PtOutColor.ImageView);
     }
 
-    /// <summary>Re-point tonemap's shared HDR-input descriptor at PtOutColor (the scene-colour image
-    /// the graph's Tonemap pass reads) and restart progressive integration. Called by the host on
-    /// mode switch / after a tonemap rebuild. The accumulator is SHARED with the other PT cores, so
-    /// resetting here -- deterministically, after the host's DeviceWaitIdle -- guarantees a fresh
-    /// start instead of `+=`-ing onto a stale image.</summary>
-    public void Activate()
-    {
-        _host.tonemapPipeline.WriteHdrInputDescriptor(
-            _host.renderTargets.PtOutColor.ImageView, _host.gBufferSampler);
-        _pipe.MarkAccumulatorDirty();
-    }
+    /// <summary>Restart progressive integration on activation. Ensures clean start when swapping between
+    /// different pathtraced modes</summary>
+    public void Activate() => _pipe.MarkAccumulatorDirty();
 
     /// <summary>Resize: reallocate the per-pixel reservoir + G-buffer to the new extent, then
     /// rebuild the graph so it imports the freshly-reallocated PT/Final targets (BuildGraph also

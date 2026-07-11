@@ -27,11 +27,8 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
 {
     private readonly Renderer _host;
 
-    // The frame graph driving the deferred chain 
+    // The frame graph driving the deferred chain
     private DeferredGraph? _graph;
-
-    // Cached view of the graph's HDR transient, rebuilt on every graph rebuild
-    private ImageView _hdrView;
 
     // Per-frame light-cull dispatch dims, written by Render (from PbrDeferredPipeline.UpdatePerFrame)
     // before Execute and pulled by the module's LightCullPass delegate at Execute time.
@@ -76,18 +73,14 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
         fg.Compile();
         _graph = fg;
 
-        // Compile() baked the g-buffer set (set 1) into the graph from the fresh transients, so
-        // no g-buffer rebind is needed here. Tonemap's HDR input is still a shared pipeline-owned
-        // descriptor, so (re)point it at this build's HDR transient.
-        _hdrView = fg.ResolveView(o.Hdr);
-        _host.tonemapPipeline.WriteHdrInputDescriptor(_hdrView, _host.gBufferSampler);
+        // Compile() baked every graph-resident descriptor set (cull, light-cull, g-buffer, and
+        // tonemap's HDR input) from the fresh transients, so there is no manual descriptor rebind
+        // left to do here.
     }
 
-    /// <summary>Re-point tonemap's shared HDR-input descriptor at this core's HDR transient. Called
-    /// by the host on mode switch / after a tonemap rebuild -- replaces the per-frame _lastRenderMode
-    /// rebind.</summary>
-    public void Activate() =>
-        _host.tonemapPipeline.WriteHdrInputDescriptor(_hdrView, _host.gBufferSampler);
+    /// <summary>Nothing to rebind on activation: tonemap's HDR input is graph-baked from this
+    /// core's own HDR transient, so switching to this core just binds its graph's set.</summary>
+    public void Activate() { }
 
     /// <summary>Rebuilds the deferred graph after an in-place PBR pipeline rebuild. Rebuild()
     /// recreates the pipeline's set-1 layout (new handle), so the graph's baked g-buffer set -

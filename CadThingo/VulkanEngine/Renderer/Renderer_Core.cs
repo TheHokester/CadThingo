@@ -617,8 +617,10 @@ public unsafe partial class Renderer
         // tonemap ref stays valid. Operator is a spec constant, read by Rebuild's Initialize.
         tonemapPipeline.Operator = tonemapOperator;
         tonemapPipeline.Rebuild();
-        // Rebind the fresh tonemap descriptor set to the ACTIVE core's HDR source (deferred HDR vs
-        // PT ptOutColor) — fixes the old always-rebind-to-deferred bug in PT mode.
+        // Rebuild reallocated the pipeline-owned HDR set (megakernel PT path); Activate rewrites it
+        // for the active core. Graph cores' baked HDR sets survive the in-place rebuild -- a set
+        // outlives its source layout and binds by pipeline-layout compatibility (identical
+        // definition), and their HDR view is unchanged -- so no graph rebuild is needed.
         _activeCore.Activate();
     }
 

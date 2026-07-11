@@ -27,10 +27,9 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// The worker chain (Generate/Extend/Shade) is serialized through the shared `counters` buffer
 /// (declared RW on each); Connect is DECOUPLED from it -- Connect(b) is declared between
 /// Extend(b+1) and Shade(b+1) with an empty barrier batch so it overlaps the trace (see
-/// AddConnectPass + the Extend pass's phantom declarations). Tonemap is a DIRECT pass --
-/// not the TonemapModule, whose ExpectImage demands R16F while PtOutColor is R32F -- reading the
-/// imported out-color (its HDR-input descriptor is re-pointed to PtOutColor in the core's Activate)
-/// and writing the imported FinalColor.
+/// AddConnectPass + the Extend pass's phantom declarations). Tonemap is the composed
+/// TonemapModule (HDR format parameterized to PtOutColor's R32F): its HDR-input set is
+/// graph-baked from the imported out-color, so no host-side rebind happens on core switch.
 /// </summary>
 public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, WavefrontPTModule.Outputs>
 {
@@ -90,14 +89,18 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
         var counters     = scope.ImportBuffer(_pipe.Counters,     default, "counters");
         var dispatchArgs = scope.ImportBuffer(_pipe.DispatchArgsBuffer, default, "dispatchArgs");
 
-        // ---- Import the host-owned storage images (General, preserved) + FinalColor ----
+        // ---- Import the host-owned storage images (General, preserved) ----
+        // FinalColor is NOT imported here: the composed TonemapModule below imports it.
         var accum = scope.ImportImage(inp.Accumulator.Image, inp.Accumulator.ImageView, default,
             ImageLayout.General, "ptAccum");
-        var outColor = scope.ImportImage(inp.OutColor.Image, inp.OutColor.ImageView, default,
+        // Full desc (not default) so TonemapModule's ExpectImage port check can validate it.
+        var outColorDesc = new ImageDesc
+        {
+            Format = inp.OutColor._format, Mips = 1, Layers = 1,
+            Usage = ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
+        };
+        var outColor = scope.ImportImage(inp.OutColor.Image, inp.OutColor.ImageView, in outColorDesc,
             ImageLayout.General, "ptOutColor");
-        var finalDesc = new ImageDesc { Format = inp.FinalColor._format, Mips = 1, Layers = 1 };
-        var final = scope.ImportImage(inp.FinalColor.Image, inp.FinalColor.ImageView, in finalDesc,
-            ImageLayout.Undefined, "FinalColor", ImageLayout.ShaderReadOnlyOptimal);
 
         // ---- Generate: dense primary rays, seed rayQueue0 + counters + extend-args[0] ----
         // Generate also writes the first bounce's indirect launch dims (the old PrepExtend(0)
@@ -332,18 +335,11 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordFinalize(cmd, f));
 
-        // ---- Tonemap: direct pass (out-color -> FinalColor). The tonemap pipeline samples
-        // PtOutColor through its own HDR-input descriptor (bound to PtOutColor in the core's
-        // Activate); the graph import of outColor here is only for barrier derivation. ----
-        scope.AddPass("Tonemap", PassType.Graphics, QueueClass.Graphics,
-            bld =>
-            {
-                bld.Read(outColor, ResourceUsage.SampledFragment);
-                final = bld.Write(final, ResourceUsage.ColorAttachment);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                _tonemap.Record(cmd, f, res.View(final)));
+        // ---- Tonemap: the shared TonemapModule (HDR format parameterized to PtOutColor's
+        // R32F). Its HDR-input set is GRAPH-BAKED 
+        var tonemapModule = new TonemapModule(_tonemap, inp.OutColor._format);
+        tonemapModule.Build(scope, new TonemapModule.Input(outColor, inp.FinalColor), out var tm);
 
-        o = new Outputs(final);
+        o = new Outputs(tm.FinalColor);
     }
 }

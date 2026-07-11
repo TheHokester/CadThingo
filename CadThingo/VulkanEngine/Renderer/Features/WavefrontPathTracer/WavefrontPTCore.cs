@@ -79,19 +79,9 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
             _host.renderTargets.PtAccumulator.ImageView, _host.renderTargets.PtOutColor.ImageView);
     }
 
-    /// <summary>Re-point tonemap's shared HDR-input descriptor at PtOutColor (the wavefront
-    /// scene-colour image the graph's Tonemap pass reads), and restart progressive integration.
-    /// Called by the host on mode switch / after a tonemap rebuild. The accumulator is SHARED with
-    /// the megakernel PT cores, so on a switch into this core it still holds the previous core's
-    /// (possibly high-sample-count) result; resetting here -- deterministically, after the host's
-    /// DeviceWaitIdle -- guarantees a fresh start instead of `+=`-ing onto a stale image, rather
-    /// than relying on the host accumulator-dirty flag arriving a frame later.</summary>
-    public void Activate()
-    {
-        _host.tonemapPipeline.WriteHdrInputDescriptor(
-            _host.renderTargets.PtOutColor.ImageView, _host.gBufferSampler);
-        _pipe.MarkAccumulatorDirty();
-    }
+    /// <summary>On activation marks accumulator dirty to reset any potentially high sample count
+    ///work done by other pathtraced cores.</summary>
+    public void Activate() => _pipe.MarkAccumulatorDirty();
 
     /// <summary>Resize: reallocate the SoA working set to the new extent (which rewrites set 4 +
     /// marks the accumulator dirty), then rebuild the graph so it imports the fresh buffers + the

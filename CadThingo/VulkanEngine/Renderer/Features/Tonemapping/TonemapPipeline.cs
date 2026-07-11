@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
@@ -42,6 +44,17 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
     /// <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
     public TonemapOperator Operator { get; set; } = TonemapOperator.Filmic;
 
+    // Graph-baked pass set (set 0): the single HDR-input sampler, filled by a graph core's
+    // TonemapModule from its scene-colour transient. Name matches the TonemapPass Read bind; the
+    // sampler is immutable in the layout, so only the view is written. The megakernel PT cores
+    // don't graph-bake -- they keep the pipeline-owned set + WriteHdrInputDescriptor.
+    private static readonly BindingDesc[] _passBindings =
+    {
+        new("hdrInput", 0, 0, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
+    };
+
+    public PassSetSpec PassSet => new(SetIndex: 0, DescriptorSetLayouts[0], _passBindings);
+
     public TonemapPipeline(Renderer renderer) : base(renderer)
     {
         PushConstantRanges = new[]
@@ -55,14 +68,20 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         };
     }
 
+    // Megakernel PT cores (non-graph) bind the pipeline-owned HDR set, rebound per mode switch
+    // by WriteHdrInputDescriptor.
     internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor)
+        => Record(cmd, ctx, finalColor, GetDescriptorSet(0, 0));
+
+    // Graph cores' TonemapModule passes its graph-baked HDR set (see PassSet).
+    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor, DescriptorSet hdrSet)
     {
         BeginRendering(cmd,
             ctx.RenderExtent,
             [finalColor],
             colorLoad: AttachmentLoadOp.DontCare
             );
-       
+
         Vk!.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, Handle);
 
         Viewport vp = new()
@@ -75,13 +94,12 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdSetViewport(cmd, 0, 1, &vp);
         Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
 
-        var set = GetDescriptorSet(0, 0);
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, 0, 1, &set, 0, null);
+            Layout, 0, 1, &hdrSet, 0, null);
         PushConstants(cmd);
 
         Vk!.CmdDraw(cmd, 3, 1, 0, 0);
-        
+
         EndRendering(cmd);
     }
     
@@ -141,12 +159,17 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         DescriptorSetLayouts = new DescriptorSetLayout[1];
         OwnedDescriptorSetLayoutIndices = new[] { 0 };
 
+        // The HDR sampler is baked in as an IMMUTABLE sampler: the graph-baked HDR set (see
+        // PassSet) then only writes the view, and the megakernel path's WriteHdrInputDescriptor
+        // likewise only supplies the view (the sampler field is ignored).
+        Sampler hdrSampler = Renderer.gBufferSampler;
         var binding = new DescriptorSetLayoutBinding
         {
-            Binding         = 0,
-            DescriptorType  = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags      = ShaderStageFlags.FragmentBit,
+            Binding            = 0,
+            DescriptorType     = DescriptorType.CombinedImageSampler,
+            DescriptorCount    = 1,
+            StageFlags         = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &hdrSampler,
         };
         var layoutInfo = new DescriptorSetLayoutCreateInfo
         {
@@ -164,7 +187,8 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
 
     protected override void CreateDescriptorSets()
     {
-        // Single shared set — HDR image is single-buffered like FinalColor.
+        // The pipeline-owned HDR set, used only by the megakernel PT cores (graph cores bake
+        // their own via PassSet). Single-buffered like FinalColor; rebound by WriteHdrInputDescriptor.
         var layout = DescriptorSetLayouts[0];
         DescriptorSetAllocateInfo allocInfo = new()
         {
@@ -182,11 +206,12 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         }
     }
 
-    // Descriptor target (HDRColor view) only exists after the render graph compiles,
-    // so the renderer calls WriteHdrInputDescriptor explicitly post-setup and on
-    // every swapchain recreate.
     protected override void WriteDescriptors() { }
 
+    /// <summary>Points the pipeline-owned HDR set at a scene-colour view. Used only by the
+    /// non-graph megakernel PT cores (rebound on mode switch); graph cores bake this via the
+    /// graph. The sampler arg is ignored (the layout carries an immutable sampler) - kept for
+    /// call-site compatibility.</summary>
     public void WriteHdrInputDescriptor(ImageView hdrView, Sampler sampler)
     {
         DescriptorImageInfo imageInfo = new()
