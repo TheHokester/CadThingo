@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
@@ -42,6 +44,17 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
     public Buffer GetTileLightCountBuffer  (uint frame) => TileLightCountBuffers[frame].buffer;
     public Buffer GetTileLightIndicesBuffer(uint frame) => TileLightIndicesBuffers[frame].buffer;
+
+    // Graph-baked pass set (set 1): the two tile-cull outputs, filled by the deferred FrameGraph
+    // (they are graph imports this pass writes). Names match the LightCullPass Write binds; the
+    // pipeline owns only the layout (its VkPipelineLayout borrows it at set 1).
+    private static readonly BindingDesc[] _passBindings =
+    {
+        new("tileLightCount",   SetTileOut, 0, DescriptorType.StorageBuffer, 1, ShaderStageFlags.ComputeBit),
+        new("tileLightIndices", SetTileOut, 1, DescriptorType.StorageBuffer, 1, ShaderStageFlags.ComputeBit),
+    };
+
+    public PassSetSpec PassSet => new(SetIndex: SetTileOut, DescriptorSetLayouts[SetTileOut], _passBindings);
 
     public LightCullPipeline(Renderer renderer) : base(renderer)
     {
@@ -108,72 +121,16 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         }
     }
 
-    protected override void CreateDescriptorSets()
-    {
-        DescriptorSets = new DescriptorSet[2][];
-
-        // Set 0 — scene set is owned by DescriptorRegistry; Record binds
-        // Renderer.descriptorRegistry.SceneSet(frame) directly.
-        DescriptorSets[SetScene] = null;
-
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[SetTileOut];
-
-        DescriptorSetAllocateInfo alloc = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts        = layouts,
-        };
-        DescriptorSets[SetTileOut] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* pSets = DescriptorSets[SetTileOut])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &alloc, pSets) != Result.Success)
-                throw new Exception("Failed to allocate light-cull descriptor sets");
-        }
-    }
-
-    protected override void WriteDescriptors()
-    {
-        // Only the owned tile outputs; sceneLights is registry-maintained.
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo bufTileCount = new()
-            {
-                Buffer = TileLightCountBuffers[i].buffer, Offset = 0,
-                Range  = (ulong)(Renderer.MAX_TILE_COUNT * sizeof(uint)),
-            };
-            DescriptorBufferInfo bufTileIdx = new()
-            {
-                Buffer = TileLightIndicesBuffers[i].buffer, Offset = 0,
-                Range  = (ulong)(Renderer.MAX_TILE_COUNT * Renderer.MAX_LIGHTS_PER_TILE * sizeof(uint)),
-            };
-
-            var writes = stackalloc WriteDescriptorSet[2];
-            for (uint b = 0; b < 2; b++)
-            {
-                writes[b] = new WriteDescriptorSet
-                {
-                    SType           = StructureType.WriteDescriptorSet,
-                    DstSet          = DescriptorSets[SetTileOut][i],
-                    DstBinding      = b,
-                    DescriptorType  = DescriptorType.StorageBuffer,
-                    DescriptorCount = 1,
-                };
-            }
-            writes[0].PBufferInfo = &bufTileCount;
-            writes[1].PBufferInfo = &bufTileIdx;
-
-            Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-        }
-    }
+    // Descriptor sets are graph-owned now: the deferred FrameGraph allocates set 1 from this
+    // pipeline's pass-set layout and writes the two tile buffers by name each Compile. The
+    // scene set (sceneLights) comes from the registry. No CreateDescriptorSets / WriteDescriptors.
 
     // CPU side. Computes invViewProj + tile counts from the current
-    // camera/swapchain extent, pushes them, dispatches one group per tile, and
-    // barriers compute-write -> fragment-read on the two tile buffers.
+    // camera/swapchain extent, pushes them, and dispatches one group per tile.
+    // (The compute-write -> fragment-read barrier on the tile buffers is derived
+    // by the graph from the LightCullPass Write + the lighting-pass Read.)
     public void Record(CommandBuffer cmd, uint frameIndex, Camera cam,
-                       uint lightCount, uint tileCountX, uint tileCountY)
+                       uint lightCount, uint tileCountX, uint tileCountY, DescriptorSet tileSet)
     {
         if (tileCountX == 0 || tileCountY == 0) return;
 
@@ -182,11 +139,12 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         // The scene-set layout carries the (0,0) dynamic constant slot even
         // though this shader doesn't declare it (params ride push constants),
         // so the bind must still supply one dynamic offset - zero is valid.
+        // Set 1 is the graph-baked tile-output pass set.
         uint zeroOffset = 0;
         var sets = stackalloc DescriptorSet[2]
         {
             Renderer.descriptorRegistry.SceneSet(frameIndex),
-            DescriptorSets[SetTileOut][frameIndex],
+            tileSet,
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute,
             PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);

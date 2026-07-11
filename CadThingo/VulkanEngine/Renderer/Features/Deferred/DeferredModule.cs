@@ -127,13 +127,15 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         scope.AddPass("LightCullPass", PassType.Compute, QueueClass.Graphics,
             b =>
             {
-                tileCount   = b.Write(tileCount,   ResourceUsage.StorageWriteCompute);
-                tileIndices = b.Write(tileIndices, ResourceUsage.StorageWriteCompute);
+                // Tile outputs (set 1) are graph-baked; names match LightCullPipeline.PassSet.
+                b.UsePassSet(_lightCull.PassSet);
+                tileCount   = b.Write(tileCount,   ResourceUsage.StorageWriteCompute, "tileLightCount");
+                tileIndices = b.Write(tileIndices, ResourceUsage.StorageWriteCompute, "tileLightIndices");
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
             {
                 var (lightCount, tileCountX, tileCountY) = _lightCullParams();
-                _lightCull.Record(cmd, f.FrameIndex, f.Camera, lightCount, tileCountX, tileCountY);
+                _lightCull.Record(cmd, f.FrameIndex, f.Camera, lightCount, tileCountX, tileCountY, res.PassSet);
             });
 
         // Geometry -> g-buffers + depth. Reads the post-cull indirect buffers (IndirectArg) +
