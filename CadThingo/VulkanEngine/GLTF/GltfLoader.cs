@@ -1,4 +1,5 @@
 using System.Numerics;
+using CadThingo.VulkanEngine.Renderer;
 using SharpGLTF.Memory;
 using SharpGLTF.Schema2;
 using SharpGLTF.Validation;
@@ -26,13 +27,13 @@ public static unsafe class GltfLoader
         string path,
         string idPrefix,
         ResourceManager rm,
-        Renderer.Renderer renderer,
+        GraphicsDevice gfx,
         Scene scene)
     {
         // 1. Fallback textures must exist before any material build runs.
         //    Run BEFORE opening the manifest capture so the global defaults
         //    don't get attributed to this file (they're shared across loads).
-        GltfDefaults.EnsureRegistered(rm, renderer);
+        GltfDefaults.EnsureRegistered(rm, gfx);
 
         var manifest = new LoadManifest();
         using var _ = rm.BeginManifestCapture(manifest);
@@ -47,7 +48,7 @@ public static unsafe class GltfLoader
         for (int matIdx = 0; matIdx < model.LogicalMaterials.Count; matIdx++)
         {
             var gltfMat = model.LogicalMaterials[matIdx];
-            var pbr = GltfMaterialResource.BuildAndRegister(idPrefix, matIdx, gltfMat, rm, renderer);
+            var pbr = GltfMaterialResource.BuildAndRegister(idPrefix, matIdx, gltfMat, rm, gfx);
             int sceneMatIdx = scene.AddMaterial(pbr);
             materialIndexMap[gltfMat] = sceneMatIdx;
             manifest.MaterialIndices.Add(sceneMatIdx);

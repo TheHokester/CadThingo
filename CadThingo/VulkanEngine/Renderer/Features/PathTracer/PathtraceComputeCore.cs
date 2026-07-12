@@ -1,3 +1,4 @@
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
@@ -6,16 +7,22 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 /// <summary>
 /// Progressive ray-query path tracer driven by a compute dispatch (RenderMode.RayCompute).
 /// A thin <see cref="PathTraceCoreBase"/> subclass binding the renderer-owned
-/// <see cref="PTComputePipeline"/>; the writer stage is the compute shader.
+/// <see cref="PTComputePipeline"/>; the Trace pass runs as a graph compute pass.
 /// </summary>
-internal sealed class PathtraceComputeCore(Renderer host) : PathTraceCoreBase(host)
+internal sealed class PathtraceComputeCore : PathTraceCoreBase
 {
-    private readonly PTComputePipeline _pipeline = host.ptComputePipeline;
+    private readonly PTComputePipeline _pipeline;
+
+    public PathtraceComputeCore(Renderer host) : base(host)
+    {
+        _pipeline = host.ptComputePipeline;
+        BuildGraph();
+    }
 
     public override string Name => "PathTrace (Compute)";
     public override Renderer.RenderMode Mode => Renderer.RenderMode.RayCompute;
 
-    protected override PipelineStageFlags WriterStage => PipelineStageFlags.ComputeShaderBit;
+    protected override PassType TracePassType => PassType.Compute;
     protected override void PipelineMarkAccumulatorDirty() => _pipeline.MarkAccumulatorDirty();
     protected override bool PipelineUpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent) =>
         _pipeline.UpdatePerFrame(frameIndex, camera, lightCount, renderExtent);

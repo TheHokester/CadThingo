@@ -44,10 +44,10 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
     /// <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
     public TonemapOperator Operator { get; set; } = TonemapOperator.Filmic;
 
-    // Graph-baked pass set (set 0): the single HDR-input sampler, filled by a graph core's
-    // TonemapModule from its scene-colour transient. Name matches the TonemapPass Read bind; the
-    // sampler is immutable in the layout, so only the view is written. The megakernel PT cores
-    // don't graph-bake -- they keep the pipeline-owned set + WriteHdrInputDescriptor.
+    // Graph-baked pass set (set 0): the single HDR-input sampler, filled by each core's
+    // TonemapModule from its scene-colour source. Name matches the TonemapPass Read bind; the
+    // sampler is immutable in the layout, so only the view is written. Every core is
+    // graph-resident now, so this is the ONLY way the HDR input is bound.
     private static readonly BindingDesc[] _passBindings =
     {
         new("hdrInput", 0, 0, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
@@ -68,12 +68,7 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         };
     }
 
-    // Megakernel PT cores (non-graph) bind the pipeline-owned HDR set, rebound per mode switch
-    // by WriteHdrInputDescriptor.
-    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor)
-        => Record(cmd, ctx, finalColor, GetDescriptorSet(0, 0));
-
-    // Graph cores' TonemapModule passes its graph-baked HDR set (see PassSet).
+    // TonemapModule passes its graph-baked HDR set (see PassSet).
     internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor, DescriptorSet hdrSet)
     {
         BeginRendering(cmd,
@@ -160,8 +155,7 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         OwnedDescriptorSetLayoutIndices = new[] { 0 };
 
         // The HDR sampler is baked in as an IMMUTABLE sampler: the graph-baked HDR set (see
-        // PassSet) then only writes the view, and the megakernel path's WriteHdrInputDescriptor
-        // likewise only supplies the view (the sampler field is ignored).
+        // PassSet) then only writes the view.
         Sampler hdrSampler = Renderer.gBufferSampler;
         var binding = new DescriptorSetLayoutBinding
         {
@@ -185,53 +179,10 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
     // and tunables ride in push constants.
     protected override void CreateResources() { }
 
-    protected override void CreateDescriptorSets()
-    {
-        // The pipeline-owned HDR set, used only by the megakernel PT cores (graph cores bake
-        // their own via PassSet). Single-buffered like FinalColor; rebound by WriteHdrInputDescriptor.
-        var layout = DescriptorSetLayouts[0];
-        DescriptorSetAllocateInfo allocInfo = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts        = &layout,
-        };
-        DescriptorSets = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[1];
-        fixed (DescriptorSet* pSet = DescriptorSets[0])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &allocInfo, pSet) != Result.Success)
-                throw new Exception("Failed to allocate tonemap descriptor set");
-        }
-    }
+    // No pipeline-owned sets: every core's TonemapModule graph-bakes the HDR-input set (PassSet).
+    protected override void CreateDescriptorSets() { }
 
     protected override void WriteDescriptors() { }
-
-    /// <summary>Points the pipeline-owned HDR set at a scene-colour view. Used only by the
-    /// non-graph megakernel PT cores (rebound on mode switch); graph cores bake this via the
-    /// graph. The sampler arg is ignored (the layout carries an immutable sampler) - kept for
-    /// call-site compatibility.</summary>
-    public void WriteHdrInputDescriptor(ImageView hdrView, Sampler sampler)
-    {
-        DescriptorImageInfo imageInfo = new()
-        {
-            ImageView   = hdrView,
-            Sampler     = sampler,
-            ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
-        };
-        WriteDescriptorSet write = new()
-        {
-            SType           = StructureType.WriteDescriptorSet,
-            DstSet          = DescriptorSets[0][0],
-            DstBinding      = 0,
-            DstArrayElement = 0,
-            DescriptorType  = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            PImageInfo      = &imageInfo,
-        };
-        Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-    }
 
     public void PushConstants(CommandBuffer cmd)
     {

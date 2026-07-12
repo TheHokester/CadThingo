@@ -205,10 +205,7 @@ public unsafe partial class Renderer
     internal ReStirDIPipeline?    reStirPipeline;        // opt-in ReSTIR DI tracer, RT-pipeline (null when unsupported)
     internal SelectionSystem      selection = null!;     // host-owned editor selection: pick + coverage mask + outline
 
-    // GPU block-compression encoder for material textures (lazy: created on the first compressed
-    // texture load, so it costs nothing for runs that never load a BC-formatted asset).
-    private Features.TextureCompression.BcEncoder? _bcEncoder;
-    internal Features.TextureCompression.BcEncoder BcEncoder => _bcEncoder ??= new Features.TextureCompression.BcEncoder(gfx);
+    
 
     // Specialization-constant gate for soft (PCSS-style) ray-queried shadows.
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
@@ -605,22 +602,21 @@ public unsafe partial class Renderer
 
     /// <summary>
     /// Rebuild the tonemap pipeline. Use this after changing tonemapOperator —
-    /// the operator selection is a fragment-stage spec constant. HDRColor view
-    /// is re-bound because Initialize() allocated a fresh descriptor set.
+    /// the operator selection is a fragment-stage spec constant.
     /// </summary>
     public void RebuildTonemapPipeline()
     {
         if (!initialized) return;
         vk!.DeviceWaitIdle(device);
 
-        // In-place rebuild (stable object identity, fresh GPU handles) so the DeferredModule's
+        // In-place rebuild (stable object identity, fresh GPU handles) so each core module's
         // tonemap ref stays valid. Operator is a spec constant, read by Rebuild's Initialize.
         tonemapPipeline.Operator = tonemapOperator;
         tonemapPipeline.Rebuild();
-        // Rebuild reallocated the pipeline-owned HDR set (megakernel PT path); Activate rewrites it
-        // for the active core. Graph cores' baked HDR sets survive the in-place rebuild -- a set
-        // outlives its source layout and binds by pipeline-layout compatibility (identical
-        // definition), and their HDR view is unchanged -- so no graph rebuild is needed.
+        // Every core's graph-baked HDR set survives the in-place rebuild -- a set outlives its
+        // source layout and binds by pipeline-layout compatibility (identical definition), and
+        // the HDR view is unchanged -- so no graph rebuild is needed. Activate restarts the PT
+        // cores' progressive accumulation.
         _activeCore.Activate();
     }
 
@@ -720,7 +716,6 @@ public unsafe partial class Renderer
         selection?.Dispose();
 
         // Pipelines (each pipeline disposes its own buffers, sets, layouts)
-        _bcEncoder           ?.Dispose();
         reStirPipeline     ?.Dispose();
         rtPipeline         ?.Dispose();
         wavefrontPipeline  ?.Dispose();

@@ -237,7 +237,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
             Height = (uint)texHeight,
             Depth = 1
         };
-        fontTexture = Texture.CreateTextureFromMemory(renderer, fontData, (uint)texWidth,
+        fontTexture = Texture.CreateTextureFromMemory(renderer.gfx, fontData, (uint)texWidth,
             (uint)texHeight, Format.R8G8B8A8Unorm, fontExtent);
 
         // Eagerly allocate one vertex/index buffer per frame-in-flight at a

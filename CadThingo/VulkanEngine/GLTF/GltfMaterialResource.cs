@@ -30,7 +30,7 @@ public static class GltfMaterialResource
         int matIdx,
         SharpGLTF.Schema2.Material gltfMat,
         ResourceManager rm,
-        Renderer.Renderer renderer)
+        GraphicsDevice gfx)
     {
         Span<int> texIdx = stackalloc int[5];
 
@@ -51,7 +51,7 @@ public static class GltfMaterialResource
                     : GltfTextureResource.PrePack.None;
                 string texId = $"{idPrefix}:img:{image.LogicalIndex}:fmt{(int)format}";
                 var tex = GltfTextureResource.BuildAndRegister(
-                    texId, rm, renderer,
+                    texId, rm, gfx,
                     image.Content.Content,
                     image.Content.MimeType,
                     format, prePack);
@@ -75,7 +75,7 @@ public static class GltfMaterialResource
         float transmissionFactor = (float)SafeGetFactor(transmissionChannel, "TransmissionFactor", 0.0);
         int transmissionTex = LoadExtensionTexture(idPrefix, matIdx, "Transmission", transmissionChannel,
                                                    Format.R8G8B8A8Unorm, GltfDefaults.OcclusionIndex,
-                                                   rm, renderer);
+                                                   rm, gfx);
 
         // SharpGLTF surfaces KHR_materials_ior as a direct property on Material.
         // Default is 1.5 (dielectric / glass).
@@ -97,13 +97,13 @@ public static class GltfMaterialResource
 
         int clearcoatTex          = LoadExtensionTexture(idPrefix, matIdx, "ClearCoat", clearcoatChannel,
                                                           Format.R8G8B8A8Unorm, GltfDefaults.OcclusionIndex,
-                                                          rm, renderer);
+                                                          rm, gfx);
         int clearcoatRoughnessTex = LoadExtensionTexture(idPrefix, matIdx, "ClearCoatRoughness", clearcoatRoughnessChannel,
                                                           Format.R8G8B8A8Unorm, GltfDefaults.OcclusionIndex,
-                                                          rm, renderer);
+                                                          rm, gfx);
         int clearcoatNormalTex    = LoadExtensionTexture(idPrefix, matIdx, "ClearCoatNormal", clearcoatNormalChannel,
                                                           Format.R8G8B8A8Unorm, GltfDefaults.NormalIndex,
-                                                          rm, renderer);
+                                                          rm, gfx);
 
         // KHR_materials_volume — absorption only (thickness / scattering ignored).
         // FindChannel is null-safe: if the extension is absent (or the channel
@@ -176,7 +176,7 @@ public static class GltfMaterialResource
         Format format,
         int fallbackBindlessIndex,
         ResourceManager rm,
-        Renderer.Renderer renderer)
+        GraphicsDevice gfx)
     {
         var image = channel?.Texture?.PrimaryImage;
         if (image == null) return fallbackBindlessIndex;
@@ -186,7 +186,7 @@ public static class GltfMaterialResource
         // commonly read from three channels in one material.
         string texId = $"{idPrefix}:img:{image.LogicalIndex}:fmt{(int)format}";
         var tex = GltfTextureResource.BuildAndRegister(
-            texId, rm, renderer,
+            texId, rm, gfx,
             image.Content.Content,
             image.Content.MimeType,
             format);

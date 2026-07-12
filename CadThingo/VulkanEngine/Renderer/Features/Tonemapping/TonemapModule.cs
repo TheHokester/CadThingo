@@ -18,9 +18,9 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 /// the module imports it directly from the host-owned <see cref="ImageResource"/>.
 ///
 /// The pipeline is injected. The HDR-input descriptor (set 0) is graph-baked: this module names
-/// the HDR read, so the graph allocates + writes tonemap's set from the upstream transient and no
-/// host-side rebind is needed. (The non-graph megakernel PT cores keep the pipeline-owned set +
-/// WriteHdrInputDescriptor, since they don't run through a graph.)
+/// the HDR read, so the graph allocates + writes tonemap's set from the upstream resource and no
+/// host-side rebind is needed. Every core is graph-resident and composes this module, so this is
+/// the only binding path.
 /// </summary>
 public sealed class TonemapModule : IGraphModule<TonemapModule.Input, TonemapModule.Output>
 {

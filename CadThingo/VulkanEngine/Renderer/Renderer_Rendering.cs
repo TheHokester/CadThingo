@@ -112,9 +112,8 @@ public unsafe partial class Renderer
         // next dispatch clears fresh memory).
         foreach (var core in _renderCores) core.Resize(renderExtent);
 
-        // Re-point tonemap's HDR input at the ACTIVE core's fresh scene-colour source (deferred
-        // HDR vs PT ptOutColor). Subsumes the old per-mode branch: DeferredCore.Resize just bound
-        // tonemap to the new deferred HDR, so in a PT mode we must override it back to ptOutColor.
+        // Tonemap's HDR input is graph-baked, re-pointed by each core's graph rebuild above;
+        // Activate restarts the active PT core's progressive accumulation on the fresh targets.
         _activeCore.Activate();
 
         // FinalColor ImageView is fresh - re-bind it for the ImGui viewport panel.
@@ -196,11 +195,10 @@ public unsafe partial class Renderer
         //     so it sits here before the per-frame command buffer is recorded.
         selection.ProcessPickRequest();
 
-        // 0d. Render-mode change: swap the active core. Its Activate() rebinds tonemap's HDR
-        //     input to the core's scene-colour source (deferred HDR vs PT ptOutColor).
-        //     DeviceWaitIdle ensures no in-flight frame is still using the old binding. Mode
-        //     flips are user-driven (ImGui combo), so the hitch is acceptable. This replaces the
-        //     old per-frame _lastRenderMode tonemap-rebind check.
+        // 0d. Render-mode change: swap the active core. Tonemap's HDR input is graph-baked per
+        //     core, so Activate() only restarts the PT cores' progressive accumulation.
+        //     DeviceWaitIdle ensures no in-flight frame straddles the switch. Mode flips are
+        //     user-driven (ImGui combo), so the hitch is acceptable.
         var desiredCore = _renderCores[_desiredCoreIndex];
         if (!ReferenceEquals(desiredCore, _activeCore))
         {

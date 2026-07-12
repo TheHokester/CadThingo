@@ -32,21 +32,21 @@ public static unsafe class GltfDefaults
     public static Texture Occlusion         => _occlusion         ?? throw new InvalidOperationException("GltfDefaults not registered");
     public static Texture Emissive          => _emissive          ?? throw new InvalidOperationException("GltfDefaults not registered");
 
-    public static void EnsureRegistered(ResourceManager rm, Renderer.Renderer renderer)
+    public static void EnsureRegistered(ResourceManager rm, GraphicsDevice gfx)
     {
         if (_registered) return;
 
         // BaseColor: white sRGB so the baseColorFactor multiplier comes through unmodified.
-        _baseColor         = MakeOnePixel(renderer, 255, 255, 255, 255, Format.R8G8B8A8Srgb);
+        _baseColor         = MakeOnePixel(gfx, 255, 255, 255, 255, Format.R8G8B8A8Srgb);
         // MetallicRoughness: consumers sample .rg → red=metallic, green=roughness (matches the
         // BC5 repack layout). (0,255,0,255) → metallic=0, roughness=1 (glTF default factors).
-        _metallicRoughness = MakeOnePixel(renderer,   0, 255,   0, 255, Format.R8G8B8A8Unorm);
+        _metallicRoughness = MakeOnePixel(gfx,   0, 255,   0, 255, Format.R8G8B8A8Unorm);
         // Normal: flat normal pointing +Z in tangent space, encoded (128,128,255).
-        _normal            = MakeOnePixel(renderer, 128, 128, 255, 255, Format.R8G8B8A8Unorm);
+        _normal            = MakeOnePixel(gfx, 128, 128, 255, 255, Format.R8G8B8A8Unorm);
         // Occlusion: 1.0 = no occlusion.
-        _occlusion         = MakeOnePixel(renderer, 255, 255, 255, 255, Format.R8G8B8A8Unorm);
+        _occlusion         = MakeOnePixel(gfx, 255, 255, 255, 255, Format.R8G8B8A8Unorm);
         // Emissive: black sRGB so missing emissive contributes nothing additive.
-        _emissive          = MakeOnePixel(renderer,   255,   255,   255, 255, Format.R8G8B8A8Srgb);
+        _emissive          = MakeOnePixel(gfx,   255,   255,   255, 255, Format.R8G8B8A8Srgb);
 
         rm.Load<TextureResource>(BaseColorId,         _ => new TextureResource(BaseColorId,         _baseColor));
         rm.Load<TextureResource>(MetallicRoughnessId, _ => new TextureResource(MetallicRoughnessId, _metallicRoughness));
@@ -64,12 +64,13 @@ public static unsafe class GltfDefaults
         _registered = true;
     }
 
-    private static Texture MakeOnePixel(Renderer.Renderer renderer, byte r, byte g, byte b, byte a, Format format)
+    private static Texture MakeOnePixel(GraphicsDevice gfx
+        , byte r, byte g, byte b, byte a, Format format)
     {
         Span<byte> rgba = stackalloc byte[4] { r, g, b, a };
         fixed (byte* p = rgba)
         {
-            return Texture.CreateTextureFromMemory(renderer, p, 1, 1, format, new Extent3D(1, 1, 1));
+            return Texture.CreateTextureFromMemory(gfx, p, 1, 1, format, new Extent3D(1, 1, 1));
         }
     }
 }

@@ -151,6 +151,11 @@ public sealed unsafe class GraphicsDevice : IDisposable
     /// <summary>True iff textureCompressionBC was enabled at device creation (BC1-7 sampling).
     /// The glTF texture loader compresses material textures to BC only when this is set.</summary>
     public bool  TextureCompressionBcEnabled { get; private set; }
+    
+    // GPU block-compression encoder for material textures (lazy: created on the first compressed
+    // texture load, so it costs nothing for runs that never load a BC-formatted asset).
+    private Features.TextureCompression.BcEncoder? _bcEncoder;
+    internal Features.TextureCompression.BcEncoder BcEncoder => _bcEncoder ??= new Features.TextureCompression.BcEncoder(this);
 
     // Read-only handle accessor — pipelines that load their own device-extension
     // dispatch tables (e.g. RtPipeline → KhrRayTracingPipeline) need the instance
@@ -216,6 +221,9 @@ public sealed unsafe class GraphicsDevice : IDisposable
     // has been freed. Globals.vk is a process-wide singleton — never disposed here.
     public void Dispose()
     {
+        
+        _bcEncoder?.Dispose();
+        
         // Descriptor pool (frees the descriptor sets owned by the pipelines)
         if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
 

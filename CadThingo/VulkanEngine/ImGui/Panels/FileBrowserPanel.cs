@@ -95,7 +95,7 @@ public static unsafe class FileBrowserPanel
         GltfLoader.LoadResult result;
         try
         {
-            result = GltfLoader.Load(path, idPrefix, Engine.ResourceManager, renderer, scene);
+            result = GltfLoader.Load(path, idPrefix, Engine.ResourceManager, renderer.gfx, scene);
         }
         catch (Exception ex)
         {
@@ -400,7 +400,7 @@ public static unsafe class FileBrowserPanel
         GltfLoader.LoadResult result;
         try
         {
-            result = GltfLoader.Load(f.Path, idPrefix, Engine.ResourceManager, renderer, scene);
+            result = GltfLoader.Load(f.Path, idPrefix, Engine.ResourceManager, renderer.gfx, scene);
         }
         catch (Exception ex)
         {
