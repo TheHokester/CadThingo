@@ -667,6 +667,10 @@ public unsafe partial class Renderer
         r.RegisterBufferPerFrame("probes", probes);
         r.RegisterBufferPerFrame("probeClusterRange", clusterRange);
         r.RegisterBufferPerFrame("probeIndexList", indexList);
+
+        // FeatureEnv (set 3): the raw environment cube, owned by IblSystem and consumed by the
+        // skybox + path tracers. Stable handle (rebakes overwrite content), registered once.
+        r.RegisterImage("envCube", Ibl.envCubeView, ImageLayout.ShaderReadOnlyOptimal, Ibl.iblCubeSampler);
     }
 
     // Centralized teardown. Each lifetime-scoped owner (FrameRing, RenderTargets,
