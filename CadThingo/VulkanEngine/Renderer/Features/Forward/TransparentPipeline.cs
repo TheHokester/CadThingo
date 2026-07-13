@@ -1,7 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.IBL;   // ReflectionProbeSystem, ProbeGpuRecord
 using Silk.NET.Vulkan;
 
@@ -61,13 +63,22 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
     public bool SoftShadowsEnabled { get; set; } = true;
 
     // Set 0 - unified scene set (registry-owned): lights, TLAS, bindless
-    //         materials/textures/samplers. Frame constants ride its (0,0)
-    //         dynamic slot.
-    // Set 1 - pass-local lighting inputs: tile-cull outputs, global IBL
-    //         split-sum, reflection probes. Per-frame (tile/probe buffers are
-    //         per-frame allocations). Same layout/order as PBR's set 2.
-    private const int SetScene          = 0;
-    private const int SetLightingInputs = 1;
+    //         materials/textures/samplers. Frame constants ride its (0,0) dynamic slot.
+    // Set 1 - graph-baked pass set: the tile-cull outputs.
+    // Set 2 - FeatureIBL (registry-owned): global IBL split-sum + reflection probes.
+    private const int SetScene = 0;
+    private const int SetTile  = 1;
+    private const string FeatureIbl = "FeatureIBL";
+
+    // Graph-baked pass set (set 1): the two tile-cull outputs (graph resources the
+    // TransparentPass reads). Names match the TransparentPass Read binds.
+    private static readonly BindingDesc[] _passBindings =
+    {
+        new("tileLightCount",   SetTile, 0, DescriptorType.StorageBuffer, 1, ShaderStageFlags.FragmentBit),
+        new("tileLightIndices", SetTile, 1, DescriptorType.StorageBuffer, 1, ShaderStageFlags.FragmentBit),
+    };
+
+    public PassSetSpec PassSet => new(SetIndex: SetTile, DescriptorSetLayouts[SetTile], _passBindings);
 
     // Frame constants staged by UpdatePerFrame, pushed into the constant arena
     // by Record (which runs later the same frame inside the graph).
@@ -93,7 +104,7 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         internal readonly ImageView Depth = depth;
     }
 
-    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, IReadOnlyList<TransparentDraw> transparentDraws,Attachments attachments)
+    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, IReadOnlyList<TransparentDraw> transparentDraws, Attachments attachments, DescriptorSet tileSet)
     {
         BeginRendering(cmd,
             ctx.RenderExtent,
@@ -114,17 +125,18 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdSetViewport(cmd, 0, 1, &vp);
         Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
 
-        // Set 0 = scene set with the frame constants' dynamic offset (arena push
-        // of the UBO staged by UpdatePerFrame). Set 1 = tile cull + IBL + probes.
+        // Set 0 = scene set with the frame constants' dynamic offset (arena push of the UBO
+        // staged by UpdatePerFrame). Set 1 = graph-baked tile pass set. Set 2 = FeatureIBL.
         var registry = Renderer.descriptorRegistry;
         uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
-        var sets = stackalloc DescriptorSet[2]
+        var sets = stackalloc DescriptorSet[3]
         {
             registry.SceneSet(ctx.FrameIndex),
-            GetDescriptorSet(SetLightingInputs, ctx.FrameIndex),
+            tileSet,
+            registry.FeatureSet(FeatureIbl, ctx.FrameIndex),
         };
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, 0, 2, sets, 1, &frameConstants);
+            Layout, 0, 3, sets, 1, &frameConstants);
 
         // Bind global VB/IB once — every BLEND entity references offsets into these.
         var vb = Engine.ResourceManager.GlobalVertexBuffer;
@@ -221,216 +233,35 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Set 0 is borrowed from DescriptorRegistry (never destroyed here);
-        // set 1 is owned by this pipeline.
-        DescriptorSetLayouts = new DescriptorSetLayout[2];
-        OwnedDescriptorSetLayoutIndices = new[] { SetLightingInputs };
-        DescriptorSetLayouts[SetScene] = Renderer.descriptorRegistry.SceneSetLayout;
-
-        // Set 1: pass-local lighting inputs. Written only at Initialize /
-        // Rebuild / cross-pipeline wiring, all under an idle device, so no
-        // update-after-bind flags are needed.
-        //   0 tileLightCount   1 tileLightIndices   (LightCulling outputs)
-        //   2 irradianceCube   3 prefilteredCube    4 brdfLut   (global IBL)
-        //   5 probeCubeArray   6 probes   7 probeClusterRange   8 probeIndexList
-        var set1Types = new[]
-        {
-            DescriptorType.StorageBuffer,
-            DescriptorType.StorageBuffer,
-            DescriptorType.CombinedImageSampler,
-            DescriptorType.CombinedImageSampler,
-            DescriptorType.CombinedImageSampler,
-            DescriptorType.CombinedImageSampler,
-            DescriptorType.StorageBuffer,
-            DescriptorType.StorageBuffer,
-            DescriptorType.StorageBuffer,
-        };
-        var set1Bindings = new DescriptorSetLayoutBinding[set1Types.Length];
-        for (uint b = 0; b < set1Types.Length; b++)
-        {
-            set1Bindings[b] = new DescriptorSetLayoutBinding
+        // Pass set (set 1): the two tile-cull output storage buffers. The pipeline owns this
+        // LAYOUT; the deferred FrameGraph owns + writes the SETS allocated from it.
+        var passBindings = new DescriptorSetLayoutBinding[2];
+        for (uint b = 0; b < 2; b++)
+            passBindings[b] = new DescriptorSetLayoutBinding
             {
-                Binding            = b,
-                DescriptorType     = set1Types[b],
-                DescriptorCount    = 1,
-                StageFlags         = ShaderStageFlags.FragmentBit,
-                PImmutableSamplers = null,
+                Binding = b, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1,
+                StageFlags = ShaderStageFlags.FragmentBit,
             };
+
+        DescriptorSetLayout passLayout;
+        fixed (DescriptorSetLayoutBinding* pPass = passBindings)
+        {
+            var info = new DescriptorSetLayoutCreateInfo
+            {
+                SType = StructureType.DescriptorSetLayoutCreateInfo,
+                BindingCount = (uint)passBindings.Length,
+                PBindings = pPass,
+            };
+            if (Vk.CreateDescriptorSetLayout(Device, &info, null, out passLayout) != Result.Success)
+                throw new Exception("Failed to create transparent pass-set (set 1) layout");
         }
 
-        fixed (DescriptorSetLayoutBinding* pSet1 = set1Bindings)
-        {
-            var set1LayoutInfo = new DescriptorSetLayoutCreateInfo
-            {
-                SType        = StructureType.DescriptorSetLayoutCreateInfo,
-                BindingCount = (uint)set1Bindings.Length,
-                PBindings    = pSet1,
-            };
-            if (Vk.CreateDescriptorSetLayout(Device, &set1LayoutInfo, null, out DescriptorSetLayouts[SetLightingInputs]) != Result.Success)
-                throw new Exception("Failed to create transparent set 1 (LightingInputs) layout");
-        }
+        // Assemble [scene(0), pass(1), FeatureIBL(2)]; the pipeline owns only the pass layout.
+        DescriptorSetLayouts = Renderer.descriptorRegistry.BuildPipelineSetLayouts(passLayout, FeatureIbl);
+        OwnedDescriptorSetLayoutIndices = new[] { SetTile };
     }
 
-    protected override void CreateDescriptorSets()
-    {
-        DescriptorSets = new DescriptorSet[2][];
-
-        // Set 0 — scene set is owned by DescriptorRegistry; Record binds
-        // Renderer.descriptorRegistry.SceneSet(frame) directly.
-        DescriptorSets[SetScene] = null;
-
-        // Set 1 — per-frame: the tile-cull and probe buffers it points at are
-        // per-frame allocations.
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[SetLightingInputs];
-
-        var allocInfo = new DescriptorSetAllocateInfo
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts        = layouts,
-        };
-        DescriptorSets[SetLightingInputs] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* pSets = DescriptorSets[SetLightingInputs])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &allocInfo, pSets) != Result.Success)
-                throw new Exception("Failed to allocate transparent lighting-inputs descriptor sets");
-        }
-    }
-
-    // Only the IBL bindings are written here. Bindings 0/1 (tile buffers) point
-    // at LightCullPipeline's buffers and are written by the renderer after that
-    // pipeline exists; the probe quartet after the probe system exists. The
-    // scene set (lights / TLAS / bindless) is registry-maintained.
-    protected override void WriteDescriptors()
-    {
-        WriteIblDescriptors();
-    }
-
-    /// <summary>Writes bindings 0 + 1 of set 1 (per-tile light count and indices)
-    /// on the per-frame lighting-inputs sets. Call once at startup after the
-    /// light-cull pipeline exists — its output buffers are this pipeline's inputs.</summary>
-    public void WriteTileBufferDescriptors(LightCullPipeline lightCull)
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo tileCountInfo = new()
-            {
-                Buffer = lightCull.GetTileLightCountBuffer((uint)i),
-                Offset = 0,
-                Range  = (ulong)(Renderer.MAX_TILE_COUNT * sizeof(uint)),
-            };
-            DescriptorBufferInfo tileIdxInfo = new()
-            {
-                Buffer = lightCull.GetTileLightIndicesBuffer((uint)i),
-                Offset = 0,
-                Range  = (ulong)(Renderer.MAX_TILE_COUNT * Renderer.MAX_LIGHTS_PER_TILE * sizeof(uint)),
-            };
-
-            var writes = stackalloc WriteDescriptorSet[2];
-            writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetLightingInputs][i], DstBinding = 0, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &tileCountInfo };
-            writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetLightingInputs][i], DstBinding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &tileIdxInfo };
-            Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-        }
-    }
-
-    /// <summary>Mirror of PbrDeferredPipeline.WriteIblDescriptors — same renderer-
-    /// wide images, separate descriptor sets. Called once at startup after the
-    /// IBL resources exist; doesn't need re-running on rebake because the VkImage
-    /// handles persist.</summary>
-    public void WriteIblDescriptors()
-    {
-        var imageInfos = stackalloc DescriptorImageInfo[3]
-        {
-            new() { ImageView = Renderer.Ibl.irradianceCubeView,  Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.prefilteredCubeView, Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.brdfLutView,         Sampler = Renderer.Ibl.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-        };
-
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            var writes = stackalloc WriteDescriptorSet[3];
-            for (uint b = 0; b < 3; b++)
-            {
-                writes[b] = new WriteDescriptorSet
-                {
-                    SType           = StructureType.WriteDescriptorSet,
-                    DstSet          = DescriptorSets[SetLightingInputs][i],
-                    DstBinding      = 2 + b,
-                    DstArrayElement = 0,
-                    DescriptorType  = DescriptorType.CombinedImageSampler,
-                    DescriptorCount = 1,
-                    PImageInfo      = &imageInfos[b],
-                };
-            }
-            Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
-        }
-    }
-
-    /// <summary>Mirror of PbrDeferredPipeline.WriteProbeDescriptors — writes
-    /// bindings 5/6/7/8 of set 1 on each per-frame transparent set. Call once
-    /// after the probe system exists; underlying handles are stable for the
-    /// renderer's lifetime so no per-frame rewrites needed.</summary>
-    public void WriteProbeDescriptors()
-    {
-        var probeSys = Renderer.reflectionProbeSystem;
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorImageInfo cubeArrayInfo = new()
-            {
-                Sampler     = probeSys.prefilteredArraySampler,
-                ImageView   = probeSys.prefilteredArrayView,
-                ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
-            };
-            DescriptorBufferInfo recordsInfo = new()
-            {
-                Buffer = probeSys.probeRecordBuffers[i].buffer,
-                Offset = 0,
-                Range  = ReflectionProbeSystem.MaxProbes * (ulong)sizeof(ProbeGpuRecord),
-            };
-            DescriptorBufferInfo clusterRangeInfo = new()
-            {
-                Buffer = probeSys.clusterGrid.GetClusterRangeBuffer((uint)i),
-                Offset = 0,
-                Range  = probeSys.clusterGrid.ClusterRangeBufferSize,
-            };
-            DescriptorBufferInfo indexListInfo = new()
-            {
-                Buffer = probeSys.clusterGrid.GetProbeIndexBuffer((uint)i),
-                Offset = 0,
-                Range  = probeSys.clusterGrid.ProbeIndexBufferSize,
-            };
-
-            var writes = stackalloc WriteDescriptorSet[4];
-            writes[0] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetLightingInputs][i],
-                DstBinding = 5, DescriptorType = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1, PImageInfo = &cubeArrayInfo,
-            };
-            writes[1] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetLightingInputs][i],
-                DstBinding = 6, DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1, PBufferInfo = &recordsInfo,
-            };
-            writes[2] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetLightingInputs][i],
-                DstBinding = 7, DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1, PBufferInfo = &clusterRangeInfo,
-            };
-            writes[3] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetLightingInputs][i],
-                DstBinding = 8, DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1, PBufferInfo = &indexListInfo,
-            };
-            Vk.UpdateDescriptorSets(Device, 4, writes, 0, null);
-        }
-    }
-
+    
     /// <summary>Fill the frame constants from the current camera + tile counts,
     /// staged for Record's arena push. Call once per frame from DrawFrame;
     /// tileCount / lightCount come from PbrDeferredPipeline.UpdatePerFrame so

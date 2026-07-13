@@ -405,12 +405,6 @@ public unsafe partial class Renderer
         // the tile cull buffers are wired from LightCullPipeline below.
         transparentPipeline = new TransparentPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
         transparentPipeline.Initialize();
-        transparentPipeline.WriteTileBufferDescriptors(lightCullPipeline);
-        // IBL bindings live on Renderer-owned VkImages that exist before any
-        // pipeline initializes; write them straight after Initialize.
-        transparentPipeline.WriteIblDescriptors();
-        // Probe bindings — same stable-handle story as IBL. Wired once at init.
-        transparentPipeline.WriteProbeDescriptors();
 
         // Skybox renders the envCube into HDRColor between lighting and transparent.
         // EditorState.SkyboxEnabled gates the draw without re-recording the graph.
@@ -584,11 +578,7 @@ public unsafe partial class Renderer
         // g-buffer set (set 1) is graph-owned now, so DeferredCore re-bakes it by rebuilding
         // the deferred graph against PBR's new layout.
         _renderCores.OfType<DeferredCore>().FirstOrDefault()?.OnPbrPipelineRebuilt();
-        transparentPipeline.WriteTileBufferDescriptors(lightCullPipeline);
-        transparentPipeline.WriteIblDescriptors();
-        transparentPipeline.WriteProbeDescriptors();
-        // TLAS / shadow-alpha / lights bindings for both PBR pipelines live on
-        // the registry-owned scene set, which survives the rebuild untouched.
+        
     }
 
     /// <summary>

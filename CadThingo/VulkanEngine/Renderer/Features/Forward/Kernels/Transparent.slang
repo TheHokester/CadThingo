@@ -6,6 +6,7 @@
 
 import PbrUtils;      // BRDF/light/IBL math + re-exported CommonTypes
 import SceneBindings; // scene set 0: lights/TLAS/materials/textures/samplers
+import FeatureIBL;    // feature set 2: irradiance/prefiltered/brdfLut + reflection probes
 
 struct FrameUBO {
     float4x4 view;
@@ -45,20 +46,11 @@ struct DrawPC {
 // from the imported SceneBindings module.
 [[vk::binding(0, 0)]] ConstantBuffer<FrameUBO>              frame;
 
-// Set 1 — pass-local lighting inputs, same layout/order as PBR.slang's set 2:
-// tile-cull outputs, then the global IBL split-sum (same VkImages as the
-// deferred pass, separate descriptor set), then the reflection probes (empty
-// clusterRange.count makes the probe loop a no-op and the global IBL fallback
-// takes over cleanly).
-[[vk::binding(0, 1)]] StructuredBuffer<uint>                tileLightCount;
-[[vk::binding(1, 1)]] StructuredBuffer<uint>                tileLightIndices;
-[[vk::binding(2, 1)]] SamplerCube                           irradianceCube;
-[[vk::binding(3, 1)]] SamplerCube                           prefilteredCube;
-[[vk::binding(4, 1)]] Sampler2D                             brdfLut;
-[[vk::binding(5, 1)]] SamplerCubeArray                     probeCubeArray;
-[[vk::binding(6, 1)]] StructuredBuffer<ProbeRecord>        probes;
-[[vk::binding(7, 1)]] StructuredBuffer<ProbeClusterRange>  probeClusterRange;
-[[vk::binding(8, 1)]] StructuredBuffer<uint>               probeIndexList;
+// Set 1 - graph-baked pass set: the tile-cull outputs (the only pass-local graph
+// resources this shader reads). The IBL split-sum + reflection probes come from the
+// imported FeatureIBL module (set 2), registry-owned and shared with the deferred pass.
+[[vk::binding(0, 1)]] StructuredBuffer<uint> tileLightCount;
+[[vk::binding(1, 1)]] StructuredBuffer<uint> tileLightIndices;
 
 [[vk::push_constant]] DrawPC draw;
 

@@ -204,12 +204,17 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         scope.AddPass("TransparentPass", PassType.Graphics, QueueClass.Graphics,
             b =>
             {
+                // Tile-cull outputs ride the graph-baked pass set (set 1); IBL/probes come from
+                // the registry's FeatureIBL set.
+                b.UsePassSet(_transparent.PassSet);
+                b.Read(tileCount,   ResourceUsage.StorageReadFragment, "tileLightCount");
+                b.Read(tileIndices, ResourceUsage.StorageReadFragment, "tileLightIndices");
                 hdr   = b.Write(hdr,   ResourceUsage.ColorAttachment);
                 depth = b.Write(depth, ResourceUsage.DepthAttachment);
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
                 _transparent.Record(cmd, f, _cull.LastTransparentDraws,
-                    new TransparentPipeline.Attachments(res.View(hdr), res.View(depth))));
+                    new TransparentPipeline.Attachments(res.View(hdr), res.View(depth)), res.PassSet));
 
         // Tonemap is a nested submodule: it imports FinalColor and reads HDRColor@v3 and writes the final image.
         _tonemap.Build(scope.Child("Tonemap"),
