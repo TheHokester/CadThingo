@@ -37,6 +37,29 @@ public sealed unsafe class DescriptorRegistry : IDisposable
     private readonly Dictionary<string, object> _registered = new();
     private readonly HashSet<string>[] _dirty;
 
+    // A feature descriptor set: a fixed-index global set,
+    // pinned at its own >= FirstFeature index by its shader module (e.g. FeatureIBL @ set 2),
+    // owned here like the scene set but simpler - no dynamic-UBO arena slot, no bindless array.
+    // Resources register by name (routed here from the same RegisterBuffer/Image/... calls) and
+    // land per frame slot through the same fence-safe BeginFrame queue.
+    private sealed class FeatureGroup
+    {
+        public string Name = "";
+        public uint SetIndex;
+        public DescriptorSetLayout Layout;
+        public DescriptorSet[] Sets = [];
+        public readonly Dictionary<string, BindingDesc> Bindings = new();
+        public readonly Dictionary<string, object> Registered = new();
+        public HashSet<string>[] Dirty = [];
+    }
+    private readonly List<FeatureGroup> _features = new();
+
+    // Zero-binding layout used to plug the gaps a sparse feature-set consumer leaves in its
+    // pipeline layout array (a shader using set 0 + set 3 needs valid layouts at 1 and 2). Never
+    // has a set bound to it - gaps are simply not bound at record time.
+    private DescriptorSetLayout _emptyLayout;
+    private DescriptorPool _featurePool;
+
     private int _nextBindlessSlot;
     private readonly Stack<int> _freeBindlessSlots = new();
     private readonly List<(int Slot, ImageView View, ImageLayout Layout)>[] _pendingBindless;
@@ -44,6 +67,39 @@ public sealed unsafe class DescriptorRegistry : IDisposable
     public PassConstantArena ConstantArena { get; }
     public DescriptorSetLayout SceneSetLayout => _sceneLayout;
     public DescriptorSet SceneSet(uint frame) => _sceneSets[frame];
+
+    /// The zero-binding placeholder layout for unused set slots (see <see cref="BuildPipelineSetLayouts"/>).
+    public DescriptorSetLayout EmptySetLayout => _emptyLayout;
+
+    /// The layout of a feature set, by module name (e.g. "FeatureIBL"). For pipelines that build
+    /// their own layout array; most should use <see cref="BuildPipelineSetLayouts"/>.
+    public DescriptorSetLayout FeatureSetLayout(string feature) => Feature(feature).Layout;
+
+    /// This frame's instance of a feature set, for the pipeline's CmdBindDescriptorSets.
+    public DescriptorSet FeatureSet(string feature, uint frame) => Feature(feature).Sets[frame];
+
+    /// <summary>Assembles a pipeline's full descriptor-set-layout array: scene at set 0, the
+    /// pipeline's own pass-set layout at set 1 (pass null if it has none), each named feature at
+    /// its pinned global index, and the shared empty layout in every gap. The array is sized to
+    /// the highest set index actually used. Callers bind only the sets their shader uses - gaps
+    /// are never bound.</summary>
+    public DescriptorSetLayout[] BuildPipelineSetLayouts(DescriptorSetLayout? passSet, params string[] features)
+    {
+        uint max = ShaderSets.Scene;
+        if (passSet is not null) max = Math.Max(max, ShaderSets.Pass);
+        foreach (var f in features) max = Math.Max(max, Feature(f).SetIndex);
+
+        var arr = new DescriptorSetLayout[max + 1];
+        for (int i = 0; i < arr.Length; i++) arr[i] = _emptyLayout;
+        arr[ShaderSets.Scene] = _sceneLayout;
+        if (passSet is not null) arr[ShaderSets.Pass] = passSet.Value;
+        foreach (var f in features) { var g = Feature(f); arr[g.SetIndex] = g.Layout; }
+        return arr;
+    }
+
+    private FeatureGroup Feature(string name)
+        => _features.FirstOrDefault(f => f.Name == name)
+           ?? throw new ArgumentException($"unknown feature set '{name}' (known: {string.Join(", ", _features.Select(f => f.Name))})");
 
     public DescriptorRegistry(GraphicsDevice gfx, ShaderLibrary shaders, uint framesInFlight)
     {
@@ -68,6 +124,12 @@ public sealed unsafe class DescriptorRegistry : IDisposable
 
         CreateLayoutPoolAndSets(reflected);
         ConstantArena = new PassConstantArena(gfx, framesInFlight);
+
+        // Feature sets: each is a shader module pinning its own global set index. The
+        // resource owners (IblSystem / ReflectionProbeSystem) register into them by name after
+        // construction. Add a module name here to introduce a new feature set.
+        CreateEmptyLayout();
+        CreateFeatureSets(shaders, "FeatureIBL", "FeatureEnv");
 
         // Binding 0 (dynamic constant slot) is stable for the registry's lifetime; the sets
         // are idle at construction, so write it directly.
@@ -196,6 +258,110 @@ public sealed unsafe class DescriptorRegistry : IDisposable
         }
     }
 
+    private void CreateEmptyLayout()
+    {
+        var info = new DescriptorSetLayoutCreateInfo
+        {
+            SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 0,
+        };
+        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out _emptyLayout) != Result.Success)
+            throw new Exception("DescriptorRegistry: failed to create empty placeholder layout");
+    }
+
+    // Reflects each feature module into its own fixed-index set, then allocates one set per frame
+    // from a shared feature pool. Feature sets are plain: no dynamic-UBO slot, no bindless array,
+    // all-stages visibility. Idle at construction; resources land later via the register + BeginFrame path.
+    private void CreateFeatureSets(ShaderLibrary shaders, params string[] moduleNames)
+    {
+        var poolSizes = new Dictionary<DescriptorType, uint>();
+        uint totalSets = 0;
+
+        foreach (var moduleName in moduleNames)
+        {
+            var reflected = shaders.ReflectModule(moduleName).Bindings;
+            var group = new FeatureGroup { Name = moduleName, Sets = new DescriptorSet[_frames], Dirty = new HashSet<string>[_frames] };
+            for (int i = 0; i < _frames; i++) group.Dirty[i] = [];
+            ValidateFeatureModule(moduleName, reflected, out group.SetIndex);
+
+            var layoutBindings = new DescriptorSetLayoutBinding[reflected.Length];
+            for (int i = 0; i < reflected.Length; i++)
+            {
+                var b = reflected[i];
+                group.Bindings[b.Name] = b;
+                layoutBindings[i] = new DescriptorSetLayoutBinding
+                {
+                    Binding = b.Binding,
+                    DescriptorType = b.Type,
+                    DescriptorCount = b.Count,
+                    StageFlags = ShaderStageFlags.All,
+                };
+                poolSizes[b.Type] = poolSizes.GetValueOrDefault(b.Type) + b.Count * _frames;
+            }
+            fixed (DescriptorSetLayoutBinding* pB = layoutBindings)
+            {
+                var info = new DescriptorSetLayoutCreateInfo
+                {
+                    SType = StructureType.DescriptorSetLayoutCreateInfo,
+                    BindingCount = (uint)layoutBindings.Length,
+                    PBindings = pB,
+                };
+                if (Vk.CreateDescriptorSetLayout(Device, &info, null, out group.Layout) != Result.Success)
+                    throw new Exception($"DescriptorRegistry: failed to create '{moduleName}' layout");
+            }
+            _features.Add(group);
+            totalSets += _frames;
+        }
+
+        if (_features.Count == 0) return;
+
+        var sizes = poolSizes.Select(kv => new DescriptorPoolSize { Type = kv.Key, DescriptorCount = kv.Value }).ToArray();
+        fixed (DescriptorPoolSize* pSizes = sizes)
+        {
+            var poolInfo = new DescriptorPoolCreateInfo
+            {
+                SType = StructureType.DescriptorPoolCreateInfo,
+                PoolSizeCount = (uint)sizes.Length,
+                PPoolSizes = pSizes,
+                MaxSets = totalSets,
+            };
+            if (Vk.CreateDescriptorPool(Device, &poolInfo, null, out _featurePool) != Result.Success)
+                throw new Exception("DescriptorRegistry: failed to create feature descriptor pool");
+        }
+
+        foreach (var group in _features)
+        {
+            var layouts = stackalloc DescriptorSetLayout[(int)_frames];
+            for (int i = 0; i < _frames; i++) layouts[i] = group.Layout;
+            var alloc = new DescriptorSetAllocateInfo
+            {
+                SType = StructureType.DescriptorSetAllocateInfo,
+                DescriptorPool = _featurePool,
+                DescriptorSetCount = _frames,
+                PSetLayouts = layouts,
+            };
+            fixed (DescriptorSet* pSets = group.Sets)
+                if (Vk.AllocateDescriptorSets(Device, &alloc, pSets) != Result.Success)
+                    throw new Exception($"DescriptorRegistry: failed to allocate '{group.Name}' sets");
+        }
+    }
+
+    // Feature modules pin one global set index (>= FirstFeature); no bindless arrays (v1).
+    private static void ValidateFeatureModule(string name, BindingDesc[] bindings, out uint setIndex)
+    {
+        if (bindings.Length == 0) throw new Exception($"{name} reflected no bindings");
+        setIndex = bindings[0].Set;
+        if (setIndex < ShaderSets.FirstFeature)
+            throw new Exception($"{name}: set {setIndex} is below FirstFeature ({ShaderSets.FirstFeature})");
+        foreach (var b in bindings)
+        {
+            if (b.Set != setIndex)
+                throw new Exception($"{name}: '{b.Name}' is in set {b.Set}, expected a single feature set {setIndex}");
+            if (b.Count == 0)
+                throw new Exception($"{name}: '{b.Name}' is an unbounded array; feature sets are fixed-count (v1)");
+        }
+    }
+
     // ---- name -> resource registration --------------------------------------------------
 
     public void RegisterBuffer(string name, Buffer buf, ulong offset = 0, ulong range = Vk.WholeSize)
@@ -210,9 +376,8 @@ public sealed unsafe class DescriptorRegistry : IDisposable
 
     private void RegisterBufferInternal(string name, Buffer[] perFrame, ulong offset, ulong range)
     {
-        var b = Expect(name, DescriptorType.StorageBuffer, DescriptorType.UniformBuffer);
-        _registered[name] = new BufferReg { PerFrame = perFrame, Offset = offset, Range = range };
-        MarkDirty(name);
+        var (group, _) = Expect(name, DescriptorType.StorageBuffer, DescriptorType.UniformBuffer);
+        StoreReg(group, name, new BufferReg { PerFrame = perFrame, Offset = offset, Range = range });
     }
 
     public void RegisterImage(string name, ImageView view, ImageLayout layout, Sampler? sampler = null)
@@ -227,26 +392,25 @@ public sealed unsafe class DescriptorRegistry : IDisposable
 
     private void RegisterImageInternal(string name, ImageView[] perFrame, ImageLayout layout, Sampler? sampler)
     {
-        var b = Expect(name, DescriptorType.SampledImage, DescriptorType.CombinedImageSampler, DescriptorType.StorageImage);
+        var (group, b) = Expect(name, DescriptorType.SampledImage, DescriptorType.CombinedImageSampler, DescriptorType.StorageImage);
         if (b.Type == DescriptorType.CombinedImageSampler && sampler is null)
             throw new ArgumentException($"'{name}' is a combined image sampler; a sampler is required");
-        _registered[name] = new ImageReg { PerFrame = perFrame, Layout = layout, Sampler = sampler ?? default };
-        MarkDirty(name);
+        StoreReg(group, name, new ImageReg { PerFrame = perFrame, Layout = layout, Sampler = sampler ?? default });
     }
 
     public void RegisterTlas(string name, AccelerationStructureKHR tlas)
     {
-        Expect(name, DescriptorType.AccelerationStructureKhr);
-        _registered[name] = new TlasReg { Tlas = tlas };
-        MarkDirty(name);
+        var (group, _) = Expect(name, DescriptorType.AccelerationStructureKhr);
+        StoreReg(group, name, new TlasReg { Tlas = tlas });
     }
 
     public void RegisterSampler(string name, Sampler sampler, int arrayIndex = 0)
     {
-        var b = Expect(name, DescriptorType.Sampler);
+        var (group, b) = Expect(name, DescriptorType.Sampler);
         if (arrayIndex < 0 || arrayIndex >= b.Count)
             throw new ArgumentException($"'{name}'[{arrayIndex}] out of range (count {b.Count})");
-        if (_registered.TryGetValue(name, out var existing) && existing is SamplerReg reg)
+        var store = group?.Registered ?? _registered;
+        if (store.TryGetValue(name, out var existing) && existing is SamplerReg reg)
         {
             reg.Slots[arrayIndex] = sampler;
             reg.Valid[arrayIndex] = true;
@@ -256,25 +420,42 @@ public sealed unsafe class DescriptorRegistry : IDisposable
             var fresh = new SamplerReg { Slots = new Sampler[b.Count], Valid = new bool[b.Count] };
             fresh.Slots[arrayIndex] = sampler;
             fresh.Valid[arrayIndex] = true;
-            _registered[name] = fresh;
+            store[name] = fresh;
         }
-        MarkDirty(name);
+        MarkDirtyOn(group, name);
     }
 
-    private BindingDesc Expect(string name, params DescriptorType[] allowed)
+    // Resolves a name to its owning set (null group == scene) + BindingDesc, validating the type.
+    private (FeatureGroup? group, BindingDesc b) Expect(string name, params DescriptorType[] allowed)
     {
-        if (!_sceneBindings.TryGetValue(name, out var b))
-            throw new ArgumentException($"'{name}' is not a SceneBindings parameter (known: {string.Join(", ", _sceneBindings.Keys)})");
-        if (name == _texturesName)
-            throw new ArgumentException($"'{name}' is the bindless array; use RegisterBindlessTexture");
-        if (!allowed.Contains(b.Type))
-            throw new ArgumentException($"'{name}' is {b.Type}, not {string.Join("/", allowed)}");
-        return b;
+        if (_sceneBindings.TryGetValue(name, out var sb))
+        {
+            if (name == _texturesName)
+                throw new ArgumentException($"'{name}' is the bindless array; use RegisterBindlessTexture");
+            if (!allowed.Contains(sb.Type))
+                throw new ArgumentException($"'{name}' is {sb.Type}, not {string.Join("/", allowed)}");
+            return (null, sb);
+        }
+        foreach (var g in _features)
+            if (g.Bindings.TryGetValue(name, out var fb))
+            {
+                if (!allowed.Contains(fb.Type))
+                    throw new ArgumentException($"'{name}' is {fb.Type}, not {string.Join("/", allowed)}");
+                return (g, fb);
+            }
+        throw new ArgumentException($"'{name}' is not a scene or feature-set parameter");
     }
 
-    private void MarkDirty(string name)
+    // Stores a resource reg into its owning set + marks that set dirty on every frame slot.
+    private void StoreReg(FeatureGroup? group, string name, object reg)
     {
-        foreach (var set in _dirty) set.Add(name);
+        (group?.Registered ?? _registered)[name] = reg;
+        MarkDirtyOn(group, name);
+    }
+
+    private void MarkDirtyOn(FeatureGroup? group, string name)
+    {
+        foreach (var set in group?.Dirty ?? _dirty) set.Add(name);
     }
 
     // ---- bindless texture table ----------------------------------------------------------
@@ -343,20 +524,34 @@ public sealed unsafe class DescriptorRegistry : IDisposable
             Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
         }
         _pendingBindless[frame].Clear();
+
+        // Feature sets ride the same fence-safe queue: flush each one's dirty names into this
+        // frame slot (provably idle here). Handles are usually stable, so this is a one-shot per
+        // frame slot at registration and again after a resource realloc.
+        foreach (var g in _features)
+        {
+            foreach (var name in g.Dirty[frame])
+                WriteBinding(g.Sets[frame], g.Bindings[name], g.Registered[name], frame);
+            g.Dirty[frame].Clear();
+        }
     }
 
     private void WriteOne(uint frame, string name)
+        => WriteBinding(_sceneSets[frame], _sceneBindings[name], _registered[name], frame);
+
+    // Emits the descriptor write(s) for one registered resource into a specific set. Shared by the
+    // scene set and every feature set - the only differences (which set, which binding) are args.
+    private void WriteBinding(DescriptorSet set, BindingDesc b, object resource, uint frame)
     {
-        var b = _sceneBindings[name];
         var write = new WriteDescriptorSet
         {
             SType = StructureType.WriteDescriptorSet,
-            DstSet = _sceneSets[frame],
+            DstSet = set,
             DstBinding = b.Binding,
             DescriptorType = b.Type,
             DescriptorCount = 1,
         };
-        switch (_registered[name])
+        switch (resource)
         {
             case BufferReg reg:
             {
@@ -430,5 +625,10 @@ public sealed unsafe class DescriptorRegistry : IDisposable
         ConstantArena.Dispose();
         if (_pool.Handle != 0) Vk.DestroyDescriptorPool(Device, _pool, null);
         if (_sceneLayout.Handle != 0) Vk.DestroyDescriptorSetLayout(Device, _sceneLayout, null);
+
+        if (_featurePool.Handle != 0) Vk.DestroyDescriptorPool(Device, _featurePool, null);
+        foreach (var g in _features)
+            if (g.Layout.Handle != 0) Vk.DestroyDescriptorSetLayout(Device, g.Layout, null);
+        if (_emptyLayout.Handle != 0) Vk.DestroyDescriptorSetLayout(Device, _emptyLayout, null);
     }
 }
