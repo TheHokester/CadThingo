@@ -1,5 +1,6 @@
 import PbrUtils;      // BRDF/light/IBL math + re-exported CommonTypes (types, consts, vertex helpers)
 import SceneBindings; // scene set 0: lights/TLAS/entity-info/vb+ib/materials/textures/samplers
+import FeatureIBL;    // feature set 2: irradiance/prefiltered/brdfLut + reflection probes
 
 // Output from vertex shader / Input to fragment shader - Interpolated data
 struct LightingVSOutput {
@@ -46,28 +47,14 @@ struct LightingFrameUBO {
 // Flip CadThingo's Renderer.softShadowsEnabled and rebuild the PBR pipeline.
 [[vk::constant_id(0)]] const bool SOFT_SHADOWS = false;
 
-// GBuffer inputs — pass-local set 1
+// GBuffer inputs + tileLight buffers pass-local set 1
 [[vk::binding(0, 1)]] Sampler2D gBufferPositionSampler;
 [[vk::binding(1, 1)]] Sampler2D gBufferNormalSampler;
 [[vk::binding(2, 1)]] Sampler2D gBufferAlbedoSampler;
 [[vk::binding(3, 1)]] Sampler2D gBufferMaterialSampler;
 [[vk::binding(4, 1)]] Sampler2D gBufferEmissiveSampler;
-
-// Set 2: lighting inputs local to this pass — tile-cull outputs, then the
-// global IBL split-sum (irradiance + prefiltered cubes give diffuse and
-// per-roughness specular, brdfLut the view-independent F0 fit; black-cleared
-// until LoadEnvironmentHdr runs, giving zero IBL contribution), then the
-// reflection probes (empty clusterRange.count makes the probe loop a no-op
-// and the global IBL fallback takes over).
-[[vk::binding(0, 2)]] StructuredBuffer<uint>                tileLightCount;
-[[vk::binding(1, 2)]] StructuredBuffer<uint>                tileLightIndices;
-[[vk::binding(2, 2)]] SamplerCube                           irradianceCube;
-[[vk::binding(3, 2)]] SamplerCube                           prefilteredCube;
-[[vk::binding(4, 2)]] Sampler2D                             brdfLut;
-[[vk::binding(5, 2)]] SamplerCubeArray                     probeCubeArray;
-[[vk::binding(6, 2)]] StructuredBuffer<ProbeRecord>        probes;
-[[vk::binding(7, 2)]] StructuredBuffer<ProbeClusterRange>  probeClusterRange;
-[[vk::binding(8, 2)]] StructuredBuffer<uint>               probeIndexList;
+[[vk::binding(5, 1)]] StructuredBuffer<uint> tileLightCount;
+[[vk::binding(6, 1)]] StructuredBuffer<uint> tileLightIndices;
 
 // Vertex stride / fetch helpers live in CommonTypes; they take the
 // ByteAddressBuffer as a parameter (sceneVertices / sceneIndices).

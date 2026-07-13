@@ -346,15 +346,7 @@ public unsafe partial class Renderer
 
         lightCullPipeline = new LightCullPipeline(this);
         lightCullPipeline.Initialize();
-        
-        // Wire light-cull tile buffers into the PBR lighting set now that both exist.
-        PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
-        // Same idea for the reflection-probe bindings — the cube array, probe
-        // records SSBO, cluster range / index list SSBOs are all stable for the
-        // renderer's lifetime so we write once at init.
-        PbrDeferredPipeline.WriteProbeDescriptors();
-        
-        
+
         // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless)
         // come from the scene set; only the storage-image IO + IBL sets are wired here.
         ptComputePipeline = new PTComputePipeline(this);
@@ -441,6 +433,7 @@ public unsafe partial class Renderer
         // at init, matched by SceneBindings parameter name. Runtime handle changes
         // re-register at their rebuild sites; the dump shows any remaining holes.
         RegisterSceneBindings();
+        RegisterFeatureBindings();
         Console.WriteLine(descriptorRegistry.DumpBindings());
 
         // Stand up the render cores. Each ctor registers the core into _renderCores
@@ -591,8 +584,6 @@ public unsafe partial class Renderer
         // g-buffer set (set 1) is graph-owned now, so DeferredCore re-bakes it by rebuilding
         // the deferred graph against PBR's new layout.
         _renderCores.OfType<DeferredCore>().FirstOrDefault()?.OnPbrPipelineRebuilt();
-        PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
-        PbrDeferredPipeline.WriteProbeDescriptors();
         transparentPipeline.WriteTileBufferDescriptors(lightCullPipeline);
         transparentPipeline.WriteIblDescriptors();
         transparentPipeline.WriteProbeDescriptors();
@@ -657,6 +648,35 @@ public unsafe partial class Renderer
             descriptorRegistry.RegisterBuffer("sceneEmissiveTris", EmissiveTriBuffer);
             descriptorRegistry.RegisterBuffer("sceneEmissiveAlias", EmissiveAliasBuffer);
         }
+    }
+
+    // Registers the FeatureIBL set (set 2): the global IBL split-sum + reflection-probe resources
+    // consumed by the raster lighting shaders. Owned by IblSystem / ReflectionProbeSystem; their
+    // views and (max-sized) buffers are stable for the renderer's lifetime and rebakes overwrite
+    // content not handles, so registering once at init is enough. FeatureEnv's envCube registers
+    // from IblSystem in a later step.
+    private void RegisterFeatureBindings()
+    {
+        var r = descriptorRegistry;
+        r.RegisterImage("irradianceCube",  Ibl.irradianceCubeView,  ImageLayout.ShaderReadOnlyOptimal, Ibl.iblCubeSampler);
+        r.RegisterImage("prefilteredCube", Ibl.prefilteredCubeView, ImageLayout.ShaderReadOnlyOptimal, Ibl.iblCubeSampler);
+        r.RegisterImage("brdfLut",         Ibl.brdfLutView,         ImageLayout.ShaderReadOnlyOptimal, Ibl.iblLutSampler);
+
+        var probeSys = reflectionProbeSystem;
+        r.RegisterImage("probeCubeArray", probeSys.prefilteredArrayView, ImageLayout.ShaderReadOnlyOptimal, probeSys.prefilteredArraySampler);
+
+        var probes       = new Buffer[MAX_CONCURRENT_FRAMES];
+        var clusterRange = new Buffer[MAX_CONCURRENT_FRAMES];
+        var indexList    = new Buffer[MAX_CONCURRENT_FRAMES];
+        for (int i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            probes[i]       = probeSys.probeRecordBuffers[i].buffer;
+            clusterRange[i] = probeSys.clusterGrid.GetClusterRangeBuffer((uint)i);
+            indexList[i]    = probeSys.clusterGrid.GetProbeIndexBuffer((uint)i);
+        }
+        r.RegisterBufferPerFrame("probes", probes);
+        r.RegisterBufferPerFrame("probeClusterRange", clusterRange);
+        r.RegisterBufferPerFrame("probeIndexList", indexList);
     }
 
     // Centralized teardown. Each lifetime-scoped owner (FrameRing, RenderTargets,

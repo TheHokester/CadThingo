@@ -3,9 +3,7 @@
 // Shaders import this module instead of declaring their own; DescriptorRegistry reflects it
 // once to build the VkDescriptorSetLayout and owns the per-frame set instances. The underlying
 // resources stay owned by IblSystem / ReflectionProbeSystem, which register them by name.
-//
-// Fixed global set index 2 (ShaderSets.FirstFeature). A shader using this feature but not the
-// pass set (1) leaves that slot as an empty placeholder in its pipeline layout.
+
 module FeatureIBL;
 
 __exported import CommonTypes; // ProbeRecord / ProbeClusterRange

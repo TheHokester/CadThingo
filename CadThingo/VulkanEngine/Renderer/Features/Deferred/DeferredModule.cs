@@ -179,9 +179,9 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 b.Read(albedo,   ResourceUsage.SampledFragment, "gAlbedo");
                 b.Read(material, ResourceUsage.SampledFragment, "gMaterial");
                 b.Read(emissive, ResourceUsage.SampledFragment, "gEmissive");
-                // Tile-cull outputs stay on the pipeline-owned set 2 (shared with IBL/probes).
-                b.Read(tileCount,   ResourceUsage.StorageReadFragment);
-                b.Read(tileIndices, ResourceUsage.StorageReadFragment);
+                // Tile-cull outputs now ride the same pass set as the g-buffer (bindings 5/6).
+                b.Read(tileCount,   ResourceUsage.StorageReadFragment, "tileLightCount");
+                b.Read(tileIndices, ResourceUsage.StorageReadFragment, "tileLightIndices");
                 hdr = b.Write(hdr, ResourceUsage.ColorAttachment);
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
