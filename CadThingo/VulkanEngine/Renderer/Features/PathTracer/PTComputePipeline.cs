@@ -61,7 +61,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 
     private const int SetScene = 0;
     private const int SetIO    = 1;
-    private const int SetIbl   = 2;
+    private const string FeatureEnv = "FeatureEnv";   // set 4 (registry-owned): envCube
 
     private static readonly string ShaderPath = ShaderPaths.Kernel("PathTracer", "PTCompute");
 
@@ -107,23 +107,16 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     // Descriptor set layouts
     protected override void CreateDescriptorSetLayouts()
     {
-        // Set 0 is borrowed from DescriptorRegistry (never destroyed here);
-        // sets 1 and 2 are owned by this pipeline.
-        DescriptorSetLayouts            = new DescriptorSetLayout[3];
-        OwnedDescriptorSetLayoutIndices = new[] { SetIO, SetIbl };
-        DescriptorSetLayouts[SetScene]  = Renderer.descriptorRegistry.SceneSetLayout;
-
-        // Set 1: accumulator + outColor storage images.
+        // Set 1: accumulator + outColor storage images (pipeline-owned).
         var set1 = stackalloc DescriptorSetLayoutBinding[2];
         for (uint b = 0; b < 2; b++)
             set1[b] = new() { Binding = b, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        CreateLayout(set1, 2, out DescriptorSetLayouts[SetIO]);
+        CreateLayout(set1, 2, out var ioLayout);
 
-        // Set 2: IBL cubes + BRDF LUT + full-res envCube.
-        var set2 = stackalloc DescriptorSetLayoutBinding[4];
-        for (uint b = 0; b < 4; b++)
-            set2[b] = new() { Binding = b, DescriptorType = DescriptorType.CombinedImageSampler, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        CreateLayout(set2, 4, out DescriptorSetLayouts[SetIbl]);
+        // [scene(0), IO(1), empty(2), empty(3), FeatureEnv(4)]. envCube is registry-owned on
+        // FeatureEnv; the graph-shared and FeatureIBL slots are unused gaps for the tracer.
+        DescriptorSetLayouts            = Renderer.descriptorRegistry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
+        OwnedDescriptorSetLayoutIndices = new[] { SetIO };
     }
 
     private void CreateLayout(DescriptorSetLayoutBinding* bindings, uint count, out DescriptorSetLayout layout)
@@ -208,7 +201,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     // Descriptor set allocation
     protected override void CreateDescriptorSets()
     {
-        DescriptorSets = new DescriptorSet[3][];
+        DescriptorSets = new DescriptorSet[2][];
 
         // Set 0 - scene set is owned by DescriptorRegistry; Record binds
         // Renderer.descriptorRegistry.SceneSet(frame) directly.
@@ -227,25 +220,9 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
         fixed (DescriptorSet* p = DescriptorSets[SetIO])
             if (Vk.AllocateDescriptorSets(Device, &alloc1, p) != Result.Success)
                 throw new Exception("Failed to allocate pathtracer set 1");
-
-        // Set 2 - IBL, single shared (renderer-wide images).
-        var iblLayout = DescriptorSetLayouts[SetIbl];
-        DescriptorSetAllocateInfo alloc2 = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts        = &iblLayout,
-        };
-        DescriptorSets[SetIbl] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[SetIbl])
-            if (Vk.AllocateDescriptorSets(Device, &alloc2, p) != Result.Success)
-                throw new Exception("Failed to allocate pathtracer set 2");
     }
 
-    // Nothing to write at Initialize: the storage images are created by the
-    // renderer (WriteStorageImageDescriptors) and IBL is wired externally
-    // (WriteIblDescriptors); the scene set is registry-maintained.
+   
 
     /// <summary>Set 1 bindings 0/1: accumulator + outColor storage images.
     /// Both VkImages must be in ImageLayout.General before Record runs. Call
@@ -264,36 +241,6 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
         // invalid by construction — drop the sample count.
         MarkAccumulatorDirty();
     }
-
-    /// <summary>Set 2 bindings 0/1/2/3: irradiance + prefiltered cube + BRDF LUT
-    /// + full-res envCube. Call once after the IblSystem is constructed; underlying
-    /// VkImage handles persist across IBL rebakes so content updates don't
-    /// require re-writes.</summary>
-    public void WriteIblDescriptors()
-    {
-        var imageInfos = stackalloc DescriptorImageInfo[4]
-        {
-            new() { ImageView = Renderer.Ibl.irradianceCubeView,  Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.prefilteredCubeView, Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.brdfLutView,         Sampler = Renderer.Ibl.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.envCubeView,         Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-        };
-        var writes = stackalloc WriteDescriptorSet[4];
-        for (uint b = 0; b < 4; b++)
-        {
-            writes[b] = new WriteDescriptorSet
-            {
-                SType           = StructureType.WriteDescriptorSet,
-                DstSet          = DescriptorSets[SetIbl][0],
-                DstBinding      = b,
-                DescriptorType  = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
-                PImageInfo      = &imageInfos[b],
-            };
-        }
-        Vk.UpdateDescriptorSets(Device, 4, writes, 0, null);
-    }
-
 
     // Per-frame constants
     /// <summary>Stages the PathFrameUBO for Record's arena push. Returns true
@@ -372,16 +319,19 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _modePipelines[modeIdx]);
 
-        // Scene set with the frame constants' dynamic offset, then the owned sets.
+        // Scene(0) + IO(1) with the frame constants' dynamic offset, then FeatureEnv at its own
+        // reflected index (set 4); the intervening slots are gaps, never bound.
         var registry = Renderer.descriptorRegistry;
         uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
-        var sets = stackalloc DescriptorSet[3]
+        var sets = stackalloc DescriptorSet[2]
         {
             registry.SceneSet(ctx.FrameIndex),
             DescriptorSets[SetIO][0],
-            DescriptorSets[SetIbl][0],
         };
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 3, sets, 1, &frameConstants);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 2, sets, 1, &frameConstants);
+
+        var envSet = registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
 
         // 8×8 workgroup matches [numthreads(8,8,1)] in PTCompute.slang.
         uint gx = (ctx.RenderExtent.Width  + 7u) / 8u;

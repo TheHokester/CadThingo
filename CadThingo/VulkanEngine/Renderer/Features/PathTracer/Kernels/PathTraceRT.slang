@@ -16,6 +16,7 @@ import PTUtils;       // BSDF/sampling/RNG/camera + re-exported PbrUtils/CommonT
 import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
                       // sceneVertices+sceneIndices/sceneEmissiveTris+Alias/
                       // sceneMaterials/sceneTextures/sceneSamplers
+import FeatureEnv;    // feature set 4: envCube (miss-ray background)
 
 // Per-pass constants in the reserved (0,0) dynamic slot.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
@@ -23,9 +24,6 @@ import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
 // Set 1 — pass-local IO.
 [[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
 [[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
-
-// Set 2 — full-res environment cube (miss-ray background; binding 3 matches PTCompute).
-[[vk::binding(3, 2)]] SamplerCube envCube;
 
 // Compile-time config (the RT pipeline doesn't bake spec constants; hardcoded to
 // the compute path's defaults).

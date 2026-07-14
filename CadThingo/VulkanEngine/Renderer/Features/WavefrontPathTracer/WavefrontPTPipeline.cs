@@ -57,11 +57,12 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
 
     // Set 0 borrowed from DescriptorRegistry (scene resources + the (0,0) constant-arena slot
-    // carrying PathFrameUBO); sets 1 (IO) / 2 (IBL) / 3 (SoA working set) are pipeline-owned.
+    // carrying PathFrameUBO); sets 1 (IO) / 2 (SoA working, the graph-shared slot) are
+    // pipeline-owned; envCube rides the registry-owned FeatureEnv set (set 4).
     private const int SetScene     = 0;
     private const int SetIO        = 1;
-    private const int SetIbl       = 2;
-    private const int SetWavefront = 3;
+    private const int SetWavefront = 2;
+    private const string FeatureEnv = "FeatureEnv";
 
     // ---- Material-sorted shading (P3): C routing classes (must match WavefrontBindings.WF_SHADE_CLASSES) -
     public const uint ShadeClasses = 4u;
@@ -210,12 +211,18 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
 
-    // ---- Descriptor-set layouts. Set 0 borrowed from the registry; sets 1-3 owned. ----
+    // ---- Descriptor-set layouts. Set 0 (scene) + FeatureEnv (set 4) borrowed from the registry;
+    // sets 1 (IO) / 2 (working) owned. Array is [scene, IO, working, empty, FeatureEnv]. ----
     protected override void CreateDescriptorSetLayouts()
     {
-        DescriptorSetLayouts            = new DescriptorSetLayout[4];
-        OwnedDescriptorSetLayoutIndices = new[] { SetIO, SetIbl, SetWavefront };
-        DescriptorSetLayouts[SetScene]  = Renderer.descriptorRegistry.SceneSetLayout;
+        var registry = Renderer.descriptorRegistry;
+        uint envIndex = registry.FeatureSetIndex(FeatureEnv);
+
+        DescriptorSetLayouts            = new DescriptorSetLayout[envIndex + 1];
+        for (int i = 0; i < DescriptorSetLayouts.Length; i++) DescriptorSetLayouts[i] = registry.EmptySetLayout;
+        OwnedDescriptorSetLayoutIndices = new[] { SetIO, SetWavefront };
+        DescriptorSetLayouts[SetScene]  = registry.SceneSetLayout;
+        DescriptorSetLayouts[envIndex]  = registry.FeatureSetLayout(FeatureEnv);
 
         // Set 1: accumulator + outColor storage images.
         var set1 = stackalloc DescriptorSetLayoutBinding[2];
@@ -223,15 +230,10 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         set1[1] = Binding(1, DescriptorType.StorageImage);
         CreateLayout(set1, 2, out DescriptorSetLayouts[SetIO]);
 
-        // Set 2: IBL cubes + BRDF LUT + full-res envCube (4 combined image samplers; only envCube read).
-        var set2 = stackalloc DescriptorSetLayoutBinding[4];
-        for (uint b = 0; b < 4; b++) set2[b] = Binding(b, DescriptorType.CombinedImageSampler);
-        CreateLayout(set2, 4, out DescriptorSetLayouts[SetIbl]);
-
-        // Set 3: the SoA working set (25 storage buffers).
-        var set3 = stackalloc DescriptorSetLayoutBinding[Set4BindingCount];
-        for (uint b = 0; b < Set4BindingCount; b++) set3[b] = Binding(b, DescriptorType.StorageBuffer);
-        CreateLayout(set3, Set4BindingCount, out DescriptorSetLayouts[SetWavefront]);
+        // Set 2 (graph-shared): the SoA working set (25 storage buffers).
+        var set2 = stackalloc DescriptorSetLayoutBinding[Set4BindingCount];
+        for (uint b = 0; b < Set4BindingCount; b++) set2[b] = Binding(b, DescriptorType.StorageBuffer);
+        CreateLayout(set2, Set4BindingCount, out DescriptorSetLayouts[SetWavefront]);
     }
 
     private static DescriptorSetLayoutBinding Binding(uint binding, DescriptorType type) => new()
@@ -413,13 +415,12 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     // ---- Descriptor-set allocation -------------------------------------------
     protected override void CreateDescriptorSets()
     {
-        DescriptorSets = new DescriptorSet[4][];
+        DescriptorSets = new DescriptorSet[SetWavefront + 1][];
 
-        // Set 0 — registry-owned; Record binds Renderer.descriptorRegistry.SceneSet(frame).
+        // Set 0 - registry-owned; Record binds Renderer.descriptorRegistry.SceneSet(frame).
         DescriptorSets[SetScene] = null;
-        // Sets 1 / 2 / 3 — single shared (handles are renderer/pipeline-wide singletons).
+        // Sets 1 / 2 - single shared (handles are renderer/pipeline-wide singletons).
         DescriptorSets[SetIO]        = AllocSets(SetIO, 1);
-        DescriptorSets[SetIbl]       = AllocSets(SetIbl, 1);
         DescriptorSets[SetWavefront] = AllocSets(SetWavefront, 1);
     }
 
@@ -446,7 +447,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         WriteSet4Descriptors();
     }
 
-    /// <summary>Set 3 (the SoA working set). Stable pipeline-owned handles,
+    /// <summary>Set 2 (the SoA working set). Stable pipeline-owned handles,
     /// so write once at init + after a resize realloc.</summary>
     public void WriteSet4Descriptors()
     {
@@ -476,22 +477,6 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 1, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &outInfo };
         Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
         MarkAccumulatorDirty();
-    }
-
-    /// <summary>Set 2 bindings 0/1/2/3: irradiance + prefiltered + BRDF LUT + full-res envCube.</summary>
-    public void WriteIblDescriptors()
-    {
-        var imageInfos = stackalloc DescriptorImageInfo[4]
-        {
-            new() { ImageView = Renderer.Ibl.irradianceCubeView,  Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.prefilteredCubeView, Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.brdfLutView,         Sampler = Renderer.Ibl.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.envCubeView,         Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-        };
-        var writes = stackalloc WriteDescriptorSet[4];
-        for (uint b = 0; b < 4; b++)
-            writes[b] = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIbl][0], DstBinding = b, DescriptorType = DescriptorType.CombinedImageSampler, DescriptorCount = 1, PImageInfo = &imageInfos[b] };
-        Vk.UpdateDescriptorSets(Device, 4, writes, 0, null);
     }
 
 
@@ -547,14 +532,18 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private void BindSets(CommandBuffer cmd, uint frameIndex)
     {
         uint frameConstants = _frameConstants;
-        var sets = stackalloc DescriptorSet[4]
+        var registry = Renderer.descriptorRegistry;
+        var sets = stackalloc DescriptorSet[3]
         {
-            Renderer.descriptorRegistry.SceneSet(frameIndex),
+            registry.SceneSet(frameIndex),
             DescriptorSets[SetIO][0],
-            DescriptorSets[SetIbl][0],
             DescriptorSets[SetWavefront][0],
         };
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 4, sets, 1, &frameConstants);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 3, sets, 1, &frameConstants);
+
+        // envCube (FeatureEnv) sits at its own reflected index (set 4) with a gap at set 3.
+        var envSet = registry.FeatureSet(FeatureEnv, frameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
     }
 
     private void PushWavefront(CommandBuffer cmd, uint bounce, uint argsClass)

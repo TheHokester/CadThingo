@@ -8,7 +8,7 @@
 //   3. shades the surviving sample with one opaque shadow ray,
 //   4. sums it with sceneRadiance and folds the result into the progressive accumulator.
 //
-// Runs on the RT pipeline's SHARED layout (set 0 = scene, set 1 = accum/outColor IO, set 3 = the
+// Runs on the RT pipeline's SHARED layout (set 0 = scene, set 1 = accum/outColor IO, set 2 = the
 // ReSTIR working set), binding the exact descriptor sets the Trace pass uses -- the scene-set layout
 // is All-stages and the IO/working sets carry ComputeBit. The shadow ray is ALPHA-TESTED (masked /
 // blended / transmissive geometry occludes exactly as in the other tracers, for parity).
@@ -95,11 +95,11 @@ HitInfo unpackHit(PackedHit p, float3 rayOrigin) {
 [[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
 [[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
 
-[[vk::binding(0, 3)]] RWStructuredBuffer<Reservoir> reservoirA;
-[[vk::binding(1, 3)]] RWStructuredBuffer<Reservoir> reservoirB;
-[[vk::binding(2, 3)]] RWStructuredBuffer<PackedHit> gbufferA;
-[[vk::binding(3, 3)]] RWStructuredBuffer<PackedHit> gbufferB;
-[[vk::binding(4, 3)]] RWStructuredBuffer<float4>    sceneRadiance;   // Trace's indirect+emissive+env
+[[vk::binding(0, 2)]] RWStructuredBuffer<Reservoir> reservoirA;
+[[vk::binding(1, 2)]] RWStructuredBuffer<Reservoir> reservoirB;
+[[vk::binding(2, 2)]] RWStructuredBuffer<PackedHit> gbufferA;
+[[vk::binding(3, 2)]] RWStructuredBuffer<PackedHit> gbufferB;
+[[vk::binding(4, 2)]] RWStructuredBuffer<float4>    sceneRadiance;   // Trace's indirect+emissive+env
 
 struct ReStirPush { float4x4 prevViewProj; uint frameParity; uint hasHistory; uint pad0, pad1; };
 [[vk::push_constant]] ReStirPush rpc;

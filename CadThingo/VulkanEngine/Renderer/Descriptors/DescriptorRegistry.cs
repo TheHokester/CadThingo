@@ -78,6 +78,11 @@ public sealed unsafe class DescriptorRegistry : IDisposable
     /// This frame's instance of a feature set, for the pipeline's CmdBindDescriptorSets.
     public DescriptorSet FeatureSet(string feature, uint frame) => Feature(feature).Sets[frame];
 
+    /// The pinned global set index of a feature set (reflected from its module). Consumers bind
+    /// their feature set at this index instead of hardcoding the literal, so renumbering a feature
+    /// is a one-line edit in its shader module - no C# bind sites to chase.
+    public uint FeatureSetIndex(string feature) => Feature(feature).SetIndex;
+
     /// <summary>Assembles a pipeline's full descriptor-set-layout array: scene at set 0, the
     /// pipeline's own pass-set layout at set 1 (pass null if it has none), each named feature at
     /// its pinned global index, and the shared empty layout in every gap. The array is sized to

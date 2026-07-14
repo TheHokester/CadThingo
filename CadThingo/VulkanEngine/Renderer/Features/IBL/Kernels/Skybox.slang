@@ -12,7 +12,7 @@ struct SkyboxUBO {
     float    _pad2;
 };
 
-import FeatureEnv; // feature set 3: envCube
+import FeatureEnv; // feature set 4: envCube
 
 [[vk::binding(0, 0)]] ConstantBuffer<SkyboxUBO> ubo;
 

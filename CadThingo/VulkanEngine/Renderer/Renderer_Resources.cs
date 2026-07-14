@@ -42,7 +42,7 @@ namespace CadThingo.VulkanEngine.Renderer;
    is keyed by Mesh* for exactly this reason.
 
   TLAS (Top-Level) — built per scene. Doesn't hold triangles at all. Each entry is a tiny record: a 3×4 transform + a pointer to a BLAS. So 100 viking rooms = one BLAS + 100 small TLAS records. When a viking room moves, you
-   only rebuild the TLAS (cheap — it's effectively a scene graph in spatial form). The BLAS is untouched.
+   only rebuild the TLAS (cheap - it's effectively a scene graph in spatial form). The BLAS is untouched.
  */
 public unsafe partial class Renderer
 {

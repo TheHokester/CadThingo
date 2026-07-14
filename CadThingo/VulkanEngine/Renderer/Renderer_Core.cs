@@ -354,16 +354,15 @@ public unsafe partial class Renderer
         ptComputePipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
         // Same as the transparent / deferred pipelines: IBL images are Renderer-
         // owned and stable across rebakes, so the IBL set only needs writing once.
-        ptComputePipeline.WriteIblDescriptors();
 
         // Wavefront path tracer (RenderMode.RayWavefront). Shares the same accumulator /
         // out-color images as the megakernel; scene buffers (TLAS / lights / shadow info /
         // vb+ib / emissive / bindless) come from the scene set. The SoA working set is
-        // pipeline-owned. Only the storage-image IO + IBL sets are wired here.
+        // pipeline-owned; envCube rides the registry-owned FeatureEnv set. Only the storage-image
+        // IO set is wired here.
         wavefrontPipeline = new WavefrontPTPipeline(this);
         wavefrontPipeline.Initialize();
         wavefrontPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-        wavefrontPipeline.WriteIblDescriptors();
 
         // Opt-in RT-pipeline path tracer (RenderMode.RayTrace). Shares the same
         // accumulator/outColor images + scene buffers as the compute path; only
@@ -371,12 +370,12 @@ public unsafe partial class Renderer
         // are bound below after InitRayQuery, mirroring the compute pipeline.
         if (RayTracePipelineSupported)
         {
-            // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come
-            // from the scene set; only the storage-image IO + IBL sets are wired here.
+            // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come from
+            // the scene set; envCube rides the registry-owned FeatureEnv set; only the storage-image
+            // IO set is wired here.
             rtPipeline = new RTPipeline(this);
             rtPipeline.Initialize();
             rtPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-            rtPipeline.WriteIblDescriptors();
 
             // ReSTIR DI tracer (RenderMode.ReStirDI). Same RT-pipeline machinery as rtPipeline
             // (it subclasses RTPipeline), forked only at the shader; shares the same accumulator /
@@ -384,7 +383,6 @@ public unsafe partial class Renderer
             reStirPipeline = new ReStirDIPipeline(this);
             reStirPipeline.Initialize();
             reStirPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-            reStirPipeline.WriteIblDescriptors();
         }
 
         // Editor selection - object picking + ray-query coverage mask + outline

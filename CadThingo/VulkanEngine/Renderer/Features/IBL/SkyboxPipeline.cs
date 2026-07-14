@@ -75,13 +75,14 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdSetViewport(cmd, 0, 1, &vp);
         Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
 
-        // Set 0 = private UBO; set 3 = FeatureEnv (envCube). Sets 1/2 are gaps in the layout and
-        // are never bound (the shader doesn't use them), so this is two non-contiguous binds.
+        // Set 0 = private UBO; FeatureEnv (envCube) at its own reflected index (set 4). The
+        // intervening slots are gaps in the layout, never bound, so this is two separate binds.
+        var registry = Renderer.descriptorRegistry;
         var set0 = GetDescriptorSet(0, ctx.FrameIndex);
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Layout, 0, 1, &set0, 0, null);
 
-        var envSet = Renderer.descriptorRegistry.FeatureSet(FeatureEnv, ctx.FrameIndex);
-        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Layout, 3, 1, &envSet, 0, null);
+        var envSet = registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Layout, registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
 
         Vk!.CmdDraw(cmd, 3, 1, 0, 0);
         
@@ -121,9 +122,9 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
     protected override void CreateDescriptorSetLayouts()
     {
         // Private set 0: the skybox's own per-frame UBO (this pass is not on the scene set).
-        // envCube now comes from the registry-owned FeatureEnv set (set 3), so the pipeline
-        // layout carries empty placeholders at sets 1/2 (the pass + FeatureIBL slots this pass
-        // doesn't use). This is the first consumer to exercise the gap-filling path.
+        // envCube comes from the registry-owned FeatureEnv set (set 4), so the pipeline layout
+        // carries empty placeholders in every slot between (pass / graph-shared / FeatureIBL,
+        // none of which this pass uses). This is the first consumer to exercise the gap-filling path.
         var uboBinding = new DescriptorSetLayoutBinding
         {
             Binding         = 0,
@@ -141,14 +142,15 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         if (Vk.CreateDescriptorSetLayout(Device, &info, null, out set0) != Result.Success)
             throw new System.Exception("Failed to create skybox UBO descriptor set layout");
 
+        // Array sized to FeatureEnv's reflected index: private UBO at 0, the shared empty layout
+        // in every gap, FeatureEnv at its pinned index. Follows a module renumber automatically.
         var registry = Renderer.descriptorRegistry;
-        DescriptorSetLayouts = new[]
-        {
-            set0,
-            registry.EmptySetLayout,
-            registry.EmptySetLayout,
-            registry.FeatureSetLayout(FeatureEnv),
-        };
+        uint envIndex = registry.FeatureSetIndex(FeatureEnv);
+        var layouts = new DescriptorSetLayout[envIndex + 1];
+        for (int i = 0; i < layouts.Length; i++) layouts[i] = registry.EmptySetLayout;
+        layouts[0] = set0;
+        layouts[envIndex] = registry.FeatureSetLayout(FeatureEnv);
+        DescriptorSetLayouts = layouts;
         OwnedDescriptorSetLayoutIndices = new[] { 0 };   // only the private UBO layout
     }
 

@@ -30,7 +30,7 @@ public sealed unsafe class FrameRing : IDisposable
     private ulong frameCounter;
 
     // Reserved for async transfer-queue uploads (timeline semaphore). Declared but
-    // not yet wired — carried over from the pre-refactor Renderer.
+    // not yet wired - carried over from the pre-refactor Renderer.
     private Semaphore uploadsTimeline;
     private volatile uint lastTimelineValue;
 

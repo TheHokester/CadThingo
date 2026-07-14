@@ -2,6 +2,7 @@
 import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
                       // sceneVertices+sceneIndices/sceneEmissiveTris+Alias/
                       // sceneMaterials/sceneTextures/sceneSamplers
+import FeatureEnv;    // feature set 3: envCube (sharp miss-ray background)
 
 // Per-pass constants in the reserved (0,0) dynamic slot.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
@@ -10,14 +11,6 @@ import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
 // RGBA32F intentionally, R16F starves dark regions after ~64 samples.
 [[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
 [[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
-
-// Set 2: IBL. Sampled on miss (sky contribution) and clamped fallback.
-// Full-res environment (512²); prefilteredCube is 128² GGX-convolved, so use
-// envCube for sharp miss-ray background sampling.
-[[vk::binding(0, 2)]] SamplerCube irradianceCube;
-[[vk::binding(1, 2)]] SamplerCube prefilteredCube;
-[[vk::binding(2, 2)]] Sampler2D brdfLUT;
-[[vk::binding(3, 2)]] SamplerCube envCube;
 
 
 //Specialization constants

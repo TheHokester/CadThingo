@@ -74,13 +74,13 @@ HitInfo unpackHit(PackedHit p, float3 rayOrigin) {
 // ---- Bindings -------------------------------------------------------------------------------------
 // Scene set 0 (sceneLights / sceneEmissiveTris+Alias / sceneVertices+sceneIndices /
 // sceneTextures+sceneSamplers) comes from the imported SceneBindings module; only the
-// per-pass constants and the set-3 ReSTIR working buffers are declared here.
+// per-pass constants and the set-2 (graph-shared) ReSTIR working buffers are declared here.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO>  frameUBO;
 
-[[vk::binding(0, 3)]] RWStructuredBuffer<Reservoir> reservoirA;
-[[vk::binding(1, 3)]] RWStructuredBuffer<Reservoir> reservoirB;
-[[vk::binding(2, 3)]] RWStructuredBuffer<PackedHit> gbufferA;
-[[vk::binding(3, 3)]] RWStructuredBuffer<PackedHit> gbufferB;
+[[vk::binding(0, 2)]] RWStructuredBuffer<Reservoir> reservoirA;
+[[vk::binding(1, 2)]] RWStructuredBuffer<Reservoir> reservoirB;
+[[vk::binding(2, 2)]] RWStructuredBuffer<PackedHit> gbufferA;
+[[vk::binding(3, 2)]] RWStructuredBuffer<PackedHit> gbufferB;
 
 struct ReStirPush { float4x4 prevViewProj; uint frameParity; uint hasHistory; uint pad0, pad1; };
 [[vk::push_constant]] ReStirPush rpc;

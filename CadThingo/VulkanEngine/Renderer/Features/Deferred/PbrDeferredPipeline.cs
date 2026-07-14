@@ -51,7 +51,8 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
     //         Per-frame constants ride its (0,0) dynamic slot.
     // Set 1 - graph-baked pass set: the five g-buffer transients + the two tile-cull
     //         outputs (all graph resources the LightingPass reads).
-    // Set 2 - FeatureIBL (registry-owned): global IBL split-sum + reflection probes.
+    // Set 3 - FeatureIBL (registry-owned): global IBL split-sum + reflection probes.
+   
     private const int SetScene   = 0;
     private const int SetGBuffer = 1;
     private const string FeatureIbl = "FeatureIBL";
@@ -101,18 +102,21 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
 
         // Set 0 = scene set with the frame constants' dynamic offset (arena push of the UBO
-        // staged by UpdatePerFrame). Set 1 = graph-baked g-buffer + tile pass set. Set 2 =
-        // FeatureIBL (registry-owned). No push constants.
+        // staged by UpdatePerFrame). Set 1 = graph-baked g-buffer + tile pass set. FeatureIBL
+        // sits at its own reflected index (set 3) with a gap at set 2, so it binds separately.
         var registry = Renderer.descriptorRegistry;
         uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
-        var sets = stackalloc DescriptorSet[3]
+        var sets = stackalloc DescriptorSet[2]
         {
             registry.SceneSet(ctx.FrameIndex),
             gBufferSet,                               // graph-baked (set 1)
-            registry.FeatureSet(FeatureIbl, ctx.FrameIndex),
         };
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, 0, 3, sets, 1, &frameConstants);
+            Layout, 0, 2, sets, 1, &frameConstants);
+
+        var iblSet = registry.FeatureSet(FeatureIbl, ctx.FrameIndex);
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
+            Layout, registry.FeatureSetIndex(FeatureIbl), 1, &iblSet, 0, null);
 
         // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
         Vk!.CmdDraw(cmd, 3, 1, 0, 0);
@@ -205,8 +209,8 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
                 throw new Exception("Failed to create PBR pass-set (set 1) descriptor set layout");
         }
 
-        // Assemble [scene(0), pass(1), FeatureIBL(2)]. Scene + FeatureIBL are registry-owned; the
-        // pipeline owns only the pass layout it just built.
+        // Assemble [scene(0), pass(1), empty(2), FeatureIBL(3)]. Scene + FeatureIBL are
+        // registry-owned; the pipeline owns only the pass layout it just built.
         DescriptorSetLayouts = Renderer.descriptorRegistry.BuildPipelineSetLayouts(passLayout, FeatureIbl);
         OwnedDescriptorSetLayoutIndices = new[] { SetGBuffer };
     }

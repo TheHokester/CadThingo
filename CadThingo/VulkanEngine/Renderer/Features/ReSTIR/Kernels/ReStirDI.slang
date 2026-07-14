@@ -16,6 +16,7 @@ import PTUtils;       // BSDF/sampling/RNG/camera + re-exported PbrUtils/CommonT
 import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
                       // sceneVertices+sceneIndices/sceneEmissiveTris+Alias/
                       // sceneMaterials/sceneTextures/sceneSamplers
+import FeatureEnv;    // feature set 4: envCube (miss-ray background)
 
 // Per-pass constants in the reserved (0,0) dynamic slot.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
@@ -24,10 +25,7 @@ import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
 [[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
 [[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
 
-// Set 2 — full-res environment cube (miss-ray background; binding 3 matches PTCompute).
-[[vk::binding(3, 2)]] SamplerCube envCube;
-
-// Set 4 — ReSTIR working set (ReStirDIPipeline-owned, sized to the render extent, indexed by
+// Set 2 (graph-shared) - ReSTIR working set (ReStirDIPipeline-owned, sized to the render extent, indexed by
 // pixel = y*width + x). P1 writes both at the primary hit; the temporal/spatial reuse passes
 // consume them in later phases. Scalar-only structs (4B fields, tight packing) so the Slang
 // stride matches the C# byte strides in ReStirDIPipeline (ReservoirBytes/GBufferBytes).
@@ -74,11 +72,11 @@ struct PackedHit {
 // sceneRadiance (binding 4) is the deferred-shading hand-off: Trace writes everything EXCEPT the
 // analytic direct light (indirect + emissive + env); SpatialShade adds the analytic direct +
 // accumulates. P3 deferred split (the reservoir analytic shade moved out of this megakernel).
-[[vk::binding(0, 3)]] RWStructuredBuffer<Reservoir> reservoirA;
-[[vk::binding(1, 3)]] RWStructuredBuffer<Reservoir> reservoirB;
-[[vk::binding(2, 3)]] RWStructuredBuffer<PackedHit> gbufferA;
-[[vk::binding(3, 3)]] RWStructuredBuffer<PackedHit> gbufferB;
-[[vk::binding(4, 3)]] RWStructuredBuffer<float4>    sceneRadiance;
+[[vk::binding(0, 2)]] RWStructuredBuffer<Reservoir> reservoirA;
+[[vk::binding(1, 2)]] RWStructuredBuffer<Reservoir> reservoirB;
+[[vk::binding(2, 2)]] RWStructuredBuffer<PackedHit> gbufferA;
+[[vk::binding(3, 2)]] RWStructuredBuffer<PackedHit> gbufferB;
+[[vk::binding(4, 2)]] RWStructuredBuffer<float4>    sceneRadiance;
 
 // Per-frame ReSTIR state (push constant). prevViewProj reprojects a current-frame world position
 // into LAST frame's screen (same view*proj(M22-flipped) construction the engine's raster/pick path
