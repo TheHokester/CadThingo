@@ -83,7 +83,7 @@ public abstract unsafe class PipelineBase : IDisposable
     /// The immutable sampler to bake into a reflected layout binding, or null for none.
     /// Reflection reports that a binding is a combined image sampler but not which sampler the
     /// layout pins, so the pipeline still answers that.
-    protected virtual Sampler? ImmutableSamplerFor(string bindingName) => null;
+    protected virtual Sampler? ImmutableSamplerFor(in BindingDesc binding) => null;
 
     /// The program's reflected bindings for one descriptor set, ordered by binding index.
     protected BindingDesc[] ReflectedBindings(uint set)
@@ -117,7 +117,7 @@ public abstract unsafe class PipelineBase : IDisposable
                     DescriptorCount = b.Count,
                     StageFlags      = b.Stages,
                 };
-                if (ImmutableSamplerFor(b.Name) is { } s)
+                if (ImmutableSamplerFor(in b) is { } s)
                 {
                     samplers[i] = s;
                     bindings[i].PImmutableSamplers = &pSamplers[i];

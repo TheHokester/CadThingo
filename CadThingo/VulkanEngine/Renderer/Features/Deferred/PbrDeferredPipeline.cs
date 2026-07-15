@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Shaders;
@@ -40,7 +41,10 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
         public float probeMipLevels;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "PBR");
+    // Ray-queried shadows need the capability at compile time even when SOFT_SHADOWS is off:
+    // the traceRayInline call sites are in the shader either way.
+    protected override ShaderCompileRequest? Program =>
+        new("Deferred/PBR", ["VSMain", "PSMain"], [], ["spvRayQueryKHR"]);
 
     // Lighting writes linear HDR scene-referred color; tone-map + gamma run in
     // the separate TonemapPipeline pass that consumes this attachment.
@@ -53,33 +57,21 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
     //         outputs (all graph resources the LightingPass reads).
     // Set 3 - FeatureIBL (registry-owned): global IBL split-sum + reflection probes.
    
-    private const int SetScene   = 0;
-    private const int SetGBuffer = 1;
     private const string FeatureIbl = "FeatureIBL";
 
-    // Graph-baked pass set (set 1): five g-buffer transients (immutable-sampler CIS) plus the
-    // two tile-cull output buffers. Names match the LightingPass Read binds; the graph fills the
-    // set, so only the views/buffers are written (sampler is immutable in the layout).
-    private static readonly BindingDesc[] _passBindings =
-    {
-        new("gPosition",        SetGBuffer, 0, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
-        new("gNormal",          SetGBuffer, 1, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
-        new("gAlbedo",          SetGBuffer, 2, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
-        new("gMaterial",        SetGBuffer, 3, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
-        new("gEmissive",        SetGBuffer, 4, DescriptorType.CombinedImageSampler, 1, ShaderStageFlags.FragmentBit),
-        new("tileLightCount",   SetGBuffer, 5, DescriptorType.StorageBuffer,        1, ShaderStageFlags.FragmentBit),
-        new("tileLightIndices", SetGBuffer, 6, DescriptorType.StorageBuffer,        1, ShaderStageFlags.FragmentBit),
-    };
-
-    public PassSetSpec PassSet => new(SetIndex: SetGBuffer, DescriptorSetLayouts[SetGBuffer], _passBindings);
+    // Graph-baked pass set: five g-buffer transients (immutable-sampler CIS) plus the two
+    // tile-cull output buffers. Both the layout and the names the graph matches against come from
+    // PBR.slang's set-1 declarations, so the LightingPass Read binds name the shader globals.
+    public PassSetSpec PassSet =>
+        new(ShaderSets.Pass, DescriptorSetLayouts[ShaderSets.Pass], ReflectedBindings(ShaderSets.Pass));
 
     // Frame constants staged by UpdatePerFrame, pushed into the constant arena
     // by Record (which runs later the same frame inside the graph).
     private LightingFrameUBO _frameUbo;
 
-    /// <summary>True = wire the PCSS-style soft-shadow specialization constant on,
-    /// pulled into the fragment shader as <c>constant_id 0</c>. Read at each pipeline
-    /// build; set then call <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
+    /// <summary>True = wire the PCSS-style soft-shadow path on via the SOFT_SHADOWS spec
+    /// constant. Read at each pipeline build; set then call
+    /// <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
     public bool SoftShadowsEnabled { get; set; } = true;
 
     public PbrDeferredPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
@@ -104,19 +96,18 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
         // Set 0 = scene set with the frame constants' dynamic offset (arena push of the UBO
         // staged by UpdatePerFrame). Set 1 = graph-baked g-buffer + tile pass set. FeatureIBL
         // sits at its own reflected index (set 3) with a gap at set 2, so it binds separately.
-        var registry = Renderer.descriptorRegistry;
-        uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
+        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
         var sets = stackalloc DescriptorSet[2]
         {
-            registry.SceneSet(ctx.FrameIndex),
+            Registry.SceneSet(ctx.FrameIndex),
             gBufferSet,                               // graph-baked (set 1)
         };
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, 0, 2, sets, 1, &frameConstants);
+            Layout, ShaderSets.Scene, 2, sets, 1, &frameConstants);
 
-        var iblSet = registry.FeatureSet(FeatureIbl, ctx.FrameIndex);
+        var iblSet = Registry.FeatureSet(FeatureIbl, ctx.FrameIndex);
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, registry.FeatureSetIndex(FeatureIbl), 1, &iblSet, 0, null);
+            Layout, Registry.FeatureSetIndex(FeatureIbl), 1, &iblSet, 0, null);
 
         // Fullscreen triangle — VSMain synthesizes 3 verts from SV_VertexID
         Vk!.CmdDraw(cmd, 3, 1, 0, 0);
@@ -149,70 +140,23 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
         DepthBiasEnable         = false,
     };
 
-    // Wire constant_id 0 (SOFT_SHADOWS) on the fragment stage. Vulkan bool spec
-    // constants are 32-bit, so we pack the value into a uint.
-    protected override int FillSpecializationData(
-        int stageIdx,
-        SpecializationMapEntry* entries,
-        byte* data,
-        out uint dataSize)
-    {
-        // ShaderStages default: [0]=VS, [1]=FS. Spec constant lives on FS only.
-        if (stageIdx == 1)
-        {
-            entries[0] = new SpecializationMapEntry
-            {
-                ConstantID = 0,
-                Offset     = 0,
-                Size       = sizeof(uint),
-            };
-            *(uint*)data = SoftShadowsEnabled ? 1u : 0u;
-            dataSize = sizeof(uint);
-            return 1;
-        }
-        dataSize = 0;
-        return 0;
-    }
+    // The g-buffer sampler is baked into every set-1 image binding as an IMMUTABLE sampler, so the
+    // graph writes only the views - no sampler plumbing, no update-after-bind. The tile buffers
+    // are storage buffers and take none.
+    protected override Sampler? ImmutableSamplerFor(in BindingDesc binding)
+        => binding.Type == DescriptorType.CombinedImageSampler ? Renderer.gBufferSampler : null;
 
+    protected override SpecValues? Specialization =>
+        new SpecValues().Set("SOFT_SHADOWS", SoftShadowsEnabled);
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Pass set (set 1): five g-buffer combined-image-samplers with the g-buffer sampler baked
-        // in as an IMMUTABLE sampler (the graph writes only the views, no sampler plumbing, no
-        // update-after-bind), plus the two tile-cull output storage buffers. The pipeline owns
-        // this LAYOUT; the deferred FrameGraph owns + writes the SETS allocated from it.
-        Sampler gSampler = Renderer.gBufferSampler;
-        var passBindings = new DescriptorSetLayoutBinding[7];
-        for (uint b = 0; b < 5; b++)
-            passBindings[b] = new DescriptorSetLayoutBinding
-            {
-                Binding = b, DescriptorType = DescriptorType.CombinedImageSampler, DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit, PImmutableSamplers = &gSampler,
-            };
-        for (uint b = 5; b < 7; b++)
-            passBindings[b] = new DescriptorSetLayoutBinding
-            {
-                Binding = b, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit,
-            };
-
-        DescriptorSetLayout passLayout;
-        fixed (DescriptorSetLayoutBinding* pPass = passBindings)
-        {
-            var info = new DescriptorSetLayoutCreateInfo
-            {
-                SType = StructureType.DescriptorSetLayoutCreateInfo,
-                BindingCount = (uint)passBindings.Length,
-                PBindings = pPass,
-            };
-            if (Vk.CreateDescriptorSetLayout(Device, &info, null, out passLayout) != Result.Success)
-                throw new Exception("Failed to create PBR pass-set (set 1) descriptor set layout");
-        }
-
         // Assemble [scene(0), pass(1), empty(2), FeatureIBL(3)]. Scene + FeatureIBL are
-        // registry-owned; the pipeline owns only the pass layout it just built.
-        DescriptorSetLayouts = Renderer.descriptorRegistry.BuildPipelineSetLayouts(passLayout, FeatureIbl);
-        OwnedDescriptorSetLayoutIndices = new[] { SetGBuffer };
+        // registry-owned; the pipeline owns only the pass layout, built from PBR.slang's set-1
+        // declarations.
+        var passLayout = CreateReflectedSetLayout(ShaderSets.Pass);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout, FeatureIbl);
+        OwnedDescriptorSetLayoutIndices = new[] { (int)ShaderSets.Pass };
     }
 
     // Per-frame upload

@@ -1,6 +1,6 @@
 import PbrUtils;      // BRDF/light/IBL math + re-exported CommonTypes (types, consts, vertex helpers)
 import SceneBindings; // scene set 0: lights/TLAS/entity-info/vb+ib/materials/textures/samplers
-import FeatureIBL;    // feature set 2: irradiance/prefiltered/brdfLut + reflection probes
+import FeatureIBL;    // feature set 3: irradiance/prefiltered/brdfLut + reflection probes
 
 // Output from vertex shader / Input to fragment shader - Interpolated data
 struct LightingVSOutput {
@@ -48,11 +48,11 @@ struct LightingFrameUBO {
 [[vk::constant_id(0)]] const bool SOFT_SHADOWS = false;
 
 // GBuffer inputs + tileLight buffers pass-local set 1
-[[vk::binding(0, 1)]] Sampler2D gBufferPositionSampler;
-[[vk::binding(1, 1)]] Sampler2D gBufferNormalSampler;
-[[vk::binding(2, 1)]] Sampler2D gBufferAlbedoSampler;
-[[vk::binding(3, 1)]] Sampler2D gBufferMaterialSampler;
-[[vk::binding(4, 1)]] Sampler2D gBufferEmissiveSampler;
+[[vk::binding(0, 1)]] Sampler2D gPosition;
+[[vk::binding(1, 1)]] Sampler2D gNormal;
+[[vk::binding(2, 1)]] Sampler2D gAlbedo;
+[[vk::binding(3, 1)]] Sampler2D gMaterial;
+[[vk::binding(4, 1)]] Sampler2D gEmissive;
 [[vk::binding(5, 1)]] StructuredBuffer<uint> tileLightCount;
 [[vk::binding(6, 1)]] StructuredBuffer<uint> tileLightIndices;
 
@@ -254,15 +254,15 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
     // gBufferPosition.w == 1.0 wherever Geometry.slang ran; == 0.0 on the
     // cleared sky pixels. Bail early so we don't sample irradiance with an
     // undefined-normalized normal (and so the skybox pass can paint here).
-    float4 WorldPosW = gBufferPositionSampler.Sample(input.UV);
+    float4 WorldPosW = gPosition.Sample(input.UV);
     if (WorldPosW.w < 0.5) return float4(0, 0, 0, 1);
     float3 WorldPos = WorldPosW.xyz;
-    float3 N = normalize(gBufferNormalSampler.Sample(input.UV)).xyz;
+    float3 N = normalize(gNormal.Sample(input.UV)).xyz;
 
-    float4 albedoMet = gBufferAlbedoSampler.Sample(input.UV);
+    float4 albedoMet = gAlbedo.Sample(input.UV);
     float3 baseColor = albedoMet.rgb;
     float metallic = albedoMet.w;
-    float2 mat = gBufferMaterialSampler.Sample(input.UV).xy;
+    float2 mat = gMaterial.Sample(input.UV).xy;
     float roughness = mat.x;
     float ao = mat.y;
     // === LIGHTING SETUP ===
@@ -379,7 +379,7 @@ float4 PSMain(LightingVSOutput input) : SV_TARGET
 
     // Emissive radiance written by the geometry pass — added pre-tone-map so
     // exposure/gamma apply uniformly with the rest of the lighting.
-    float3 emissive = gBufferEmissiveSampler.Sample(input.UV).rgb;
+    float3 emissive = gEmissive.Sample(input.UV).rgb;
 
     // Combine all lighting contributions
     float3 color = ambient + Lo + emissive;
