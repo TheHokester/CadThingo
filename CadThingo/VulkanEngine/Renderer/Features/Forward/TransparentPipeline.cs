@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Shaders;
@@ -56,7 +57,10 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         public uint      _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Forward", "Transparent");
+    // Ray-queried shadows need the capability at compile time even when SOFT_SHADOWS is off:
+    // the traceRayInline call sites are in the shader either way.
+    protected override ShaderCompileRequest? Program =>
+        new("Forward/Transparent", ["VSMain", "PSMain"], [], ["spvRayQueryKHR"]);
 
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 
@@ -67,19 +71,14 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
     // Set 1 - graph-baked pass set: the tile-cull outputs.
     // Set 3 - FeatureIBL (registry-owned): global IBL split-sum + reflection probes.
     //         (Set 2 is the graph-shared slot this pass doesn't use - a gap in the layout.)
-    private const int SetScene = 0;
-    private const int SetTile  = 1;
     private const string FeatureIbl = "FeatureIBL";
 
-    // Graph-baked pass set (set 1): the two tile-cull outputs (graph resources the
-    // TransparentPass reads). Names match the TransparentPass Read binds.
-    private static readonly BindingDesc[] _passBindings =
-    {
-        new("tileLightCount",   SetTile, 0, DescriptorType.StorageBuffer, 1, ShaderStageFlags.FragmentBit),
-        new("tileLightIndices", SetTile, 1, DescriptorType.StorageBuffer, 1, ShaderStageFlags.FragmentBit),
-    };
-
-    public PassSetSpec PassSet => new(SetIndex: SetTile, DescriptorSetLayouts[SetTile], _passBindings);
+    // Graph-baked pass set: the two tile-cull outputs (the only graph resources the
+    // TransparentPass reads). Both the layout and the names the graph matches against come from
+    // Transparent.slang's set-1 declarations, so the TransparentPass Read binds name the shader
+    // globals.
+    public PassSetSpec PassSet =>
+        new(ShaderSets.Pass, DescriptorSetLayouts[ShaderSets.Pass], ReflectedBindings(ShaderSets.Pass));
 
     // Frame constants staged by UpdatePerFrame, pushed into the constant arena
     // by Record (which runs later the same frame inside the graph).
@@ -88,15 +87,18 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
     public TransparentPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         DepthAttachmentFormat = Gfx.FindDepthFormat();
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(TransparentPushConstants),
-            }
-        };
+    }
+
+    // No owned buffers — frame constants ride the scene set's arena and per-draw state is pushed.
+    // The size check is the one thing reflection cannot enforce on its own: the C# mirror of
+    // DrawPC has to keep matching the shader.
+    protected override void CreateResources()
+    {
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(TransparentPushConstants))
+            throw new Exception(
+                $"TransparentPushConstants is {sizeof(TransparentPushConstants)} bytes but " +
+                $"Transparent.slang reflects {reflected}");
     }
 
     internal readonly ref struct Attachments(ImageView hdrColor, ImageView depth)
@@ -161,28 +163,8 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
 
         EndRendering(cmd);
     }
-    // Wire constant_id 0 (SOFT_SHADOWS) on the fragment stage — mirrors PbrDeferredPipeline.
-    protected override int FillSpecializationData(
-        int stageIdx,
-        SpecializationMapEntry* entries,
-        byte* data,
-        out uint dataSize)
-    {
-        if (stageIdx == 1)
-        {
-            entries[0] = new SpecializationMapEntry
-            {
-                ConstantID = 0,
-                Offset     = 0,
-                Size       = sizeof(uint),
-            };
-            *(uint*)data = SoftShadowsEnabled ? 1u : 0u;
-            dataSize = sizeof(uint);
-            return 1;
-        }
-        dataSize = 0;
-        return 0;
-    }
+    protected override SpecValues? Specialization =>
+        new SpecValues().Set("SOFT_SHADOWS", SoftShadowsEnabled);
 
     // Pipeline state overrides
 
@@ -237,32 +219,12 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Pass set (set 1): the two tile-cull output storage buffers. The pipeline owns this
-        // LAYOUT; the deferred FrameGraph owns + writes the SETS allocated from it.
-        var passBindings = new DescriptorSetLayoutBinding[2];
-        for (uint b = 0; b < 2; b++)
-            passBindings[b] = new DescriptorSetLayoutBinding
-            {
-                Binding = b, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit,
-            };
-
-        DescriptorSetLayout passLayout;
-        fixed (DescriptorSetLayoutBinding* pPass = passBindings)
-        {
-            var info = new DescriptorSetLayoutCreateInfo
-            {
-                SType = StructureType.DescriptorSetLayoutCreateInfo,
-                BindingCount = (uint)passBindings.Length,
-                PBindings = pPass,
-            };
-            if (Vk.CreateDescriptorSetLayout(Device, &info, null, out passLayout) != Result.Success)
-                throw new Exception("Failed to create transparent pass-set (set 1) layout");
-        }
-
-        // Assemble [scene(0), pass(1), empty(2), FeatureIBL(3)]; the pipeline owns only the pass layout.
+        // Assemble [scene(0), pass(1), empty(2), FeatureIBL(3)]. Scene + FeatureIBL are
+        // registry-owned; the pipeline owns only the pass layout, built from Transparent.slang's
+        // set-1 declarations. The deferred FrameGraph owns + writes the SETS allocated from it.
+        var passLayout = CreateReflectedSetLayout(ShaderSets.Pass);
         DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout, FeatureIbl);
-        OwnedDescriptorSetLayoutIndices = new[] { SetTile };
+        OwnedDescriptorSetLayoutIndices = new[] { (int)ShaderSets.Pass };
     }
 
     

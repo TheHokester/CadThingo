@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
@@ -25,7 +26,7 @@ public sealed unsafe class OutlinePipeline : Pipelines.GraphicsPipeline
         public int     _pad;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Selection", "Outline");
+    protected override ShaderCompileRequest? Program => new("Selection/Outline", ["VSMain", "PSMain"], [], []);
 
     // Writes FinalColor (LDR), same format as the tonemap pass.
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R8G8B8A8Unorm };
@@ -33,18 +34,7 @@ public sealed unsafe class OutlinePipeline : Pipelines.GraphicsPipeline
     public Vector3 Color     { get; set; } = new(1.0f, 0.55f, 0.1f);   // editor orange
     public int     Thickness { get; set; } = 3;
 
-    public OutlinePipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.FragmentBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(OutlinePushConstants),
-            }
-        };
-    }
+    public OutlinePipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     // Fullscreen triangle — no vertex inputs, no depth, no cull, no blend.
     protected override PipelineDepthStencilStateCreateInfo BuildDepthStencil() => new()
@@ -71,25 +61,10 @@ public sealed unsafe class OutlinePipeline : Pipelines.GraphicsPipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        DescriptorSetLayouts            = new DescriptorSetLayout[1];
+        // Private set 0 (the mask, fetched via .Load with no sampler): this pass is not on the
+        // scene set, so the layout is just the reflected set.
+        DescriptorSetLayouts            = new[] { CreateReflectedSetLayout(0) };
         OwnedDescriptorSetLayoutIndices = new[] { 0 };
-
-        // Binding 0: mask as a sampled image (fetched via .Load, no sampler).
-        var binding = new DescriptorSetLayoutBinding
-        {
-            Binding         = 0,
-            DescriptorType  = DescriptorType.SampledImage,
-            DescriptorCount = 1,
-            StageFlags      = ShaderStageFlags.FragmentBit,
-        };
-        var info = new DescriptorSetLayoutCreateInfo
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 1,
-            PBindings    = &binding,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out DescriptorSetLayouts[0]) != Result.Success)
-            throw new Exception("Failed to create outline descriptor set layout");
     }
 
     protected override void CreateDescriptorSets()
@@ -107,6 +82,16 @@ public sealed unsafe class OutlinePipeline : Pipelines.GraphicsPipeline
         fixed (DescriptorSet* p = DescriptorSets[0])
             if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
                 throw new Exception("Failed to allocate outline descriptor set");
+    }
+
+    // The C# mirror of OutlineParams is the one thing reflection cannot keep honest.
+    protected override void CreateResources()
+    {
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(OutlinePushConstants))
+            throw new Exception(
+                $"OutlinePushConstants is {sizeof(OutlinePushConstants)} bytes but Outline.slang " +
+                $"reflects {reflected}");
     }
 
     // Mask view only exists after CreateSelectionResources, so it's written
@@ -158,7 +143,8 @@ public sealed unsafe class OutlinePipeline : Pipelines.GraphicsPipeline
             ScreenH   = (int)extent.Height,
             Thickness = Thickness,
         };
-        Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.FragmentBit,
+        // Reflection owns the range's stage mask; vkCmdPushConstants requires the two to agree.
+        Vk.CmdPushConstants(cmd, Layout, PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(OutlinePushConstants), &pc);
 
         Vk.CmdDraw(cmd, 3, 1, 0, 0);

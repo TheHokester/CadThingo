@@ -15,9 +15,10 @@ namespace CadThingo.VulkanEngine.Renderer.Shaders;
 internal sealed class ShaderCache
 {
     private const uint Magic = 0x4C464552; // "REFL"
-    // Also covers the fixed compiler options (optimization level, entry-point naming): they are
-    // not part of the request, so a change to them only invalidates cached blobs via this bump.
-    private const uint FormatVersion = 2;
+    // Also covers the fixed compiler options (optimization level, entry-point naming, matrix
+    // layout): they are not part of the request, so a change to them only invalidates cached
+    // blobs via this bump.
+    private const uint FormatVersion = 5;
     private static readonly TimeSpan GcAge = TimeSpan.FromDays(30);
 
     private readonly string _dir;

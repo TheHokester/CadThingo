@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -63,7 +64,8 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     private const int SetIO    = 1;
     private const string FeatureEnv = "FeatureEnv";   // set 4 (registry-owned): envCube
 
-    private static readonly string ShaderPath = ShaderPaths.Kernel("PathTracer", "PTCompute");
+    protected override ShaderCompileRequest? Program =>
+        new("PathTracer/PTCompute", ["main"], [], ["spvRayQueryKHR"]);
 
     /// <summary>Multi-PSO pattern: one pipeline per camera mode, mode baked via spec
     ///constant id=3. Mode switch at Record time = `CmdBindPipeline` only, no
@@ -107,74 +109,55 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     // Descriptor set layouts
     protected override void CreateDescriptorSetLayouts()
     {
-        // Set 1: accumulator + outColor storage images (pipeline-owned).
-        var set1 = stackalloc DescriptorSetLayoutBinding[2];
-        for (uint b = 0; b < 2; b++)
-            set1[b] = new() { Binding = b, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        CreateLayout(set1, 2, out var ioLayout);
-
-        // [scene(0), IO(1), empty(2), empty(3), FeatureEnv(4)]. envCube is registry-owned on
-        // FeatureEnv; the graph-shared and FeatureIBL slots are unused gaps for the tracer.
+        // Set 1 (accumulator + outColor storage images) is pipeline-owned and reflected from
+        // PTCompute.slang. [scene(0), IO(1), empty(2), empty(3), FeatureEnv(4)]: envCube is
+        // registry-owned on FeatureEnv; the graph-shared and FeatureIBL slots are unused gaps.
+        var ioLayout = CreateReflectedSetLayout(SetIO);
         DescriptorSetLayouts            = Registry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
         OwnedDescriptorSetLayoutIndices = new[] { SetIO };
     }
 
-    private void CreateLayout(DescriptorSetLayoutBinding* bindings, uint count, out DescriptorSetLayout layout)
-    {
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = count,
-            PBindings    = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out layout) != Result.Success)
-            throw new Exception("Failed to create pathtracer descriptor set layout");
-    }
 
+    // The camera mode the PSO currently being built bakes in. The build loop patches this between
+    // pipelines; every other spec value is constant across the four.
+    private uint _specMode;
 
-    // Pipeline build: one PSO per camera mode
+    protected override SpecValues? Specialization => new SpecValues()
+        .Set("ENABLE_NEE",       EnableNee)
+        .Set("RUSSIAN_ROULETTE", RussianRoulette)
+        .Set("MAX_BOUNCES",      MaxBouncesHardCap)
+        .Set("MODE",             _specMode);
+
+    // Pipeline build: one PSO per camera mode, all from one cached SPIR-V - the modes differ only
+    // in the MODE spec constant.
     protected override void CreatePipeline()
     {
-        byte[] code     = File.ReadAllBytes(ShaderPath);
-        var    module   = Gfx.CreateShaderModule(code);
-        var    entryPtr = SilkMarshal.StringToPtr("main");
+        var entryPoint = Reflected!.Reflection.EntryPoints[0];
+        var module     = CreateReflectedModule(0);
+        var entryPtr   = SilkMarshal.StringToPtr(entryPoint.Name);
 
-        // 4 spec entries packed into a 16B blob:
-        //   id 0 = ENABLE_NEE        (bool → uint)
-        //   id 1 = RUSSIAN_ROULETTE  (bool → uint)
-        //   id 2 = MAX_BOUNCES       (uint)
-        //   id 3 = MODE              (uint) — patched per pipeline below
-        var specEntries = stackalloc SpecializationMapEntry[4];
-        specEntries[0] = new() { ConstantID = 0, Offset = 0,  Size = sizeof(uint) };
-        specEntries[1] = new() { ConstantID = 1, Offset = 4,  Size = sizeof(uint) };
-        specEntries[2] = new() { ConstantID = 2, Offset = 8,  Size = sizeof(uint) };
-        specEntries[3] = new() { ConstantID = 3, Offset = 12, Size = sizeof(uint) };
-
-        var specData = stackalloc uint[4];
-        specData[0] = EnableNee       ? 1u : 0u;
-        specData[1] = RussianRoulette ? 1u : 0u;
-        specData[2] = MaxBouncesHardCap;
-        // specData[3] patched per-mode in the loop.
-
-        var specInfo = new SpecializationInfo
-        {
-            MapEntryCount = 4,
-            PMapEntries   = specEntries,
-            DataSize      = (UIntPtr)(4u * sizeof(uint)),
-            PData         = specData,
-        };
+        var specEntries = stackalloc SpecializationMapEntry[SpecScratchEntries];
+        var specData    = stackalloc byte[SpecScratchBytes];
 
         for (uint mode = 0; mode < 4; mode++)
         {
-            specData[3] = mode;
+            _specMode = mode;
+            int filled = FillStageSpecialization(0, specEntries, specData, out uint dataSize);
+            var specInfo = new SpecializationInfo
+            {
+                MapEntryCount = (uint)filled,
+                PMapEntries   = specEntries,
+                DataSize      = (UIntPtr)dataSize,
+                PData         = specData,
+            };
 
             var stage = new PipelineShaderStageCreateInfo
             {
                 SType               = StructureType.PipelineShaderStageCreateInfo,
-                Stage               = ShaderStageFlags.ComputeBit,
+                Stage               = entryPoint.Stage,
                 Module              = module,
                 PName               = (byte*)entryPtr,
-                PSpecializationInfo = &specInfo,
+                PSpecializationInfo = filled > 0 ? &specInfo : null,
             };
 
             var info = new ComputePipelineCreateInfo

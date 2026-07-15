@@ -85,6 +85,16 @@ public abstract unsafe class PipelineBase : IDisposable
     /// layout pins, so the pipeline still answers that.
     protected virtual Sampler? ImmutableSamplerFor(in BindingDesc binding) => null;
 
+    /// Stages to OR onto a reflected binding's visibility. Reflection only knows the stages of the
+    /// program it walked, so a pipeline that builds SIBLING PSOs of a different kind against the
+    /// same layout (ReSTIR's compute passes on the RT layout) must name those stages here, or the
+    /// sibling cannot bind the set.
+    protected virtual ShaderStageFlags ExtraStagesFor(in BindingDesc binding) => 0;
+
+    /// Stages to OR onto every reflected push-constant range, for the same reason as
+    /// <see cref="ExtraStagesFor"/>.
+    protected virtual ShaderStageFlags ExtraPushStages => 0;
+
     /// The program's reflected bindings for one descriptor set, ordered by binding index.
     protected BindingDesc[] ReflectedBindings(uint set)
     {
@@ -115,7 +125,7 @@ public abstract unsafe class PipelineBase : IDisposable
                     Binding         = b.Binding,
                     DescriptorType  = b.Type,
                     DescriptorCount = b.Count,
-                    StageFlags      = b.Stages,
+                    StageFlags      = b.Stages | ExtraStagesFor(in b),
                 };
                 if (ImmutableSamplerFor(in b) is { } s)
                 {
@@ -216,7 +226,10 @@ public abstract unsafe class PipelineBase : IDisposable
         Reflected = Program is { } request ? Shaders.GetProgram(request) : null;
         if (Reflected != null)
             PushConstantRanges = Reflected.Reflection.PushConstants
-                .Select(p => new PushConstantRange { StageFlags = p.Stages, Offset = 0, Size = p.Size })
+                .Select(p => new PushConstantRange
+                {
+                    StageFlags = p.Stages | ExtraPushStages, Offset = 0, Size = p.Size,
+                })
                 .ToArray();
 
         CreateDescriptorSetLayouts();
@@ -585,18 +598,32 @@ public abstract unsafe class ComputePipeline : PipelineBase
 
     protected ComputePipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
-    protected abstract string ShaderPath { get; }
+    // Build-time .spv for the legacy route; null on the reflected route (see PipelineBase.Program).
+    protected virtual string? ShaderPath => null;
 
-    // slangc emits the SPIR-V OpEntryPoint as "main" regardless of the source
-    // function name. Override only if the .spv was produced by a toolchain
-    // that preserves a different entry-point symbol.
+    // Legacy-route entry-point symbol: slangc emits the SPIR-V OpEntryPoint as "main" regardless
+    // of the source function name when compiling a single-entry kernel. The reflected route takes
+    // the name from reflection instead and ignores this.
     protected virtual string EntryPoint => "main";
 
     protected sealed override void CreatePipeline()
     {
-        byte[] code   = File.ReadAllBytes(ShaderPath);
-        var    module = Gfx.CreateShaderModule(code);
-        var    entry  = SilkMarshal.StringToPtr(EntryPoint);
+        ShaderModule module;
+        string entryName;
+        if (Reflected != null)
+        {
+            var ep = Reflected.Reflection.EntryPoints[0];
+            module = CreateReflectedModule(0);
+            entryName = ep.Name;
+        }
+        else
+        {
+            module = Gfx.CreateShaderModule(File.ReadAllBytes(
+                ShaderPath ?? throw new InvalidOperationException(
+                    $"{GetType().Name}: needs either a Program or a ShaderPath.")));
+            entryName = EntryPoint;
+        }
+        var entry = SilkMarshal.StringToPtr(entryName);
 
         var stage = new PipelineShaderStageCreateInfo
         {
@@ -605,6 +632,23 @@ public abstract unsafe class ComputePipeline : PipelineBase
             Module = module,
             PName  = (byte*)entry,
         };
+
+        // Scratch must outlive the create call below.
+        var specInfo    = new SpecializationInfo();
+        var specEntries = stackalloc SpecializationMapEntry[SpecScratchEntries];
+        var specData    = stackalloc byte[SpecScratchBytes];
+        int filled = FillStageSpecialization(0, specEntries, specData, out uint dataSize);
+        if (filled > 0)
+        {
+            specInfo = new SpecializationInfo
+            {
+                MapEntryCount = (uint)filled,
+                PMapEntries   = specEntries,
+                DataSize      = (UIntPtr)dataSize,
+                PData         = specData,
+            };
+            stage.PSpecializationInfo = &specInfo;
+        }
 
         var info = new ComputePipelineCreateInfo
         {
@@ -632,7 +676,8 @@ public abstract unsafe class RtPipeline : PipelineBase
 {
     public override PipelineBindPoint BindPoint => PipelineBindPoint.RayTracingKhr;
 
-    protected abstract string ShaderPath { get; }
+    // Build-time .spv for the legacy route; null on the reflected route (see PipelineBase.Program).
+    protected virtual string? ShaderPath => null;
 
     // VK_KHR_ray_tracing_pipeline dispatch table + SBT-layout properties, loaded
     // once per instance from the device. Null / zero if the extension failed to

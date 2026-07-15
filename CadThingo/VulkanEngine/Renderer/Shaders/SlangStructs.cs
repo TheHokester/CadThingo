@@ -23,6 +23,10 @@ internal enum CompilerOptionName : int
 {
     MacroDefine = 0,   // stringValue0 = name, stringValue1 = value
     Include = 6,       // stringValue0 = search path
+    // bool. NOTE the inversion: COLUMN here emits SPIR-V members decorated RowMajor, which is
+    // what slangc's default (and therefore every build-time .spv) produces. See CreateSession.
+    MatrixLayoutColumn = 8,
+    MatrixLayoutRow = 9,
     Profile = 15,      // intValue0 = SlangProfileID
     Capability = 39,   // intValue0 = SlangCapabilityID from IGlobalSession::findCapability
     Optimization = 46, // intValue0 = 0..3 (-O0..-O3)
@@ -130,6 +134,9 @@ internal unsafe struct SessionDesc
     public static SessionDesc Create() => new()
     {
         StructureSize = (nuint)sizeof(SessionDesc),
-        DefaultMatrixLayoutMode = 1, // SLANG_MATRIX_LAYOUT_ROW_MAJOR
+        // SLANG_MATRIX_LAYOUT_COLUMN_MAJOR. Counterintuitive but correct: this is what slangc
+        // defaults to for SPIR-V, and it emits matrix members decorated RowMajor - the layout the
+        // C# Matrix4x4 mirrors upload. ROW_MAJOR here transposes every matrix. See CreateSession.
+        DefaultMatrixLayoutMode = 2,
     };
 }

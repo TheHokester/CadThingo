@@ -27,7 +27,8 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         public uint    _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "CullDraws");
+    protected override ShaderCompileRequest? Program =>
+        new("Deferred/CullDraws", ["Main"], [], []);
 
     // Per-frame buffers owned by this pipeline. .
     private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
@@ -37,21 +38,17 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     public Buffer GetIndirectCountBuffer(uint frame) => IndirectCountBuffers[frame].buffer;
     public Buffer GetRenderablesBuffer  (uint frame) => Renderer.gpuScene.GetRenderablesBuffer(frame);
 
-    // Pass-set contract for the deferred FrameGraph (descriptor-system.md phase C). The four
+    // Pass-set contract for the deferred FrameGraph. The four
     // storage buffers this compute shader binds are all graph resources -- the input renderable
     // list plus the three post-cull outputs the graph imports -- so the graph allocates + writes
     // the set; the pipeline just owns the layout (its VkPipelineLayout borrows it at set 0) and
-    // binds whatever set the graph hands Record. Names match the CullPass Read/Write binds, not
-    // the .slang identifiers (bindings map by (set,binding) number).
-    private static readonly BindingDesc[] _passBindings =
-    {
-        new("renderables",   0, 0, DescriptorType.StorageBuffer, 1, ShaderStageFlags.ComputeBit),
-        new("indirectCmd",   0, 1, DescriptorType.StorageBuffer, 1, ShaderStageFlags.ComputeBit),
-        new("instanceData",  0, 2, DescriptorType.StorageBuffer, 1, ShaderStageFlags.ComputeBit),
-        new("indirectCount", 0, 3, DescriptorType.StorageBuffer, 1, ShaderStageFlags.ComputeBit),
-    };
+    // binds whatever set the graph hands Record. No scene set here, so this kernel's own set is
+    // set 0; contents and names both come from CullDraws.slang's set-0 declarations, which the
+    // CullPass Read/Write binds now match by name.
+    private const uint PassSetIndex = 0;
 
-    public PassSetSpec PassSet => new(SetIndex: 0, DescriptorSetLayouts[0], _passBindings);
+    public PassSetSpec PassSet =>
+        new(PassSetIndex, DescriptorSetLayouts[PassSetIndex], ReflectedBindings(PassSetIndex));
 
     /// <summary>Renderables packed in the most recent Record() call — drives
     /// maxDrawCount on vkCmdDrawIndexedIndirectCount.</summary>
@@ -66,18 +63,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     /// Consumed by the TransparentPass; empty when no scene material is BLEND-mode.</summary>
     public IReadOnlyList<TransparentDraw> LastTransparentDraws => _transparentDraws;
 
-    public DrawCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.ComputeBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(CullPushConstants),
-            }
-        };
-    }
+    // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
+    // still matches the reflected size.
+    public DrawCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     public override void Dispose()
     {
@@ -91,32 +79,20 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         // The pass-set layout (set 0): 4 storage buffers, borrowed by the deferred FrameGraph
         // to allocate + write the descriptor set. The pipeline owns the layout; the graph owns
         // the sets. Exposed to the graph via PassSet.
-        var bindings = stackalloc DescriptorSetLayoutBinding[4];
-        for (uint b = 0; b < 4; b++)
-        {
-            bindings[b] = new DescriptorSetLayoutBinding
-            {
-                Binding         = b,
-                DescriptorType  = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                StageFlags      = ShaderStageFlags.ComputeBit,
-                PImmutableSamplers = null,
-            };
-        }
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 4,
-            PBindings    = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
-            throw new Exception("Failed to create cull descriptor set layout");
-        DescriptorSetLayouts = new[] { layout };
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
+        DescriptorSetLayouts = new[] { CreateReflectedSetLayout(PassSetIndex) };
+        OwnedDescriptorSetLayoutIndices = new[] { (int)PassSetIndex };
     }
 
     protected override void CreateResources()
     {
+        // Reflection cannot check this on its own: the C# mirror of CullParams has to keep
+        // matching the shader.
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(CullPushConstants))
+            throw new Exception(
+                $"CullPushConstants is {sizeof(CullPushConstants)} bytes but CullDraws.slang " +
+                $"reflects {reflected}");
+
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
             // Indirect-command buffer also needs IndirectBuffer usage so the
@@ -208,7 +184,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
             PlaneF = frustum.PlaneFar.Data,
             RenderableCount = count,
         };
-        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, ShaderStageFlags.ComputeBit,
+        // Stage mask comes from the reflected range the layout was built from: vkCmdPushConstants
+        // requires the two to agree, so neither side names a stage mask of its own.
+        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(CullPushConstants), &push);
 
         // 64 threads per group; ceil-divide so the last group covers the tail.

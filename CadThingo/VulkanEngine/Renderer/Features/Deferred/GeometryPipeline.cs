@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
@@ -18,7 +19,9 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
         public Matrix4x4 proj;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "Geometry");
+    protected override ShaderCompileRequest? Program =>
+        new("Deferred/Geometry", ["VSMain", "PSMain"], [], []);
+
     protected override Format[] ColorAttachmentFormats { get; } =
     [
         Format.R32G32B32A32Sfloat, // Position
@@ -118,9 +121,10 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
     }
     protected override void CreateDescriptorSetLayouts()
     {
-        // Scene set only, borrowed from the registry (never destroyed here). The pipeline
-        // owns no descriptor sets, layouts, or UBO buffers anymore.
-        DescriptorSetLayouts = [Registry.SceneSetLayout];
+        // Scene set only - Geometry.slang declares nothing outside SceneBindings, so there is no
+        // pass set to build. The layout is registry-owned and borrowed (never destroyed here);
+        // the pipeline owns no descriptor sets, layouts, or UBO buffers.
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(null);
         OwnedDescriptorSetLayoutIndices = [];
     }
 

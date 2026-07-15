@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
@@ -25,46 +27,37 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
         public uint      _pad;           //  4
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Selection", "SelectionMask");
+    // Ray-queried masking needs the capability at compile time: the TraceRayInline call site is
+    // in the shader unconditionally.
+    protected override ShaderCompileRequest? Program =>
+        new("Selection/SelectionMask", ["main"], [], ["spvRayQueryKHR"]);
 
-    public SelectionMaskPipeline(GpuContext gpu,Renderer renderer) : base(gpu, renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.ComputeBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(MaskPushConstants),
-            }
-        };
-    }
+    // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
+    // still matches the reflected size.
+    public SelectionMaskPipeline(GpuContext gpu,Renderer renderer) : base(gpu, renderer) { }
 
     // Set 0 borrowed from the registry (sceneTlas + sceneEntityInfo); set 1 owns the mask image.
-    private const int SetScene = 0;
-    private const int SetMask  = 1;
+    private const int SetMask = (int)ShaderSets.Pass;
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Set 1 binding 0: the R32F coverage mask. TLAS + entityInfo now resolve
-        // through the scene set (sceneTlas / sceneEntityInfo).
-        var binding = new DescriptorSetLayoutBinding
-        {
-            Binding = 0, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit,
-        };
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 1,
-            PBindings    = &binding,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
-            throw new Exception("Failed to create selection-mask descriptor set layout");
-
-        DescriptorSetLayouts            = new DescriptorSetLayout[2];
-        DescriptorSetLayouts[SetScene]  = Registry.SceneSetLayout;
-        DescriptorSetLayouts[SetMask]   = layout;
+        // Assemble [scene(0), pass(1)]. Scene is registry-owned; the pipeline owns only the pass
+        // layout (the R32F coverage mask), built from SelectionMask.slang's set-1 declaration.
+        // TLAS + entityInfo resolve through the scene set.
+        var passLayout = CreateReflectedSetLayout(ShaderSets.Pass);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout);
         OwnedDescriptorSetLayoutIndices = new[] { SetMask };
+    }
+
+    protected override void CreateResources()
+    {
+        // Reflection cannot check this on its own: the C# mirror of MaskParams has to keep
+        // matching the shader.
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(MaskPushConstants))
+            throw new Exception(
+                $"MaskPushConstants is {sizeof(MaskPushConstants)} bytes but SelectionMask.slang " +
+                $"reflects {reflected}");
     }
 
     protected override void CreateDescriptorSets()
@@ -78,9 +71,10 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
             DescriptorSetCount = 1,
             PSetLayouts        = &layout,
         };
-        DescriptorSets           = new DescriptorSet[2][];
-        DescriptorSets[SetScene] = null;
-        DescriptorSets[SetMask]  = new DescriptorSet[1];
+        // Scene slot stays null: Record binds Registry.SceneSet(frame) directly.
+        DescriptorSets                   = new DescriptorSet[2][];
+        DescriptorSets[ShaderSets.Scene] = null;
+        DescriptorSets[SetMask]          = new DescriptorSet[1];
         fixed (DescriptorSet* p = DescriptorSets[SetMask])
             if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
                 throw new Exception("Failed to allocate selection-mask descriptor set");
@@ -132,7 +126,9 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
             ScreenSize    = new Vector2(extent.Width, extent.Height),
             SelectedIndex = selectedIndex,
         };
-        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, ShaderStageFlags.ComputeBit,
+        // Stage mask comes from the reflected range the layout was built from: vkCmdPushConstants
+        // requires the two to agree, so neither side names a stage mask of its own.
+        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(MaskPushConstants), &push);
 
         uint gx = (extent.Width  + 7u) / 8u;

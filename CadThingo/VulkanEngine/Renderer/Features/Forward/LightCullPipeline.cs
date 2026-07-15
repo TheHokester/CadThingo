@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Shaders;
@@ -26,7 +27,8 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         public uint      _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Forward", "LightCulling");
+    protected override ShaderCompileRequest? Program =>
+        new("Forward/LightCulling", ["Main"], [], []);
 
     // Set 0 - unified scene set (sceneLights is the only read; this pass keeps
     //         its params in push constants so the (0,0) slot goes unused and the
@@ -36,38 +38,22 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
     //         TileLightIndices[tileIdx*MAX + slot] is the flat index into the
     //         lights SSBO. The lighting passes read both, keyed by
     //         tileIdx = (gl_FragCoord / TILE_SIZE).
-    private const int SetScene   = 0;
-    private const int SetTileOut = 1;
-
     private UboBuffer[] TileLightCountBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
     private UboBuffer[] TileLightIndicesBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
     public Buffer GetTileLightCountBuffer  (uint frame) => TileLightCountBuffers[frame].buffer;
     public Buffer GetTileLightIndicesBuffer(uint frame) => TileLightIndicesBuffers[frame].buffer;
 
-    // Graph-baked pass set (set 1): the two tile-cull outputs, filled by the deferred FrameGraph
-    // (they are graph imports this pass writes). Names match the LightCullPass Write binds; the
-    // pipeline owns only the layout (its VkPipelineLayout borrows it at set 1).
-    private static readonly BindingDesc[] _passBindings =
-    {
-        new("tileLightCount",   SetTileOut, 0, DescriptorType.StorageBuffer, 1, ShaderStageFlags.ComputeBit),
-        new("tileLightIndices", SetTileOut, 1, DescriptorType.StorageBuffer, 1, ShaderStageFlags.ComputeBit),
-    };
+    // Graph-baked pass set: the two tile-cull outputs, filled by the deferred FrameGraph (they
+    // are graph imports this pass writes). Both the layout and the names the graph matches
+    // against come from LightCulling.slang's set-1 declarations, so the LightCullPass Write
+    // binds name the shader globals; the pipeline owns only the layout.
+    public PassSetSpec PassSet =>
+        new(ShaderSets.Pass, DescriptorSetLayouts[ShaderSets.Pass], ReflectedBindings(ShaderSets.Pass));
 
-    public PassSetSpec PassSet => new(SetIndex: SetTileOut, DescriptorSetLayouts[SetTileOut], _passBindings);
-
-    public LightCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.ComputeBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(LightCullPushConstants),
-            }
-        };
-    }
+    // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
+    // still matches the reflected size.
+    public LightCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     public override void Dispose()
     {
@@ -78,36 +64,23 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Set 0 is borrowed from DescriptorRegistry (never destroyed here);
-        // set 1 (the two tile output SSBOs) is owned by this pipeline.
-        DescriptorSetLayouts = new DescriptorSetLayout[2];
-        OwnedDescriptorSetLayoutIndices = new[] { SetTileOut };
-        DescriptorSetLayouts[SetScene] = Registry.SceneSetLayout;
-
-        var bindings = stackalloc DescriptorSetLayoutBinding[2];
-        for (uint b = 0; b < 2; b++)
-        {
-            bindings[b] = new DescriptorSetLayoutBinding
-            {
-                Binding         = b,
-                DescriptorType  = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                StageFlags      = ShaderStageFlags.ComputeBit,
-                PImmutableSamplers = null,
-            };
-        }
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 2,
-            PBindings    = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out DescriptorSetLayouts[SetTileOut]) != Result.Success)
-            throw new Exception("Failed to create light-cull tile-output descriptor set layout");
+        // Assemble [scene(0), pass(1)]. Scene is registry-owned; the pipeline owns only the pass
+        // layout, built from LightCulling.slang's set-1 declarations.
+        var passLayout = CreateReflectedSetLayout(ShaderSets.Pass);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout);
+        OwnedDescriptorSetLayoutIndices = new[] { (int)ShaderSets.Pass };
     }
 
     protected override void CreateResources()
     {
+        // Reflection cannot check this on its own: the C# mirror of CullParams has to keep
+        // matching the shader.
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(LightCullPushConstants))
+            throw new Exception(
+                $"LightCullPushConstants is {sizeof(LightCullPushConstants)} bytes but " +
+                $"LightCulling.slang reflects {reflected}");
+
         // Tile-cull buffers sized for worst-case tile count (MAX_TILE_COUNT).
         // Per frame: TileLightCount = MAX × 4B, TileLightIndices = MAX × MAX_LIGHTS_PER_TILE × 4B.
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
@@ -170,7 +143,9 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
             TileCountY  = tileCountY,
             LightCount  = lightCount,
         };
-        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, ShaderStageFlags.ComputeBit,
+        // Stage mask comes from the reflected range the layout was built from: vkCmdPushConstants
+        // requires the two to agree, so neither side names a stage mask of its own.
+        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(LightCullPushConstants), &push);
 
         // One thread group per tile (each group is 16×16 = 256 threads).

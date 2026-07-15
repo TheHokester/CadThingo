@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -65,11 +66,19 @@ public unsafe class RTPipeline : RtPipeline
         ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.MissBitKhr |
         ShaderStageFlags.ClosestHitBitKhr | ShaderStageFlags.AnyHitBitKhr;
 
-    // SER variant (HitObject + ReorderThread  + Invoke raygen) when the device exposes
-    // VK_NV_ray_tracing_invocation_reorder; otherwise the plain TraceRay variant.
-    // Both .spv expose the same entry points, so the pipeline build is identical.
-    protected override string ShaderPath =>
-        ShaderPaths.Kernel("PathTracer", Gfx.SerSupported ? "PathTraceRT_SER" : "PathTraceRT");
+    // SBT group order. The request's entry order drives both Reflection.EntryPoints[i] and
+    // Spirv(i), so stage i lands in the group that names it below; reordering this list silently
+    // rewires the SBT, hence the stage assert in CreatePipeline.
+    private static readonly string[] RtEntries = ["rayGenMain", "missMain", "closestHitMain", "anyHitMain"];
+
+    /// <summary>The RT program for <paramref name="module"/>, SER-specialized for this device. SER
+    /// (HitObject + ReorderThread + Invoke raygen) is now a define on the SAME source rather than a
+    /// separate _SER.slang output, so the variant is a runtime capability decision.</summary>
+    protected ShaderCompileRequest RtProgram(string module) => Gfx.SerSupported
+        ? new(module, RtEntries, ["USE_SER=1"], ["spvRayTracingKHR", "spvShaderInvocationReorderNV"])
+        : new(module, RtEntries, [], ["spvRayTracingKHR"]);
+
+    protected override ShaderCompileRequest? Program => RtProgram("PathTracer/PathTraceRT");
 
     // SBT: one buffer holding [raygen][miss][hit] regions, each padded to the
     // device's shaderGroupBaseAlignment; CmdTraceRays reads the strided regions.
@@ -101,39 +110,26 @@ public unsafe class RTPipeline : RtPipeline
     // storage images with a compute sibling (ReSTIR's SpatialShade, which folds the analytic direct
     // into the accumulator) returns ComputeBit so the set is bindable from both. Base returns 0 -> the
     // megakernel RT pipeline's IO set stays RT-stages-only.
+    // Reflection cannot discover this: it only walks the RT program, so it never sees the sibling
+    // compute PSOs built against this same layout.
     protected virtual ShaderStageFlags OwnedSetExtraStages => 0;
 
+    // Only consulted for sets this pipeline reflects and owns (IO, plus ReSTIR's working set) -
+    // registry-owned scene/feature sets never route through CreateReflectedSetLayout and are
+    // All-stages already, so this needs no per-set gate.
+    protected override ShaderStageFlags ExtraStagesFor(in BindingDesc binding) => OwnedSetExtraStages;
+
+    protected override ShaderStageFlags ExtraPushStages => OwnedSetExtraStages;
+
     // Descriptor set layouts. Set 0 (scene) + FeatureEnv (set 4) borrowed from the registry; set 1
-    // (IO) owned. Array is [scene, IO, empty, empty, FeatureEnv]; a subclass may install its own
-    // graph-shared working layout into the set-2 gap (ReSTIR does).
+    // (IO, reflected from the tracer's accumulator/outColor declarations) owned. Array is
+    // [scene, IO, empty, empty, FeatureEnv]; a subclass may install its own graph-shared working
+    // layout into the set-2 gap (ReSTIR does).
     protected override void CreateDescriptorSetLayouts()
     {
-        uint envIndex = Registry.FeatureSetIndex(FeatureEnv);
-
-        DescriptorSetLayouts            = new DescriptorSetLayout[envIndex + 1];
-        for (int i = 0; i < DescriptorSetLayouts.Length; i++) DescriptorSetLayouts[i] = Registry.EmptySetLayout;
-        OwnedDescriptorSetLayoutIndices = new[] { SetIO };
-        DescriptorSetLayouts[SetScene]  = Registry.SceneSetLayout;
-        DescriptorSetLayouts[envIndex]  = Registry.FeatureSetLayout(FeatureEnv);
-
-        // Set 1: accumulator + outColor storage images.
-        ShaderStageFlags io = RtAll | OwnedSetExtraStages;
-        var set1 = stackalloc DescriptorSetLayoutBinding[2];
-        for (uint b = 0; b < 2; b++)
-            set1[b] = new() { Binding = b, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, StageFlags = io };
-        CreateLayout(set1, 2, out DescriptorSetLayouts[SetIO]);
-    }
-
-    private void CreateLayout(DescriptorSetLayoutBinding* bindings, uint count, out DescriptorSetLayout layout)
-    {
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = count,
-            PBindings    = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out layout) != Result.Success)
-            throw new Exception("Failed to create RT pipeline descriptor set layout");
+        var ioLayout = CreateReflectedSetLayout(SetIO);
+        DescriptorSetLayouts            = Registry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
+        OwnedDescriptorSetLayoutIndices = new[] { (int)SetIO };
     }
 
 
@@ -143,21 +139,32 @@ public unsafe class RTPipeline : RtPipeline
         if (KhrRtPipeline == null)
             throw new Exception("RTPipeline: VK_KHR_ray_tracing_pipeline dispatch table not loaded");
 
-        byte[] code   = File.ReadAllBytes(ShaderPath);
-        var    module = Gfx.CreateShaderModule(code);
+        // Slang compiles one SPIR-V module PER ENTRY POINT, so this is 4 modules rather than the
+        // single multi-entry .spv the build-time route produced. Entry i is parallel to
+        // RtEntries[i], which is what the group table below assumes.
+        var reflectedEntries = Reflected!.Reflection.EntryPoints;
+        ReadOnlySpan<ShaderStageFlags> expected =
+        [
+            ShaderStageFlags.RaygenBitKhr, ShaderStageFlags.MissBitKhr,
+            ShaderStageFlags.ClosestHitBitKhr, ShaderStageFlags.AnyHitBitKhr,
+        ];
+        if (reflectedEntries.Length != expected.Length)
+            throw new Exception($"RTPipeline: expected {expected.Length} entry points, reflected {reflectedEntries.Length}");
 
-        // Entry-point names preserved by slangc for the multi-entry-point module
-        // (confirmed in phase 1: rayGenMain / missMain / closestHitMain / anyHitMain).
-        var rgName = SilkMarshal.StringToPtr("rayGenMain");
-        var msName = SilkMarshal.StringToPtr("missMain");
-        var chName = SilkMarshal.StringToPtr("closestHitMain");
-        var ahName = SilkMarshal.StringToPtr("anyHitMain");
-
-        var stages = stackalloc PipelineShaderStageCreateInfo[4];
-        stages[0] = Stage(ShaderStageFlags.RaygenBitKhr,     module, rgName);
-        stages[1] = Stage(ShaderStageFlags.MissBitKhr,       module, msName);
-        stages[2] = Stage(ShaderStageFlags.ClosestHitBitKhr, module, chName);
-        stages[3] = Stage(ShaderStageFlags.AnyHitBitKhr,     module, ahName);
+        var modules   = stackalloc ShaderModule[4];
+        var entryPtrs = stackalloc nint[4];
+        var stages    = stackalloc PipelineShaderStageCreateInfo[4];
+        for (int i = 0; i < 4; i++)
+        {
+            // A silent SBT misorder is unrecoverable at runtime, so pin the contract here.
+            if (reflectedEntries[i].Stage != expected[i])
+                throw new Exception(
+                    $"RTPipeline: entry {i} '{reflectedEntries[i].Name}' is {reflectedEntries[i].Stage}, " +
+                    $"expected {expected[i]} - SBT group order would be wrong");
+            modules[i]   = CreateReflectedModule(i);
+            entryPtrs[i] = SilkMarshal.StringToPtr(reflectedEntries[i].Name);
+            stages[i]    = Stage(expected[i], modules[i], entryPtrs[i]);
+        }
 
         const uint UNUSED = uint.MaxValue;   // VK_SHADER_UNUSED_KHR
         var groups = stackalloc RayTracingShaderGroupCreateInfoKHR[3];
@@ -191,11 +198,11 @@ public unsafe class RTPipeline : RtPipeline
             throw new Exception($"Failed to create ray tracing pipeline: {res}");
         PipelineHandle = pipeline;
 
-        SilkMarshal.Free(rgName);
-        SilkMarshal.Free(msName);
-        SilkMarshal.Free(chName);
-        SilkMarshal.Free(ahName);
-        Vk.DestroyShaderModule(Device, module, null);
+        for (int i = 0; i < 4; i++)
+        {
+            SilkMarshal.Free(entryPtrs[i]);
+            Vk.DestroyShaderModule(Device, modules[i], null);
+        }
 
         BuildShaderBindingTable();
     }

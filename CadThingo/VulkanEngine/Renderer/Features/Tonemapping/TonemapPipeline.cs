@@ -56,7 +56,7 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
     public TonemapPipeline(GpuContext gpu, Renderer renderer) : base( gpu, renderer) { }
 
     // The graph writes only the view into the pass set, so the sampler is pinned here.
-    protected override Sampler? ImmutableSamplerFor(in BindingDesc binding)
+    protected override Sampler? ImmutableSamplerFor(in BindingDesc binding) 
         => binding.Name == "hdrInput" ? Renderer.gBufferSampler : null;
 
     protected override SpecValues? Specialization =>

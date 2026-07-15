@@ -159,6 +159,7 @@ public sealed unsafe class SlangShaderCompiler(string libDir, string featuresDir
                 macros[i].Value = Utf8(eq < 0 ? "1" : defines[i][(eq + 1)..]);
             }
 
+            // Target-scoped options (everything at/after CompilerOptionName.Capability in slang.h).
             // -O2 to match the Shaders.targets flags the runtime path replaces.
             var options = new CompilerOptionEntry[capabilities.Length + 2];
             for (int i = 0; i < capabilities.Length; i++)
@@ -176,9 +177,24 @@ public sealed unsafe class SlangShaderCompiler(string libDir, string featuresDir
             options[^1].Value.Kind = CompilerOptionValueKind.Int;
             options[^1].Value.IntValue0 = 1;
 
+            // Session-scoped options (declared BEFORE the "// Target" marker in slang.h's
+            // CompilerOptionName); a target entry for these is silently ignored.
+            //
+            // COLUMN_MAJOR here emits SPIR-V matrix members decorated RowMajor -- Slang's
+            // source-semantics naming is the INVERSE of the SPIR-V decoration. Verified with
+            // slangc + spirv-dis: no flag (its default) -> RowMajor decoration, which is what
+            // every build-time .spv the engine has ever run was compiled with and what the C#
+            // Matrix4x4 mirrors are laid out for. Asking for ROW_MAJOR instead yields a
+            // ColMajor decoration and transposes every matrix a shader reads.
+            var sessionOptions = new CompilerOptionEntry[1];
+            sessionOptions[0].Name = CompilerOptionName.MatrixLayoutColumn;
+            sessionOptions[0].Value.Kind = CompilerOptionValueKind.Int;
+            sessionOptions[0].Value.IntValue0 = 1;
+
             fixed (nint* pPaths = pathPtrs)
             fixed (PreprocessorMacroDesc* pMacros = macros)
             fixed (CompilerOptionEntry* pOptions = options)
+            fixed (CompilerOptionEntry* pSessionOptions = sessionOptions)
             {
                 var target = TargetDesc.Create();
                 target.Format = SlangCompileTarget.Spirv;
@@ -191,6 +207,8 @@ public sealed unsafe class SlangShaderCompiler(string libDir, string featuresDir
                 desc.TargetCount = 1;
                 desc.SearchPaths = (byte**)pPaths;
                 desc.SearchPathCount = pathPtrs.Length;
+                desc.CompilerOptionEntries = pSessionOptions;
+                desc.CompilerOptionEntryCount = (uint)sessionOptions.Length;
                 if (macros.Length > 0)
                 {
                     desc.PreprocessorMacros = pMacros;

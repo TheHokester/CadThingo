@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
@@ -31,7 +33,10 @@ public sealed unsafe class PickPipeline : ComputePipeline
         public uint      PixelY;        //  4
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Selection", "PickCompute");
+    // Ray-queried picking needs the capability at compile time: the TraceRayInline call site is
+    // in the shader unconditionally.
+    protected override ShaderCompileRequest? Program =>
+        new("Selection/PickCompute", ["main"], [], ["spvRayQueryKHR"]);
 
     // 4B result (entity index or PickNone). Host-visible + coherent so the
     // single-time submit's QueueWaitIdle is all the synchronisation the readback
@@ -40,18 +45,9 @@ public sealed unsafe class PickPipeline : ComputePipeline
     private SubAlloc _resultAlloc;
     private void*    _resultMapped;
 
-    public PickPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.ComputeBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(PickPushConstants),
-            }
-        };
-    }
+    // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
+    // still matches the reflected size.
+    public PickPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     public override void Dispose()
     {
@@ -61,35 +57,29 @@ public sealed unsafe class PickPipeline : ComputePipeline
     }
 
     // Set 0 borrowed from the registry (sceneTlas + sceneEntityInfo); set 1 owns the result SSBO.
-    private const int SetScene  = 0;
-    private const int SetResult = 1;
+    private const int SetResult = (int)ShaderSets.Pass;
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Set 1 binding 0: result SSBO (single uint). TLAS + entityInfo now resolve
-        // through the scene set (sceneTlas / sceneEntityInfo), so the hit still maps to
-        // an entity via sceneEntityInfo[InstanceCustomIndex + GeometryIndex].entityIndex.
-        var binding = new DescriptorSetLayoutBinding
-        {
-            Binding = 0, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit,
-        };
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 1,
-            PBindings    = &binding,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
-            throw new Exception("Failed to create pick descriptor set layout");
-
-        DescriptorSetLayouts                 = new DescriptorSetLayout[2];
-        DescriptorSetLayouts[SetScene]       = Registry.SceneSetLayout;
-        DescriptorSetLayouts[SetResult]      = layout;
-        OwnedDescriptorSetLayoutIndices      = new[] { SetResult };
+        // Assemble [scene(0), pass(1)]. Scene is registry-owned; the pipeline owns only the pass
+        // layout (the result SSBO), built from PickCompute.slang's set-1 declaration. TLAS +
+        // entityInfo resolve through the scene set, so the hit still maps to an entity via
+        // sceneEntityInfo[InstanceCustomIndex + GeometryIndex].entityIndex.
+        var passLayout = CreateReflectedSetLayout(ShaderSets.Pass);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout);
+        OwnedDescriptorSetLayoutIndices = new[] { SetResult };
     }
 
     protected override void CreateResources()
     {
+        // Reflection cannot check this on its own: the C# mirror of PickParams has to keep
+        // matching the shader.
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(PickPushConstants))
+            throw new Exception(
+                $"PickPushConstants is {sizeof(PickPushConstants)} bytes but PickCompute.slang " +
+                $"reflects {reflected}");
+
         Gfx.CreateBuffer(sizeof(uint),
             BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
@@ -108,9 +98,10 @@ public sealed unsafe class PickPipeline : ComputePipeline
             DescriptorSetCount = 1,
             PSetLayouts        = &layout,
         };
-        DescriptorSets            = new DescriptorSet[2][];
-        DescriptorSets[SetScene]  = null;
-        DescriptorSets[SetResult] = new DescriptorSet[1];
+        // Scene slot stays null: Record binds Registry.SceneSet(frame) directly.
+        DescriptorSets                     = new DescriptorSet[2][];
+        DescriptorSets[ShaderSets.Scene]   = null;
+        DescriptorSets[SetResult]          = new DescriptorSet[1];
         fixed (DescriptorSet* p = DescriptorSets[SetResult])
             if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
                 throw new Exception("Failed to allocate pick descriptor set");
@@ -160,7 +151,9 @@ public sealed unsafe class PickPipeline : ComputePipeline
             PixelX      = pixelX,
             PixelY      = pixelY,
         };
-        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, ShaderStageFlags.ComputeBit,
+        // Stage mask comes from the reflected range the layout was built from: vkCmdPushConstants
+        // requires the two to agree, so neither side names a stage mask of its own.
+        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(PickPushConstants), &push);
 
         Vk.CmdDispatch(cmd, 1, 1, 1);

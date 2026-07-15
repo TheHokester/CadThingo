@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -79,18 +80,33 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
 
     /// The graph-shared working-set spec (layout + current buffer handles). Read by the module at
     /// Build time; on resize the buffers realloc first, so the rebuilt graph bakes the new handles.
+    /// Binding index and type come from ReStirBindings' set-2 declarations; only the buffer each
+    /// name maps to is ours to state.
     public GraphSharedSetSpec GraphSharedSpec => new(
-        ShaderSets.GraphShared, DescriptorSetLayouts[SetReStir], new GraphSharedBinding[]
-        {
-            new(0, DescriptorType.StorageBuffer, _resA),
-            new(1, DescriptorType.StorageBuffer, _resB),
-            new(2, DescriptorType.StorageBuffer, _gbufA),
-            new(3, DescriptorType.StorageBuffer, _gbufB),
-            new(4, DescriptorType.StorageBuffer, _sceneRad),
-        });
+        ShaderSets.GraphShared, DescriptorSetLayouts[SetReStir],
+        ReflectedBindings(SetReStir)
+            .Select(b => new GraphSharedBinding(b.Binding, b.Type, BufferFor(b.Name)))
+            .ToArray());
 
-    protected override string ShaderPath =>
-        ShaderPaths.Kernel("ReSTIR", Gfx.SerSupported ? "ReStirDI_SER" : "ReStirDI");
+    // Throws rather than binding a default handle if the shader grows a set-2 buffer with no C#
+    // owner - a stale/null descriptor there would be a silent corruption.
+    private Buffer BufferFor(string name) => name switch
+    {
+        "reservoirA"    => _resA,
+        "reservoirB"    => _resB,
+        "gbufferA"      => _gbufA,
+        "gbufferB"      => _gbufB,
+        "sceneRadiance" => _sceneRad,
+        _ => throw new InvalidOperationException(
+            $"ReStirDIPipeline: ReStirBindings declares set-{SetReStir} buffer '{name}' with no backing buffer"),
+    };
+
+    protected override ShaderCompileRequest? Program => RtProgram("ReSTIR/ReStirDI");
+
+    // The two compute passes run on the SHARED RT pipeline layout, so they are separate programs
+    // rather than a second Program override (a pipeline has exactly one).
+    private static readonly ShaderCompileRequest BuildTemporalReq = new("ReSTIR/BuildTemporal", ["main"], [], []);
+    private static readonly ShaderCompileRequest SpatialShadeReq  = new("ReSTIR/SpatialShade", ["main"], [], ["spvRayQueryKHR"]);
 
     // The IO set (accumulator/outColor) is shared with the SpatialShade compute pipeline (it folds
     // the analytic direct into the accumulator) -> needs ComputeBit. The scene set is already
@@ -103,33 +119,15 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     {
         base.CreateDescriptorSetLayouts();   // [scene, IO, empty(2), empty(3), FeatureEnv(4)]; IO set now Raygen|...|Compute
 
-        const ShaderStageFlags s4 = ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.ComputeBit;
-        var bindings = stackalloc DescriptorSetLayoutBinding[5];
-        for (uint b = 0; b < 5; b++)
-            bindings[b] = new() { Binding = b, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = s4 };
-        var info = new DescriptorSetLayoutCreateInfo
-        {
-            SType = StructureType.DescriptorSetLayoutCreateInfo, BindingCount = 5, PBindings = bindings,
-        };
-        // Overwrite the empty placeholder the base left in the graph-shared slot (set 2).
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out DescriptorSetLayouts[SetReStir]) != Result.Success)
-            throw new Exception("ReStirDIPipeline: failed to create working-set (set 2) layout");
+        // Overwrite the empty placeholder the base left in the graph-shared slot (set 2) with the
+        // working set reflected from ReStirBindings. ExtraStagesFor adds ComputeBit here too: the
+        // RT program reflects RT stages only, but both compute passes bind this set.
+        DescriptorSetLayouts[SetReStir] = CreateReflectedSetLayout(SetReStir);
 
         var owned = OwnedDescriptorSetLayoutIndices;
         Array.Resize(ref owned, owned.Length + 1);
         owned[^1] = SetReStir;
         OwnedDescriptorSetLayoutIndices = owned;
-
-        // Push-constant range read by the base CreatePipelineLayout (runs after this). Visible to
-        // both the raygen Trace shader and the SpatialShade compute shader (shared layout).
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.ComputeBit,
-                Offset = 0, Size = (uint)sizeof(ReStirPush),
-            },
-        };
     }
 
     // Build the RT pipeline + SBT (base), then the two ReSTIR compute pipelines (BuildTemporal +
@@ -138,26 +136,27 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     protected override void CreatePipeline()
     {
         base.CreatePipeline();
-        _buildTemporalPipeline = CreateComputePipeline("BuildTemporal");
-        _spatialPipeline       = CreateComputePipeline("SpatialShade");
+        _buildTemporalPipeline = CreateComputePipeline(BuildTemporalReq);
+        _spatialPipeline       = CreateComputePipeline(SpatialShadeReq);
     }
 
-    private Pipeline CreateComputePipeline(string kernel)
+    private Pipeline CreateComputePipeline(in ShaderCompileRequest request)
     {
-        byte[] code   = File.ReadAllBytes(ShaderPaths.Kernel("ReSTIR", kernel));
-        var    module = Gfx.CreateShaderModule(code);
-        var    entry  = SilkMarshal.StringToPtr("main");
+        var program = Shaders.GetProgram(request);
+        var entryPoint = program.Reflection.EntryPoints[0];
+        var module = Gfx.CreateShaderModule(program.Spirv(0).ToArray());
+        var entry  = SilkMarshal.StringToPtr(entryPoint.Name);
         var stage = new PipelineShaderStageCreateInfo
         {
             SType = StructureType.PipelineShaderStageCreateInfo,
-            Stage = ShaderStageFlags.ComputeBit, Module = module, PName = (byte*)entry,
+            Stage = entryPoint.Stage, Module = module, PName = (byte*)entry,
         };
         var info = new ComputePipelineCreateInfo
         {
             SType = StructureType.ComputePipelineCreateInfo, Stage = stage, Layout = PipelineLayoutHandle,
         };
         if (Vk.CreateComputePipelines(Device, PipelineCacheHandle, 1, &info, null, out Pipeline pipeline) != Result.Success)
-            throw new Exception($"ReStirDIPipeline: failed to create {kernel} compute pipeline");
+            throw new Exception($"ReStirDIPipeline: failed to create {request.Module} compute pipeline");
         SilkMarshal.Free(entry);
         Vk.DestroyShaderModule(Device, module, null);
         return pipeline;
@@ -228,8 +227,11 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
 
     protected override void RecordPushConstants(CommandBuffer cmd)
     {
+        // Must cover the range's FULL stage mask, not just the stage doing the work: the range is
+        // shared with the compute passes, and vkCmdPushConstants requires the mask to include every
+        // stage of each range it overlaps.
         var p = _push;
-        Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.RaygenBitKhr, 0, (uint)sizeof(ReStirPush), &p);
+        Vk.CmdPushConstants(cmd, Layout, PushConstantRanges[0].StageFlags, 0, (uint)sizeof(ReStirPush), &p);
     }
 
     /// <summary>Records the BuildTemporal compute pass: reconstruct the surface from the G-buffer,
@@ -262,7 +264,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
 
         var p = _push;
-        Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.ComputeBit, 0, (uint)sizeof(ReStirPush), &p);
+        Vk.CmdPushConstants(cmd, Layout, PushConstantRanges[0].StageFlags, 0, (uint)sizeof(ReStirPush), &p);
 
         Vk.CmdDispatch(cmd, (ctx.RenderExtent.Width + 7) / 8, (ctx.RenderExtent.Height + 7) / 8, 1);
     }

@@ -4,6 +4,7 @@ using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -13,17 +14,18 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 //
 //  Wavefront path-tracer pipeline (graph-resident, dispatchIndirect, SoA).
 //
-//  Owns:    9 compute PSOs (Generate x4 by camera-mode spec id 0, plus Extend /
-//           Shade / Connect / Finalize / Tail); the set-3 SoA working-set buffers
-//           (device-local, single-buffered, sized to the render extent); sets 1/2/3
-//           layouts. PathFrameUBO is staged per frame and pushed into the scene set's
-//           (0,0) constant-arena slot at record.
+//  Owns:    12 compute PSOs (Generate x4 by camera mode, Shade x4 by material class,
+//           plus Extend / Connect / Finalize / Tail); the SoA working-set buffers
+//           (device-local, single-buffered, sized to the render extent); the set-1 (IO)
+//           and set-2 (working) layouts. PathFrameUBO is staged per frame and pushed into
+//           the scene set's (0,0) constant-arena slot at record.
 //  Borrows: the scene set (set 0, registry-owned) -- TLAS, lights, ShadowEntityInfo,
 //           global VB/IB, emissive tables, bindless materials/textures/samplers.
 //
-//  Inherits PipelineBase (not ComputePipeline) for full control over the multi-
-//  PSO build, exactly like PTComputePipeline. All 9 PSOs share one pipeline
-//  layout (4 sets + a single 16-byte ComputeBit push-constant range for WavefrontPush).
+//  Inherits PipelineBase (not ComputePipeline) because ComputePipeline builds the single
+//  PSO its Program reflects; this pipeline bakes twelve from six programs. Program (Shade)
+//  still drives the shared layout: all 12 PSOs bind one pipeline layout (5 set slots + the
+//  single reflected 16-byte ComputeBit push range for WavefrontPush).
 public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 {
     // Matches WavefrontBindings / PTUtils PathFrameUBO byte-for-byte (same as
@@ -107,15 +109,27 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private const ulong DispatchArgsBytes = (ulong)MaxBounces * StagesPerBounce * ArgStride;  // 4*6*12 = 288
     private const ulong CountersBytes     = 32;   // 8 uints; indices reach COMPLETED_WG=7
 
-    private static readonly string GenerateSpv = ShaderPaths.Kernel("WavefrontPathTracer", "Generate");
-    private static readonly string ExtendSpv   = ShaderPaths.Kernel("WavefrontPathTracer", "Extend");
-    private static readonly string ShadeSpv    = ShaderPaths.Kernel("WavefrontPathTracer", "Shade");
-    private static readonly string ConnectSpv  = ShaderPaths.Kernel("WavefrontPathTracer", "Connect");
-    private static readonly string FinalizeSpv = ShaderPaths.Kernel("WavefrontPathTracer", "Finalize");
-    private static readonly string TailSpv     = ShaderPaths.Kernel("WavefrontPathTracer", "TailMegakernel");
+    // Each kernel is its own Slang module (they share the layout only by importing
+    // WavefrontBindings), so each resolves its own program. All six are single-entry compute with
+    // the ray-query capability the traceRayInline call sites need.
+    private static ShaderCompileRequest Kernel(string name) =>
+        new($"WavefrontPathTracer/{name}", ["main"], [], ["spvRayQueryKHR"]);
 
-    // Generate is baked per camera mode (spec id 0); Shade is baked per material class (P3b
-    // SHADING_CLASS spec id 0 -> lobe stripping); Extend/Connect/Finalize are single PSOs. (No
+    private static readonly ShaderCompileRequest GenerateReq = Kernel("Generate");
+    private static readonly ShaderCompileRequest ExtendReq   = Kernel("Extend");
+    private static readonly ShaderCompileRequest ShadeReq    = Kernel("Shade");
+    private static readonly ShaderCompileRequest ConnectReq  = Kernel("Connect");
+    private static readonly ShaderCompileRequest FinalizeReq = Kernel("Finalize");
+    private static readonly ShaderCompileRequest TailReq     = Kernel("TailMegakernel");
+
+    // Shade drives the shared layout: PipelineBase reflects the push range + the set layouts from
+    // Program alone, and Shade is the kernel that actually reads WavefrontPush AND touches the full
+    // binding set, so nothing the other eleven PSOs need can be missing from what it reflects.
+    // Every kernel imports WavefrontBindings, so all six reflect the same sets either way.
+    protected override ShaderCompileRequest? Program => ShadeReq;
+
+    // Generate is baked per camera mode (its `mode` constant); Shade per material class
+    // (SHADING_CLASS -> P3b lobe stripping); Extend/Connect/Finalize are single PSOs. (No
     // PrepareArgs PSO anymore -- arg generation is fused onto the producers' tails.)
     private readonly Pipeline[] _generatePsos = new Pipeline[4];
     private readonly Pipeline[] _shadePsos    = new Pipeline[ShadeClasses];
@@ -162,9 +176,13 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     {
         get
         {
-            var bindings = new GraphSharedBinding[Set4BindingCount];
-            for (uint i = 0; i < Set4BindingCount; i++)
-                bindings[i] = new(i, DescriptorType.StorageBuffer, _set4Buf[i]);
+            // Binding index + descriptor type come from WavefrontBindings' set-2 declarations; the
+            // buffer filling each is _set4Buf[binding] (the B_* constants ARE binding numbers, and
+            // CreateDescriptorSetLayouts asserts the declaration count still matches the array).
+            var declared = ReflectedBindings((uint)SetWavefront);
+            var bindings = new GraphSharedBinding[declared.Length];
+            for (int i = 0; i < declared.Length; i++)
+                bindings[i] = new(declared[i].Binding, declared[i].Type, _set4Buf[declared[i].Binding]);
             return new(ShaderSets.GraphShared, DescriptorSetLayouts[SetWavefront], bindings);
         }
     }
@@ -215,68 +233,52 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     public void MarkAccumulatorDirty() => _accumDirty = true;
     public uint CurrentSampleCount => _accumSamples;
 
-    public WavefrontPTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
-    {
-        // One 16-byte ComputeBit range for WavefrontPush (the workers; Generate/Finalize don't
-        // read it and Slang dead-strips it from their modules).
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.ComputeBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(WavefrontPush),   // 16 (4 uints)
-            }
-        };
-    }
+    // The single 16-byte ComputeBit range for WavefrontPush is reflected from Program by
+    // Initialize; CreateResources asserts the C# mirror still matches it.
+    public WavefrontPTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
 
     // ---- Descriptor-set layouts. Set 0 (scene) + FeatureEnv (set 4) borrowed from the registry;
-    // sets 1 (IO) / 2 (working) owned. Array is [scene, IO, working, empty, FeatureEnv]. ----
+    // sets 1 (IO) / 2 (working) owned, both built from WavefrontBindings' declarations. Array is
+    // [scene, IO, working, empty, FeatureEnv] -- set 3 (FeatureIBL's slot) is a gap we never bind.
     protected override void CreateDescriptorSetLayouts()
     {
-        var registry = Renderer.descriptorRegistry;
-        uint envIndex = registry.FeatureSetIndex(FeatureEnv);
-
-        DescriptorSetLayouts            = new DescriptorSetLayout[envIndex + 1];
-        for (int i = 0; i < DescriptorSetLayouts.Length; i++) DescriptorSetLayouts[i] = registry.EmptySetLayout;
+        // BuildPipelineSetLayouts covers scene + the pass slot + the features; the graph-shared
+        // slot has no place in its signature, so the working layout drops into index 2 after.
+        var ioLayout = CreateReflectedSetLayout((uint)SetIO);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
+        DescriptorSetLayouts[SetWavefront] = CreateReflectedSetLayout((uint)SetWavefront);
         OwnedDescriptorSetLayoutIndices = new[] { SetIO, SetWavefront };
-        DescriptorSetLayouts[SetScene]  = registry.SceneSetLayout;
-        DescriptorSetLayouts[envIndex]  = registry.FeatureSetLayout(FeatureEnv);
 
-        // Set 1: accumulator + outColor storage images.
-        var set1 = stackalloc DescriptorSetLayoutBinding[2];
-        set1[0] = Binding(0, DescriptorType.StorageImage);
-        set1[1] = Binding(1, DescriptorType.StorageImage);
-        CreateLayout(set1, 2, out DescriptorSetLayouts[SetIO]);
-
-        // Set 2 (graph-shared): the SoA working set (25 storage buffers).
-        var set2 = stackalloc DescriptorSetLayoutBinding[Set4BindingCount];
-        for (uint b = 0; b < Set4BindingCount; b++) set2[b] = Binding(b, DescriptorType.StorageBuffer);
-        CreateLayout(set2, Set4BindingCount, out DescriptorSetLayouts[SetWavefront]);
-    }
-
-    private static DescriptorSetLayoutBinding Binding(uint binding, DescriptorType type) => new()
-    {
-        Binding = binding, DescriptorType = type, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit,
-    };
-
-    private void CreateLayout(DescriptorSetLayoutBinding* bindings, uint count, out DescriptorSetLayout layout)
-    {
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType = StructureType.DescriptorSetLayoutCreateInfo, BindingCount = count, PBindings = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out layout) != Result.Success)
-            throw new Exception("Failed to create wavefront descriptor set layout");
+        // The SoA buffers are indexed BY binding number (the B_* constants ARE the bindings they
+        // fill), so a binding added to set 2 without a matching field here would silently leave a
+        // stale descriptor. Reflection cannot allocate the buffer for us; it can refuse to start.
+        int declared = ReflectedBindings((uint)SetWavefront).Length;
+        if (declared != Set4BindingCount)
+            throw new Exception(
+                $"WavefrontBindings declares {declared} bindings in set {SetWavefront} but the " +
+                $"pipeline allocates {Set4BindingCount} SoA buffers for them");
     }
 
 
-    // ---- PSO build: 4 Generate (camera-mode spec id 0) + 5 single PSOs --------
+    // ---- PSO build: 4 Generate (camera mode) + 4 Shade (material class) + 4 single PSOs -------
+    // Twelve PSOs over six programs on one shared layout. PipelineBase resolves only Program
+    // (Shade); the others resolve here. ShaderLibrary memoizes by request, so a Rebuild re-reads
+    // the same programs rather than recompiling them.
     protected override void CreatePipeline()
     {
-        var specEntry = new SpecializationMapEntry { ConstantID = 0, Offset = 0, Size = sizeof(uint) };
+        var generate = Shaders.GetProgram(GenerateReq);
+        var shade    = Reflected!;
+
+        // Generate and Shade each bake ONE uint constant, and each declares it in its OWN module.
+        // The base's Specialization hook resolves names against Program alone, which cannot see
+        // Generate's constant, so the by-name lookup runs per program here instead. Same contract
+        // either way: C# names the constant, the shader owns the id.
         uint specData = 0;
+        var specEntry = new SpecializationMapEntry
+        {
+            ConstantID = SpecId(generate, "mode"), Offset = 0, Size = sizeof(uint),
+        };
         var specInfo = new SpecializationInfo
         {
             MapEntryCount = 1, PMapEntries = &specEntry, DataSize = sizeof(uint), PData = &specData,
@@ -284,38 +286,52 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         for (uint mode = 0; mode < 4; mode++)
         {
             specData = mode;
-            _generatePsos[mode] = CreateComputePso(GenerateSpv, &specInfo);
+            _generatePsos[mode] = CreateComputePso(generate, &specInfo);
         }
 
-        // Shade: one PSO per material class, SHADING_CLASS baked via the same spec id 0 (Shade is a
-        // distinct shader, so reusing the entry/info is fine). P3b lobe-strips per class; in P3a the
-        // shader ignored the constant so all four were byte-identical.
+        // Shade: one PSO per material class. P3b lobe-strips per class; in P3a the shader ignored
+        // the constant so all four were byte-identical.
+        specEntry.ConstantID = SpecId(shade, "SHADING_CLASS");
         for (uint cls = 0; cls < ShadeClasses; cls++)
         {
             specData = cls;
-            _shadePsos[cls] = CreateComputePso(ShadeSpv, &specInfo);
+            _shadePsos[cls] = CreateComputePso(shade, &specInfo);
         }
 
-        _extendPso   = CreateComputePso(ExtendSpv,   null);
-        _connectPso  = CreateComputePso(ConnectSpv,  null);
-        _finalizePso = CreateComputePso(FinalizeSpv, null);
-        if (TailEnabled) _tailPso = CreateComputePso(TailSpv, null);
+        _extendPso   = CreateComputePso(Shaders.GetProgram(ExtendReq),   null);
+        _connectPso  = CreateComputePso(Shaders.GetProgram(ConnectReq),  null);
+        _finalizePso = CreateComputePso(Shaders.GetProgram(FinalizeReq), null);
+        if (TailEnabled) _tailPso = CreateComputePso(Shaders.GetProgram(TailReq), null);
 
         // Alias mode 0 to PipelineHandle so base.Dispose destroys exactly one PSO
         // via that path; everything else is torn down in our Dispose override.
         PipelineHandle = _generatePsos[0];
     }
 
-    private Pipeline CreateComputePso(string spvPath, SpecializationInfo* specInfo)
+    // A kernel's spec-constant id, by NAME. Mirrors what PipelineBase does for Program, against
+    // whichever program actually declares the constant.
+    private static uint SpecId(ShaderProgram program, string name)
     {
-        byte[] code   = File.ReadAllBytes(spvPath);
-        var    module = Gfx.CreateShaderModule(code);
-        var    entry  = SilkMarshal.StringToPtr("main");
+        var match = program.Reflection.SpecConstants.FirstOrDefault(c => c.Name == name);
+        if (match.Name != name)
+            throw new InvalidOperationException(
+                $"WavefrontPTPipeline: spec constant '{name}' is not declared by {program.Desc.Module} " +
+                $"(declared: {string.Join(", ", program.Reflection.SpecConstants.Select(c => c.Name))})");
+        return match.ConstantId;
+    }
+
+    // Entry name + stage both come from reflection: slangc now preserves the source entry symbol
+    // into the SPIR-V, so a hardcoded "main" here would be a second, silently-drifting contract.
+    private Pipeline CreateComputePso(ShaderProgram program, SpecializationInfo* specInfo)
+    {
+        var ep     = program.Reflection.EntryPoints[0];
+        var module = Gfx.CreateShaderModule(program.Spirv(0).ToArray());
+        var entry  = SilkMarshal.StringToPtr(ep.Name);
 
         var stage = new PipelineShaderStageCreateInfo
         {
             SType               = StructureType.PipelineShaderStageCreateInfo,
-            Stage               = ShaderStageFlags.ComputeBit,
+            Stage               = ep.Stage,
             Module              = module,
             PName               = (byte*)entry,
             PSpecializationInfo = specInfo,
@@ -325,7 +341,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
             SType = StructureType.ComputePipelineCreateInfo, Stage = stage, Layout = PipelineLayoutHandle,
         };
         if (Vk.CreateComputePipelines(Device, PipelineCacheHandle, 1, &info, null, out var pso) != Result.Success)
-            throw new Exception($"Failed to create wavefront compute pipeline from {Path.GetFileName(spvPath)}");
+            throw new Exception($"Failed to create wavefront compute pipeline from {program.Desc.Module}");
 
         SilkMarshal.Free(entry);
         Vk.DestroyShaderModule(Device, module, null);
@@ -336,6 +352,15 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     // ---- Owned resources: the set-3 SoA buffers (frame UBO rides the scene arena) -----
     protected override void CreateResources()
     {
+        // All twelve PSOs share the layout's single reflected push range, but only the worker
+        // kernels read it -- so this asserts both that the C# mirror of WavefrontPush still matches
+        // the shader AND that Program's reflection carried the range at all (a Program whose module
+        // never declared `pc` would silently strip it from the shared layout).
+        if (PushConstantRanges.Length != 1 || PushConstantRanges[0].Size != (uint)sizeof(WavefrontPush))
+            throw new Exception(
+                $"WavefrontPathTracer/Shade must reflect exactly one {sizeof(WavefrontPush)}-byte push " +
+                $"range for WavefrontPush; got [{string.Join(", ", PushConstantRanges.Select(p => p.Size))}]");
+
         AllocSet4(PathCount(Renderer.RenderExtent));
 
         // TEMP/debug compaction readback staging (host-visible, mapped). See _argsReadback.
@@ -520,7 +545,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         };
         // Push once per frame; every BindSets this frame reuses the returned dynamic offset.
         // Safe here: the registry reset this frame's arena slice in BeginFrame, before Render.
-        _frameConstants = Renderer.descriptorRegistry.ConstantArena.Push(frameIndex, _frameUbo);
+        _frameConstants = Registry.ConstantArena.Push(frameIndex, _frameUbo);
         return reset;
     }
 
@@ -529,7 +554,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private void BindSets(CommandBuffer cmd, uint frameIndex)
     {
         uint frameConstants = _frameConstants;
-        var registry = Renderer.descriptorRegistry;
+        var registry = Registry;
         var sets = stackalloc DescriptorSet[3]
         {
             registry.SceneSet(frameIndex),
@@ -546,7 +571,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     private void PushWavefront(CommandBuffer cmd, uint bounce, uint argsClass)
     {
         var pc = new WavefrontPush { bounce = bounce, srcParity = bounce & 1u, argsClass = argsClass, maxBounces = MaxBounces };
-        Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.ComputeBit, 0, (uint)sizeof(WavefrontPush), &pc);
+        // Stages come from the reflected range the layout was built from -- vkCmdPushConstants
+        // requires the two to agree, so neither side names a stage mask of its own.
+        Vk.CmdPushConstants(cmd, Layout, PushConstantRanges[0].StageFlags, 0, (uint)sizeof(WavefrontPush), &pc);
     }
 
     /// <summary>Dense primary-ray generation (one PSO per camera mode).</summary>
