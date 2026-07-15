@@ -68,6 +68,9 @@ public static class ShaderAudit
         // TextureCompression
         new("TextureCompression/BcEncode", Compute, None, None),
 
+        // Tonemapping
+        new("Tonemapping/Tonemap", Graphics, None, None),
+
         // WavefrontPathTracer
         new("WavefrontPathTracer/Connect", Compute, None, RayQuery),
         new("WavefrontPathTracer/Extend", Compute, None, RayQuery),

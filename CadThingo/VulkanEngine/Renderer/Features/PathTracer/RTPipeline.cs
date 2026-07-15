@@ -91,7 +91,7 @@ public unsafe class RTPipeline : RtPipeline
     private uint _accumSamples;
     private bool _accumDirty = true;
 
-    public RTPipeline(Renderer renderer) : base(renderer) { }
+    public RTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     public void MarkAccumulatorDirty() => _accumDirty = true;
     public uint CurrentSampleCount => _accumSamples;
@@ -108,14 +108,13 @@ public unsafe class RTPipeline : RtPipeline
     // graph-shared working layout into the set-2 gap (ReSTIR does).
     protected override void CreateDescriptorSetLayouts()
     {
-        var registry = Renderer.descriptorRegistry;
-        uint envIndex = registry.FeatureSetIndex(FeatureEnv);
+        uint envIndex = Registry.FeatureSetIndex(FeatureEnv);
 
         DescriptorSetLayouts            = new DescriptorSetLayout[envIndex + 1];
-        for (int i = 0; i < DescriptorSetLayouts.Length; i++) DescriptorSetLayouts[i] = registry.EmptySetLayout;
+        for (int i = 0; i < DescriptorSetLayouts.Length; i++) DescriptorSetLayouts[i] = Registry.EmptySetLayout;
         OwnedDescriptorSetLayoutIndices = new[] { SetIO };
-        DescriptorSetLayouts[SetScene]  = registry.SceneSetLayout;
-        DescriptorSetLayouts[envIndex]  = registry.FeatureSetLayout(FeatureEnv);
+        DescriptorSetLayouts[SetScene]  = Registry.SceneSetLayout;
+        DescriptorSetLayouts[envIndex]  = Registry.FeatureSetLayout(FeatureEnv);
 
         // Set 1: accumulator + outColor storage images.
         ShaderStageFlags io = RtAll | OwnedSetExtraStages;
@@ -367,18 +366,17 @@ public unsafe class RTPipeline : RtPipeline
 
         // Scene set with the frame constants' dynamic offset (arena push), then IO + any subclass
         // graph-shared set (contiguous from set 0), then FeatureEnv at its own reflected index (4).
-        var registry = Renderer.descriptorRegistry;
-        uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
+        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
 
         uint contiguous = 2u + ExtraSetCount;
         var sets = stackalloc DescriptorSet[(int)contiguous];
-        sets[0] = registry.SceneSet(ctx.FrameIndex);
+        sets[0] = Registry.SceneSet(ctx.FrameIndex);
         sets[1] = DescriptorSets[SetIO][0];
         if (ExtraSetCount > 0u) WriteExtraSets(sets + 2, ctx.FrameIndex);
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, 0, contiguous, sets, 1, &frameConstants);
 
-        var envSet = registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+        var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
 
         RecordPushConstants(cmd);
 
@@ -391,7 +389,7 @@ public unsafe class RTPipeline : RtPipeline
     // offset. ReSTIR's compute passes (built on the shared layout) call this so they can bind the
     // scene set with the same frame constants the RT Trace pass uses. Keeps PathFrameUBO private.
     protected uint PushFrameConstants(uint frameIndex) =>
-        Renderer.descriptorRegistry.ConstantArena.Push(frameIndex, _frameUbo);
+        Registry.ConstantArena.Push(frameIndex, _frameUbo);
 
 
     public override void Dispose()

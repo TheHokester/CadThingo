@@ -40,7 +40,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
     private SubAlloc _resultAlloc;
     private void*    _resultMapped;
 
-    public PickPipeline(Renderer renderer) : base(renderer)
+    public PickPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         PushConstantRanges = new[]
         {
@@ -83,7 +83,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
             throw new Exception("Failed to create pick descriptor set layout");
 
         DescriptorSetLayouts                 = new DescriptorSetLayout[2];
-        DescriptorSetLayouts[SetScene]       = Renderer.descriptorRegistry.SceneSetLayout;
+        DescriptorSetLayouts[SetScene]       = Registry.SceneSetLayout;
         DescriptorSetLayouts[SetResult]      = layout;
         OwnedDescriptorSetLayoutIndices      = new[] { SetResult };
     }
@@ -147,7 +147,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
         uint zeroOffset = 0;
         var sets = stackalloc DescriptorSet[2]
         {
-            Renderer.descriptorRegistry.SceneSet(Renderer.currentFrame),
+            Registry.SceneSet(Renderer.currentFrame),
             DescriptorSets[SetResult][0],
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);

@@ -29,7 +29,7 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
     ];
 
 
-    public GeometryPipeline(Renderer renderer) : base(renderer)
+    public GeometryPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
@@ -85,9 +85,8 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
         // First SceneBindings consumer: the unified scene set carries the bindless
         // materials/instances/textures/samplers, and the per-pass view+proj rides the
         // (0,0) dynamic slot as an arena push. One set, one bind, zero per-draw rebinds.
-        var registry = Renderer.descriptorRegistry;
-        uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, BuildFrameUbo(ctx.Camera));
-        var sceneSet = registry.SceneSet(ctx.FrameIndex);
+        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, BuildFrameUbo(ctx.Camera));
+        var sceneSet = Registry.SceneSet(ctx.FrameIndex);
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
             Layout, 0, 1, &sceneSet, 1, &frameConstants);
 
@@ -121,7 +120,7 @@ public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
     {
         // Scene set only, borrowed from the registry (never destroyed here). The pipeline
         // owns no descriptor sets, layouts, or UBO buffers anymore.
-        DescriptorSetLayouts = [Renderer.descriptorRegistry.SceneSetLayout];
+        DescriptorSetLayouts = [Registry.SceneSetLayout];
         OwnedDescriptorSetLayoutIndices = [];
     }
 

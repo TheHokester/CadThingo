@@ -82,7 +82,7 @@ public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
     /// build; set then call <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
     public bool SoftShadowsEnabled { get; set; } = true;
 
-    public PbrDeferredPipeline(Renderer renderer) : base(renderer) { }
+    public PbrDeferredPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, ImageView HdrTarget, DescriptorSet gBufferSet)
     {

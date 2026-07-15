@@ -48,6 +48,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     public static readonly uint ProbeMipLevels =
         (uint)System.Math.Floor(System.Math.Log2(ProbeFaceSize)) + 1;
     private readonly Renderer _renderer;
+    private readonly GpuContext _gpu;
     private readonly GraphicsDevice _gfx;
     private readonly IblSystem _iblSystem;
     private readonly Vk       _vk;
@@ -120,12 +121,13 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
     public IReadOnlyList<ReflectionProbeComponent> Probes => _probes;
 
-    public ReflectionProbeSystem(Renderer renderer, IblSystem iblSystem)
+    public ReflectionProbeSystem(GpuContext gpu, Renderer renderer, IblSystem iblSystem)
     {
+        _gpu = gpu;
         _renderer = renderer;
-        _gfx = renderer.gfx;
-        _vk = renderer.vk!;
-        _device = renderer.device;
+        _gfx = _gpu.Gfx;
+        _vk = _gpu.Gfx.Vk;
+        _device = _gpu.Gfx.Device;
         _iblSystem = iblSystem;
 
         CreatePrefilteredArray();
@@ -191,7 +193,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
                               "Build the project (shaders compile automatically) to enable probe captures.");
             return;
         }
-        capturePipeline = new ProbeCapturePipeline(_renderer);
+        capturePipeline = new ProbeCapturePipeline(_gpu , _renderer);
         capturePipeline.Initialize();
     }
 

@@ -95,7 +95,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     private uint _accumSamples;
     private bool _accumDirty = true;
 
-    public PTComputePipeline(Renderer renderer) : base(renderer) { }
+    public PTComputePipeline(GpuContext gpu, Renderer renderer) : base( gpu, renderer) { }
 
     /// <summary>Force the next dispatch to overwrite (not add to) the
     /// accumulator. Call from input / scene-edit handlers.</summary>
@@ -115,7 +115,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 
         // [scene(0), IO(1), empty(2), empty(3), FeatureEnv(4)]. envCube is registry-owned on
         // FeatureEnv; the graph-shared and FeatureIBL slots are unused gaps for the tracer.
-        DescriptorSetLayouts            = Renderer.descriptorRegistry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
+        DescriptorSetLayouts            = Registry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
         OwnedDescriptorSetLayoutIndices = new[] { SetIO };
     }
 
@@ -321,17 +321,16 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 
         // Scene(0) + IO(1) with the frame constants' dynamic offset, then FeatureEnv at its own
         // reflected index (set 4); the intervening slots are gaps, never bound.
-        var registry = Renderer.descriptorRegistry;
-        uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
+        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
         var sets = stackalloc DescriptorSet[2]
         {
-            registry.SceneSet(ctx.FrameIndex),
+            Registry.SceneSet(ctx.FrameIndex),
             DescriptorSets[SetIO][0],
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 2, sets, 1, &frameConstants);
 
-        var envSet = registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+        var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
 
         // 8×8 workgroup matches [numthreads(8,8,1)] in PTCompute.slang.
         uint gx = (ctx.RenderExtent.Width  + 7u) / 8u;

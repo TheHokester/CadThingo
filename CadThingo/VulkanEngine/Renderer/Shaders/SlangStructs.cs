@@ -26,6 +26,8 @@ internal enum CompilerOptionName : int
     Profile = 15,      // intValue0 = SlangProfileID
     Capability = 39,   // intValue0 = SlangCapabilityID from IGlobalSession::findCapability
     Optimization = 46, // intValue0 = 0..3 (-O0..-O3)
+    
+    VulkanUseEntryPointName = 52,//keep slang entry point name as declared, otherwise gets simplified to "main"
 }
 
 [StructLayout(LayoutKind.Sequential)]

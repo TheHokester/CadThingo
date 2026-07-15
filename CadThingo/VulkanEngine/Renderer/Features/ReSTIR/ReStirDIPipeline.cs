@@ -63,7 +63,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     private Pipeline _buildTemporalPipeline;   // BuildTemporal compute (reservoir build + temporal)
     private Pipeline _spatialPipeline;         // SpatialShade compute (spatial reuse + shade)
 
-    public ReStirDIPipeline(Renderer renderer) : base(renderer) { }
+    public ReStirDIPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     // Public handles for the graph module to import (barrier ordering across passes + frames).
     public Buffer ReservoirA    => _resA;
@@ -251,16 +251,15 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
 
-        var registry = Renderer.descriptorRegistry;
         uint frameConstants = PushFrameConstants(ctx.FrameIndex);
         var sets = stackalloc DescriptorSet[3];
-        sets[0] = registry.SceneSet(ctx.FrameIndex);  // frame UBO + lights / tlas / entityInfo / vb+ib / emissive / bindless
+        sets[0] = Registry.SceneSet(ctx.FrameIndex);  // frame UBO + lights / tlas / entityInfo / vb+ib / emissive / bindless
         sets[1] = DescriptorSets[SetIO][0];           // accumulator / outColor
         sets[2] = _sharedSet;                         // reservoirs / gbuffers / sceneRadiance (graph-owned)
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 3, sets, 1, &frameConstants);
 
-        var envSet = registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+        var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
 
         var p = _push;
         Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.ComputeBit, 0, (uint)sizeof(ReStirPush), &p);

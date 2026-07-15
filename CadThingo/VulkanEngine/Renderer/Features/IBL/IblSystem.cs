@@ -27,6 +27,7 @@ public unsafe sealed class IblSystem : IDisposable
     internal const uint BrdfLutSize            = 512;
 
     private readonly Renderer _renderer;
+    private readonly GpuContext _gpu;
     private readonly GraphicsDevice _gfx;
     private readonly Vk       _vk;
     private readonly Device   _device;
@@ -58,12 +59,13 @@ public unsafe sealed class IblSystem : IDisposable
     internal Sampler        iblCubeSampler;
     internal Sampler        iblLutSampler;
 
-    public IblSystem(Renderer renderer)
+    public IblSystem(GpuContext gpu, Renderer renderer)
     {
         _renderer = renderer;
-        _gfx       = renderer.gfx;
-        _vk       = renderer.vk!;
-        _device   = renderer.device;
+        _gpu = gpu;
+        _gfx       = gpu.Gfx;
+        _vk       = _gfx.Vk!;
+        _device   = _gfx.Device;
 
         // IBL images allocated up-front, cleared to black. The PBR lighting set
         // binds them unconditionally; the compute bake passes fill the content
@@ -350,13 +352,13 @@ public unsafe sealed class IblSystem : IDisposable
 
     void CreateIblBakePipelines()
     {
-        equirectToCubePipeline = new IblBakePipeline(_renderer,
+        equirectToCubePipeline = new IblBakePipeline(_gpu, _renderer,
             ShaderPaths.Kernel("IBL", "EquirectToCube"),     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
-        irradianceConvolvePipeline = new IblBakePipeline(_renderer,
+        irradianceConvolvePipeline = new IblBakePipeline(_gpu, _renderer,
             ShaderPaths.Kernel("IBL", "IrradianceConvolve"), hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
-        prefilterEnvPipeline = new IblBakePipeline(_renderer,
+        prefilterEnvPipeline = new IblBakePipeline(_gpu, _renderer,
             ShaderPaths.Kernel("IBL", "PrefilterEnv"),       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
-        brdfLutGenPipeline = new IblBakePipeline(_renderer,
+        brdfLutGenPipeline = new IblBakePipeline(_gpu, _renderer,
             ShaderPaths.Kernel("IBL", "BrdfLutGen"),         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
 
         equirectToCubePipeline    .Initialize();

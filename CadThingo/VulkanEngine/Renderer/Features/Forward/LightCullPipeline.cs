@@ -56,7 +56,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
     public PassSetSpec PassSet => new(SetIndex: SetTileOut, DescriptorSetLayouts[SetTileOut], _passBindings);
 
-    public LightCullPipeline(Renderer renderer) : base(renderer)
+    public LightCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         PushConstantRanges = new[]
         {
@@ -82,7 +82,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         // set 1 (the two tile output SSBOs) is owned by this pipeline.
         DescriptorSetLayouts = new DescriptorSetLayout[2];
         OwnedDescriptorSetLayoutIndices = new[] { SetTileOut };
-        DescriptorSetLayouts[SetScene] = Renderer.descriptorRegistry.SceneSetLayout;
+        DescriptorSetLayouts[SetScene] = Registry.SceneSetLayout;
 
         var bindings = stackalloc DescriptorSetLayoutBinding[2];
         for (uint b = 0; b < 2; b++)
@@ -143,7 +143,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         uint zeroOffset = 0;
         var sets = stackalloc DescriptorSet[2]
         {
-            Renderer.descriptorRegistry.SceneSet(frameIndex),
+            Registry.SceneSet(frameIndex),
             tileSet,
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute,

@@ -1,3 +1,5 @@
+using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
@@ -27,11 +29,14 @@ public abstract unsafe class PipelineBase : IDisposable
     // system, per-frame scene packing). That residual coupling is what L2/L3 remove.
     protected readonly Renderer Renderer;
 
-    // The device-services surface (L1). Pure RHI calls — Vk / Device / PhysicalDevice
-    // / shader-module + buffer creation / single-time commands — go through this, not
-    // the Renderer god object. Resolved off the renderer because GraphicsDevice exists
-    // by the time any pipeline is constructed (Renderer.Initialize builds it first).
-    protected GraphicsDevice Gfx => Renderer.gfx;
+    // The injected device-services channel. Anything RHI, descriptor, or shader related goes
+    // through these three handles rather than the Renderer god object; Renderer above stays
+    // only for the technique/scene reaches that have no other home yet.
+    protected readonly GpuContext Gpu;
+
+    protected GraphicsDevice     Gfx      => Gpu.Gfx;
+    protected DescriptorRegistry Registry => Gpu.Registry;
+    protected ShaderLibrary      Shaders  => Gpu.Shaders;
 
     // Convenience accessors so subclass bodies stay short — forward to the device.
     protected Vk     Vk     => Gfx.Vk;
@@ -63,8 +68,141 @@ public abstract unsafe class PipelineBase : IDisposable
     public DescriptorSet GetDescriptorSet(int layoutNum, uint frame) => DescriptorSets[layoutNum][frame];
     public abstract PipelineBindPoint BindPoint { get; }
 
-    protected PipelineBase(Renderer renderer)
+    // ---- reflected-program route ---------------------------------------------------------
+    // Non-null routes this pipeline through ShaderLibrary: SPIR-V, push-constant ranges, spec
+    // constants and set layouts are all derived from the .slang source rather than a build-time
+    // .spv plus hand-transcribed declarations. Null keeps the legacy ShaderPath route.
+    protected virtual ShaderCompileRequest? Program => null;
+
+    /// The resolved program on the reflected route, else null. Valid from the start of Initialize.
+    protected ShaderProgram? Reflected { get; private set; }
+
+    /// Values for the program's reflected spec constants, keyed by name. Read at each build.
+    protected virtual SpecValues? Specialization => null;
+
+    /// The immutable sampler to bake into a reflected layout binding, or null for none.
+    /// Reflection reports that a binding is a combined image sampler but not which sampler the
+    /// layout pins, so the pipeline still answers that.
+    protected virtual Sampler? ImmutableSamplerFor(string bindingName) => null;
+
+    /// The program's reflected bindings for one descriptor set, ordered by binding index.
+    protected BindingDesc[] ReflectedBindings(uint set)
     {
+        var program = Reflected ?? throw new InvalidOperationException(
+            $"{GetType().Name}: ReflectedBindings requires a Program.");
+        return program.Reflection.Bindings.Where(b => b.Set == set).OrderBy(b => b.Binding).ToArray();
+    }
+
+    /// Builds a VkDescriptorSetLayout for one reflected set. The shader declaration is the whole
+    /// contract: binding index, descriptor type, and count all come from reflection.
+    protected DescriptorSetLayout CreateReflectedSetLayout(uint set)
+    {
+        var reflected = ReflectedBindings(set);
+        if (reflected.Length == 0)
+            throw new InvalidOperationException($"{GetType().Name}: program reflects no bindings in set {set}.");
+
+        var bindings = new DescriptorSetLayoutBinding[reflected.Length];
+        // One slot per binding; taking the address of a list element requires it to stay put,
+        // hence a flat array pinned for the whole create call.
+        var samplers = new Sampler[reflected.Length];
+        fixed (Sampler* pSamplers = samplers)
+        {
+            for (int i = 0; i < reflected.Length; i++)
+            {
+                var b = reflected[i];
+                bindings[i] = new DescriptorSetLayoutBinding
+                {
+                    Binding         = b.Binding,
+                    DescriptorType  = b.Type,
+                    DescriptorCount = b.Count,
+                    StageFlags      = b.Stages,
+                };
+                if (ImmutableSamplerFor(b.Name) is { } s)
+                {
+                    samplers[i] = s;
+                    bindings[i].PImmutableSamplers = &pSamplers[i];
+                }
+            }
+
+            fixed (DescriptorSetLayoutBinding* pBindings = bindings)
+            {
+                var info = new DescriptorSetLayoutCreateInfo
+                {
+                    SType        = StructureType.DescriptorSetLayoutCreateInfo,
+                    BindingCount = (uint)bindings.Length,
+                    PBindings    = pBindings,
+                };
+                if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
+                    throw new Exception($"{GetType().Name}: failed to create reflected set {set} layout");
+                return layout;
+            }
+        }
+    }
+
+    // Builds the VkSpecializationInfo payload for one stage: joins the pipeline's named values
+    // with the program's reflected constant ids, keeping only ids this stage's SPIR-V declares
+    // (Slang strips constants an entry point never reads). Returns the entry count.
+    private int FillReflectedSpecialization(
+        int entryIndex, SpecializationMapEntry* entries, byte* data, out uint dataSize)
+    {
+        dataSize = 0;
+        var program = Reflected!;
+        if (Specialization is not { } values || values.Bits.Count == 0) return 0;
+
+        var declared = SpirvUtil.SpecConstantIds(program.Spirv(entryIndex).Span);
+        int filled = 0;
+        foreach (var (name, bits) in values.Bits)
+        {
+            var match = program.Reflection.SpecConstants.FirstOrDefault(c => c.Name == name);
+            if (match.Name != name)
+                throw new InvalidOperationException(
+                    $"{GetType().Name}: spec constant '{name}' is not declared by {program.Desc.Module} " +
+                    $"(declared: {string.Join(", ", program.Reflection.SpecConstants.Select(c => c.Name))})");
+            if (!declared.Contains(match.ConstantId)) continue;
+
+            entries[filled] = new SpecializationMapEntry
+            {
+                ConstantID = match.ConstantId,
+                Offset     = dataSize,
+                Size       = sizeof(uint),
+            };
+            *(uint*)(data + dataSize) = bits;
+            dataSize += sizeof(uint);
+            filled++;
+        }
+        return filled;
+    }
+
+    // Creates the shader module for one entry point of the reflected program.
+    protected ShaderModule CreateReflectedModule(int entryIndex)
+        => Gfx.CreateShaderModule(Reflected!.Spirv(entryIndex).ToArray());
+
+    // Shared by GraphicsPipeline / ComputePipeline: build a stage's spec info on whichever route
+    // is active. Scratch must outlive the vkCreate*Pipelines call.
+    private protected int FillStageSpecialization(
+        int stageIdx, SpecializationMapEntry* entries, byte* data, out uint dataSize)
+        => Reflected != null
+            ? FillReflectedSpecialization(stageIdx, entries, data, out dataSize)
+            : FillSpecializationData(stageIdx, entries, data, out dataSize);
+
+    // Legacy specialization hook - stage-indexed and unsafe. Pipelines on the reflected route
+    // override Specialization instead.
+    protected const int SpecScratchEntries = 8;   // max spec entries per stage
+    protected const int SpecScratchBytes   = 64;  // max spec data bytes per stage
+
+    protected virtual int FillSpecializationData(
+        int stageIdx,
+        SpecializationMapEntry* entries,
+        byte* data,
+        out uint dataSize)
+    {
+        dataSize = 0;
+        return 0;
+    }
+
+    protected PipelineBase(in GpuContext gpu, Renderer renderer)
+    {
+        Gpu = gpu;
         Renderer = renderer;
     }
 
@@ -73,6 +211,14 @@ public abstract unsafe class PipelineBase : IDisposable
     // re-implementing the whole flow.
     public void Initialize()
     {
+        // Resolve first: CreateDescriptorSetLayouts reads reflection on the new route, and the
+        // push ranges reflection yields feed CreatePipelineLayout below.
+        Reflected = Program is { } request ? Shaders.GetProgram(request) : null;
+        if (Reflected != null)
+            PushConstantRanges = Reflected.Reflection.PushConstants
+                .Select(p => new PushConstantRange { StageFlags = p.Stages, Offset = 0, Size = p.Size })
+                .ToArray();
+
         CreateDescriptorSetLayouts();
         CreatePipelineLayout();
         CreatePipeline();
@@ -156,9 +302,10 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
 {
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Graphics;
 
-    protected GraphicsPipeline(Renderer renderer) : base(renderer) { }
+    protected GraphicsPipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
-    protected abstract string   ShaderPath              { get; }
+    // Build-time .spv for the legacy route; null on the reflected route (see PipelineBase.Program).
+    protected virtual  string?  ShaderPath              => null;
     protected abstract Format[] ColorAttachmentFormats  { get; }
 
     // Optional hooks (defaults match the common case)
@@ -243,32 +390,28 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
 
     protected virtual DynamicState[] DynamicStates => new[] { DynamicState.Viewport, DynamicState.Scissor };
 
-    // Specialization-constant hook. Default = none. Subclasses override to wire
-    // per-stage spec constants. Stack scratch is supplied by the base
-    // CreatePipeline so the data outlives the vkCreateGraphicsPipelines call.
-    // Return the number of map entries written for this stage.
-    protected const int SpecScratchEntries = 8;   // max spec entries per stage
-    protected const int SpecScratchBytes   = 64;  // max spec data bytes per stage
-
-    protected virtual int FillSpecializationData(
-        int stageIdx,
-        SpecializationMapEntry* entries,
-        byte* data,
-        out uint dataSize)
-    {
-        dataSize = 0;
-        return 0;
-    }
-
     // Drives the pipeline build from the hooks above. Sealed because concrete
     // pipelines should configure via overrides rather than re-implementing
     // the whole assembly — that's the main thing keeping the sprawl out.
     protected sealed override void CreatePipeline()
     {
-        byte[] code   = File.ReadAllBytes(ShaderPath);
-        var    module = Gfx.CreateShaderModule(code);
+        // Reflected route: one module per entry point, stages named by reflection. Legacy route:
+        // one build-time .spv holding every entry point, stages named by the ShaderStages hook.
+        var stageDefs = Reflected != null
+            ? Reflected.Reflection.EntryPoints.Select(e => (e.Stage, EntryPoint: e.Name)).ToArray()
+            : ShaderStages;
 
-        var stageDefs = ShaderStages;
+        var modules = new ShaderModule[stageDefs.Length];
+        if (Reflected != null)
+            for (int i = 0; i < modules.Length; i++) modules[i] = CreateReflectedModule(i);
+        else
+        {
+            var shared = Gfx.CreateShaderModule(File.ReadAllBytes(
+                ShaderPath ?? throw new InvalidOperationException(
+                    $"{GetType().Name}: needs either a Program or a ShaderPath.")));
+            Array.Fill(modules, shared);
+        }
+
         var stages    = stackalloc PipelineShaderStageCreateInfo[stageDefs.Length];
         var entryPtrs = stackalloc nint[stageDefs.Length];
 
@@ -285,13 +428,13 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
             {
                 SType  = StructureType.PipelineShaderStageCreateInfo,
                 Stage  = stageDefs[i].Stage,
-                Module = module,
+                Module = modules[i],
                 PName  = (byte*)entryPtrs[i],
             };
 
             var entriesSlot = &specEntries[i * SpecScratchEntries];
             var dataSlot    = &specData[i * SpecScratchBytes];
-            int filled = FillSpecializationData(i, entriesSlot, dataSlot, out uint dataSize);
+            int filled = FillStageSpecialization(i, entriesSlot, dataSlot, out uint dataSize);
             if (filled > 0)
             {
                 specInfos[i] = new SpecializationInfo
@@ -383,7 +526,8 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
         }
 
         for (int i = 0; i < stageDefs.Length; i++) SilkMarshal.Free(entryPtrs[i]);
-        Vk.DestroyShaderModule(Device, module, null);
+        // Distinct() because the legacy route shares one module across every stage.
+        foreach (var m in modules.Distinct()) Vk.DestroyShaderModule(Device, m, null);
     }
 
     protected void BeginRendering(
@@ -439,7 +583,7 @@ public abstract unsafe class ComputePipeline : PipelineBase
 {
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
 
-    protected ComputePipeline(Renderer renderer) : base(renderer) { }
+    protected ComputePipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     protected abstract string ShaderPath { get; }
 
@@ -499,7 +643,7 @@ public abstract unsafe class RtPipeline : PipelineBase
     protected uint ShaderGroupHandleAlignment;   // per-handle stride alignment within a region
     protected uint MaxRayRecursionDepth;         // device cap; the path tracer targets depth 1
 
-    protected RtPipeline(Renderer renderer) : base(renderer)
+    protected RtPipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         LoadDispatchAndProperties();
     }

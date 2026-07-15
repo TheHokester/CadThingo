@@ -160,16 +160,21 @@ public sealed unsafe class SlangShaderCompiler(string libDir, string featuresDir
             }
 
             // -O2 to match the Shaders.targets flags the runtime path replaces.
-            var options = new CompilerOptionEntry[capabilities.Length + 1];
+            var options = new CompilerOptionEntry[capabilities.Length + 2];
             for (int i = 0; i < capabilities.Length; i++)
             {
                 options[i].Name = CompilerOptionName.Capability;
                 options[i].Value.Kind = CompilerOptionValueKind.Int;
                 options[i].Value.IntValue0 = (int)_global.FindCapability(capabilities[i]);
             }
-            options[^1].Name = CompilerOptionName.Optimization;
+            options[^2].Name = CompilerOptionName.Optimization;
+            options[^2].Value.Kind = CompilerOptionValueKind.Int;
+            options[^2].Value.IntValue0 = 2;
+            // Keeps OpEntryPoint named as declared, so the names reflection reports are the names
+            // VkPipelineShaderStageCreateInfo.pName can use.
+            options[^1].Name = CompilerOptionName.VulkanUseEntryPointName;
             options[^1].Value.Kind = CompilerOptionValueKind.Int;
-            options[^1].Value.IntValue0 = 2;
+            options[^1].Value.IntValue0 = 1;
 
             fixed (nint* pPaths = pathPtrs)
             fixed (PreprocessorMacroDesc* pMacros = macros)

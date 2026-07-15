@@ -27,7 +27,7 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
 
     protected override string ShaderPath { get; } = ShaderPaths.Kernel("Selection", "SelectionMask");
 
-    public SelectionMaskPipeline(Renderer renderer) : base(renderer)
+    public SelectionMaskPipeline(GpuContext gpu,Renderer renderer) : base(gpu, renderer)
     {
         PushConstantRanges = new[]
         {
@@ -62,7 +62,7 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
             throw new Exception("Failed to create selection-mask descriptor set layout");
 
         DescriptorSetLayouts            = new DescriptorSetLayout[2];
-        DescriptorSetLayouts[SetScene]  = Renderer.descriptorRegistry.SceneSetLayout;
+        DescriptorSetLayouts[SetScene]  = Registry.SceneSetLayout;
         DescriptorSetLayouts[SetMask]   = layout;
         OwnedDescriptorSetLayoutIndices = new[] { SetMask };
     }
@@ -120,7 +120,7 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
         uint zeroOffset = 0;
         var sets = stackalloc DescriptorSet[2]
         {
-            Renderer.descriptorRegistry.SceneSet(Renderer.currentFrame),
+            Registry.SceneSet(Renderer.currentFrame),
             DescriptorSets[SetMask][0],
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);

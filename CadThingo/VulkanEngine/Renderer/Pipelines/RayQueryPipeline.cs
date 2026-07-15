@@ -2,7 +2,7 @@
 
 public class RayQueryPipeline : ComputePipeline
 {
-    public RayQueryPipeline(Renderer renderer) : base(renderer)
+    public RayQueryPipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
     }
 

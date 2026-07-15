@@ -215,7 +215,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     public void MarkAccumulatorDirty() => _accumDirty = true;
     public uint CurrentSampleCount => _accumSamples;
 
-    public WavefrontPTPipeline(Renderer renderer) : base(renderer)
+    public WavefrontPTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         // One 16-byte ComputeBit range for WavefrontPush (the workers; Generate/Finalize don't
         // read it and Slang dead-strips it from their modules).

@@ -22,20 +22,20 @@ public unsafe sealed class SelectionSystem : IDisposable
     internal SelectionMaskPipeline selectionMaskPipeline;
     internal OutlinePipeline       outlinePipeline;
 
-    public SelectionSystem(Renderer renderer)
+    public SelectionSystem(GpuContext gpu, Renderer renderer)
     {
         _renderer = renderer;
 
         // Object picking owns only a tiny result SSBO; the TLAS is bound later.
-        pickPipeline = new PickPipeline(renderer);
+        pickPipeline = new PickPipeline( gpu, renderer);
         pickPipeline.Initialize();
 
         // Mask pipeline writes the coverage image; outline reads it back.
-        selectionMaskPipeline = new SelectionMaskPipeline(renderer);
+        selectionMaskPipeline = new SelectionMaskPipeline(gpu, renderer);
         selectionMaskPipeline.Initialize();
         selectionMaskPipeline.WriteMaskImageDescriptor(Mask.ImageView);
 
-        outlinePipeline = new OutlinePipeline(renderer);
+        outlinePipeline = new OutlinePipeline(gpu, renderer);
         outlinePipeline.Initialize();
         outlinePipeline.WriteMaskDescriptor(Mask.ImageView);
     }

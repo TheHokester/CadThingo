@@ -66,7 +66,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     /// Consumed by the TransparentPass; empty when no scene material is BLEND-mode.</summary>
     public IReadOnlyList<TransparentDraw> LastTransparentDraws => _transparentDraws;
 
-    public DrawCullPipeline(Renderer renderer) : base(renderer)
+    public DrawCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         PushConstantRanges = new[]
         {

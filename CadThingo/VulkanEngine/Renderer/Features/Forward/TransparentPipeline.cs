@@ -85,7 +85,7 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
     // by Record (which runs later the same frame inside the graph).
     private TransparentFrameUBO _frameUbo;
 
-    public TransparentPipeline(Renderer renderer) : base(renderer)
+    public TransparentPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         DepthAttachmentFormat = Gfx.FindDepthFormat();
         PushConstantRanges = new[]
@@ -129,19 +129,18 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         // Set 0 = scene set with the frame constants' dynamic offset (arena push of the UBO
         // staged by UpdatePerFrame). Set 1 = graph-baked tile pass set. FeatureIBL sits at its
         // own reflected index (set 3) with a gap at set 2, so it binds separately.
-        var registry = Renderer.descriptorRegistry;
-        uint frameConstants = registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
+        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
         var sets = stackalloc DescriptorSet[2]
         {
-            registry.SceneSet(ctx.FrameIndex),
+            Registry.SceneSet(ctx.FrameIndex),
             tileSet,
         };
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
             Layout, 0, 2, sets, 1, &frameConstants);
 
-        var iblSet = registry.FeatureSet(FeatureIbl, ctx.FrameIndex);
+        var iblSet = Registry.FeatureSet(FeatureIbl, ctx.FrameIndex);
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, registry.FeatureSetIndex(FeatureIbl), 1, &iblSet, 0, null);
+            Layout, Registry.FeatureSetIndex(FeatureIbl), 1, &iblSet, 0, null);
 
         // Bind global VB/IB once — every BLEND entity references offsets into these.
         var vb = Engine.ResourceManager.GlobalVertexBuffer;
@@ -262,7 +261,7 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         }
 
         // Assemble [scene(0), pass(1), empty(2), FeatureIBL(3)]; the pipeline owns only the pass layout.
-        DescriptorSetLayouts = Renderer.descriptorRegistry.BuildPipelineSetLayouts(passLayout, FeatureIbl);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout, FeatureIbl);
         OwnedDescriptorSetLayoutIndices = new[] { SetTile };
     }
 

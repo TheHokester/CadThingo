@@ -20,8 +20,8 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
     readonly bool   _hasInputSampler;
     readonly uint   _pushSize;
 
-    public IblBakePipeline(Renderer renderer, string shaderPath, bool hasInputSampler, uint pushSize)
-        : base(renderer)
+    public IblBakePipeline(GpuContext gpu, Renderer renderer, string shaderPath, bool hasInputSampler, uint pushSize)
+        : base(gpu, renderer)
     {
         _shaderPath      = shaderPath;
         _hasInputSampler = hasInputSampler;

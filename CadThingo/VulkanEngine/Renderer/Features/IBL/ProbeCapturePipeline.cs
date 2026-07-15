@@ -46,7 +46,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
 
     private UboBuffer[] _ubos = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
-    public ProbeCapturePipeline(Renderer renderer) : base(renderer)
+    public ProbeCapturePipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         // Matches the capture depth attachment created by ReflectionProbeSystem.
         DepthAttachmentFormat = Format.D32Sfloat;
