@@ -64,9 +64,9 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
         fg.Compile();
         _graph = fg;
 
-        // Set 4 is bound through stable pipeline-owned handles (already written at init / resize);
-        // re-bind from those handles after compile to match the imports the graph just adopted.
-        _pipe.WriteSet4Descriptors();
+        // Hand the graph-owned SoA working set (set 2, baked in Compile from the pipeline's current
+        // buffer handles) back to the pipeline for its record-time binds.
+        _pipe.SetGraphSharedSet(fg.GraphSharedSet);
 
         // CRITICAL: rebind set 0 bindings 4/5 (accumulator + out-color storage images) to the SAME
         // host-owned handles the graph just imported. On a resize RebuildRenderTargets reallocates

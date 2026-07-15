@@ -17,27 +17,13 @@
 // spatial reuse is the coherence-friendly design: a uniform dispatch with a tiny register footprint
 // + one coherent shadow ray, vs burying the work in the divergent megakernel.
 
-import PTUtils;       // BRDF/light eval (evaluateFullBrdf, evaluateLight, LightSample), HitInfo, rand
-import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/sceneVertices+sceneIndices/sceneMaterials+sceneTextures+sceneSamplers
+import PTUtils;        // BRDF/light eval (evaluateFullBrdf, evaluateLight, LightSample), HitInfo, rand
+import SceneBindings;  // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/sceneVertices+sceneIndices/sceneMaterials+sceneTextures+sceneSamplers
+import ReStirBindings; // set 2 (graph-owned) working set + Reservoir/PackedHit record types
 
-// ---- Shared types (mirror ReStirDI.slang) --------------------------------------------------------
-struct Reservoir {
-    uint   sampleType;  // SAMPLE_NONE / SAMPLE_ANALYTIC / SAMPLE_EMISSIVE
-    uint   index;       // analytic: light index
-    float3 samplePos;   // emissive: sampled world point Q
-    float3 sampleLe;    // emissive: radiance Le at Q
-    float  sampleEsPdf; // emissive: NEE solid-angle pdf at build (for NEE<->BSDF MIS)
-    uint   M; float wSum; float W; float pHat;
-};
-struct PackedHit {
-    float3 worldPos; uint nOct; uint ngOct; uint baseIor; uint emisRG; uint scal0; uint scal1; uint matFlags;
-};
 // Resolved sample ready to shade (unified across analytic + emissive).
 struct ShadeSample { float3 L; float3 radiance; float dist; bool castShadows; float weight; bool valid; };
 
-static const uint  SAMPLE_NONE            = 0u;
-static const uint  SAMPLE_ANALYTIC        = 1u;
-static const uint  SAMPLE_EMISSIVE        = 2u;
 static const uint  TEMPORAL_M_CAP         = 30u;
 static const uint  RESTIR_SPATIAL_SAMPLES = 4u;
 static const float RESTIR_SPATIAL_RADIUS  = 16.0;
@@ -85,21 +71,14 @@ HitInfo unpackHit(PackedHit p, float3 rayOrigin) {
 }
 
 // ---- Bindings -------------------------------------------------------------------------------------
-// Scene set 0 (sceneLights / sceneTlas / sceneEntityInfo / sceneVertices+sceneIndices /
-// sceneMaterials+sceneTextures+sceneSamplers) comes from the imported SceneBindings module; the
-// alpha-tested shadow ray reads them exactly like the other tracers (parity). The scene-set layout
-// carries All stages so it binds from this compute pass. Only the per-pass constants, pass-local IO,
-// and the set-3 ReSTIR working buffers are declared here.
+// Scene set 0 comes from the imported SceneBindings module (the alpha-tested shadow ray reads it
+// exactly like the other tracers; the scene-set layout carries All stages so it binds from compute).
+// The set-2 (graph-owned) working buffers come from ReStirBindings. Only the per-pass constant UBO
+// and the pass-local IO images are declared here.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
 
 [[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
 [[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
-
-[[vk::binding(0, 2)]] RWStructuredBuffer<Reservoir> reservoirA;
-[[vk::binding(1, 2)]] RWStructuredBuffer<Reservoir> reservoirB;
-[[vk::binding(2, 2)]] RWStructuredBuffer<PackedHit> gbufferA;
-[[vk::binding(3, 2)]] RWStructuredBuffer<PackedHit> gbufferB;
-[[vk::binding(4, 2)]] RWStructuredBuffer<float4>    sceneRadiance;   // Trace's indirect+emissive+env
 
 struct ReStirPush { float4x4 prevViewProj; uint frameParity; uint hasHistory; uint pad0, pad1; };
 [[vk::push_constant]] ReStirPush rpc;

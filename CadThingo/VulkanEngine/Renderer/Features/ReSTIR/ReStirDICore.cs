@@ -65,6 +65,9 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore
         fg.Compile();
         _graph = fg;
 
+        // Hand the graph-owned working set (set 2, baked in Compile) to the pipeline for its binds.
+        _pipe.SetGraphSharedSet(fg.GraphSharedSet);
+
         // CRITICAL (same reasoning as WavefrontPTCore): rebind the pipeline's storage-image
         // descriptors (set 0 bindings 4/5 = accumulator + out-color) to the SAME host handles the
         // graph just imported. On a resize RebuildRenderTargets reallocates these images before

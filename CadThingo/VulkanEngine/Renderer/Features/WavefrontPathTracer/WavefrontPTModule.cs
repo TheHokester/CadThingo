@@ -89,6 +89,10 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
         var counters     = scope.ImportBuffer(_pipe.Counters,     default, "counters");
         var dispatchArgs = scope.ImportBuffer(_pipe.DispatchArgsBuffer, default, "dispatchArgs");
 
+        // The set-2 SoA working set is graph-owned: the graph allocates + writes it from the
+        // pipeline's buffer handles, and the core hands the baked set back to the pipeline post-Compile.
+        scope.UseGraphSharedSet(_pipe.GraphSharedSpec);
+
         // ---- Import the host-owned storage images (General, preserved) ----
         // FinalColor is NOT imported here: the composed TonemapModule below imports it.
         var accum = scope.ImportImage(inp.Accumulator.Image, inp.Accumulator.ImageView, default,

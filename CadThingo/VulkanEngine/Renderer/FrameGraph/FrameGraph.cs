@@ -377,6 +377,10 @@ public unsafe class FrameGraph : IDisposable
         // Allocate + fill each opting pass's per-frame set from the now-resolved handles.
         BakePassSets();
 
+        // ---- Graph-owned shared set (opt-in via UseGraphSharedSet) ---------------
+        // One set for the whole graph, shared by every pass (the PT working set).
+        BakeGraphSharedSet();
+
         // ---- Debug instrumentation: query pools, labels, object names ------------
         SetupDebug();
 
@@ -929,6 +933,65 @@ public unsafe class FrameGraph : IDisposable
             foreach (var a in NamedAccesses(pass))
                 for (uint f = 0; f < frames; f++)
                     WritePassBinding(sets[f], spec, in a, f);
+        }
+    }
+
+    // ---- Graph-owned shared set  ---------
+    // ONE descriptor set for the whole graph, shared by every pass (vs pass sets, one per pass).
+    // Fits a technique whose passes all touch the same working buffers (the PT SoA / ReSTIR
+    // reservoirs): the pipeline still owns the buffers + the layout, the graph owns just the set.
+    // Single instance (not per-frame): the handles never change in flight -- a resize rebuilds the
+    // whole graph -- and the buffer contents are ordered by the passes' declared barriers. The core
+    // reads GraphSharedSet after Compile and hands it to the pipeline for its record-time binds.
+    private GraphSharedSetSpec? _graphSharedSpec;
+    private DescriptorSet _graphSharedSet;
+    private DescriptorPool _graphSharedPool;
+
+    /// <summary>Opts the graph into owning one shared descriptor set (see <see cref="GraphSharedSetSpec"/>),
+    /// allocated + written at Compile from the pipeline-supplied buffer handles. Call once during Build.</summary>
+    public void UseGraphSharedSet(in GraphSharedSetSpec spec) => _graphSharedSpec = spec;
+
+    /// <summary>The graph-owned shared set, valid after <see cref="Compile"/> (default handle if the
+    /// graph never opted in). Bound by the pipeline at the spec's set index.</summary>
+    public DescriptorSet GraphSharedSet => _graphSharedSet;
+
+    private void BakeGraphSharedSet()
+    {
+        if (_graphSharedSpec is not { } spec || spec.Bindings.Count == 0) return;
+
+        var poolSizes = new Dictionary<DescriptorType, uint>();
+        foreach (var b in spec.Bindings) poolSizes[b.Type] = poolSizes.GetValueOrDefault(b.Type) + 1;
+        var sizes = poolSizes.Select(kv => new DescriptorPoolSize { Type = kv.Key, DescriptorCount = kv.Value }).ToArray();
+        fixed (DescriptorPoolSize* pSizes = sizes)
+        {
+            var poolInfo = new DescriptorPoolCreateInfo
+            {
+                SType = StructureType.DescriptorPoolCreateInfo,
+                PoolSizeCount = (uint)sizes.Length, PPoolSizes = pSizes, MaxSets = 1,
+            };
+            if (gfx.Vk.CreateDescriptorPool(gfx.Device, &poolInfo, null, out _graphSharedPool) != Result.Success)
+                throw new Exception("FrameGraph: failed to create graph-shared descriptor pool");
+        }
+
+        var layout = spec.Layout;
+        var alloc = new DescriptorSetAllocateInfo
+        {
+            SType = StructureType.DescriptorSetAllocateInfo,
+            DescriptorPool = _graphSharedPool, DescriptorSetCount = 1, PSetLayouts = &layout,
+        };
+        fixed (DescriptorSet* p = &_graphSharedSet)
+            if (gfx.Vk.AllocateDescriptorSets(gfx.Device, &alloc, p) != Result.Success)
+                throw new Exception("FrameGraph: failed to allocate graph-shared set");
+
+        foreach (var b in spec.Bindings)
+        {
+            var info = new DescriptorBufferInfo { Buffer = b.Buffer, Offset = 0, Range = Vk.WholeSize };
+            var write = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet, DstSet = _graphSharedSet,
+                DstBinding = b.Binding, DescriptorType = b.Type, DescriptorCount = 1, PBufferInfo = &info,
+            };
+            gfx.Vk.UpdateDescriptorSets(gfx.Device, 1, &write, 0, null);
         }
     }
 
@@ -1527,8 +1590,9 @@ public unsafe class FrameGraph : IDisposable
         if (_gfxTimeline.Handle  != 0) vk.DestroySemaphore(dev, _gfxTimeline, null);
         if (_cmpTimeline.Handle  != 0) vk.DestroySemaphore(dev, _cmpTimeline, null);
 
-        // Graph-baked pass sets: freed with their pool (sets need no individual free).
+        // Graph-baked pass sets + the graph-owned shared set: freed with their pools.
         if (_passSetPool.Handle != 0) vk.DestroyDescriptorPool(dev, _passSetPool, null);
+        if (_graphSharedPool.Handle != 0) vk.DestroyDescriptorPool(dev, _graphSharedPool, null);
 
         foreach (var res in _resources.Values)
         {

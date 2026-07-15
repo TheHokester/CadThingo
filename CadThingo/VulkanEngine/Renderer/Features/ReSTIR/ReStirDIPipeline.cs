@@ -1,6 +1,8 @@
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using Silk.NET.Core.Native;
@@ -69,6 +71,23 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     public Buffer GBufferA      => _gbufA;
     public Buffer GBufferB      => _gbufB;
     public Buffer SceneRadiance => _sceneRad;
+
+    // The working set (set 2) is graph-owned: the pipeline owns the buffers + the layout, but the
+    // FrameGraph allocates + writes the descriptor set from this spec and hands it back after Compile.
+    private DescriptorSet _sharedSet;   // set by the core via SetGraphSharedSet after the graph compiles
+    public void SetGraphSharedSet(DescriptorSet set) => _sharedSet = set;
+
+    /// The graph-shared working-set spec (layout + current buffer handles). Read by the module at
+    /// Build time; on resize the buffers realloc first, so the rebuilt graph bakes the new handles.
+    public GraphSharedSetSpec GraphSharedSpec => new(
+        ShaderSets.GraphShared, DescriptorSetLayouts[SetReStir], new GraphSharedBinding[]
+        {
+            new(0, DescriptorType.StorageBuffer, _resA),
+            new(1, DescriptorType.StorageBuffer, _resB),
+            new(2, DescriptorType.StorageBuffer, _gbufA),
+            new(3, DescriptorType.StorageBuffer, _gbufB),
+            new(4, DescriptorType.StorageBuffer, _sceneRad),
+        });
 
     protected override string ShaderPath =>
         ShaderPaths.Kernel("ReSTIR", Gfx.SerSupported ? "ReStirDI_SER" : "ReStirDI");
@@ -150,30 +169,6 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         AllocBuffers(Renderer.RenderExtent);
     }
 
-    protected override void CreateDescriptorSets()
-    {
-        base.CreateDescriptorSets();   // set 1 (IO); set 0 (scene) + FeatureEnv (set 4) are registry-owned
-
-        // The base sized DescriptorSets to the full layout array; just fill the graph-shared slot.
-        var layout = DescriptorSetLayouts[SetReStir];
-        var alloc = new DescriptorSetAllocateInfo
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = Gfx.DescriptorPool, DescriptorSetCount = 1, PSetLayouts = &layout,
-        };
-        DescriptorSets[SetReStir] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[SetReStir])
-            if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
-                throw new Exception("ReStirDIPipeline: failed to allocate working set (set 2)");
-    }
-
-    protected override void WriteDescriptors()
-    {
-        base.WriteDescriptors();
-        WriteReStirDescriptors();
-    }
-
-
     // ---- ReSTIR working-set buffers (extent-sized, device-local, ping-ponged) -------------------
     private void AllocBuffers(Extent2D extent)
     {
@@ -197,31 +192,13 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         _resA = default; _resB = default; _gbufA = default; _gbufB = default; _sceneRad = default;
     }
 
-    private void WriteReStirDescriptors()
-    {
-        var set = DescriptorSets[SetReStir][0];
-        Span<Buffer> bufs = stackalloc Buffer[5] { _resA, _resB, _gbufA, _gbufB, _sceneRad };
-        var infos  = stackalloc DescriptorBufferInfo[5];
-        var writes = stackalloc WriteDescriptorSet[5];
-        for (uint b = 0; b < 5; b++)
-        {
-            infos[b] = new DescriptorBufferInfo { Buffer = bufs[(int)b], Offset = 0, Range = Vk.WholeSize };
-            writes[b] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = set, DstBinding = b,
-                DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &infos[b],
-            };
-        }
-        Vk.UpdateDescriptorSets(Device, 5, writes, 0, null);
-    }
-
-    /// <summary>Resize path: reallocate the per-pixel working set to the new extent + rewrite set 4.
-    /// Resets the history gate. Called by the core's Resize before the graph rebuild.</summary>
+    /// <summary>Resize path: reallocate the per-pixel working set to the new extent. Resets the
+    /// history gate. Called by the core's Resize before the graph rebuild, which re-bakes the
+    /// graph-owned set 2 from the fresh buffer handles (see GraphSharedSpec).</summary>
     public void ReallocReStirBuffers(Extent2D extent)
     {
         FreeBuffers();
         AllocBuffers(extent);
-        WriteReStirDescriptors();
     }
 
 
@@ -279,7 +256,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         var sets = stackalloc DescriptorSet[3];
         sets[0] = registry.SceneSet(ctx.FrameIndex);  // frame UBO + lights / tlas / entityInfo / vb+ib / emissive / bindless
         sets[1] = DescriptorSets[SetIO][0];           // accumulator / outColor
-        sets[2] = DescriptorSets[SetReStir][0];       // reservoirs / gbuffers / sceneRadiance (graph-shared)
+        sets[2] = _sharedSet;                         // reservoirs / gbuffers / sceneRadiance (graph-owned)
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 3, sets, 1, &frameConstants);
 
         var envSet = registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
@@ -292,11 +269,11 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     }
 
 
-    // ---- Install the working set in the base's graph-shared slot (set 2, RTPipeline.Record) ------
+    // ---- Install the graph-owned working set in the base's graph-shared slot (set 2, RTPipeline.Record) --
     protected override uint ExtraSetCount => 1u;
     protected override void WriteExtraSets(DescriptorSet* dst, uint frame)
     {
-        dst[0] = DescriptorSets[SetReStir][0];
+        dst[0] = _sharedSet;
     }
 
     protected override void ReleaseGpuResources()

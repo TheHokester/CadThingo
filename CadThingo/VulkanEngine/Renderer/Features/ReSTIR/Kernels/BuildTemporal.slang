@@ -10,27 +10,13 @@
 // (the second pass) then does spatial reuse + shading. Build does NO visibility (no rays) -- shadow
 // rays live only in the shade pass -- so this pass needs no TLAS.
 //
-// Helpers mirror ReStirDI.slang / SpatialShade.slang (hand-synced; small + stable).
+// Record types + the set-2 working buffers come from the shared ReStirBindings module; only the
+// unpack helpers below still mirror ReStirDI.slang / SpatialShade.slang (small + stable).
 
-import PTUtils;       // BRDF/light eval, emissive structs, HitInfo, rand/initRNG, fetchVertex*
-import SceneBindings; // scene set 0: sceneLights/sceneEmissiveTris+Alias/sceneVertices+sceneIndices/sceneTextures+sceneSamplers
+import PTUtils;        // BRDF/light eval, emissive structs, HitInfo, rand/initRNG, fetchVertex*
+import SceneBindings;  // scene set 0: sceneLights/sceneEmissiveTris+Alias/sceneVertices+sceneIndices/sceneTextures+sceneSamplers
+import ReStirBindings; // set 2 (graph-owned) working set + Reservoir/PackedHit record types
 
-// ---- Shared types (mirror ReStirDI.slang) --------------------------------------------------------
-struct Reservoir {
-    uint   sampleType;  // SAMPLE_NONE / SAMPLE_ANALYTIC / SAMPLE_EMISSIVE
-    uint   index;       // analytic: light index
-    float3 samplePos;   // emissive: sampled world point Q
-    float3 sampleLe;    // emissive: radiance Le at Q
-    float  sampleEsPdf; // emissive: NEE solid-angle pdf at build (for NEE<->BSDF MIS)
-    uint   M; float wSum; float W; float pHat;
-};
-struct PackedHit {
-    float3 worldPos; uint nOct; uint ngOct; uint baseIor; uint emisRG; uint scal0; uint scal1; uint matFlags;
-};
-
-static const uint  SAMPLE_NONE            = 0u;
-static const uint  SAMPLE_ANALYTIC        = 1u;
-static const uint  SAMPLE_EMISSIVE        = 2u;
 static const uint  TEMPORAL_M_CAP         = 20u;
 static const uint  RIS_LIGHT_SAMPLE_COUNT = 5u;
 // Decorrelate the build RNG from the megakernel's stream (which reused the same pixel/frame seed for
@@ -72,15 +58,9 @@ HitInfo unpackHit(PackedHit p, float3 rayOrigin) {
 }
 
 // ---- Bindings -------------------------------------------------------------------------------------
-// Scene set 0 (sceneLights / sceneEmissiveTris+Alias / sceneVertices+sceneIndices /
-// sceneTextures+sceneSamplers) comes from the imported SceneBindings module; only the
-// per-pass constants and the set-2 (graph-shared) ReSTIR working buffers are declared here.
+// Scene set 0 comes from the imported SceneBindings module; the set-2 (graph-owned) working buffers
+// from ReStirBindings. Only the per-pass constant UBO is declared here.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO>  frameUBO;
-
-[[vk::binding(0, 2)]] RWStructuredBuffer<Reservoir> reservoirA;
-[[vk::binding(1, 2)]] RWStructuredBuffer<Reservoir> reservoirB;
-[[vk::binding(2, 2)]] RWStructuredBuffer<PackedHit> gbufferA;
-[[vk::binding(3, 2)]] RWStructuredBuffer<PackedHit> gbufferB;
 
 struct ReStirPush { float4x4 prevViewProj; uint frameParity; uint hasHistory; uint pad0, pad1; };
 [[vk::push_constant]] ReStirPush rpc;

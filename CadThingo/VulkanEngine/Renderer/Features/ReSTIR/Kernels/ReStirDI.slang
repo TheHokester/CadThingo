@@ -16,7 +16,8 @@ import PTUtils;       // BSDF/sampling/RNG/camera + re-exported PbrUtils/CommonT
 import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
                       // sceneVertices+sceneIndices/sceneEmissiveTris+Alias/
                       // sceneMaterials/sceneTextures/sceneSamplers
-import FeatureEnv;    // feature set 4: envCube (miss-ray background)
+import FeatureEnv;      // feature set 4: envCube (miss-ray background)
+import ReStirBindings;  // set 2 (graph-owned) working set + Reservoir/PackedHit record types
 
 // Per-pass constants in the reserved (0,0) dynamic slot.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
@@ -25,58 +26,10 @@ import FeatureEnv;    // feature set 4: envCube (miss-ray background)
 [[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
 [[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
 
-// Set 2 (graph-shared) - ReSTIR working set (ReStirDIPipeline-owned, sized to the render extent, indexed by
-// pixel = y*width + x). P1 writes both at the primary hit; the temporal/spatial reuse passes
-// consume them in later phases. Scalar-only structs (4B fields, tight packing) so the Slang
-// stride matches the C# byte strides in ReStirDIPipeline (ReservoirBytes/GBufferBytes).
-
-// Per-pixel DI reservoir over the UNIFIED light set (analytic punctual/dir lights + emissive
-// triangles). The selected sample is re-evaluable at any pixel: analytic = a light index
-// (deterministic L from index + worldPos); emissive = the sampled world POINT + its (textured)
-// radiance Le, so reuse + shading need NO emissive-triangle/texture fetch (keeps the shade pass
-// lean). pHat = target fn of the selected sample; W = wSum/(M*pHat) the unbiased contribution
-// weight. Scalar/tight Slang packing (float3 stays 12B, like PackedHit) -> C# stride 48B.
-struct Reservoir {
-    uint   sampleType;   // SAMPLE_NONE / SAMPLE_ANALYTIC / SAMPLE_EMISSIVE
-    uint   index;        // analytic: light index (emissive: unused)
-    float3 samplePos;    // emissive: sampled world point Q (analytic: unused)
-    float3 sampleLe;     // emissive: radiance Le at Q (analytic: unused)
-    float  sampleEsPdf;  // emissive: NEE solid-angle pdf at build (for shade-time NEE<->BSDF MIS)
-    uint   M;            // candidates streamed
-    float  wSum;         // running Σ RIS weights
-    float  W;            // unbiased contribution weight
-    float  pHat;         // target fn of the selected sample
-};
-static const uint SAMPLE_NONE     = 0u;
-static const uint SAMPLE_ANALYTIC = 1u;
-static const uint SAMPLE_EMISSIVE = 2u;
-
-// Fat G-buffer = the compact hit record (40B) the closesthit already packs. Storing it per pixel
-// lets the deferred SpatialShade pass reconstruct the full BRDF (unpackHit) without re-tracing.
-// (Defined here, before the set-4 bindings that use it; packHit/unpackHit are below.)
-struct PackedHit {
-    float3 worldPos;    // full precision (shadow-ray origins / NEE)
-    uint   nOct;        // shading normal, oct 2x16
-    uint   ngOct;       // geometric normal, oct 2x16
-    uint   baseIor;     // baseColor.rgb unorm8 | ior unorm8 over [1,3]
-    uint   emisRG;      // emissive.rg as f16x2
-    uint   scal0;       // metallic | roughness | transmission | clearcoat (unorm8x4)
-    uint   scal1;       // clearcoatRoughness unorm8 | emissive.b f16 in bits 16..31
-    uint   matFlags;    // matidx:24 | hit:bit24 | frontFace:bit25
-};
-
-// Reservoir + G-buffer PING-PONG (P2 temporal reuse): two physical buffers per role. frameParity
-// (monotonic frame counter & 1, from the push constant) picks which is CURRENT (written this
-// frame) vs PREVIOUS (last frame's result, read for reprojected reuse). The host binds all four;
-// the graph imports them so consecutive frames' accesses are ordered (cross-frame WAW barrier).
-// sceneRadiance (binding 4) is the deferred-shading hand-off: Trace writes everything EXCEPT the
-// analytic direct light (indirect + emissive + env); SpatialShade adds the analytic direct +
-// accumulates. P3 deferred split (the reservoir analytic shade moved out of this megakernel).
-[[vk::binding(0, 2)]] RWStructuredBuffer<Reservoir> reservoirA;
-[[vk::binding(1, 2)]] RWStructuredBuffer<Reservoir> reservoirB;
-[[vk::binding(2, 2)]] RWStructuredBuffer<PackedHit> gbufferA;
-[[vk::binding(3, 2)]] RWStructuredBuffer<PackedHit> gbufferB;
-[[vk::binding(4, 2)]] RWStructuredBuffer<float4>    sceneRadiance;
+// Reservoir / PackedHit record types + the set-2 (graph-owned) working buffers come from the
+// shared ReStirBindings module (imported above) so all three ReSTIR kernels agree byte-for-byte.
+// sceneRadiance is the deferred-shading hand-off: Trace writes everything EXCEPT the analytic
+// direct light (indirect + emissive + env); SpatialShade adds the analytic direct + accumulates.
 
 // Per-frame ReSTIR state (push constant). prevViewProj reprojects a current-frame world position
 // into LAST frame's screen (same view*proj(M22-flipped) construction the engine's raster/pick path

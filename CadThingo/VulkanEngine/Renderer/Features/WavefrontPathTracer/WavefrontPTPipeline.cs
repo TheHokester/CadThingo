@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using Silk.NET.Core.Native;
@@ -148,6 +150,24 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 
     private readonly Buffer[]   _set4Buf   = new Buffer[Set4BindingCount];
     private readonly SubAlloc[] _set4Alloc = new SubAlloc[Set4BindingCount];
+
+    // The SoA working set (set 2) is graph-owned: the pipeline owns the buffers + the layout, but the
+    // FrameGraph allocates + writes the descriptor set from this spec and hands it back after Compile.
+    private DescriptorSet _sharedSet;   // set by the core via SetGraphSharedSet after the graph compiles
+    public void SetGraphSharedSet(DescriptorSet set) => _sharedSet = set;
+
+    /// The graph-shared working-set spec (layout + current buffer handles). Read by the module at
+    /// Build time; on resize the buffers realloc first, so the rebuilt graph bakes the new handles.
+    public GraphSharedSetSpec GraphSharedSpec
+    {
+        get
+        {
+            var bindings = new GraphSharedBinding[Set4BindingCount];
+            for (uint i = 0; i < Set4BindingCount; i++)
+                bindings[i] = new(i, DescriptorType.StorageBuffer, _set4Buf[i]);
+            return new(ShaderSets.GraphShared, DescriptorSetLayouts[SetWavefront], bindings);
+        }
+    }
 
     // Handles imported by the module for barrier derivation.
     public Buffer PsRayOrigin   => _set4Buf[B_PS_RAY_ORIGIN];
@@ -407,21 +427,19 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     {
         FreeSet4();
         AllocSet4(PathCount(extent));
-        WriteSet4Descriptors();
         MarkAccumulatorDirty();
+        // The graph re-bakes the graph-owned set 2 from the fresh handles on the following rebuild.
     }
 
 
     // ---- Descriptor-set allocation -------------------------------------------
+    // Only the IO set (set 1) is pipeline-owned. Set 0 (scene) + FeatureEnv (set 4) are
+    // registry-owned; the SoA working set (set 2) is graph-owned (see GraphSharedSpec).
     protected override void CreateDescriptorSets()
     {
-        DescriptorSets = new DescriptorSet[SetWavefront + 1][];
-
-        // Set 0 - registry-owned; Record binds Renderer.descriptorRegistry.SceneSet(frame).
+        DescriptorSets = new DescriptorSet[SetIO + 1][];
         DescriptorSets[SetScene] = null;
-        // Sets 1 / 2 - single shared (handles are renderer/pipeline-wide singletons).
-        DescriptorSets[SetIO]        = AllocSets(SetIO, 1);
-        DescriptorSets[SetWavefront] = AllocSets(SetWavefront, 1);
+        DescriptorSets[SetIO]    = AllocSets(SetIO, 1);
     }
 
     private DescriptorSet[] AllocSets(int layoutIdx, uint count)
@@ -441,30 +459,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
 
-    // Owned writes at init; the storage-image + IBL sets are wired externally by the renderer.
-    protected override void WriteDescriptors()
-    {
-        WriteSet4Descriptors();
-    }
-
-    /// <summary>Set 2 (the SoA working set). Stable pipeline-owned handles,
-    /// so write once at init + after a resize realloc.</summary>
-    public void WriteSet4Descriptors()
-    {
-        var set = DescriptorSets[SetWavefront][0];
-        var infos  = stackalloc DescriptorBufferInfo[Set4BindingCount];
-        var writes = stackalloc WriteDescriptorSet[Set4BindingCount];
-        for (uint b = 0; b < Set4BindingCount; b++)
-        {
-            infos[b] = new DescriptorBufferInfo { Buffer = _set4Buf[b], Offset = 0, Range = Vk.WholeSize };
-            writes[b] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = set, DstBinding = b,
-                DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &infos[b],
-            };
-        }
-        Vk.UpdateDescriptorSets(Device, Set4BindingCount, writes, 0, null);
-    }
+    // The IO set is wired externally by the renderer (WriteStorageImageDescriptors); the SoA working
+    // set (set 2) is graph-owned; the scene + FeatureEnv sets are registry-maintained. Nothing here.
+    protected override void WriteDescriptors() { }
 
     /// <summary>Set 1 bindings 0/1: accumulator + outColor storage images (both in General).
     /// Single shared set (both frames dispatch into the same images).</summary>
@@ -537,7 +534,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         {
             registry.SceneSet(frameIndex),
             DescriptorSets[SetIO][0],
-            DescriptorSets[SetWavefront][0],
+            _sharedSet,                 // SoA working set (set 2), graph-owned
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 3, sets, 1, &frameConstants);
 

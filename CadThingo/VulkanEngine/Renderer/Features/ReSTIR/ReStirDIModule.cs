@@ -69,6 +69,10 @@ internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReSti
         var gbufB    = scope.ImportBuffer(_pipe.GBufferB,      default, "gbufferB");
         var sceneRad = scope.ImportBuffer(_pipe.SceneRadiance, default, "sceneRadiance");
 
+        // The set-2 working set is graph-owned: the graph allocates + writes it from the pipeline's
+        // buffer handles, and the core hands the baked set back to the pipeline after Compile.
+        scope.UseGraphSharedSet(_pipe.GraphSharedSpec);
+
         // ---- Trace (RT): path-trace to the fat G-buffer + sceneRadiance (indirect + emissive + env --
         // everything EXCEPT primary direct light). The reservoir build moved OUT of this megakernel
         // (BuildTemporal below) to relieve its register pressure / occupancy. Does NOT touch the

@@ -21,6 +21,21 @@ public readonly record struct PassSetSpec(
     DescriptorSetLayout Layout,
     IReadOnlyList<BindingDesc> Bindings);
 
+/// One buffer slot of a graph-owned shared set: the pipeline supplies the physical buffer handle
+/// directly (it still allocates the buffer), the graph writes it into the set it owns.
+public readonly record struct GraphSharedBinding(uint Binding, DescriptorType Type, Buffer Buffer);
+
+/// <summary>What a pipeline hands the graph so the graph owns its ONE shared working set (the
+/// graph-shared slot, <see cref="Descriptors.ShaderSets.GraphShared"/>). Unlike a pass set (one per
+/// opting pass, resources resolved from named graph accesses), this is a single instance for the
+/// whole graph, self-contained: the pipeline still owns the buffers + the layout (its VkPipelineLayout
+/// borrows it at <paramref name="SetIndex"/>); the graph only allocates + writes + owns the descriptor
+/// set, then hands it back via <see cref="FrameGraph.GraphSharedSet"/> after Compile. Buffers only (v1).</summary>
+public readonly record struct GraphSharedSetSpec(
+    uint SetIndex,
+    DescriptorSetLayout Layout,
+    IReadOnlyList<GraphSharedBinding> Bindings);
+
 internal struct ResourceAccess
 {
     public int ResourceId;

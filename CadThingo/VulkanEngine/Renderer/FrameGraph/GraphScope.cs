@@ -55,6 +55,12 @@ public readonly struct GraphScope
     public GraphBuffer ImportBufferPerFrame(Buffer[] perFrame, in BufferDesc desc, string name) =>
         _g.ImportBufferPerFrame(perFrame, in desc, Qualify(name));
 
+    // ---- Graph-owned shared set -----------------------------------------------------------
+    /// <summary>Opts the graph into owning one shared descriptor set for the whole module (see
+    /// <see cref="GraphSharedSetSpec"/>). The pipeline supplies the layout + current buffer handles;
+    /// the graph allocates + writes + owns the set and exposes it via <see cref="FrameGraph.GraphSharedSet"/>.</summary>
+    public void UseGraphSharedSet(in GraphSharedSetSpec spec) => _g.UseGraphSharedSet(spec);
+
     // ---- Pass declaration -----------------------------------------------------------------
     public void AddPass(string name, PassType type, QueueClass queue,
         PassSetup setup, PassExecute execute,
