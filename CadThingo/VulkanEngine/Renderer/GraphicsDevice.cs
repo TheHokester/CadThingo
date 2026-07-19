@@ -1,3 +1,4 @@
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -93,6 +94,7 @@ public sealed unsafe class GraphicsDevice : IDisposable
     private GpuMemoryAllocator memAllocator = null!;
     private DescriptorPool descriptorPool;
     private CommandPool commandPool;
+    private PipelineLayoutCache layoutCache = null!;
 
     private bool descriptorIndexEnabled = false;
     private bool robustness2Enabled = false;
@@ -121,9 +123,13 @@ public sealed unsafe class GraphicsDevice : IDisposable
     // ---- Public device-services surface ------------------------------------
 
     public Vk                 Vk             => vk;
-    
+
     public ExtDebugUtils? DebugUtils => debugUtils;
     public Device             Device         => device;
+
+    /// Shared descriptor-set / pipeline layout dedupe plus the one device-level VkPipelineCache.
+    /// Created with the logical device; every pipeline builds its layouts through it.
+    public PipelineLayoutCache LayoutCache => layoutCache;
     public PhysicalDevice     PhysicalDevice => physicalDevice;
     public GpuMemoryAllocator Allocator      => memAllocator;
     public DescriptorPool     DescriptorPool => descriptorPool;
@@ -214,6 +220,11 @@ public sealed unsafe class GraphicsDevice : IDisposable
         // struct when the driver will honour it.
         memAllocator = new GpuMemoryAllocator(vk, device, physicalDevice, memoryPriorityEnabled);
         CreateCommandPool();
+
+        // Lives next to the build output rather than in Assets: the blob is only valid for this
+        // driver + device, so a rebuilt/relocated output legitimately starts cold.
+        layoutCache = new PipelineLayoutCache(vk, device, physicalDevice,
+            Path.Combine(AppContext.BaseDirectory, "PipelineCache.bin"));
     }
 
     // Full teardown in reverse-creation order. The orchestrator (Renderer) calls
@@ -223,7 +234,11 @@ public sealed unsafe class GraphicsDevice : IDisposable
     {
         
         _bcEncoder?.Dispose();
-        
+
+        // Shared layouts + the pipeline cache (writes the warm blob back to disk). Runs after the
+        // pipelines that borrowed these handles have been disposed, before the device goes away.
+        layoutCache?.Dispose();
+
         // Descriptor pool (frees the descriptor sets owned by the pipelines)
         if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
 

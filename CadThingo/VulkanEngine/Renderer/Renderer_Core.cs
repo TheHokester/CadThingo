@@ -439,6 +439,9 @@ public unsafe partial class Renderer
         // and was handed. Runs here because it needs both sides complete: pipelines built above,
         // providers registered on the two lines before. Throws on a real mismatch.
         Console.WriteLine(descriptorRegistry.Validate(ReflectedPrograms()));
+        var lc = gfx.LayoutCache;
+        Console.WriteLine($"[layout-cache] set layouts {lc.SetLayoutCount}/{lc.SetLayoutRequests} distinct, " +
+                          $"pipeline layouts {lc.PipelineLayoutCount}/{lc.PipelineLayoutRequests} distinct");
 
         // Stand up the render cores. Each ctor registers the core into _renderCores
         // (RegisterCore) -- construction order IS the list/combo order, so Deferred (index 0) is

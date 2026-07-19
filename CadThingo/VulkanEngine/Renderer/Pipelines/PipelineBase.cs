@@ -42,7 +42,10 @@ public abstract unsafe class PipelineBase : IDisposable
 
     protected Pipeline       PipelineHandle;
     protected PipelineLayout PipelineLayoutHandle;
-    protected PipelineCache  PipelineCacheHandle;
+
+    /// The shared device-level pipeline cache every PSO build feeds, warm across runs. Was a
+    /// per-pipeline field that nothing ever created, so every PSO compiled cold on every launch.
+    protected PipelineCache PipelineCacheHandle => Gfx.LayoutCache.PipelineCache;
 
     // Subclasses populate these in CreateDescriptorSetLayouts(). The default
     // CreatePipelineLayout() reads them to build the VkPipelineLayout.
@@ -120,41 +123,22 @@ public abstract unsafe class PipelineBase : IDisposable
             throw new InvalidOperationException($"{GetType().Name}: program reflects no bindings in set {set}.");
 
         var bindings = new DescriptorSetLayoutBinding[reflected.Length];
-        // One slot per binding; taking the address of a list element requires it to stay put,
-        // hence a flat array pinned for the whole create call.
-        var samplers = new Sampler[reflected.Length];
-        fixed (Sampler* pSamplers = samplers)
+        var samplers = new Sampler?[reflected.Length];
+        for (int i = 0; i < reflected.Length; i++)
         {
-            for (int i = 0; i < reflected.Length; i++)
+            var b = reflected[i];
+            bindings[i] = new DescriptorSetLayoutBinding
             {
-                var b = reflected[i];
-                bindings[i] = new DescriptorSetLayoutBinding
-                {
-                    Binding         = b.Binding,
-                    DescriptorType  = b.Type,
-                    DescriptorCount = b.Count,
-                    StageFlags      = b.Stages | ExtraStagesFor(in b),
-                };
-                if (ImmutableSamplerFor(in b) is { } s)
-                {
-                    samplers[i] = s;
-                    bindings[i].PImmutableSamplers = &pSamplers[i];
-                }
-            }
-
-            fixed (DescriptorSetLayoutBinding* pBindings = bindings)
-            {
-                var info = new DescriptorSetLayoutCreateInfo
-                {
-                    SType        = StructureType.DescriptorSetLayoutCreateInfo,
-                    BindingCount = (uint)bindings.Length,
-                    PBindings    = pBindings,
-                };
-                if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
-                    throw new Exception($"{GetType().Name}: failed to create reflected set {set} layout");
-                return layout;
-            }
+                Binding         = b.Binding,
+                DescriptorType  = b.Type,
+                DescriptorCount = b.Count,
+                StageFlags      = b.Stages | ExtraStagesFor(in b),
+            };
+            samplers[i] = ImmutableSamplerFor(in b);
         }
+
+        // Through the cache so it owns the handle; pass sets rarely collide, so expect a miss.
+        return Gfx.LayoutCache.GetSetLayout(bindings, samplers);
     }
 
     // Builds the VkSpecializationInfo payload for one stage: joins the pipeline's named values
@@ -273,23 +257,9 @@ public abstract unsafe class PipelineBase : IDisposable
     // pipeline doesn't fit either category.
     protected abstract void CreatePipeline();
 
+    // Cache-owned, so teardown skips it (see ReleaseGpuResources).
     protected virtual void CreatePipelineLayout()
-    {
-        fixed (DescriptorSetLayout* pLayouts = DescriptorSetLayouts)
-        fixed (PushConstantRange*   pRanges  = PushConstantRanges)
-        {
-            PipelineLayoutCreateInfo info = new()
-            {
-                SType                  = StructureType.PipelineLayoutCreateInfo,
-                SetLayoutCount         = (uint)DescriptorSetLayouts.Length,
-                PSetLayouts            = pLayouts,
-                PushConstantRangeCount = (uint)PushConstantRanges.Length,
-                PPushConstantRanges    = pRanges,
-            };
-            if (Vk.CreatePipelineLayout(Device, &info, null, out PipelineLayoutHandle) != Result.Success)
-                throw new Exception($"Failed to create pipeline layout for {GetType().Name}");
-        }
-    }
+        => PipelineLayoutHandle = Gfx.LayoutCache.Get(DescriptorSetLayouts, PushConstantRanges);
 
     // Concrete pipelines override these to allocate their owned SSBOs/UBOs,
     // allocate descriptor sets from the pool, and write the initial bindings.
@@ -306,15 +276,21 @@ public abstract unsafe class PipelineBase : IDisposable
     /// Dispose keeps re-init off the IDisposable path.</summary>
     protected virtual void ReleaseGpuResources()
     {
-        if (PipelineHandle.Handle       != 0) Vk.DestroyPipeline(Device, PipelineHandle, null);
-        if (PipelineLayoutHandle.Handle != 0) Vk.DestroyPipelineLayout(Device, PipelineLayoutHandle, null);
-        // Only destroy DSLs we own — borrowed layouts (e.g. ResourceManager's bindless
-        // layout) are torn down by their owner.
+        if (PipelineHandle.Handle != 0) Vk.DestroyPipeline(Device, PipelineHandle, null);
+
+        // Cache-owned layouts are shared with other pipelines and outlive this one - destroying
+        // them here would be a double free and a use-after-free for the pipelines still holding
+        // them. Anything built by hand is still ours to release.
+        var cache = Gfx.LayoutCache;
+        if (PipelineLayoutHandle.Handle != 0 && !cache.Owns(PipelineLayoutHandle))
+            Vk.DestroyPipelineLayout(Device, PipelineLayoutHandle, null);
+
+        // Only destroy DSLs we own 
         foreach (var idx in OwnedDescriptorSetLayoutIndices)
         {
-            if (idx < DescriptorSetLayouts.Length && DescriptorSetLayouts[idx].Handle != 0)
+            if (idx < DescriptorSetLayouts.Length && DescriptorSetLayouts[idx].Handle != 0
+                && !cache.Owns(DescriptorSetLayouts[idx]))
                 Vk.DestroyDescriptorSetLayout(Device, DescriptorSetLayouts[idx], null);
         }
-        if (PipelineCacheHandle.Handle  != 0) Vk.DestroyPipelineCache(Device, PipelineCacheHandle, null);
     }
 }
