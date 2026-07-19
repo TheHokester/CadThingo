@@ -1,6 +1,6 @@
 namespace CadThingo.VulkanEngine.Renderer.Shaders;
 
-// Cache-or-compile front door for runtime shaders (docs/descriptor-system.md sections 3-4).
+// Cache-or-compile front door for runtime shaders 
 // Warm path never touches slang.dll: the compiler is constructed lazily on the first disk
 // miss, so a fully cached startup is pure file IO. Not thread-safe (neither is Slang's
 // global session) - use from one thread.

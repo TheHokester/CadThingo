@@ -22,7 +22,10 @@ public static class SpirvUtil
 {
     private const uint Magic = 0x07230203;
     private const uint OpDecorate = 71;
+    private const uint OpMemberDecorate = 72;
     private const uint DecorationSpecId = 1;
+    private const uint DecorationRowMajor = 4;
+    private const uint DecorationColMajor = 5;
 
     /// <summary>The specialization-constant ids a SPIR-V module actually declares. Slang emits one
     /// module per entry point and strips constants the entry point never reads, so a program-wide
@@ -46,5 +49,36 @@ public static class SpirvUtil
             i += (int)count;
         }
         return ids;
+    }
+
+    /// <summary>Counts the matrix-member majorness decorations in a SPIR-V module. Matrices in
+    /// interface blocks (UBO/SSBO/push) carry an OpMemberDecorate RowMajor or ColMajor per member.
+    /// This engine feeds the runtime compiler a COLUMN_MAJOR source request, which - counterintuitively
+    /// - emits RowMajor-decorated members that match every build-time .spv and the System.Numerics
+    /// mirrors. So the invariant is ColMajor == 0 across every emitted module; a single ColMajor is the
+    /// exact signature of the matrix-layout regression (transposed matrices: RT camera pinned at the
+    /// origin, matrix-using raster passes white). See slang-matrix-layout-inversion.</summary>
+    public static (int RowMajor, int ColMajor) MatrixMajorness(ReadOnlySpan<byte> spirv)
+    {
+        int row = 0, col = 0;
+        var words = MemoryMarshal.Cast<byte, uint>(spirv);
+        if (words.Length < 5 || words[0] != Magic) return (0, 0);
+
+        int i = 5; // skip the fixed-size header
+        while (i < words.Length)
+        {
+            uint count = words[i] >> 16;
+            uint op = words[i] & 0xFFFF;
+            if (count == 0) break; // malformed; refuse to spin
+            // OpMemberDecorate: [struct type, member index, decoration, ...] - decoration at word +3.
+            if (op == OpMemberDecorate && count >= 4)
+            {
+                uint dec = words[i + 3];
+                if (dec == DecorationRowMajor) row++;
+                else if (dec == DecorationColMajor) col++;
+            }
+            i += (int)count;
+        }
+        return (row, col);
     }
 }

@@ -23,10 +23,14 @@ struct VertexOutput{
     float2 TexCoord: TEXCOORD0;
 
 }
+// No explicit layout qualifier: the engine convention is to let the session default decide, which
+// emits RowMajor-decorated members matching the System.Numerics mirrors. Slang's source-level
+// row_major means the INVERSE of the SPIR-V decoration, so annotating these row_major produced
+// ColMajor members - the one kernel in the tree that disagreed with every other.
 struct UniformBufferObject{
-    row_major float4x4 model;
-    row_major float4x4 view;
-    row_major float4x4 proj;
+    float4x4 model;
+    float4x4 view;
+    float4x4 proj;
 
 }
 

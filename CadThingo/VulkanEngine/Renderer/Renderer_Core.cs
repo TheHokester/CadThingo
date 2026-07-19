@@ -1,5 +1,6 @@
 using System.Linq;
 using System.Numerics;
+using System.Reflection;
 using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
@@ -43,11 +44,11 @@ public unsafe partial class Renderer
     // repoints land (L1 of the renderer refactor).a
     internal GraphicsDevice gfx = null!;
 
-    public bool initialized = false;
+    private bool initialized = false;
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private bool enableValidationLayers = true;
+    private readonly bool enableValidationLayers = false;
     private IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------
@@ -195,7 +196,7 @@ public unsafe partial class Renderer
     RenderingAttachmentInfo depthAttachment;
     
     
-    //pipelines — each owns its own VkPipeline, layouts, descriptor sets, and per-pipeline buffers
+    //pipelines - each owns its own VkPipeline, layouts, descriptor sets, and per-pipeline buffers
     internal GeometryPipeline     geometryPipeline;
     internal DrawCullPipeline     drawCullPipeline;
     internal LightCullPipeline    lightCullPipeline;
@@ -434,6 +435,11 @@ public unsafe partial class Renderer
         RegisterFeatureBindings();
         Console.WriteLine(descriptorRegistry.DumpBindings());
 
+        // Cross-check every migrated pipeline's reflected bindings against what the registry owns
+        // and was handed. Runs here because it needs both sides complete: pipelines built above,
+        // providers registered on the two lines before. Throws on a real mismatch.
+        Console.WriteLine(descriptorRegistry.Validate(ReflectedPrograms()));
+
         // Stand up the render cores. Each ctor registers the core into _renderCores
         // (RegisterCore) -- construction order IS the list/combo order, so Deferred (index 0) is
         // the boot default + fallback. 
@@ -643,6 +649,19 @@ public unsafe partial class Renderer
             descriptorRegistry.RegisterBuffer("sceneEmissiveAlias", EmissiveAliasBuffer);
         }
     }
+
+    // Every reflected program the renderer's pipelines resolved, for the registry cross-check.
+    // Found by walking the renderer's own PipelineBase-typed fields rather than a hand-kept list:
+    // a new pipeline joins the check by existing, not by someone remembering to add it. Pipelines
+    // still on the legacy build-time-.spv route reflect nothing and drop out.
+    private IEnumerable<ProgramUse> ReflectedPrograms()
+        => GetType()
+            .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Where(f => typeof(PipelineBase).IsAssignableFrom(f.FieldType))
+            .Select(f => f.GetValue(this) as PipelineBase)
+            .Where(p => p?.ReflectedProgram != null)
+            .Select(p => new ProgramUse(p!.ReflectedProgram!, p.PrivateSetIndices))
+            .DistinctBy(u => u.Program);
 
     // Registers the FeatureIBL set (set 2): the global IBL split-sum + reflection-probe resources
     // consumed by the raster lighting shaders. Owned by IblSystem / ReflectionProbeSystem; their

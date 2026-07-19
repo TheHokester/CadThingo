@@ -15,6 +15,11 @@ namespace CadThingo.VulkanEngine.Renderer.Descriptors;
 // (VUID-VkDescriptorSetLayoutCreateInfo-descriptorType-03001), so the array is
 // PartiallyBound-only and a fresh slot becomes visible when the frame slot rewrites -
 // which is also when material rows referencing it upload.
+/// A consuming program plus the set indices its pipeline owns privately. Validation needs both:
+/// the same set index means "registry-owned" for one pipeline and "my own pass set" for another,
+/// and only the pipeline knows which.
+public readonly record struct ProgramUse(ShaderProgram Program, IReadOnlyList<int> PrivateSets);
+
 public sealed unsafe class DescriptorRegistry : IDisposable
 {
     private readonly GraphicsDevice _gfx;
@@ -608,6 +613,141 @@ public sealed unsafe class DescriptorRegistry : IDisposable
                 break;
             }
         }
+    }
+
+    // ---- startup validation ----------------------------------------------------------------
+
+    /// <summary>Cross-checks every consuming program's reflected bindings against what the registry
+    /// owns and has actually been given . This catches the
+    /// class of bug the Vulkan validation layer is blind to: a scene parameter nothing ever
+    /// registered, a name whose type or binding index drifted between the owning module and a
+    /// consumer, a set index no owner claims. Sets 1 (pass) and 2 (graph-shared) are skipped - they
+    /// are graph/pipeline-owned, not registry-owned.
+    ///
+    /// A binding with no provider only FAILS if something consumes it; an unconsumed hole is a
+    /// warning, since a resource nobody reads is merely unfinished, not broken. Throws with the
+    /// full report on any failure, otherwise returns it for logging.</summary>
+    public string Validate(IEnumerable<ProgramUse> programs)
+    {
+        var consumers = new Dictionary<string, List<string>>();   // registry-owned name -> program labels
+        var lines = new List<string>();
+        var failures = new List<string>();
+
+        void Fail(string line) { failures.Add(line); lines.Add("  FAIL " + line); }
+
+        foreach (var (program, privateSets) in programs)
+        {
+            var desc = program.Desc;
+            string label = desc.Module + (desc.Defines.Length > 0 ? $" [{string.Join(",", desc.Defines)}]" : "");
+
+            foreach (var b in program.Reflection.Bindings)
+            {
+                // Pipeline- and graph-owned sets are validated by their own owners. Note set 0 is
+                // NOT automatically the scene set: a pass with no scene dependency puts its own
+                // private pass set there, and declares that by owning the layout.
+                if (b.Set == ShaderSets.Pass || b.Set == ShaderSets.GraphShared) continue;
+                if (privateSets.Contains((int)b.Set)) continue;
+
+                // (0,0) is the arena slot the registry injects; it is deliberately absent from
+                // SceneBindings.slang, so resolve it here rather than failing the name lookup.
+                if (b.Set == ShaderSets.Scene && b.Binding == 0)
+                {
+                    if (b.Type is not (DescriptorType.UniformBuffer or DescriptorType.UniformBufferDynamic))
+                        Fail($"{label}: '{b.Name}' at the reserved (0,0) arena slot is {b.Type}, expected a uniform buffer");
+                    continue;
+                }
+
+                Dictionary<string, BindingDesc> declared;
+                string owner;
+                if (b.Set == ShaderSets.Scene) { declared = _sceneBindings; owner = "SceneBindings"; }
+                else
+                {
+                    var group = _features.FirstOrDefault(f => f.SetIndex == b.Set);
+                    if (group is null)
+                    {
+                        Fail($"{label}: '{b.Name}' is in set {b.Set}, which no registry owner claims " +
+                             $"(scene={ShaderSets.Scene}, pass={ShaderSets.Pass}, graph-shared={ShaderSets.GraphShared}, " +
+                             $"features: {string.Join(", ", _features.Select(f => $"{f.Name}@{f.SetIndex}"))})");
+                        continue;
+                    }
+                    declared = group.Bindings; owner = group.Name;
+                }
+
+                if (!declared.TryGetValue(b.Name, out var d))
+                {
+                    Fail($"{label}: '{b.Name}' ({b.Set},{b.Binding}) is not declared in {owner}{Nearest(b.Name, declared.Keys)}");
+                    continue;
+                }
+                if (d.Binding != b.Binding)
+                    Fail($"{label}: '{b.Name}' is at binding {b.Binding}, but {owner} declares it at {d.Binding}");
+                else if (d.Type != b.Type)
+                    Fail($"{label}: '{b.Name}' is {b.Type}, but {owner} declares it {d.Type}");
+                else if (d.Count != b.Count)
+                    Fail($"{label}: '{b.Name}' has count {b.Count}, but {owner} declares count {d.Count}");
+
+                if (!consumers.TryGetValue(b.Name, out var list)) consumers[b.Name] = list = [];
+                list.Add(label);
+            }
+        }
+
+        // Provider side: every owned binding, whether it has a resource, and who reads it.
+        void Report(string owner, uint set, IEnumerable<BindingDesc> bindings, Dictionary<string, object> registered)
+        {
+            lines.Add($"  {owner} (set {set}):");
+            foreach (var b in bindings.OrderBy(x => x.Binding))
+            {
+                var who = consumers.GetValueOrDefault(b.Name);
+                string read = who is null ? "unread" : $"read by {who.Count}: {string.Join(", ", who.Distinct())}";
+
+                // The bindless array is filled slot-wise, never through the name registry.
+                bool provided = registered.ContainsKey(b.Name) || (set == ShaderSets.Scene && b.Name == _texturesName);
+                string entry = $"{b.Name,-22} ({set},{b.Binding,2}) {b.Type,-26} count={b.Count,-4}";
+
+                if (provided) lines.Add($"    OK   {entry} <- {read}");
+                else if (who is not null) Fail($"{entry} <- UNREGISTERED, {read}");
+                else lines.Add($"    warn {entry} <- UNREGISTERED (unread, no consumer yet)");
+            }
+        }
+
+        Report("SceneBindings", ShaderSets.Scene, _sceneBindings.Values, _registered);
+        foreach (var g in _features) Report(g.Name, g.SetIndex, g.Bindings.Values, g.Registered);
+
+        string report = $"[registry] validate: {failures.Count} failure(s) across " +
+                        $"{consumers.Count} consumed parameter(s)" + Environment.NewLine +
+                        string.Join(Environment.NewLine, lines);
+
+        if (failures.Count > 0)
+            throw new Exception($"DescriptorRegistry.Validate found {failures.Count} problem(s):" +
+                                Environment.NewLine + report);
+        return report;
+    }
+
+    // Cheap typo hint for a failed name lookup: any candidate within edit distance 3.
+    private static string Nearest(string name, IEnumerable<string> candidates)
+    {
+        var best = candidates
+            .Select(c => (c, d: Distance(name, c)))
+            .Where(t => t.d <= 3)
+            .OrderBy(t => t.d)
+            .Select(t => t.c)
+            .FirstOrDefault();
+        return best is null ? "" : $" (did you mean '{best}'?)";
+    }
+
+    private static int Distance(string a, string b)
+    {
+        var prev = new int[b.Length + 1];
+        var cur = new int[b.Length + 1];
+        for (int j = 0; j <= b.Length; j++) prev[j] = j;
+        for (int i = 1; i <= a.Length; i++)
+        {
+            cur[0] = i;
+            for (int j = 1; j <= b.Length; j++)
+                cur[j] = Math.Min(Math.Min(prev[j] + 1, cur[j - 1] + 1),
+                                  prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1));
+            (prev, cur) = (cur, prev);
+        }
+        return prev[b.Length];
     }
 
     /// Startup diagnostics: which scene parameters have a provider, which are still holes.

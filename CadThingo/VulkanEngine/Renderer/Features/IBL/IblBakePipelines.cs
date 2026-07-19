@@ -4,14 +4,14 @@ using Silk.NET.Vulkan;
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 
 // One generic compute pipeline used by every IBL bake step. The four bake
-// shaders share an almost-identical descriptor layout — set 0 binding 0 is an
+// shaders share an almost-identical descriptor layout - set 0 binding 0 is an
 // optional input sampler (cube or 2D), binding 1 is the output storage image
 // (cube layer + mip, or 2D LUT). Push constants carry the bake-specific args
 // (face size, roughness, etc.) in a tiny <16B block.
 //
 // Per-dispatch descriptor sets are allocated on demand from the global
 // descriptor pool (FreeDescriptorSetBit is on) and freed when the bake is
-// finished — these resources are entirely transient and don't survive past
+// finished - these resources are entirely transient and don't survive past
 // the single-time command submission that drove the bake.
 
 public sealed unsafe class IblBakePipeline : ComputePipeline

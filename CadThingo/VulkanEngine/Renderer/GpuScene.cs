@@ -369,8 +369,8 @@ public sealed unsafe class GpuScene : IDisposable
     /// </summary>
     public uint ExtractRenderables(uint frameIndex, Scene scene)
     {
-        // Dirty-driven (L2 step 7): skip the walk if this slot is already current.
-        // The cull pass still re-sorts transparents by camera every frame — only the
+        // Dirty-driven: skip the walk if this slot is already current.
+        // The cull pass still re-sorts transparents by camera every frame - only the
         // (view-independent) packing is gated here, and the buffer keeps last extract's
         // rows for this slot, which stay valid until the next MarkSceneDirty.
         if (!TakeSlot(ref _renderableDirty, frameIndex)) return ExtractedRenderableCount;

@@ -84,7 +84,7 @@ public static class ShaderAudit
     {
         using var library = ShaderLibrary.CreateDefault();
         var log = new StringBuilder();
-        int failed = 0, cached = 0;
+        int failed = 0, cached = 0, colMajorKernels = 0;
         var declarations = new Dictionary<string, List<(string Module, BindingDesc B)>>();
 
         foreach (var request in Manifest)
@@ -94,9 +94,21 @@ public static class ShaderAudit
             {
                 var program = library.GetProgram(request);
                 if (program.FromCache) cached++;
-                log.AppendLine($"  OK   {label,-42} entries={request.EntryPoints.Length} " +
+
+                // Matrix-layout guard: sum RowMajor/ColMajor member decorations across every emitted
+                // stage. ColMajor > 0 means the compiler regressed to transposed matrices (see
+                // slang-matrix-layout-inversion); flag it loudly, it is silent to the validation layer.
+                int row = 0, col = 0;
+                for (int e = 0; e < request.EntryPoints.Length; e++)
+                {
+                    var (r, c) = SpirvUtil.MatrixMajorness(program.Spirv(e).Span);
+                    row += r; col += c;
+                }
+                if (col > 0) colMajorKernels++;
+
+                log.AppendLine($"  {(col > 0 ? "COLMAJ" : "OK  ")} {label,-42} entries={request.EntryPoints.Length} " +
                                $"bindings={program.Reflection.Bindings.Length} push={program.Reflection.PushConstants.Length} " +
-                               $"spec={program.Reflection.SpecConstants.Length}{(program.FromCache ? " (cache)" : "")}");
+                               $"spec={program.Reflection.SpecConstants.Length} mtx=R{row}/C{col}{(program.FromCache ? " (cache)" : "")}");
                 foreach (var b in program.Reflection.Bindings)
                 {
                     if (!declarations.TryGetValue(b.Name, out var list))
@@ -129,7 +141,8 @@ public static class ShaderAudit
         if (drifting == 0) log.AppendLine("    none");
 
         Console.WriteLine($"[slang] shader audit: {Manifest.Length - failed}/{Manifest.Length} compiled " +
-                          $"({cached} from cache), {failed} failed, {drifting} drifting parameter names");
+                          $"({cached} from cache), {failed} failed, {drifting} drifting parameter names, " +
+                          $"{colMajorKernels} col-major (matrix-layout regression if >0)");
         Console.Write(log.ToString());
     }
 }
