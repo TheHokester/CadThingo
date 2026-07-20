@@ -273,8 +273,8 @@ public static class RendererSettingsPanel
         }
 
         // Slot usage summary. Capture pipeline status is surfaced here so the
-        // user knows whether ProbeCapture.spv was found at startup — without
-        // it, registered probes register but never capture.
+        // user knows whether ProbeCapture compiled at startup — without it,
+        // probes register but never capture.
         int used = probeSys.Probes.Count;
         int total = (int)ReflectionProbeSystem.MaxProbes;
         ImGuiNET.ImGui.Text($"Slots: {used} / {total}");
@@ -282,7 +282,7 @@ public static class RendererSettingsPanel
         {
             ImGuiNET.ImGui.SameLine();
             ImGuiNET.ImGui.TextColored(new Vector4(1f, 0.5f, 0.3f, 1f),
-                "  Capture shader missing (run shaderCompile.bat)");
+                "  Capture shader failed to compile (see console)");
         }
 
         if (ImGuiNET.ImGui.Button("Spawn probe at camera"))

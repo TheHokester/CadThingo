@@ -69,17 +69,17 @@ public abstract unsafe class PipelineBase : IDisposable
     public DescriptorSet GetDescriptorSet(int layoutNum, uint frame) => DescriptorSets[layoutNum][frame];
     public abstract PipelineBindPoint BindPoint { get; }
 
-    // ---- reflected-program route ---------------------------------------------------------
-    // Non-null routes this pipeline through ShaderLibrary: SPIR-V, push-constant ranges, spec
-    // constants and set layouts are all derived from the .slang source rather than a build-time
-    // .spv plus hand-transcribed declarations. Null keeps the legacy ShaderPath route.
+    // ---- program ---------------------------------------------------------------------------
+    // The .slang module this pipeline is built from. ShaderLibrary compiles it at startup (disk
+    // cached) and reflection supplies SPIR-V, push-constant ranges and spec-constant ids; a
+    // pipeline may still hand-write its descriptor set layouts alongside. Every concrete
+    // pipeline overrides this -- CreatePipeline throws without it.
     protected virtual ShaderCompileRequest? Program => null;
 
-    /// The resolved program on the reflected route, else null. Valid from the start of Initialize.
+    /// The resolved program. Valid from the start of Initialize.
     protected ShaderProgram? Reflected { get; private set; }
 
     /// The resolved program, for whole-renderer cross-checks (DescriptorRegistry.Validate).
-    /// Null on the legacy build-time-.spv route, which reflects nothing to check.
     public ShaderProgram? ReflectedProgram => Reflected;
 
     /// The set indices this pipeline builds its own layout for, and so owns privately. Set 0 is the

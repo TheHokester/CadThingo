@@ -1,4 +1,7 @@
-﻿using System.Net.Sockets;
+﻿global using Buffer = Silk.NET.Vulkan.Buffer;
+global using Semaphore = Silk.NET.Vulkan.Semaphore;
+global using VkImage = Silk.NET.Vulkan.Image;
+using System.Net.Sockets;
 using System.Numerics;
 using Silk.NET.Input;
 using Silk.NET.Maths;

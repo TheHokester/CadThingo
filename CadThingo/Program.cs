@@ -13,7 +13,6 @@ using Silk.NET.Windowing;
 public class Program
 {
     private static IWindow? window;
-    private const bool IsTutorial = false;
     private static void Main(string[] args)
     {
         // Headless developer tools: compile + reflect every kernel, or exercise the Slang
@@ -21,16 +20,7 @@ public class Program
         if (args.Contains("--shader-audit")) { VulkanEngine.Renderer.Shaders.ShaderAudit.Run(); return; }
         if (args.Contains("--slang-smoke")) { VulkanEngine.Renderer.Shaders.SlangSmokeTest.Run(); return; }
 
-        if (IsTutorial)
-        {
-            var app = new App();
-            app.Run();
-        }
-        else
-        {
-            var app = new Engine();
-            app.Run();
-            
-        }
+        var app = new Engine();
+        app.Run();
     }
 }

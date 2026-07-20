@@ -9,8 +9,6 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
 
     protected GraphicsPipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
-    // Build-time .spv for the legacy route; null on the reflected route (see PipelineBase.Program).
-    protected virtual  string?  ShaderPath              => null;
     protected abstract Format[] ColorAttachmentFormats  { get; }
 
     // Optional hooks (defaults match the common case)
@@ -21,12 +19,6 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
     // before. Set to a bitmask with N bits to fan each draw across N layers,
     // which probe capture uses for the 6 cube faces (0x3F).
     protected virtual uint RenderingViewMask => 0u;
-
-    protected virtual (ShaderStageFlags Stage, string EntryPoint)[] ShaderStages => new[]
-    {
-        (ShaderStageFlags.VertexBit,   "VSMain"),
-        (ShaderStageFlags.FragmentBit, "PSMain"),
-    };
 
     protected virtual VertexInputBindingDescription[]   GetVertexInputBindings()   => Array.Empty<VertexInputBindingDescription>();
     protected virtual VertexInputAttributeDescription[] GetVertexInputAttributes() => Array.Empty<VertexInputAttributeDescription>();
@@ -100,22 +92,13 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
     // the whole assembly — that's the main thing keeping the sprawl out.
     protected sealed override void CreatePipeline()
     {
-        // Reflected route: one module per entry point, stages named by reflection. Legacy route:
-        // one build-time .spv holding every entry point, stages named by the ShaderStages hook.
-        var stageDefs = Reflected != null
-            ? Reflected.Reflection.EntryPoints.Select(e => (e.Stage, EntryPoint: e.Name)).ToArray()
-            : ShaderStages;
+        // One module per entry point, stage and symbol name both taken from reflection.
+        var reflected = Reflected ?? throw new InvalidOperationException(
+            $"{GetType().Name}: needs a Program.");
+        var stageDefs = reflected.Reflection.EntryPoints.Select(e => (e.Stage, EntryPoint: e.Name)).ToArray();
 
         var modules = new ShaderModule[stageDefs.Length];
-        if (Reflected != null)
-            for (int i = 0; i < modules.Length; i++) modules[i] = CreateReflectedModule(i);
-        else
-        {
-            var shared = Gfx.CreateShaderModule(File.ReadAllBytes(
-                ShaderPath ?? throw new InvalidOperationException(
-                    $"{GetType().Name}: needs either a Program or a ShaderPath.")));
-            Array.Fill(modules, shared);
-        }
+        for (int i = 0; i < modules.Length; i++) modules[i] = CreateReflectedModule(i);
 
         var stages    = stackalloc PipelineShaderStageCreateInfo[stageDefs.Length];
         var entryPtrs = stackalloc nint[stageDefs.Length];
@@ -231,8 +214,7 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
         }
 
         for (int i = 0; i < stageDefs.Length; i++) SilkMarshal.Free(entryPtrs[i]);
-        // Distinct() because the legacy route shares one module across every stage.
-        foreach (var m in modules.Distinct()) Vk.DestroyShaderModule(Device, m, null);
+        foreach (var m in modules) Vk.DestroyShaderModule(Device, m, null);
     }
 
     protected void BeginRendering(

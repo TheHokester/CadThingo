@@ -485,7 +485,7 @@ void rayGenMain() {
         // closesthit/miss), ReorderThread regroups warps by material, then Invoke
         // runs the now-coherent closesthit/miss. fillHit stays in closesthit so its
         // transient register peak is off the raygen megakernel. Needs the explicit
-        // spvShaderInvocationReorderNV cap (Shaders.targets) for consistent NV ops.
+        // spvShaderInvocationReorderNV capability requested by the compile request.
         HitObject ho = HitObject.TraceRay(sceneTlas, RAY_FLAG_NONE, 0xFF, 0u, 0u, 0u, ray, pay);
         uint matHint = ho.IsHit()
             ? sceneEntityInfo[ho.GetInstanceID() + ho.GetGeometryIndex()].materialIndex

@@ -9,32 +9,12 @@ public abstract unsafe class ComputePipeline : PipelineBase
 
     protected ComputePipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
-    // Build-time .spv for the legacy route; null on the reflected route (see PipelineBase.Program).
-    protected virtual string? ShaderPath => null;
-
-    // Legacy-route entry-point symbol: slangc emits the SPIR-V OpEntryPoint as "main" regardless
-    // of the source function name when compiling a single-entry kernel. The reflected route takes
-    // the name from reflection instead and ignores this.
-    protected virtual string EntryPoint => "main";
-
     protected sealed override void CreatePipeline()
     {
-        ShaderModule module;
-        string entryName;
-        if (Reflected != null)
-        {
-            var ep = Reflected.Reflection.EntryPoints[0];
-            module = CreateReflectedModule(0);
-            entryName = ep.Name;
-        }
-        else
-        {
-            module = Gfx.CreateShaderModule(File.ReadAllBytes(
-                ShaderPath ?? throw new InvalidOperationException(
-                    $"{GetType().Name}: needs either a Program or a ShaderPath.")));
-            entryName = EntryPoint;
-        }
-        var entry = SilkMarshal.StringToPtr(entryName);
+        var reflected = Reflected ?? throw new InvalidOperationException(
+            $"{GetType().Name}: needs a Program.");
+        ShaderModule module = CreateReflectedModule(0);
+        var entry = SilkMarshal.StringToPtr(reflected.Reflection.EntryPoints[0].Name);
 
         var stage = new PipelineShaderStageCreateInfo
         {

@@ -9,9 +9,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 //
 //  Geometry pass — writes the G-buffer
 //
-// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
-// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
-public sealed unsafe class GeometryPipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class GeometryPipeline : GraphicsPipeline
 {
     struct GeometryUBO
     {

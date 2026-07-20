@@ -13,9 +13,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 
 //  PBR deferred lighting pass — fullscreen triangle, samples G-buffer +
 //  per-tile light list, optional ray-queried shadows.
-// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
-// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
-public sealed unsafe class PbrDeferredPipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 {
     // Matches PBR.slang's LightingFrameUBO - pushed into the scene set's (0,0)
     // constant arena slot each frame.

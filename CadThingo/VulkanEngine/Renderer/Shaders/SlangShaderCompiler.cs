@@ -160,7 +160,7 @@ public sealed unsafe class SlangShaderCompiler(string libDir, string featuresDir
             }
 
             // Target-scoped options (everything at/after CompilerOptionName.Capability in slang.h).
-            // -O2 to match the Shaders.targets flags the runtime path replaces.
+            // -O2: release-grade codegen, and cheap here because results are disk-cached.
             var options = new CompilerOptionEntry[capabilities.Length + 2];
             for (int i = 0; i < capabilities.Length; i++)
             {

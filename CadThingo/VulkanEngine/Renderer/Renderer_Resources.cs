@@ -630,7 +630,8 @@ public unsafe class Texture : IDisposable
     /// sRGB-ness for the final sample (no double decode). Two single-time submits: the queue-idle
     /// between them makes the mip chain visible to the encoder without a cross-stage barrier.
     /// </summary>
-    public static Texture CreateCompressedTexture(GraphicsDevice gfx, byte* pixels,
+    public static Texture CreateCompressedTexture(GraphicsDevice gfx,
+        Features.TextureCompression.BcEncoder encoder, byte* pixels,
         uint width, uint height, Format bcFormat)
     {
         var vk     = gfx.Vk!;
@@ -701,7 +702,7 @@ public unsafe class Texture : IDisposable
 
         // ---- 3. Encode each mip, then copy the blocks into the BC image ----------------------
         var cmd2 = gfx.BeginSingleTimeCommands();
-        gfx.BcEncoder.RecordEncode(cmd2, srcView, blockBuf, mode, width, height, mipLevels);
+        encoder.RecordEncode(cmd2, srcView, blockBuf, mode, width, height, mipLevels);
 
         BufferMemoryBarrier toCopy = new()
         {

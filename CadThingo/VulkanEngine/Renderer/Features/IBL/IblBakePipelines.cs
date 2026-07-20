@@ -1,4 +1,5 @@
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -16,35 +17,29 @@ namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 
 public sealed unsafe class IblBakePipeline : ComputePipeline
 {
-    readonly string _shaderPath;
+    readonly string _module;
     readonly bool   _hasInputSampler;
     readonly uint   _pushSize;
 
-    public IblBakePipeline(GpuContext gpu, Renderer renderer, string shaderPath, bool hasInputSampler, uint pushSize)
+    public IblBakePipeline(GpuContext gpu, Renderer renderer, string module, bool hasInputSampler, uint pushSize)
         : base(gpu, renderer)
     {
-        _shaderPath      = shaderPath;
+        _module          = module;
         _hasInputSampler = hasInputSampler;
         _pushSize        = pushSize;
-
-        if (_pushSize > 0)
-        {
-            PushConstantRanges = new[]
-            {
-                new PushConstantRange
-                {
-                    StageFlags = ShaderStageFlags.ComputeBit,
-                    Offset     = 0,
-                    Size       = _pushSize,
-                }
-            };
-        }
     }
 
-    protected override string ShaderPath => _shaderPath;
+    protected override ShaderCompileRequest? Program => new(_module, ["main"], [], []);
 
     protected override void CreateDescriptorSetLayouts()
     {
+        // Assigned here, not in the ctor: Initialize derives PushConstantRanges from reflection
+        // before this runs, so a ctor assignment would be overwritten. The caller's size is the
+        // authority because it is the size the bake dispatch actually pushes.
+        PushConstantRanges = _pushSize > 0
+            ? [new PushConstantRange { StageFlags = ShaderStageFlags.ComputeBit, Offset = 0, Size = _pushSize }]
+            : [];
+
         DescriptorSetLayouts            = new DescriptorSetLayout[1];
         OwnedDescriptorSetLayoutIndices = new[] { 0 };
 
@@ -80,7 +75,7 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
                 PBindings    = p,
             };
             if (Vk.CreateDescriptorSetLayout(Device, &info, null, out DescriptorSetLayouts[0]) != Result.Success)
-                throw new System.Exception($"Failed to create IBL bake set 0 layout for {_shaderPath}");
+                throw new System.Exception($"Failed to create IBL bake set 0 layout for {_module}");
         }
     }
 

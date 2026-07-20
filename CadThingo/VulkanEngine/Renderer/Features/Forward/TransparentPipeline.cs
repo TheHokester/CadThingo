@@ -16,9 +16,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
 //  src-alpha / one-minus-src-alpha blending, depth-tested LE against the
 //  geometry pass's depth buffer (no depth write).
 //
-// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
-// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
-public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class TransparentPipeline : GraphicsPipeline
 {
     // Matches Transparent.slang::FrameUBO — pushed into the scene set's (0,0)
     // constant arena slot each frame. View+proj feed the VS; camPos + tile

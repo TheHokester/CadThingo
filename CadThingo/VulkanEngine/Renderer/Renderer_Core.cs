@@ -647,8 +647,7 @@ public unsafe partial class Renderer
 
     // Every reflected program the renderer's pipelines resolved, for the registry cross-check.
     // Found by walking the renderer's own PipelineBase-typed fields rather than a hand-kept list:
-    // a new pipeline joins the check by existing, not by someone remembering to add it. Pipelines
-    // still on the legacy build-time-.spv route reflect nothing and drop out.
+    // a new pipeline joins the check by existing, not by someone remembering to add it.
     private IEnumerable<ProgramUse> ReflectedPrograms()
         => GetType()
             .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)

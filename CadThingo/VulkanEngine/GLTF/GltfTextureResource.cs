@@ -65,7 +65,7 @@ public static unsafe class GltfTextureResource
                     $"glTF image '{id}' has unrecognised MIME type '{mimeType}'. Only image/png, image/jpeg, and image/webp are supported.");
         }
 
-        using var img = ImageSharp.Image.Load<Rgba32>(encodedBytes.Span);
+        using var img = SixLabors.ImageSharp.Image.Load<Rgba32>(encodedBytes.Span);
         var pixels = new Rgba32[img.Width * img.Height];
         img.CopyPixelDataTo(pixels);
 
@@ -84,7 +84,7 @@ public static unsafe class GltfTextureResource
         fixed (Rgba32* p = pixels)
         {
             tex = wantBc && canBc
-                ? Texture.CreateCompressedTexture(gfx, (byte*)p, (uint)img.Width, (uint)img.Height, format)
+                ? Texture.CreateCompressedTexture(gfx, rm.BcEncoder, (byte*)p, (uint)img.Width, (uint)img.Height, format)
                 : Texture.CreateTextureFromMemory(gfx, (byte*)p, (uint)img.Width, (uint)img.Height, uploadFmt,
                     new Extent3D((uint)img.Width, (uint)img.Height, 1));
         }

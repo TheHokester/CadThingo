@@ -86,10 +86,10 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     internal SubAlloc  captureDepthAlloc;
     internal ImageView captureDepthAttachmentView;
 
-    // Capture pipeline. Null when the compiled .spv isn't present at startup —
+    // Capture pipeline. Null when ProbeCapture failed to compile at startup —
     // in that state the system runs scheduler bookkeeping but skips the actual
     // draw recording. Lets the engine boot during shader iteration without a
-    // hard dependency on a freshly-compiled probe shader.
+    // hard dependency on a working probe shader.
     internal ProbeCapturePipeline? capturePipeline;
 
     // CPU-built per-cluster probe lists + the SSBOs the PBR shader will bind
@@ -186,15 +186,20 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
     private void TryCreateCapturePipeline()
     {
-        string spv = ShaderPaths.Kernel("IBL", "ProbeCapture");
-        if (!System.IO.File.Exists(spv))
+        // ProbeCapture.slang is compiled here, at pipeline-create time. A syntax error in it
+        // used to be a missing .spv; now it is an exception out of ShaderLibrary. Either way the
+        // engine still boots -- probes keep their scheduler bookkeeping and skip the draw -- so
+        // shader iteration on the capture kernel does not take the whole editor down with it.
+        try
         {
-            Console.WriteLine("[Probe] ProbeCapture.spv not found — capture pipeline skipped. " +
-                              "Build the project (shaders compile automatically) to enable probe captures.");
-            return;
+            capturePipeline = new ProbeCapturePipeline(_gpu, _renderer);
+            capturePipeline.Initialize();
         }
-        capturePipeline = new ProbeCapturePipeline(_gpu , _renderer);
-        capturePipeline.Initialize();
+        catch (Exception e)
+        {
+            capturePipeline = null;
+            Console.Error.WriteLine($"[Probe] capture pipeline skipped: {e.Message}");
+        }
     }
 
     // Registry

@@ -2,18 +2,20 @@ using System.Text;
 
 namespace CadThingo.VulkanEngine.Renderer.Shaders;
 
-// Phase A assert-mode audit (docs/descriptor-system.md section 12): compiles every engine
-// kernel through ShaderLibrary and reports, without changing what the renderer runs.
-// Two outputs:
-//   1. per-kernel compile + reflection status - a failure means the runtime compiler cannot
-//      yet replace Shaders.targets for that kernel (search path, capability, or interop gap);
-//   2. a cross-kernel drift table - parameter names declared at DIFFERENT (set, binding) or
-//      with different types across kernels, i.e. the inconsistency catalog that SceneBindings
-//      (Phase B) has to unify.
-// Log-only by design: nothing throws, the renderer keeps running on build-time .spv.
+// Headless shader check (`dotnet run --project CadThingo -- --shader-audit`). Compiles every
+// engine kernel through ShaderLibrary and reports, without bringing up a device.
+// Three outputs:
+//   1. per-kernel compile + reflection status - this is the fast syntax check. Shaders are no
+//      longer compiled by the build, so a broken kernel would otherwise only surface when the
+//      pipeline that owns it is created at runtime;
+//   2. the matrix-layout guard (see the col-major count below) - silent to the validation layer
+//      and no longer catchable by diffing against a build-time .spv;
+//   3. a cross-kernel drift table - parameter names declared at DIFFERENT (set, binding) or
+//      with different types across kernels, i.e. the inconsistency catalog SceneBindings unifies.
+// Log-only by design: nothing throws.
 //
-// The manifest mirrors Shaders.targets (entries, capabilities, SER variants) and, like it,
-// must be updated when kernels are added - until Phase B/C retire both.
+// The manifest is hand-kept: a new kernel needs an entry here (with its entry points,
+// capabilities and any -D variants) or the audit will not cover it.
 public static class ShaderAudit
 {
     private static readonly string[] None = [];
@@ -28,9 +30,8 @@ public static class ShaderAudit
 
     private static readonly ShaderCompileRequest[] Manifest =
     [
-        // legacy flat shaders (VulkanEngine/Shaders)
+        // flat shaders (VulkanEngine/Shaders)
         new("ImGui", Graphics, None, None),
-        new("TexturedMesh", ["VSMain", "FSMain"], None, None),
 
         // Deferred
         new("Deferred/CullDraws", ComputeMain, None, None),

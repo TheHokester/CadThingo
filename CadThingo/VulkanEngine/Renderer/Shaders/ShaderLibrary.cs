@@ -21,8 +21,8 @@ public sealed class ShaderLibrary : IDisposable
         _cache = new ShaderCache(cacheDir);
     }
 
-    // Same two-step resolution as ShaderPaths: content next to the executable first,
-    // source tree fallback so running from bin without a copy step works.
+    // Two-step resolution: content next to the executable first, source tree fallback so
+    // running from bin without a copy step works.
     public static ShaderLibrary CreateDefault()
     {
         string engine = Path.Combine(AppContext.BaseDirectory, "VulkanEngine");

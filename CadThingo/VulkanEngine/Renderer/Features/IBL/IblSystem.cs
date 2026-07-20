@@ -353,13 +353,13 @@ public unsafe sealed class IblSystem : IDisposable
     void CreateIblBakePipelines()
     {
         equirectToCubePipeline = new IblBakePipeline(_gpu, _renderer,
-            ShaderPaths.Kernel("IBL", "EquirectToCube"),     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
+            "IBL/EquirectToCube",     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
         irradianceConvolvePipeline = new IblBakePipeline(_gpu, _renderer,
-            ShaderPaths.Kernel("IBL", "IrradianceConvolve"), hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
+            "IBL/IrradianceConvolve", hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
         prefilterEnvPipeline = new IblBakePipeline(_gpu, _renderer,
-            ShaderPaths.Kernel("IBL", "PrefilterEnv"),       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
+            "IBL/PrefilterEnv",       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
         brdfLutGenPipeline = new IblBakePipeline(_gpu, _renderer,
-            ShaderPaths.Kernel("IBL", "BrdfLutGen"),         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
+            "IBL/BrdfLutGen",         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
 
         equirectToCubePipeline    .Initialize();
         irradianceConvolvePipeline.Initialize();

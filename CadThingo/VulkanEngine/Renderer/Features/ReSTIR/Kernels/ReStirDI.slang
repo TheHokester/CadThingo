@@ -9,8 +9,8 @@
 // stays 1. The reservoir/G-buffer/temporal/spatial reuse stages land in later
 // phases, replacing the primary-vertex NEE here.
 //
-// Pinhole camera only for now (other modes are a follow-up). Builds to
-// Assets/Shaders/ReSTIR/ReStirDI.spv (+ _SER variant); see Shaders.targets.
+// Pinhole camera only for now (other modes are a follow-up). Compiled at runtime by
+// ShaderLibrary, twice: once plain and once with -DUSE_SER=1 for the reorder variant.
 
 import PTUtils;       // BSDF/sampling/RNG/camera + re-exported PbrUtils/CommonTypes
 import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
@@ -507,7 +507,7 @@ void rayGenMain() {
         // closesthit/miss), ReorderThread regroups warps by material, then Invoke
         // runs the now-coherent closesthit/miss. fillHit stays in closesthit so its
         // transient register peak is off the raygen megakernel. Needs the explicit
-        // spvShaderInvocationReorderNV cap (Shaders.targets) for consistent NV ops.
+        // spvShaderInvocationReorderNV capability requested by the compile request.
         HitObject ho = HitObject.TraceRay(sceneTlas, RAY_FLAG_NONE, 0xFF, 0u, 0u, 0u, ray, pay);
         uint matHint = ho.IsHit()
             ? sceneEntityInfo[ho.GetInstanceID() + ho.GetGeometryIndex()].materialIndex

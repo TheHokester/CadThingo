@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
@@ -15,10 +16,7 @@ public enum TonemapOperator : uint
 
 // 
 //  Tone-map / post pass — samples HDRColor, writes FinalColor (LDR)
-// Base type is namespace-qualified: the dead VulkanTut `CadThingo.GraphicsPipeline`
-// namespace would otherwise shadow the `GraphicsPipeline` base from an enclosing-namespace
-// lookup here under Features.
-public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class TonemapPipeline : GraphicsPipeline
 {
     // Mirrors TonemapParams in Tonemap.slang. Kept off the per-frame UBO because exposure/gamma
     // change rarely and don't deserve a descriptor binding of their own. The reflected push range

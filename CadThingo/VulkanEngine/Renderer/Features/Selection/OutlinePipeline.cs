@@ -11,9 +11,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
 // selection mask and draws an outer ring around the selected entity's
 // silhouette, discarding every non-edge pixel so the rest of the image is
 // untouched. Mode-agnostic because it only depends on FinalColor + the mask.
-// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
-// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
-public sealed unsafe class OutlinePipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class OutlinePipeline : GraphicsPipeline
 {
     // Matches Outline.slang::OutlineParams. 32B, under the 128B minimum.
     [StructLayout(LayoutKind.Sequential)]

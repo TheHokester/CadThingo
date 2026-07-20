@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
@@ -11,7 +12,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 //  EQUAL against 1.0 so it lights up only the cleared (sky) pixels of the
 //  depth buffer the geometry pass left behind.
 
-public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class SkyboxPipeline : GraphicsPipeline
 {
     // Mirrors Skybox.slang::SkyboxUBO. Std140 — invViewProj is 64B, then 16B
     // camPos, then intensity + 3×4B trailing pad to round to 96B total.

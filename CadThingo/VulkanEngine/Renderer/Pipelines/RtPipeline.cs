@@ -13,9 +13,6 @@ public abstract unsafe class RtPipeline : PipelineBase
 {
     public override PipelineBindPoint BindPoint => PipelineBindPoint.RayTracingKhr;
 
-    // Build-time .spv for the legacy route; null on the reflected route (see PipelineBase.Program).
-    protected virtual string? ShaderPath => null;
-
     // VK_KHR_ray_tracing_pipeline dispatch table + SBT-layout properties, loaded
     // once per instance from the device. Null / zero if the extension failed to
     // load (defensive — the Renderer gate should prevent that).
