@@ -63,10 +63,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     // Set 0 borrowed from DescriptorRegistry (scene resources + the (0,0) constant-arena slot
     // carrying PathFrameUBO); sets 1 (IO) / 2 (SoA working, the graph-shared slot) are
     // pipeline-owned; envCube rides the registry-owned FeatureEnv set (set 4).
-    private const int SetScene     = 0;
-    private const int SetIO        = 1;
     private const int SetWavefront = 2;
-    private const string FeatureEnv = "FeatureEnv";
+    private const string FeatureEnv  = "FeatureEnv";
+    private const string FeaturePtIo = "FeaturePTIO";
 
     // ---- Material-sorted shading (P3): C routing classes (must match WavefrontBindings.WF_SHADE_CLASSES) -
     public const uint ShadeClasses = 4u;
@@ -238,17 +237,16 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     public WavefrontPTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
 
-    // ---- Descriptor-set layouts. Set 0 (scene) + FeatureEnv (set 4) borrowed from the registry;
-    // sets 1 (IO) / 2 (working) owned, both built from WavefrontBindings' declarations. Array is
-    // [scene, IO, working, empty, FeatureEnv] -- set 3 (FeatureIBL's slot) is a gap we never bind.
+    // ---- Descriptor-set layouts. Scene (set 0) + FeatureEnv (4) + FeaturePTIO (5) come from the
+    // registry; only the SoA working set (2) is built here, from WavefrontBindings' declarations.
+    // Array is [scene, empty, working, empty, FeatureEnv, FeaturePTIO] -- sets 1 and 3 are gaps.
     protected override void CreateDescriptorSetLayouts()
     {
         // BuildPipelineSetLayouts covers scene + the pass slot + the features; the graph-shared
         // slot has no place in its signature, so the working layout drops into index 2 after.
-        var ioLayout = CreateReflectedSetLayout((uint)SetIO);
-        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(null, FeatureEnv, FeaturePtIo);
         DescriptorSetLayouts[SetWavefront] = CreateReflectedSetLayout((uint)SetWavefront);
-        OwnedDescriptorSetLayoutIndices = new[] { SetIO, SetWavefront };
+        OwnedDescriptorSetLayoutIndices = new[] { SetWavefront };
 
         // The SoA buffers are indexed BY binding number (the B_* constants ARE the bindings they
         // fill), so a binding added to set 2 without a matching field here would silently leave a
@@ -457,49 +455,8 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
 
-    // ---- Descriptor-set allocation -------------------------------------------
-    // Only the IO set (set 1) is pipeline-owned. Set 0 (scene) + FeatureEnv (set 4) are
-    // registry-owned; the SoA working set (set 2) is graph-owned (see GraphSharedSpec).
-    protected override void CreateDescriptorSets()
-    {
-        DescriptorSets = new DescriptorSet[SetIO + 1][];
-        DescriptorSets[SetScene] = null;
-        DescriptorSets[SetIO]    = AllocSets(SetIO, 1);
-    }
-
-    private DescriptorSet[] AllocSets(int layoutIdx, uint count)
-    {
-        var layouts = stackalloc DescriptorSetLayout[(int)count];
-        for (int i = 0; i < count; i++) layouts[i] = DescriptorSetLayouts[layoutIdx];
-        DescriptorSetAllocateInfo alloc = new()
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = Gfx.DescriptorPool, DescriptorSetCount = count, PSetLayouts = layouts,
-        };
-        var sets = new DescriptorSet[count];
-        fixed (DescriptorSet* p = sets)
-            if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
-                throw new Exception($"Failed to allocate wavefront descriptor set {layoutIdx}");
-        return sets;
-    }
-
-
-    // The IO set is wired externally by the renderer (WriteStorageImageDescriptors); the SoA working
-    // set (set 2) is graph-owned; the scene + FeatureEnv sets are registry-maintained. Nothing here.
-    protected override void WriteDescriptors() { }
-
-    /// <summary>Set 1 bindings 0/1: accumulator + outColor storage images (both in General).
-    /// Single shared set (both frames dispatch into the same images).</summary>
-    public void WriteStorageImageDescriptors(ImageView accumView, ImageView outColorView)
-    {
-        DescriptorImageInfo accumInfo = new() { ImageView = accumView,    ImageLayout = ImageLayout.General };
-        DescriptorImageInfo outInfo   = new() { ImageView = outColorView, ImageLayout = ImageLayout.General };
-        var writes = stackalloc WriteDescriptorSet[2];
-        writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 0, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &accumInfo };
-        writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 1, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &outInfo };
-        Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-        MarkAccumulatorDirty();
-    }
+    // No pipeline-owned descriptor sets: scene (0), FeatureEnv (4) and FeaturePTIO (5) are
+    // registry-owned, and the SoA working set (2) is graph-owned (see GraphSharedSpec).
 
 
     // ---- Per-frame UBO upload (mirrors PTComputePipeline.UpdatePerFrame) -------
@@ -555,17 +512,22 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     {
         uint frameConstants = _frameConstants;
         var registry = Registry;
-        var sets = stackalloc DescriptorSet[3]
-        {
-            registry.SceneSet(frameIndex),
-            DescriptorSets[SetIO][0],
-            _sharedSet,                 // SoA working set (set 2), graph-owned
-        };
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 3, sets, 1, &frameConstants);
 
-        // envCube (FeatureEnv) sits at its own reflected index (set 4) with a gap at set 3.
+        // Set 1 is a gap now (the IO pair moved to the registry), so scene and the graph-owned
+        // working set bind separately instead of as one contiguous run.
+        var sceneSet = registry.SceneSet(frameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, ShaderSets.Scene, 1, &sceneSet, 1, &frameConstants);
+
+        var shared = _sharedSet;        // SoA working set (set 2), graph-owned
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, ShaderSets.GraphShared, 1, &shared, 0, null);
+
+        // envCube (FeatureEnv) and the accumulator / out-color pair (FeaturePTIO) each sit at their
+        // own reflected index, with a gap at set 3.
         var envSet = registry.FeatureSet(FeatureEnv, frameIndex);
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+
+        var ioSet = registry.FeatureSet(FeaturePtIo, frameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, registry.FeatureSetIndex(FeaturePtIo), 1, &ioSet, 0, null);
     }
 
     private void PushWavefront(CommandBuffer cmd, uint bounce, uint argsClass)

@@ -2,15 +2,11 @@
 import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
                       // sceneVertices+sceneIndices/sceneEmissiveTris+Alias/
                       // sceneMaterials/sceneTextures/sceneSamplers
-import FeatureEnv;    // feature set 3: envCube (sharp miss-ray background)
+import FeatureEnv;    // feature set 4: envCube (sharp miss-ray background)
+import FeaturePTIO;   // feature set 5: accumulator + outColor (RGBA32F; R16F starves darks)
 
 // Per-pass constants in the reserved (0,0) dynamic slot.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
-
-// Set 1: pass-local IO.
-// RGBA32F intentionally, R16F starves dark regions after ~64 samples.
-[[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
-[[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
 
 
 //Specialization constants

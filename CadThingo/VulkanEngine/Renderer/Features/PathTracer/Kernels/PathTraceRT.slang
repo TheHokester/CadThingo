@@ -17,13 +17,10 @@ import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
                       // sceneVertices+sceneIndices/sceneEmissiveTris+Alias/
                       // sceneMaterials/sceneTextures/sceneSamplers
 import FeatureEnv;    // feature set 4: envCube (miss-ray background)
+import FeaturePTIO;   // feature set 5: accumulator + outColor
 
 // Per-pass constants in the reserved (0,0) dynamic slot.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
-
-// Set 1 — pass-local IO.
-[[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
-[[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
 
 // Compile-time config (the RT pipeline doesn't bake spec constants; hardcoded to
 // the compute path's defaults).

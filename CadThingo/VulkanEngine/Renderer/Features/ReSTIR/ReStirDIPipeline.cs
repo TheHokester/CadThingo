@@ -253,15 +253,20 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
 
+        // Set 1 is an unused gap since the IO pair moved to the registry, so scene and the
+        // graph-owned working set bind separately rather than as one contiguous run.
         uint frameConstants = PushFrameConstants(ctx.FrameIndex);
-        var sets = stackalloc DescriptorSet[3];
-        sets[0] = Registry.SceneSet(ctx.FrameIndex);  // frame UBO + lights / tlas / entityInfo / vb+ib / emissive / bindless
-        sets[1] = DescriptorSets[SetIO][0];           // accumulator / outColor
-        sets[2] = _sharedSet;                         // reservoirs / gbuffers / sceneRadiance (graph-owned)
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 3, sets, 1, &frameConstants);
+        var sceneSet = Registry.SceneSet(ctx.FrameIndex);  // frame UBO + lights / tlas / entityInfo / vb+ib / emissive / bindless
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, ShaderSets.Scene, 1, &sceneSet, 1, &frameConstants);
+
+        var shared = _sharedSet;                           // reservoirs / gbuffers / sceneRadiance (graph-owned)
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, ShaderSets.GraphShared, 1, &shared, 0, null);
 
         var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+
+        var ioSet = Registry.FeatureSet(FeaturePtIo, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeaturePtIo), 1, &ioSet, 0, null);
 
         var p = _push;
         Vk.CmdPushConstants(cmd, Layout, PushConstantRanges[0].StageFlags, 0, (uint)sizeof(ReStirPush), &p);

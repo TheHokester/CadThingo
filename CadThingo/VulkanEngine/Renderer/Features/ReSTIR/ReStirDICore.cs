@@ -68,13 +68,10 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore
         // Hand the graph-owned working set (set 2, baked in Compile) to the pipeline for its binds.
         _pipe.SetGraphSharedSet(fg.GraphSharedSet);
 
-        // CRITICAL (same reasoning as WavefrontPTCore): rebind the pipeline's storage-image
-        // descriptors (set 0 bindings 4/5 = accumulator + out-color) to the SAME host handles the
-        // graph just imported. On a resize RebuildRenderTargets reallocates these images before
-        // Resize -> BuildGraph; without this the tracer would write through stale descriptors while
-        // the graph's barriers + tonemap target the new images. (Also marks the accumulator dirty.)
-        _pipe.WriteStorageImageDescriptors(
-            _host.renderTargets.PtAccumulator.ImageView, _host.renderTargets.PtOutColor.ImageView);
+        // accumulator + out-color are registry-owned (FeaturePTIO); the host re-registers them right
+        // after reallocating the render targets, so they already point at the same handles the graph
+        // just imported. Only the sample count needs dropping - fresh images invalidate accumulation.
+        _pipe.MarkAccumulatorDirty();
     }
 
     /// <summary>Restart progressive integration on activation. Ensures clean start when swapping between

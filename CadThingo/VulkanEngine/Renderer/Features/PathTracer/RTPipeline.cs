@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -53,12 +54,11 @@ public unsafe class RTPipeline : RtPipeline
         public float     totalEmissivePower;
     }
 
-    // protected so the ReSTIR subclass (shared layout) can index DescriptorSets by the same slots.
-    protected const int SetScene = 0;
-    protected const int SetIO    = 1;
     // Set 2 is the graph-shared slot: unused by the base megakernel, installed by the ReSTIR
-    // subclass for its working set. envCube comes from the registry-owned FeatureEnv set (set 4).
-    protected const string FeatureEnv = "FeatureEnv";
+    // subclass for its working set. envCube comes from the registry-owned FeatureEnv set (set 4),
+    // accumulator + outColor from FeaturePTIO (set 5).
+    protected const string FeatureEnv  = "FeatureEnv";
+    protected const string FeaturePtIo = "FeaturePTIO";
 
     // Every RT stage; descriptor bindings declare the union (a binding may name
     // more stages than actually read it — simpler and valid).
@@ -121,16 +121,10 @@ public unsafe class RTPipeline : RtPipeline
 
     protected override ShaderStageFlags ExtraPushStages => OwnedSetExtraStages;
 
-    // Descriptor set layouts. Set 0 (scene) + FeatureEnv (set 4) borrowed from the registry; set 1
-    // (IO, reflected from the tracer's accumulator/outColor declarations) owned. Array is
-    // [scene, IO, empty, empty, FeatureEnv]; a subclass may install its own graph-shared working
-    // layout into the set-2 gap (ReSTIR does).
+    // Descriptor set layouts, all registry-borrowed: scene (set 0), FeatureEnv (4), FeaturePTIO (5).
+    // A subclass may install its own graph-shared working layout into the set-2 gap (ReSTIR does).
     protected override void CreateDescriptorSetLayouts()
-    {
-        var ioLayout = CreateReflectedSetLayout(SetIO);
-        DescriptorSetLayouts            = Registry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
-        OwnedDescriptorSetLayoutIndices = new[] { (int)SetIO };
-    }
+        => DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(null, FeatureEnv, FeaturePtIo);
 
 
     // Pipeline build: one RT pipeline (raygen + miss + closest/any-hit group) + SBT.
@@ -271,43 +265,8 @@ public unsafe class RTPipeline : RtPipeline
     }
 
 
-    protected override void CreateDescriptorSets()
-    {
-        DescriptorSets = new DescriptorSet[DescriptorSetLayouts.Length][];
-
-        // Set 0 - scene set is owned by DescriptorRegistry; Record binds
-        // Renderer.descriptorRegistry.SceneSet(frame) directly.
-        DescriptorSets[SetScene] = null;
-
-        // Set 1 - single shared (both frames dispatch into the same images).
-        var ioLayout = DescriptorSetLayouts[SetIO];
-        DescriptorSetAllocateInfo alloc1 = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts        = &ioLayout,
-        };
-        DescriptorSets[SetIO] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[SetIO])
-            if (Vk.AllocateDescriptorSets(Device, &alloc1, p) != Result.Success)
-                throw new Exception("Failed to allocate RT pipeline set 1");
-    }
-
-    // Nothing to write at Initialize: storage images are wired by the renderer
-    // (WriteStorageImageDescriptors); envCube (FeatureEnv) is registry-maintained,
-    // as is the scene set.
-
-    public void WriteStorageImageDescriptors(ImageView accumView, ImageView outColorView)
-    {
-        DescriptorImageInfo accumInfo = new() { ImageView = accumView,    ImageLayout = ImageLayout.General };
-        DescriptorImageInfo outInfo   = new() { ImageView = outColorView, ImageLayout = ImageLayout.General };
-        var writes = stackalloc WriteDescriptorSet[2];
-        writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 0, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &accumInfo };
-        writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 1, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &outInfo };
-        Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-        MarkAccumulatorDirty();
-    }
+    // No descriptor sets to allocate or write: every set this pipeline binds (scene, FeatureEnv,
+    // FeaturePTIO) is registry-owned, and ReSTIR's set-2 working set is graph-owned.
 
 
     public virtual bool UpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent)
@@ -371,19 +330,24 @@ public unsafe class RTPipeline : RtPipeline
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.RayTracingKhr, PipelineHandle);
 
-        // Scene set with the frame constants' dynamic offset (arena push), then IO + any subclass
-        // graph-shared set (contiguous from set 0), then FeatureEnv at its own reflected index (4).
+        // Four separate binds, because the occupied sets are no longer contiguous: set 1 is now an
+        // unused gap (the IO pair moved to the registry), and the subclass working set sits at 2.
         uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
+        var sceneSet = Registry.SceneSet(ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, ShaderSets.Scene, 1, &sceneSet, 1, &frameConstants);
 
-        uint contiguous = 2u + ExtraSetCount;
-        var sets = stackalloc DescriptorSet[(int)contiguous];
-        sets[0] = Registry.SceneSet(ctx.FrameIndex);
-        sets[1] = DescriptorSets[SetIO][0];
-        if (ExtraSetCount > 0u) WriteExtraSets(sets + 2, ctx.FrameIndex);
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, 0, contiguous, sets, 1, &frameConstants);
+        if (ExtraSetCount > 0u)
+        {
+            var extra = stackalloc DescriptorSet[(int)ExtraSetCount];
+            WriteExtraSets(extra, ctx.FrameIndex);
+            Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, ShaderSets.GraphShared, ExtraSetCount, extra, 0, null);
+        }
 
         var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+
+        var ioSet = Registry.FeatureSet(FeaturePtIo, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, Registry.FeatureSetIndex(FeaturePtIo), 1, &ioSet, 0, null);
 
         RecordPushConstants(cmd);
 

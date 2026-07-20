@@ -45,7 +45,6 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
     protected abstract void PipelineMarkAccumulatorDirty();
     protected abstract bool PipelineUpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent);
     protected abstract void PipelineRecord(CommandBuffer cmd, in Renderer.FrameContext ctx);
-    protected abstract void PipelineWriteStorageImages(ImageView accumView, ImageView outColorView);
 
     /// <summary>(Re)build the Trace -> Tonemap graph. Imports the host accumulator / out-color /
     /// FinalColor (re-read here so a resize picks up the fresh handles), then rebinds the
@@ -68,8 +67,10 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
         fg.Compile();
         _graph = fg;
 
-        PipelineWriteStorageImages(
-            _host.renderTargets.PtAccumulator.ImageView, _host.renderTargets.PtOutColor.ImageView);
+        // The storage-image descriptors themselves are registry-owned (FeaturePTIO) and re-registered
+        // by the host on resize; all that is left here is dropping the sample count, since fresh
+        // images make any in-progress accumulation invalid by construction.
+        PipelineMarkAccumulatorDirty();
     }
 
     /// <summary>Restart progressive integration on activation. Tonemap's HDR input is graph-baked

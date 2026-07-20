@@ -28,6 +28,4 @@ internal sealed class PathtraceComputeCore : PathTraceCoreBase
         _pipeline.UpdatePerFrame(frameIndex, camera, lightCount, renderExtent);
     protected override void PipelineRecord(CommandBuffer cmd, in Renderer.FrameContext ctx) =>
         _pipeline.Record(cmd, ctx);
-    protected override void PipelineWriteStorageImages(ImageView accumView, ImageView outColorView) =>
-        _pipeline.WriteStorageImageDescriptors(accumView, outColorView);
 }

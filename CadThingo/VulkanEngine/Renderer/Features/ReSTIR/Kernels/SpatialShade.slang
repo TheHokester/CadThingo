@@ -20,6 +20,7 @@
 import PTUtils;        // BRDF/light eval (evaluateFullBrdf, evaluateLight, LightSample), HitInfo, rand
 import SceneBindings;  // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/sceneVertices+sceneIndices/sceneMaterials+sceneTextures+sceneSamplers
 import ReStirBindings; // set 2 (graph-owned) working set + Reservoir/PackedHit record types
+import FeaturePTIO;    // feature set 5: accumulator + outColor
 
 // Resolved sample ready to shade (unified across analytic + emissive).
 struct ShadeSample { float3 L; float3 radiance; float dist; bool castShadows; float weight; bool valid; };
@@ -73,12 +74,9 @@ HitInfo unpackHit(PackedHit p, float3 rayOrigin) {
 // ---- Bindings -------------------------------------------------------------------------------------
 // Scene set 0 comes from the imported SceneBindings module (the alpha-tested shadow ray reads it
 // exactly like the other tracers; the scene-set layout carries All stages so it binds from compute).
-// The set-2 (graph-owned) working buffers come from ReStirBindings. Only the per-pass constant UBO
-// and the pass-local IO images are declared here.
+// The set-2 (graph-owned) working buffers come from ReStirBindings, and accumulator/outColor from
+// FeaturePTIO (feature set 5). Only the per-pass constant UBO is declared here.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
-
-[[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
-[[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
 
 struct ReStirPush { float4x4 prevViewProj; uint frameParity; uint hasHistory; uint pad0, pad1; };
 [[vk::push_constant]] ReStirPush rpc;

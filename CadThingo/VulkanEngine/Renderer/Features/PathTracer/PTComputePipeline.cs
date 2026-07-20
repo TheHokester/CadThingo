@@ -60,9 +60,8 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
 
-    private const int SetScene = 0;
-    private const int SetIO    = 1;
-    private const string FeatureEnv = "FeatureEnv";   // set 4 (registry-owned): envCube
+    private const string FeatureEnv  = "FeatureEnv";    // set 4 (registry-owned): envCube
+    private const string FeaturePtIo = "FeaturePTIO";   // set 5 (registry-owned): accumulator + outColor
 
     protected override ShaderCompileRequest? Program =>
         new("PathTracer/PTCompute", ["main"], [], ["spvRayQueryKHR"]);
@@ -109,12 +108,11 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     // Descriptor set layouts
     protected override void CreateDescriptorSetLayouts()
     {
-        // Set 1 (accumulator + outColor storage images) is pipeline-owned and reflected from
-        // PTCompute.slang. [scene(0), IO(1), empty(2), empty(3), FeatureEnv(4)]: envCube is
-        // registry-owned on FeatureEnv; the graph-shared and FeatureIBL slots are unused gaps.
-        var ioLayout = CreateReflectedSetLayout(SetIO);
-        DescriptorSetLayouts            = Registry.BuildPipelineSetLayouts(ioLayout, FeatureEnv);
-        OwnedDescriptorSetLayoutIndices = new[] { SetIO };
+        // Nothing pipeline-owned: scene(0), FeatureEnv(4) and FeaturePTIO(5) are all registry-owned,
+        // and the slots between them are unused gaps. The accumulator / out-color pair used to be a
+        // pass set built and written here; it is the same two images for every tracer, so it moved
+        // to the registry.
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(null, FeatureEnv, FeaturePtIo);
     }
 
 
@@ -180,50 +178,6 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
         Vk.DestroyShaderModule(Device, module, null);
     }
 
-
-    // Descriptor set allocation
-    protected override void CreateDescriptorSets()
-    {
-        DescriptorSets = new DescriptorSet[2][];
-
-        // Set 0 - scene set is owned by DescriptorRegistry; Record binds
-        // Renderer.descriptorRegistry.SceneSet(frame) directly.
-        DescriptorSets[SetScene] = null;
-
-        // Set 1 - single shared (both frames dispatch into the same images).
-        var ioLayout = DescriptorSetLayouts[SetIO];
-        DescriptorSetAllocateInfo alloc1 = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts        = &ioLayout,
-        };
-        DescriptorSets[SetIO] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[SetIO])
-            if (Vk.AllocateDescriptorSets(Device, &alloc1, p) != Result.Success)
-                throw new Exception("Failed to allocate pathtracer set 1");
-    }
-
-   
-
-    /// <summary>Set 1 bindings 0/1: accumulator + outColor storage images.
-    /// Both VkImages must be in ImageLayout.General before Record runs. Call
-    /// after the renderer creates the images and again on render-extent
-    /// resize.</summary>
-    public void WriteStorageImageDescriptors(ImageView accumView, ImageView outColorView)
-    {
-        DescriptorImageInfo accumInfo = new() { ImageView = accumView,    ImageLayout = ImageLayout.General };
-        DescriptorImageInfo outInfo   = new() { ImageView = outColorView, ImageLayout = ImageLayout.General };
-        var writes = stackalloc WriteDescriptorSet[2];
-        writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 0, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &accumInfo };
-        writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIO][0], DstBinding = 1, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &outInfo };
-        Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-
-        // Image identity changed (resize), so any in-progress accumulation is
-        // invalid by construction — drop the sample count.
-        MarkAccumulatorDirty();
-    }
 
     // Per-frame constants
     /// <summary>Stages the PathFrameUBO for Record's arena push. Returns true
@@ -302,18 +256,17 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _modePipelines[modeIdx]);
 
-        // Scene(0) + IO(1) with the frame constants' dynamic offset, then FeatureEnv at its own
-        // reflected index (set 4); the intervening slots are gaps, never bound.
+        // Scene(0) carrying the frame constants' dynamic offset, then FeatureEnv and FeaturePTIO at
+        // their own reflected indices; the slots between are gaps, never bound.
         uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
-        var sets = stackalloc DescriptorSet[2]
-        {
-            Registry.SceneSet(ctx.FrameIndex),
-            DescriptorSets[SetIO][0],
-        };
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 2, sets, 1, &frameConstants);
+        var sceneSet = Registry.SceneSet(ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 1, &sceneSet, 1, &frameConstants);
 
         var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+
+        var ioSet = Registry.FeatureSet(FeaturePtIo, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeaturePtIo), 1, &ioSet, 0, null);
 
         // 8×8 workgroup matches [numthreads(8,8,1)] in PTCompute.slang.
         uint gx = (ctx.RenderExtent.Width  + 7u) / 8u;

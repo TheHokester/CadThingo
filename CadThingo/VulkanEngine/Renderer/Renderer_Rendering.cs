@@ -106,6 +106,9 @@ public unsafe partial class Renderer
         // re-binds its lighting + tonemap descriptors); the PT cores rebind their storage images
         // (which marks the accumulator dirty so the next dispatch clears fresh memory).
         renderTargets.ReallocateSizeDependent(new Extent2D(width, height));
+        // Fresh accumulator / out-color views: re-register before the cores rebuild, so the
+        // FeaturePTIO set points at the new images.
+        RegisterPathTraceIoBindings();
         // Every registered core rebuilds its size-dependent state: DeferredCore/WavefrontPTCore
         // re-compile their graphs (fresh transients, re-import FinalColor, re-bind descriptors);
         // the PT/RT cores rebind their storage images (which marks the accumulator dirty so the

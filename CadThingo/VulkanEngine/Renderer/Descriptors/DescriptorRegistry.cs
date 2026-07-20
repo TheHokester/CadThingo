@@ -139,7 +139,7 @@ public sealed unsafe class DescriptorRegistry : IDisposable
         // resource owners (IblSystem / ReflectionProbeSystem) register into them by name after
         // construction. Add a module name here to introduce a new feature set.
         CreateEmptyLayout();
-        CreateFeatureSets(shaders, "FeatureIBL", "FeatureEnv");
+        CreateFeatureSets(shaders, "FeatureIBL", "FeatureEnv", "FeaturePTIO");
 
         // Binding 0 (dynamic constant slot) is stable for the registry's lifetime; the sets
         // are idle at construction, so write it directly.

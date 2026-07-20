@@ -6,6 +6,7 @@ __exported import PbrUtils;
 __exported import CommonTypes;
 __exported import SceneBindings;   // scene set 0: materials/lights/tlas/geometry/emissive/textures/samplers
 __exported import FeatureEnv;      // feature set 4: envCube
+__exported import FeaturePTIO;     // feature set 5: accumulator + outColor
 
 
 public static const uint RAY_COUNT = 0, SHADE_COUNT_0 = 1, SHADOW_COUNT = 5, NEXT_RAY_COUNT = 6;
@@ -36,11 +37,6 @@ public void wrRay(uint i, uint v){
 // comes from the imported SceneBindings module.
 public [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
 
-// Set 1 - pass-local IO storage images (binding indices match PTCompute set 1).
-public [[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
-public [[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
-
-// envCube comes from the imported FeatureEnv module (feature set 4).
 
 
 

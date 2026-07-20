@@ -18,13 +18,10 @@ import SceneBindings; // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/
                       // sceneMaterials/sceneTextures/sceneSamplers
 import FeatureEnv;      // feature set 4: envCube (miss-ray background)
 import ReStirBindings;  // set 2 (graph-owned) working set + Reservoir/PackedHit record types
+import FeaturePTIO;     // feature set 5: accumulator + outColor
 
 // Per-pass constants in the reserved (0,0) dynamic slot.
 [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
-
-// Set 1 — pass-local IO.
-[[vk::binding(0, 1)]] RWTexture2D<float4> accumulator;
-[[vk::binding(1, 1)]] RWTexture2D<float4> outColor;
 
 // Reservoir / PackedHit record types + the set-2 (graph-owned) working buffers come from the
 // shared ReStirBindings module (imported above) so all three ReSTIR kernels agree byte-for-byte.

@@ -354,22 +354,16 @@ public unsafe partial class Renderer
         lightCullPipeline = new LightCullPipeline(Gpu, this);
         lightCullPipeline.Initialize();
 
-        // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless)
-        // come from the scene set; only the storage-image IO + IBL sets are wired here.
+        // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come from the
+        // scene set; the accumulator / out-color pair from the registry-owned FeaturePTIO set.
         ptComputePipeline = new PTComputePipeline(Gpu, this);
         ptComputePipeline.Initialize();
-        ptComputePipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-        // Same as the transparent / deferred pipelines: IBL images are Renderer-
-        // owned and stable across rebakes, so the IBL set only needs writing once.
 
         // Wavefront path tracer (RenderMode.RayWavefront). Shares the same accumulator /
-        // out-color images as the megakernel; scene buffers (TLAS / lights / shadow info /
-        // vb+ib / emissive / bindless) come from the scene set. The SoA working set is
-        // pipeline-owned; envCube rides the registry-owned FeatureEnv set. Only the storage-image
-        // IO set is wired here.
+        // out-color images as the megakernel via FeaturePTIO; scene buffers come from the scene
+        // set. The SoA working set is pipeline-owned; envCube rides FeatureEnv.
         wavefrontPipeline = new WavefrontPTPipeline(Gpu, this);
         wavefrontPipeline.Initialize();
-        wavefrontPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
 
         // Opt-in RT-pipeline path tracer (RenderMode.RayTrace). Shares the same
         // accumulator/outColor images + scene buffers as the compute path; only
@@ -378,18 +372,15 @@ public unsafe partial class Renderer
         if (RayTracePipelineSupported)
         {
             // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come from
-            // the scene set; envCube rides the registry-owned FeatureEnv set; only the storage-image
-            // IO set is wired here.
+            // the scene set; envCube rides FeatureEnv, accumulator / out-color ride FeaturePTIO.
             rtPipeline = new RTPipeline(Gpu, this);
             rtPipeline.Initialize();
-            rtPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
 
             // ReSTIR DI tracer (RenderMode.ReStirDI). Same RT-pipeline machinery as rtPipeline
             // (it subclasses RTPipeline), forked only at the shader; shares the same accumulator /
             // outColor + scene set.
             reStirPipeline = new ReStirDIPipeline(Gpu, this);
             reStirPipeline.Initialize();
-            reStirPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
         }
 
         // Editor selection - object picking + ray-query coverage mask + outline
@@ -433,6 +424,7 @@ public unsafe partial class Renderer
         // re-register at their rebuild sites; the dump shows any remaining holes.
         RegisterSceneBindings();
         RegisterFeatureBindings();
+        RegisterPathTraceIoBindings();
         Console.WriteLine(descriptorRegistry.DumpBindings());
 
         // Cross-check every migrated pipeline's reflected bindings against what the registry owns
@@ -665,6 +657,17 @@ public unsafe partial class Renderer
             .Where(p => p?.ReflectedProgram != null)
             .Select(p => new ProgramUse(p!.ReflectedProgram!, p.PrivateSetIndices))
             .DistinctBy(u => u.Program);
+
+    // The progressive-accumulation IO pair (FeaturePTIO, set 5), shared by all four tracers -- they
+    // all write the SAME two renderer-owned images, so this is one registry set rather than the
+    // identical pass set each pipeline used to build and write for itself. Called after every
+    // (re)allocation of the size-dependent targets, since resize replaces both views; the registry
+    // queue applies the rewrite when each frame slot is provably idle.
+    internal void RegisterPathTraceIoBindings()
+    {
+        descriptorRegistry.RegisterImage("accumulator", renderTargets.PtAccumulator.ImageView, ImageLayout.General);
+        descriptorRegistry.RegisterImage("outColor",    renderTargets.PtOutColor.ImageView,    ImageLayout.General);
+    }
 
     // Registers the FeatureIBL set (set 2): the global IBL split-sum + reflection-probe resources
     // consumed by the raster lighting shaders. Owned by IblSystem / ReflectionProbeSystem; their
