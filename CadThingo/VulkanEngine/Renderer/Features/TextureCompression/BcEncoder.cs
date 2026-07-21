@@ -14,7 +14,8 @@ public enum BcMode : uint { Bc1 = 0, Bc3 = 1, Bc5 = 2, Bc4 = 3 }
 /// compresses one mip of a SampledImage source (read raw-UNORM) into a tightly-packed output
 /// buffer, which the caller then copies into the BC image. One PSO + one reused descriptor set;
 /// callers serialize through single-time submits (so the reused set is safe to re-point per
-/// texture). Owned lazily by the Renderer; see Texture.CreateCompressedTexture.
+/// texture). Owned lazily by ResourceManager -- the device only enables the BC capability, the
+/// resource layer owns the tooling; see Texture.CreateCompressedTexture.
 /// </summary>
 public sealed unsafe class BcEncoder : IDisposable
 {
@@ -32,9 +33,9 @@ public sealed unsafe class BcEncoder : IDisposable
     private DescriptorPool      _pool;
     private DescriptorSet       _set;
 
-    public BcEncoder(GraphicsDevice gfx)
+    public BcEncoder(in GpuContext gpu)
     {
-        _gfx = gfx; _vk = gfx.Vk; _device = gfx.Device;
+        _gfx = gpu.Gfx; _vk = _gfx.Vk; _device = _gfx.Device;
 
         // Set layout: binding 0 = source (sampled image, read via Load), binding 1 = output SSBO.
         var bindings = stackalloc DescriptorSetLayoutBinding[2];
@@ -55,8 +56,11 @@ public sealed unsafe class BcEncoder : IDisposable
         if (_vk.CreatePipelineLayout(_device, &plci, null, out _pipelineLayout) != Result.Success)
             throw new Exception("BcEncoder: failed to create pipeline layout");
 
-        var module = _gfx.CreateShaderModule(File.ReadAllBytes(ShaderPaths.Kernel("TextureCompression", "BcEncode")));
-        var entry  = SilkMarshal.StringToPtr("main");
+        // Single-entry compute kernel: slang names the SPIR-V entry point "main" regardless of the
+        // source function name, so the reflected name and the PName below agree.
+        var program = gpu.Shaders.GetProgram(new Shaders.ShaderCompileRequest("TextureCompression/BcEncode", ["main"], [], []));
+        var module = _gfx.CreateShaderModule(program.Spirv(0).ToArray());
+        var entry  = SilkMarshal.StringToPtr(program.Reflection.EntryPoints[0].Name);
         var stage  = new PipelineShaderStageCreateInfo
         {
             SType = StructureType.PipelineShaderStageCreateInfo,

@@ -4,7 +4,9 @@
 // blending, depth-tested LESS_EQUAL against the geometry pass's depth buffer
 // (no depth write so multiple transparent layers can stack).
 
-import PbrUtils;   // BRDF/light/IBL math + re-exported CommonTypes
+import PbrUtils;      // BRDF/light/IBL math + re-exported CommonTypes
+import SceneBindings; // scene set 0: lights/TLAS/materials/textures/samplers
+import FeatureIBL;    // feature set 2: irradiance/prefiltered/brdfLut + reflection probes
 
 struct FrameUBO {
     float4x4 view;
@@ -39,31 +41,16 @@ struct DrawPC {
 
 // TILE_SIZE_PX / MAX_LIGHTS_PER_TILE come from CommonTypes (via import PbrUtils).
 
-// Set 0 — own UBO + pointers to lighting buffers owned by other pipelines.
+// Per-pass constants in the reserved (0,0) dynamic slot; the rest of set 0
+// (sceneLights, sceneTlas, sceneMaterials/sceneTextures/sceneSamplers) comes
+// from the imported SceneBindings module.
 [[vk::binding(0, 0)]] ConstantBuffer<FrameUBO>              frame;
-[[vk::binding(1, 0)]] StructuredBuffer<PbrLight>            lights;
-[[vk::binding(2, 0)]] RaytracingAccelerationStructure       tlas;
-[[vk::binding(3, 0)]] StructuredBuffer<uint>                tileLightCount;
-[[vk::binding(4, 0)]] StructuredBuffer<uint>                tileLightIndices;
-// IBL split-sum — same handles as PbrShader.slang. Pipelines own separate
-// descriptor sets but the underlying VkImage / Sampler resources are shared.
-[[vk::binding(5, 0)]] SamplerCube                           irradianceCube;
-[[vk::binding(6, 0)]] SamplerCube                           prefilteredCube;
-[[vk::binding(7, 0)]] Sampler2D                             brdfLut;
 
-// Probe bindings mirror PbrShader.slang set 0 slots 8-11. Empty / unregistered
-// slots leave clusterRange.count == 0 so the loop is a no-op and the global
-// IBL fallback (via the lerp coverage path) takes over cleanly.
-[[vk::binding(8,  0)]] SamplerCubeArray                     probeCubeArray;
-[[vk::binding(9,  0)]] StructuredBuffer<ProbeRecord>        probes;
-[[vk::binding(10, 0)]] StructuredBuffer<ProbeClusterRange>  probeClusterRange;
-[[vk::binding(11, 0)]] StructuredBuffer<uint>               probeIndexList;
-
-// Set 1 — bindless materials/instances/textures/samplers (shared layout with GeometryPipeline).
-[[vk::binding(0, 1)]] StructuredBuffer<PbrMaterial>         materials;
-[[vk::binding(1, 1)]] StructuredBuffer<InstanceData>        instances;     // layout parity; unused here
-[[vk::binding(2, 1)]] Texture2D                             textures[];
-[[vk::binding(3, 1)]] SamplerState                          samplers[];
+// Set 1 - graph-baked pass set: the tile-cull outputs (the only pass-local graph
+// resources this shader reads). The IBL split-sum + reflection probes come from the
+// imported FeatureIBL module (set 2), registry-owned and shared with the deferred pass.
+[[vk::binding(0, 1)]] StructuredBuffer<uint> tileLightCount;
+[[vk::binding(1, 1)]] StructuredBuffer<uint> tileLightIndices;
 
 [[vk::push_constant]] DrawPC draw;
 
@@ -86,7 +73,7 @@ bool isOccluded(float3 origin, float3 dir, float tMax)
     ray.TMax      = tMax;
 
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
+    q.TraceRayInline(sceneTlas,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
     q.Proceed();
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
@@ -100,7 +87,7 @@ float blockerSearch(float3 origin, float3 dir, float tMax)
     ray.TMax      = tMax;
 
     RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    q.TraceRayInline(sceneTlas,RAY_FLAG_NONE, 0xFF, ray);
     while (q.Proceed()) {}
     return (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ? q.CommittedRayT() : -1.0;
 }
@@ -178,20 +165,20 @@ VSOutput VSMain(VSInput input)
 [[shader("fragment")]]
 float4 PSMain(VSOutput input) : SV_TARGET
 {
-    PbrMaterial mat = materials[input.MaterialIndex];
-    SamplerState s  = samplers[0];
+    PbrMaterial mat = sceneMaterials[input.MaterialIndex];
+    SamplerState s  = sceneSamplers[0];
 
-    float4 baseColor         = textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV) * mat.baseColorFactor;
-    float2 metallicRoughness = textures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).rg;
+    float4 baseColor         = sceneTextures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV) * mat.baseColorFactor;
+    float2 metallicRoughness = sceneTextures[NonUniformResourceIndex(mat.physicalDescriptorTex)].Sample(s, input.UV).rg;
     float  metallic          = metallicRoughness.x * mat.metallicFactor;
     float  roughness         = metallicRoughness.y * mat.roughnessFactor;
-    float  ao                = textures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;
-    float3 emissiveTex       = textures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb * mat.emissiveFactor;
+    float  ao                = sceneTextures[NonUniformResourceIndex(mat.occlusionTex)].Sample(s, input.UV).r;
+    float3 emissiveTex       = sceneTextures[NonUniformResourceIndex(mat.emissiveTex)].Sample(s, input.UV).rgb * mat.emissiveFactor;
 
     // Tangent-space normal map (same as geometry pass).
     float3 N = normalize(input.Normal);
     {
-        float3 tangentNormal = decodeTangentNormal(textures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).rg);
+        float3 tangentNormal = decodeTangentNormal(sceneTextures[NonUniformResourceIndex(mat.normalTex)].Sample(s, input.UV).rg);
         N = applyNormalMap(N, input.WorldPos, input.UV, tangentNormal);
     }
 
@@ -213,7 +200,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
 
     for (uint t = 0u; t < perTile; t++) {
         uint     lightIdx = tileLightIndices[tileIdx * MAX_LIGHTS_PER_TILE + t];
-        PbrLight lt       = lights[lightIdx];
+        PbrLight lt       = sceneLights[lightIdx];
 
         uint   type      = (uint)lt.directionType.w;
         float3 lColor    = lt.colorIntensity.rgb;

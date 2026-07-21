@@ -82,7 +82,9 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         }, "Depth");
 
         // Per-frame compute-output buffers, imported so the graph derives the cull->geometry
-        // and light-cull->lighting barriers + ordering.
+        // and light-cull->lighting barriers + ordering. Renderables is the cull INPUT, imported
+        // too so it can fill the cull pass set's binding 0 (matched by name below).
+        var renderablesF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         var indirectCmdF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         var indirectCountF = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         var instanceF      = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
@@ -90,12 +92,14 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         var tileIndicesF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
         for (uint i = 0; i < HostRenderer.MAX_CONCURRENT_FRAMES; i++)
         {
+            renderablesF[i]   = _cull.GetRenderablesBuffer(i);
             indirectCmdF[i]   = _cull.GetIndirectCmdBuffer(i);
             indirectCountF[i] = _cull.GetIndirectCountBuffer(i);
             instanceF[i]      = Engine.ResourceManager.GetInstanceBuffer(i);
             tileCountF[i]     = _lightCull.GetTileLightCountBuffer(i);
             tileIndicesF[i]   = _lightCull.GetTileLightIndicesBuffer(i);
         }
+        var renderables   = scope.ImportBufferPerFrame(renderablesF,   default, "Renderables");
         var indirectCmd   = scope.ImportBufferPerFrame(indirectCmdF,   default, "IndirectCmd");
         var indirectCount = scope.ImportBufferPerFrame(indirectCountF, default, "IndirectCount");
         var instance      = scope.ImportBufferPerFrame(instanceF,      default, "InstanceData");
@@ -103,28 +107,35 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         var tileIndices   = scope.ImportBufferPerFrame(tileIndicesF,   default, "TileLightIndices");
 
        
+        // Cull is the first graph-baked pass set (descriptor-system.md phase C): its four storage
+        // buffers are all graph resources, so the graph fills the set by name and the pipeline
+        // owns only the layout. Names match DrawCullPipeline.PassSet.
         scope.AddPass("CullPass", PassType.Compute, QueueClass.Graphics,
             b =>
             {
-                indirectCmd   = b.Write(indirectCmd,   ResourceUsage.StorageWriteCompute);
-                indirectCount = b.Write(indirectCount, ResourceUsage.StorageWriteCompute);
-                instance      = b.Write(instance,      ResourceUsage.StorageWriteCompute);
+                b.UsePassSet(_cull.PassSet);
+                b.Read(renderables, ResourceUsage.StorageReadCompute, "renderables");
+                indirectCmd   = b.Write(indirectCmd,   ResourceUsage.StorageWriteCompute, "indirectCmd");
+                instance      = b.Write(instance,      ResourceUsage.StorageWriteCompute, "instanceData");
+                indirectCount = b.Write(indirectCount, ResourceUsage.StorageWriteCompute, "indirectCount");
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                _cull.Record(cmd, f.FrameIndex, f.Camera));
+                _cull.Record(cmd, f.FrameIndex, f.Camera, res.PassSet));
 
         // Light-cull (compute): bins lights into the per-tile lists the lighting FS reads.
         // Tile/light counts are computed in DeferredCore.Render and read back via _lightCullParams.
         scope.AddPass("LightCullPass", PassType.Compute, QueueClass.Graphics,
             b =>
             {
-                tileCount   = b.Write(tileCount,   ResourceUsage.StorageWriteCompute);
-                tileIndices = b.Write(tileIndices, ResourceUsage.StorageWriteCompute);
+                // Tile outputs (set 1) are graph-baked; names match LightCullPipeline.PassSet.
+                b.UsePassSet(_lightCull.PassSet);
+                tileCount   = b.Write(tileCount,   ResourceUsage.StorageWriteCompute, "tileLightCount");
+                tileIndices = b.Write(tileIndices, ResourceUsage.StorageWriteCompute, "tileLightIndices");
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
             {
                 var (lightCount, tileCountX, tileCountY) = _lightCullParams();
-                _lightCull.Record(cmd, f.FrameIndex, f.Camera, lightCount, tileCountX, tileCountY);
+                _lightCull.Record(cmd, f.FrameIndex, f.Camera, lightCount, tileCountX, tileCountY, res.PassSet);
             });
 
         // Geometry -> g-buffers + depth. Reads the post-cull indirect buffers (IndirectArg) +
@@ -161,17 +172,20 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         scope.AddPass("LightingPass", PassType.Graphics, QueueClass.Graphics,
             b =>
             {
-                b.Read(pos,      ResourceUsage.SampledFragment);
-                b.Read(normal,   ResourceUsage.SampledFragment);
-                b.Read(albedo,   ResourceUsage.SampledFragment);
-                b.Read(material, ResourceUsage.SampledFragment);
-                b.Read(emissive, ResourceUsage.SampledFragment);
-                b.Read(tileCount,   ResourceUsage.StorageReadFragment);
-                b.Read(tileIndices, ResourceUsage.StorageReadFragment);
+                // G-buffer set (set 1) is graph-baked; names match PbrDeferredPipeline.PassSet.
+                b.UsePassSet(_pbrDeferred.PassSet);
+                b.Read(pos,      ResourceUsage.SampledFragment, "gPosition");
+                b.Read(normal,   ResourceUsage.SampledFragment, "gNormal");
+                b.Read(albedo,   ResourceUsage.SampledFragment, "gAlbedo");
+                b.Read(material, ResourceUsage.SampledFragment, "gMaterial");
+                b.Read(emissive, ResourceUsage.SampledFragment, "gEmissive");
+                // Tile-cull outputs now ride the same pass set as the g-buffer (bindings 5/6).
+                b.Read(tileCount,   ResourceUsage.StorageReadFragment, "tileLightCount");
+                b.Read(tileIndices, ResourceUsage.StorageReadFragment, "tileLightIndices");
                 hdr = b.Write(hdr, ResourceUsage.ColorAttachment);
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                _pbrDeferred.Record(cmd, f, res.View(hdr)));
+                _pbrDeferred.Record(cmd, f, res.View(hdr), res.PassSet));
 
         // Skybox / Transparent both LOAD HDRColor and depth-test (DepthWriteEnable=false)
         // against the geometry depth. Their CmdBeginRendering binds depth as a
@@ -190,12 +204,17 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         scope.AddPass("TransparentPass", PassType.Graphics, QueueClass.Graphics,
             b =>
             {
+                // Tile-cull outputs ride the graph-baked pass set (set 1); IBL/probes come from
+                // the registry's FeatureIBL set.
+                b.UsePassSet(_transparent.PassSet);
+                b.Read(tileCount,   ResourceUsage.StorageReadFragment, "tileLightCount");
+                b.Read(tileIndices, ResourceUsage.StorageReadFragment, "tileLightIndices");
                 hdr   = b.Write(hdr,   ResourceUsage.ColorAttachment);
                 depth = b.Write(depth, ResourceUsage.DepthAttachment);
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
                 _transparent.Record(cmd, f, _cull.LastTransparentDraws,
-                    new TransparentPipeline.Attachments(res.View(hdr), res.View(depth))));
+                    new TransparentPipeline.Attachments(res.View(hdr), res.View(depth)), res.PassSet));
 
         // Tonemap is a nested submodule: it imports FinalColor and reads HDRColor@v3 and writes the final image.
         _tonemap.Build(scope.Child("Tonemap"),

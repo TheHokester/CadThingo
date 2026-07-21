@@ -1,4 +1,5 @@
-﻿using Silk.NET.Vulkan;
+﻿using CadThingo.VulkanEngine.Renderer.Shaders;
+using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.FrameGraph;
 
@@ -7,6 +8,34 @@ public enum PassType { Graphics, Compute, RayTrace, Transfer}
 public delegate void PassSetup(GraphBuilder b);
 public delegate void PassExecute(CommandBuffer cmd, PassResources resources, in Renderer.FrameContext frame);
 
+/// <summary>
+/// What a pipeline hands the graph so its pass-local descriptor set can be graph-baked.
+///The graph allocates one set per frame-in-flight from
+/// <paramref name="Layout"/> and fills each binding whose <see cref="BindingDesc.Name"/>
+/// a Read/Write named. The layout is reflection-built and resize-stable, so the pipeline
+/// owns it (and its VkPipelineLayout borrows it at <paramref name="SetIndex"/>); the graph
+/// only borrows it to allocate + write the sets.
+/// </summary>
+public readonly record struct PassSetSpec(
+    uint SetIndex,
+    DescriptorSetLayout Layout,
+    IReadOnlyList<BindingDesc> Bindings);
+
+/// One buffer slot of a graph-owned shared set: the pipeline supplies the physical buffer handle
+/// directly (it still allocates the buffer), the graph writes it into the set it owns.
+public readonly record struct GraphSharedBinding(uint Binding, DescriptorType Type, Buffer Buffer);
+
+/// <summary>What a pipeline hands the graph so the graph owns its ONE shared working set (the
+/// graph-shared slot, <see cref="Descriptors.ShaderSets.GraphShared"/>). Unlike a pass set (one per
+/// opting pass, resources resolved from named graph accesses), this is a single instance for the
+/// whole graph, self-contained: the pipeline still owns the buffers + the layout (its VkPipelineLayout
+/// borrows it at <paramref name="SetIndex"/>); the graph only allocates + writes + owns the descriptor
+/// set, then hands it back via <see cref="FrameGraph.GraphSharedSet"/> after Compile. Buffers only (v1).</summary>
+public readonly record struct GraphSharedSetSpec(
+    uint SetIndex,
+    DescriptorSetLayout Layout,
+    IReadOnlyList<GraphSharedBinding> Bindings);
+
 internal struct ResourceAccess
 {
     public int ResourceId;
@@ -14,7 +43,11 @@ internal struct ResourceAccess
     public ResourceUsage Usage;
     public bool IsWrite;
     public bool IsImage;
-}    
+    // Set-N parameter name this resource fills in the pass's graph-baked descriptor set,
+    // or null for a sync-only access (the pass binds it itself, or it is an attachment /
+    // indirect-arg / scene-set resource). Matched against PassSet.Bindings by name.
+    public string? Bind;
+}
     
 internal sealed class GraphPass
 {
@@ -44,13 +77,25 @@ internal sealed class GraphPass
     // Parallel to BufferBarriers: the resource id each barrier targets, so Execute can
     // patch the .Buffer field per frame for double-buffered (per-frame) imports.
     public int[] BufferBarrierRes = [];
+
+    // Graph-baked pass descriptor set. PassSet is the pipeline-supplied spec (null = the
+    // pass binds its own sets, legacy behavior); PassSets holds the graph-allocated set per
+    // frame-in-flight, written at Compile and handed to Execute via PassResources.
+    public PassSetSpec?    PassSet;
+    public DescriptorSet[] PassSets = [];
 }
 
 public readonly struct PassResources
 {
     private readonly FrameGraph _g;
-    internal PassResources(FrameGraph g) => _g = g;
+    private readonly DescriptorSet _passSet;
+    internal PassResources(FrameGraph g, DescriptorSet passSet) { _g = g; _passSet = passSet; }
     public ImageView View(GraphImage h) => _g.ResolveView(h);
     public Image Image(GraphImage h) => _g.ResolveImage(h);
     public Buffer Buffer(GraphBuffer h) => _g.ResolveBuffer(h);
+
+    /// <summary>This pass's graph-baked descriptor set for the frame being recorded, or the
+    /// default handle if the pass did not call <see cref="GraphBuilder.UsePassSet"/>. The pass
+    /// body binds it via its pipeline layout at the spec's set index.</summary>
+    public DescriptorSet PassSet => _passSet;
 }

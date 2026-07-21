@@ -6,8 +6,8 @@ namespace CadThingo.VulkanEngine.Renderer.FrameGraph;
 /// <typeparamref name="TInputs"/> to existing handles and producing <typeparamref name="TOutputs"/>.
 ///
 /// Modules are flattened into the parent graph at build time -- a logical subgraph, not a
-/// separately compiled one -- so the compiler keeps a global view for culling/sync/aliasing
-/// (render-graph.md sec 9). The host owns Compile/Execute and consumes the outputs.
+/// separately compiled one -- so the compiler keeps a global view for culling/sync/aliasing.
+/// The host owns Compile/Execute and consumes the outputs.
 /// </summary>
 public interface IGraphModule<TInputs, TOutputs>
 {

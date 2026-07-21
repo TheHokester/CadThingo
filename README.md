@@ -45,11 +45,13 @@ The solution has two projects:
 | **Event system** (`Event.cs`) | `EventBus` pub/sub with listener categories; `EventDispatcher` does type-safe routing. Events run immediately or queued. |
 | **Scene** (`Scene.cs`) | Owns the entity list and a render graph. |
 | **ResourceManager** | Async asset loading and caching from `Assets/`. |
-| **Loaders** | `GltfLoader` (SharpGLTF), `ModelLoader` (Assimp OBJ), `HdrLoader` (HDR environment maps). |
+| **Loaders** | `GltfLoader` (SharpGLTF), `HdrLoader` (HDR environment maps). |
 
 ### Shaders
 
-Shaders are authored in **[Slang](https://github.com/shader-slang/slang)** (`VulkanEngine/Shaders/*.slang`) and compiled to SPIR-V. Precompiled `.spv` files live in `CadThingo/Assets/Shaders/`. If you modify a shader, recompile it manually (see `VulkanEngine/Shaders/shaderCompile.bat`) before running.
+Shaders are authored in **[Slang](https://github.com/shader-slang/slang)** — shared modules in `VulkanEngine/Shaders/*.slang`, per-feature kernels in `VulkanEngine/Renderer/Features/<Feature>/Kernels/`. They are compiled to SPIR-V **at runtime** through `slang.dll`, with SPIR-V and reflection disk-cached under `CadThingo/Assets/ShaderCache/`; edit a shader and just run. The first run on a clean clone compiles every kernel (a few seconds), later runs load from cache.
+
+The build does not compile shaders, so a syntax error surfaces at runtime rather than at build time. `dotnet run --project CadThingo -- --shader-audit` is the fast check: it compiles and reflects every kernel headlessly and reports failures plus a matrix-layout regression guard.
 
 ---
 
@@ -97,8 +99,7 @@ CadThingo/
 │   │   ├── GLTF/               # glTF loading
 │   │   ├── ImGui/              # Editor UI + panels
 │   │   └── Shaders/            # Slang shader sources
-│   ├── Assets/                 # Models, Textures, compiled Shaders (.spv)
-│   ├── App.cs                  # Tutorial-era entry (legacy)
+│   ├── Assets/                 # Models, Textures, ShaderCache (compiled .spv + reflection)
 │   └── Program.cs              # Entry point → Engine
 └── CadThingo.Graphics/         # Abstract 3D asset library
     ├── Assets3D/               # Shapes, lighting, materials, serialization

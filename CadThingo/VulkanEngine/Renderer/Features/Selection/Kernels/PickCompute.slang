@@ -12,7 +12,7 @@
 // that flat table) — a stable RenderableHandle slot; the CPU maps the result back
 // via GpuScene.ResolveSlot. Miss PICK_NONE.
 
-import CommonTypes;   // ShadowEntityInfo
+import SceneBindings;   // scene set 0: sceneTlas + sceneEntityInfo
 
 struct PickParams {
     float4x4 invViewProj;   // un-projects NDC -> world (Y-flipped proj, matches raster)
@@ -23,9 +23,8 @@ struct PickParams {
 
 [[vk::push_constant]] PickParams params;
 
-[[vk::binding(0, 0)]] RaytracingAccelerationStructure tlas;
-[[vk::binding(1, 0)]] RWStructuredBuffer<uint>        pickResult;
-[[vk::binding(2, 0)]] StructuredBuffer<ShadowEntityInfo> entityInfo;
+// Set 1 - pass-local result SSBO (single uint). TLAS + entityInfo come from the scene set.
+[[vk::binding(0, 1)]] RWStructuredBuffer<uint> pickResult;
 
 static const uint PICK_NONE = 0xFFFFFFFFu;
 
@@ -48,7 +47,7 @@ void main() {
     ray.TMax      = 1e30;
 
     RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    q.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xFF, ray);
     // Commit every candidate so non-opaque instances (MASK / BLEND /
     // transmissive, flagged ForceNoOpaque in the TLAS) stay selectable. No
     // alpha test — picking the frontmost surface is what the user expects.
@@ -58,6 +57,6 @@ void main() {
     }
 
     pickResult[0] = (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
-                  ? entityInfo[q.CommittedInstanceID() + q.CommittedGeometryIndex()].entityIndex
+                  ? sceneEntityInfo[q.CommittedInstanceID() + q.CommittedGeometryIndex()].entityIndex
                   : PICK_NONE;
 }

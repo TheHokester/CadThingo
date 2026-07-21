@@ -3,8 +3,8 @@
 // InstanceData row to the post-cull output buffers and bump a count.
 //
 // Outputs feed:
-//   - vkCmdDrawIndexedIndirectCount        (cmds + count)
-//   - geometry pipeline VS via SV_InstanceID (instancesOut, indexed by firstInstance)
+//   - vkCmdDrawIndexedIndirectCount        (indirectCmd + indirectCount)
+//   - geometry pipeline VS via SV_InstanceID (instanceData, indexed by firstInstance)
 
 struct RenderableInput {
     float4x4 model;
@@ -51,10 +51,12 @@ struct CullParams {
 
 [[vk::push_constant]] CullParams params;
 
-[[vk::binding(0, 0)]] StructuredBuffer<RenderableInput>      inputs;
-[[vk::binding(1, 0)]] RWStructuredBuffer<DrawCmd>            cmds;
-[[vk::binding(2, 0)]] RWStructuredBuffer<InstanceData>       instancesOut;
-[[vk::binding(3, 0)]] RWStructuredBuffer<uint>               drawCount;
+// Pass set (set 0) — every binding is a graph resource, so these names are the contract the
+// CullPass Read/Write binds match against by name. Renaming one here renames it in the graph.
+[[vk::binding(0, 0)]] StructuredBuffer<RenderableInput>      renderables;
+[[vk::binding(1, 0)]] RWStructuredBuffer<DrawCmd>            indirectCmd;
+[[vk::binding(2, 0)]] RWStructuredBuffer<InstanceData>       instanceData;
+[[vk::binding(3, 0)]] RWStructuredBuffer<uint>               indirectCount;
 
 bool sphereInsidePlane(float4 plane, float3 c, float r)
 {
@@ -68,7 +70,7 @@ void Main(uint3 tid : SV_DispatchThreadID)
     uint i = tid.x;
     if (i >= params.renderableCount) return;
 
-    RenderableInput r = inputs[i];
+    RenderableInput r = renderables[i];
 
     // World-space sphere center. Slang/HLSL row-vector convention: mul(model, vec)
     // applies the matrix as (row × col), matching our CPU upload of System.Numerics
@@ -92,7 +94,7 @@ void Main(uint3 tid : SV_DispatchThreadID)
 
     // Visible - claim a slot atomically. InterlockedAdd returns the original value.
     uint slot;
-    InterlockedAdd(drawCount[0], 1u, slot);
+    InterlockedAdd(indirectCount[0], 1u, slot);
 
     DrawCmd cmd;
     cmd.indexCount    = r.indexCount;
@@ -102,7 +104,7 @@ void Main(uint3 tid : SV_DispatchThreadID)
     // firstInstance is what SV_InstanceID resolves to in the VS for indirect draws
     // with instanceCount==1, so we use the slot index itself as the instance lookup.
     cmd.firstInstance = slot;
-    cmds[slot] = cmd;
+    indirectCmd[slot] = cmd;
 
     InstanceData inst;
     inst.model         = r.model;
@@ -110,5 +112,5 @@ void Main(uint3 tid : SV_DispatchThreadID)
     inst._pad0 = 0;
     inst._pad1 = 0;
     inst._pad2 = 0;
-    instancesOut[slot] = inst;
+    instanceData[slot] = inst;
 }

@@ -27,15 +27,8 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
 {
     private readonly Renderer _host;
 
-    // The frame graph driving the deferred chain 
+    // The frame graph driving the deferred chain
     private DeferredGraph? _graph;
-
-    // Cached view of the graph's HDR transient, rebuilt on every graph rebuild
-    private ImageView _hdrView;
-
-    // Cached views of the graph's 5 g-buffer transients (pos/normal/albedo/material/emissive),
-    // refreshed on every BuildGraph. 
-    private readonly ImageView[] _gBufferViews = new ImageView[5];
 
     // Per-frame light-cull dispatch dims, written by Render (from PbrDeferredPipeline.UpdatePerFrame)
     // before Execute and pulled by the module's LightCullPass delegate at Execute time.
@@ -80,31 +73,20 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
         fg.Compile();
         _graph = fg;
 
-        // Compile() just (re)allocated the g-buffer + HDR transients. (Re)bind the only graph
-        // resources read through a PRE-BAKED descriptor set rather than a per-pass res.View: t
-        _gBufferViews[0] = fg.ResolveView(o.Position);
-        _gBufferViews[1] = fg.ResolveView(o.Normal);
-        _gBufferViews[2] = fg.ResolveView(o.Albedo);
-        _gBufferViews[3] = fg.ResolveView(o.Material);
-        _gBufferViews[4] = fg.ResolveView(o.Emissive);
-        _host.PbrDeferredPipeline.WriteGBufferDescriptors(
-            _gBufferViews[0], _gBufferViews[1], _gBufferViews[2], _gBufferViews[3], _gBufferViews[4]);
-        _hdrView = fg.ResolveView(o.Hdr);
-        _host.tonemapPipeline.WriteHdrInputDescriptor(_hdrView, _host.gBufferSampler);
+        // Compile() baked every graph-resident descriptor set (cull, light-cull, g-buffer, and
+        // tonemap's HDR input) from the fresh transients, so there is no manual descriptor rebind
+        // left to do here.
     }
 
-    /// <summary>Re-point tonemap's shared HDR-input descriptor at this core's HDR transient. Called
-    /// by the host on mode switch / after a tonemap rebuild -- replaces the per-frame _lastRenderMode
-    /// rebind.</summary>
-    public void Activate() =>
-        _host.tonemapPipeline.WriteHdrInputDescriptor(_hdrView, _host.gBufferSampler);
+    /// <summary>Nothing to rebind on activation: tonemap's HDR input is graph-baked from this
+    /// core's own HDR transient, so switching to this core just binds its graph's set.</summary>
+    public void Activate() { }
 
-    /// <summary>Re-issues the lighting pass's g-buffer descriptor writes from the cached transient
-    /// views onto the rebuilt PBR pipeline's fresh descriptor set. The host calls this inside
-    /// RebuildPbrPipelines (the only deferred-specific part of that cross-pipeline rewire).</summary>
-    public void OnPbrPipelineRebuilt() =>
-        _host.PbrDeferredPipeline.WriteGBufferDescriptors(
-            _gBufferViews[0], _gBufferViews[1], _gBufferViews[2], _gBufferViews[3], _gBufferViews[4]);
+    /// <summary>Rebuilds the deferred graph after an in-place PBR pipeline rebuild. Rebuild()
+    /// recreates the pipeline's set-1 layout (new handle), so the graph's baked g-buffer set -
+    /// allocated from the old layout - must be re-baked against the new one. The host calls this
+    /// inside RebuildPbrPipelines, which has already idled the device.</summary>
+    public void OnPbrPipelineRebuilt() => BuildGraph();
 
     public void Resize(Extent2D extent) => BuildGraph();
 
@@ -122,7 +104,8 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
         // Per-frame material SSBO snapshot
         _host.UpdateMaterials(currentFrame, scene);
 
-        _host.geometryPipeline.UpdateUbo(currentFrame, camera);
+        // Geometry's view+proj now rides the scene set's (0,0) arena slot, pushed inside
+        // its Record call - no per-frame UBO update needed here anymore.
         var (lightCount, tileCountX, tileCountY) =
             _host.PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
         _host.transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);

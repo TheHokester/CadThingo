@@ -12,8 +12,9 @@ struct SkyboxUBO {
     float    _pad2;
 };
 
+import FeatureEnv; // feature set 4: envCube
+
 [[vk::binding(0, 0)]] ConstantBuffer<SkyboxUBO> ubo;
-[[vk::binding(1, 0)]] SamplerCube               envCube;
 
 struct VSOut {
     float4 Position : SV_POSITION;  // clip space — z=1.0 lands on far plane

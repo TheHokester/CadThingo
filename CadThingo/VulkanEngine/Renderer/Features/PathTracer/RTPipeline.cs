@@ -2,6 +2,8 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -14,13 +16,12 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 //  structure, scene buffers, IBL, bindless materials, PathFrameUBO layout, and
 //  accumulator/outColor storage images as the compute path tracer — the only
 //  differences are the pipeline object (RT groups + SBT) and the dispatch
-//  (CmdTraceRays). Descriptor set layout / bindings mirror PTComputePipeline so
-//  the renderer can drive both with the same Write* calls.
+//  (CmdTraceRays).
 //
-//  Phase 2: pipeline + SBT + dispatch wired against the minimal PathTraceRT.spml
-//  (raygen/closesthit/miss/anyhit). The bounce loop / NEE / accumulation move
-//  into the shader in phase 3; the descriptor layout already carries every
-//  binding they will need.
+//  Scene set (registry): TLAS, lights, ShadowEntityInfo, global VB/IB, emissive
+//  tables, bindless materials/textures/samplers. The PathFrameUBO rides the
+//  scene set's (0,0) constant-arena slot. This pipeline owns only set 1 (the
+//  accumulator/outColor storage images); envCube rides the registry-owned FeatureEnv set (set 4).
 //
 //  Inherits RtPipeline, which owns the VK_KHR_ray_tracing_pipeline dispatch
 //  table + SBT-layout properties (loaded in its constructor from the device).
@@ -53,10 +54,11 @@ public unsafe class RTPipeline : RtPipeline
         public float     totalEmissivePower;
     }
 
-    private const int SetFrame    = 0;
-    private const int SetGeom     = 1;
-    private const int SetBindless = 2;
-    private const int SetIbl      = 3;
+    // Set 2 is the graph-shared slot: unused by the base megakernel, installed by the ReSTIR
+    // subclass for its working set. envCube comes from the registry-owned FeatureEnv set (set 4),
+    // accumulator + outColor from FeaturePTIO (set 5).
+    protected const string FeatureEnv  = "FeatureEnv";
+    protected const string FeaturePtIo = "FeaturePTIO";
 
     // Every RT stage; descriptor bindings declare the union (a binding may name
     // more stages than actually read it — simpler and valid).
@@ -64,11 +66,19 @@ public unsafe class RTPipeline : RtPipeline
         ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.MissBitKhr |
         ShaderStageFlags.ClosestHitBitKhr | ShaderStageFlags.AnyHitBitKhr;
 
-    // SER variant (HitObject + ReorderThread  + Invoke raygen) when the device exposes
-    // VK_NV_ray_tracing_invocation_reorder; otherwise the plain TraceRay variant.
-    // Both .spv expose the same entry points, so the pipeline build is identical.
-    protected override string ShaderPath =>
-        ShaderPaths.Kernel("PathTracer", Gfx.SerSupported ? "PathTraceRT_SER" : "PathTraceRT");
+    // SBT group order. The request's entry order drives both Reflection.EntryPoints[i] and
+    // Spirv(i), so stage i lands in the group that names it below; reordering this list silently
+    // rewires the SBT, hence the stage assert in CreatePipeline.
+    private static readonly string[] RtEntries = ["rayGenMain", "missMain", "closestHitMain", "anyHitMain"];
+
+    /// <summary>The RT program for <paramref name="module"/>, SER-specialized for this device. SER
+    /// (HitObject + ReorderThread + Invoke raygen) is now a define on the SAME source rather than a
+    /// separate _SER.slang output, so the variant is a runtime capability decision.</summary>
+    protected ShaderCompileRequest RtProgram(string module) => Gfx.SerSupported
+        ? new(module, RtEntries, ["USE_SER=1"], ["spvRayTracingKHR", "spvShaderInvocationReorderNV"])
+        : new(module, RtEntries, [], ["spvRayTracingKHR"]);
+
+    protected override ShaderCompileRequest? Program => RtProgram("PathTracer/PathTraceRT");
 
     // SBT: one buffer holding [raygen][miss][hit] regions, each padded to the
     // device's shaderGroupBaseAlignment; CmdTraceRays reads the strided regions.
@@ -79,7 +89,8 @@ public unsafe class RTPipeline : RtPipeline
     private StridedDeviceAddressRegionKHR _hitRegion;
     private StridedDeviceAddressRegionKHR _callableRegion;   // unused (no callables)
 
-    private UboBuffer[] _frameUbos = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    // Frame constants staged by UpdatePerFrame, pushed into the constant arena by Record.
+    private PathFrameUBO _frameUbo;
 
     // Per-frame runtime state (mirrors the compute path).
     public uint  BounceCap     { get; set; } = 8;
@@ -89,62 +100,31 @@ public unsafe class RTPipeline : RtPipeline
     private uint _accumSamples;
     private bool _accumDirty = true;
 
-    public RTPipeline(Renderer renderer) : base(renderer) { }
+    public RTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     public void MarkAccumulatorDirty() => _accumDirty = true;
     public uint CurrentSampleCount => _accumSamples;
 
 
-    // Extra stage flags OR'd onto the owned RT sets (frame set 0 + geom set 1). A subclass that
-    // shares these with a compute sibling (ReSTIR's SpatialShade, which reads entityInfo on set 0 +
-    // vertices/indices on set 1 for alpha-tested shadow rays) returns ComputeBit so the same sets are
-    // bindable from both. Base returns 0 -> the megakernel RT pipeline's sets stay RT-stages-only.
-    protected virtual ShaderStageFlags Set0ExtraStages => 0;
+    // Extra stage flags OR'd onto the owned IO set (accumulator/outColor). A subclass that shares the
+    // storage images with a compute sibling (ReSTIR's SpatialShade, which folds the analytic direct
+    // into the accumulator) returns ComputeBit so the set is bindable from both. Base returns 0 -> the
+    // megakernel RT pipeline's IO set stays RT-stages-only.
+    // Reflection cannot discover this: it only walks the RT program, so it never sees the sibling
+    // compute PSOs built against this same layout.
+    protected virtual ShaderStageFlags OwnedSetExtraStages => 0;
 
-    // Descriptor set layouts — identical bindings to PTComputePipeline, RT stages.
+    // Only consulted for sets this pipeline reflects and owns (IO, plus ReSTIR's working set) -
+    // registry-owned scene/feature sets never route through CreateReflectedSetLayout and are
+    // All-stages already, so this needs no per-set gate.
+    protected override ShaderStageFlags ExtraStagesFor(in BindingDesc binding) => OwnedSetExtraStages;
+
+    protected override ShaderStageFlags ExtraPushStages => OwnedSetExtraStages;
+
+    // Descriptor set layouts, all registry-borrowed: scene (set 0), FeatureEnv (4), FeaturePTIO (5).
+    // A subclass may install its own graph-shared working layout into the set-2 gap (ReSTIR does).
     protected override void CreateDescriptorSetLayouts()
-    {
-        DescriptorSetLayouts            = new DescriptorSetLayout[4];
-        OwnedDescriptorSetLayoutIndices = new[] { SetFrame, SetGeom, SetIbl };
-
-        ShaderStageFlags s0 = RtAll | Set0ExtraStages;
-        var set0 = stackalloc DescriptorSetLayoutBinding[8];
-        set0[0] = new() { Binding = 0, DescriptorType = DescriptorType.UniformBuffer,            DescriptorCount = 1, StageFlags = s0 };
-        set0[1] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = s0 };
-        set0[2] = new() { Binding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = s0 };
-        set0[3] = new() { Binding = 3, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = s0 };
-        set0[4] = new() { Binding = 4, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = s0 };
-        set0[5] = new() { Binding = 5, DescriptorType = DescriptorType.StorageImage,             DescriptorCount = 1, StageFlags = s0 };
-        set0[6] = new() { Binding = 6, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = s0 };
-        set0[7] = new() { Binding = 7, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = s0 };
-        CreateLayout(set0, 8, out DescriptorSetLayouts[SetFrame]);
-
-        var set1 = stackalloc DescriptorSetLayoutBinding[2];
-        set1[0] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = s0 };
-        set1[1] = new() { Binding = 2, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = s0 };
-        CreateLayout(set1, 2, out DescriptorSetLayouts[SetGeom]);
-
-        // Borrowed bindless layout (ResourceManager adds RT stage flags when
-        // RayTracePipelineSupported - see CreateBindlessDescriptorSetLayout).
-        DescriptorSetLayouts[SetBindless] = Engine.ResourceManager.GetBindlessLayout();
-
-        var set3 = stackalloc DescriptorSetLayoutBinding[4];
-        for (uint b = 0; b < 4; b++)
-            set3[b] = new() { Binding = b, DescriptorType = DescriptorType.CombinedImageSampler, DescriptorCount = 1, StageFlags = RtAll };
-        CreateLayout(set3, 4, out DescriptorSetLayouts[SetIbl]);
-    }
-
-    private void CreateLayout(DescriptorSetLayoutBinding* bindings, uint count, out DescriptorSetLayout layout)
-    {
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = count,
-            PBindings    = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out layout) != Result.Success)
-            throw new Exception("Failed to create RT pipeline descriptor set layout");
-    }
+        => DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(null, FeatureEnv, FeaturePtIo);
 
 
     // Pipeline build: one RT pipeline (raygen + miss + closest/any-hit group) + SBT.
@@ -153,21 +133,32 @@ public unsafe class RTPipeline : RtPipeline
         if (KhrRtPipeline == null)
             throw new Exception("RTPipeline: VK_KHR_ray_tracing_pipeline dispatch table not loaded");
 
-        byte[] code   = File.ReadAllBytes(ShaderPath);
-        var    module = Gfx.CreateShaderModule(code);
+        // Slang compiles one SPIR-V module PER ENTRY POINT, so this is 4 modules rather than the
+        // single multi-entry .spv the build-time route produced. Entry i is parallel to
+        // RtEntries[i], which is what the group table below assumes.
+        var reflectedEntries = Reflected!.Reflection.EntryPoints;
+        ReadOnlySpan<ShaderStageFlags> expected =
+        [
+            ShaderStageFlags.RaygenBitKhr, ShaderStageFlags.MissBitKhr,
+            ShaderStageFlags.ClosestHitBitKhr, ShaderStageFlags.AnyHitBitKhr,
+        ];
+        if (reflectedEntries.Length != expected.Length)
+            throw new Exception($"RTPipeline: expected {expected.Length} entry points, reflected {reflectedEntries.Length}");
 
-        // Entry-point names preserved by slangc for the multi-entry-point module
-        // (confirmed in phase 1: rayGenMain / missMain / closestHitMain / anyHitMain).
-        var rgName = SilkMarshal.StringToPtr("rayGenMain");
-        var msName = SilkMarshal.StringToPtr("missMain");
-        var chName = SilkMarshal.StringToPtr("closestHitMain");
-        var ahName = SilkMarshal.StringToPtr("anyHitMain");
-
-        var stages = stackalloc PipelineShaderStageCreateInfo[4];
-        stages[0] = Stage(ShaderStageFlags.RaygenBitKhr,     module, rgName);
-        stages[1] = Stage(ShaderStageFlags.MissBitKhr,       module, msName);
-        stages[2] = Stage(ShaderStageFlags.ClosestHitBitKhr, module, chName);
-        stages[3] = Stage(ShaderStageFlags.AnyHitBitKhr,     module, ahName);
+        var modules   = stackalloc ShaderModule[4];
+        var entryPtrs = stackalloc nint[4];
+        var stages    = stackalloc PipelineShaderStageCreateInfo[4];
+        for (int i = 0; i < 4; i++)
+        {
+            // A silent SBT misorder is unrecoverable at runtime, so pin the contract here.
+            if (reflectedEntries[i].Stage != expected[i])
+                throw new Exception(
+                    $"RTPipeline: entry {i} '{reflectedEntries[i].Name}' is {reflectedEntries[i].Stage}, " +
+                    $"expected {expected[i]} - SBT group order would be wrong");
+            modules[i]   = CreateReflectedModule(i);
+            entryPtrs[i] = SilkMarshal.StringToPtr(reflectedEntries[i].Name);
+            stages[i]    = Stage(expected[i], modules[i], entryPtrs[i]);
+        }
 
         const uint UNUSED = uint.MaxValue;   // VK_SHADER_UNUSED_KHR
         var groups = stackalloc RayTracingShaderGroupCreateInfoKHR[3];
@@ -201,11 +192,11 @@ public unsafe class RTPipeline : RtPipeline
             throw new Exception($"Failed to create ray tracing pipeline: {res}");
         PipelineHandle = pipeline;
 
-        SilkMarshal.Free(rgName);
-        SilkMarshal.Free(msName);
-        SilkMarshal.Free(chName);
-        SilkMarshal.Free(ahName);
-        Vk.DestroyShaderModule(Device, module, null);
+        for (int i = 0; i < 4; i++)
+        {
+            SilkMarshal.Free(entryPtrs[i]);
+            Vk.DestroyShaderModule(Device, modules[i], null);
+        }
 
         BuildShaderBindingTable();
     }
@@ -274,175 +265,8 @@ public unsafe class RTPipeline : RtPipeline
     }
 
 
-    // Per-pipeline-owned resources (per-frame UBO).
-    protected override void CreateResources()
-    {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Gfx.CreateMappedUniformBuffer(sizeof(PathFrameUBO), ref _frameUbos[i]);
-    }
-
-
-    protected override void CreateDescriptorSets()
-    {
-        DescriptorSets = new DescriptorSet[4][];
-
-        var set0Layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) set0Layouts[i] = DescriptorSetLayouts[SetFrame];
-        DescriptorSetAllocateInfo alloc0 = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts        = set0Layouts,
-        };
-        DescriptorSets[SetFrame] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* p = DescriptorSets[SetFrame])
-            if (Vk.AllocateDescriptorSets(Device, &alloc0, p) != Result.Success)
-                throw new Exception("Failed to allocate RT pipeline set 0");
-
-        var geomLayout = DescriptorSetLayouts[SetGeom];
-        DescriptorSetAllocateInfo alloc1 = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts        = &geomLayout,
-        };
-        DescriptorSets[SetGeom] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[SetGeom])
-            if (Vk.AllocateDescriptorSets(Device, &alloc1, p) != Result.Success)
-                throw new Exception("Failed to allocate RT pipeline set 1");
-
-        DescriptorSets[SetBindless] = null;   // borrowed
-
-        var iblLayout = DescriptorSetLayouts[SetIbl];
-        DescriptorSetAllocateInfo alloc3 = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts        = &iblLayout,
-        };
-        DescriptorSets[SetIbl] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[SetIbl])
-            if (Vk.AllocateDescriptorSets(Device, &alloc3, p) != Result.Success)
-                throw new Exception("Failed to allocate RT pipeline set 3");
-    }
-
-
-    protected override void WriteDescriptors()
-    {
-        WriteFrameUboDescriptors();
-        WriteGeometryDescriptors();
-    }
-
-    private void WriteFrameUboDescriptors()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo info = new() { Buffer = _frameUbos[i].buffer, Offset = 0, Range = (ulong)sizeof(PathFrameUBO) };
-            var write = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i],
-                DstBinding = 0, DescriptorType = DescriptorType.UniformBuffer, DescriptorCount = 1, PBufferInfo = &info,
-            };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    public void WriteGeometryDescriptors()
-    {
-        var rm = Engine.ResourceManager;
-        DescriptorBufferInfo vbInfo = new() { Buffer = rm.GlobalVertexBuffer, Offset = 0, Range = Vk.WholeSize };
-        DescriptorBufferInfo ibInfo = new() { Buffer = rm.GlobalIndexBuffer,  Offset = 0, Range = Vk.WholeSize };
-        var writes = stackalloc WriteDescriptorSet[2];
-        writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetGeom][0], DstBinding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &vbInfo };
-        writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetGeom][0], DstBinding = 2, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &ibInfo };
-        Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-    }
-
-    public void WriteLightsDescriptor()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo info = new() { Buffer = Renderer.GetLightStorageBuffer((uint)i), Offset = 0, Range = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)) };
-            var write = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &info };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    public void WriteTlasDescriptor(AccelerationStructureKHR tlas)
-    {
-        if (tlas.Handle == 0) return;
-        var tlasH = tlas;
-        var asWrite = new WriteDescriptorSetAccelerationStructureKHR
-        {
-            SType = StructureType.WriteDescriptorSetAccelerationStructureKhr,
-            AccelerationStructureCount = 1, PAccelerationStructures = &tlasH,
-        };
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            var write = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, PNext = &asWrite, DstSet = DescriptorSets[SetFrame][i], DstBinding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1 };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    public void WriteShadowInfoDescriptor()
-    {
-        var buf = Renderer.ShadowInfoBuffer;
-        if (buf.Handle == 0) return;
-        DescriptorBufferInfo info = new() { Buffer = buf, Offset = 0, Range = Renderer.ShadowInfoBufferSize };
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            var write = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 3, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &info };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    public void WriteEmissiveDescriptors()
-    {
-        var triBuf   = Renderer.EmissiveTriBuffer;
-        var aliasBuf = Renderer.EmissiveAliasBuffer;
-        if (triBuf.Handle == 0 || aliasBuf.Handle == 0) return;
-        DescriptorBufferInfo triInfo   = new() { Buffer = triBuf,   Offset = 0, Range = Renderer.EmissiveTriBufferSize };
-        DescriptorBufferInfo aliasInfo = new() { Buffer = aliasBuf, Offset = 0, Range = Renderer.EmissiveAliasBufferSize };
-        var writes = stackalloc WriteDescriptorSet[2];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 6, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &triInfo };
-            writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 7, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &aliasInfo };
-            Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-        }
-    }
-
-    public void WriteStorageImageDescriptors(ImageView accumView, ImageView outColorView)
-    {
-        DescriptorImageInfo accumInfo = new() { ImageView = accumView,    ImageLayout = ImageLayout.General };
-        DescriptorImageInfo outInfo   = new() { ImageView = outColorView, ImageLayout = ImageLayout.General };
-        var writes = stackalloc WriteDescriptorSet[2];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 4, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &accumInfo };
-            writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetFrame][i], DstBinding = 5, DescriptorType = DescriptorType.StorageImage, DescriptorCount = 1, PImageInfo = &outInfo };
-            Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
-        }
-        MarkAccumulatorDirty();
-    }
-
-    public void WriteIblDescriptors()
-    {
-        var imageInfos = stackalloc DescriptorImageInfo[4]
-        {
-            new() { ImageView = Renderer.Ibl.irradianceCubeView,  Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.prefilteredCubeView, Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.brdfLutView,         Sampler = Renderer.Ibl.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.envCubeView,         Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-        };
-        var writes = stackalloc WriteDescriptorSet[4];
-        for (uint b = 0; b < 4; b++)
-            writes[b] = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[SetIbl][0], DstBinding = b, DescriptorType = DescriptorType.CombinedImageSampler, DescriptorCount = 1, PImageInfo = &imageInfos[b] };
-        Vk.UpdateDescriptorSets(Device, 4, writes, 0, null);
-    }
+    // No descriptor sets to allocate or write: every set this pipeline binds (scene, FeatureEnv,
+    // FeaturePTIO) is registry-owned, and ReSTIR's set-2 working set is graph-owned.
 
 
     public virtual bool UpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent)
@@ -462,7 +286,7 @@ public unsafe class RTPipeline : RtPipeline
         float fovRad     = fovDeg * (float)(Math.PI / 180.0);
         float tanHalfFov = MathF.Tan(fovRad * 0.5f);
 
-        PathFrameUBO ubo = new()
+        _frameUbo = new PathFrameUBO
         {
             invView                  = invView,
             invProj                  = invProj,
@@ -483,18 +307,16 @@ public unsafe class RTPipeline : RtPipeline
             emissiveTriCount         = Renderer.EmissiveTriangleCount,
             totalEmissivePower       = Renderer.TotalEmissivePower,
         };
-
-        void* data = _frameUbos[frameIndex].mapped;
-        new Span<PathFrameUBO>(data, 1).Fill(ubo);
         return reset;
     }
 
 
     /// <summary>Records the CmdTraceRays dispatch. Caller must have run
-    /// UpdatePerFrame, written all external descriptors, and transitioned the
-    /// accumulator/outColor images to GENERAL beforehand.</summary>
-    // Extra descriptor sets a subclass binds after the four base sets (0-3). ReSTIR appends its
-    // set 4 (reservoirs + G-buffer). Base pipeline binds none.
+    /// UpdatePerFrame, written the storage-image + IBL descriptors, and
+    /// transitioned the accumulator/outColor images to GENERAL beforehand.</summary>
+    // Extra descriptor sets a subclass binds in the graph-shared slot right after the base sets
+    // (0-1), i.e. starting at set 2. ReSTIR installs its working set (reservoirs + G-buffer) there.
+    // Base pipeline binds none.
     protected virtual uint ExtraSetCount => 0u;
     protected virtual void WriteExtraSets(DescriptorSet* dst, uint frame) { }
 
@@ -508,14 +330,24 @@ public unsafe class RTPipeline : RtPipeline
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.RayTracingKhr, PipelineHandle);
 
-        uint total = 4u + ExtraSetCount;
-        var sets = stackalloc DescriptorSet[(int)total];
-        sets[0] = DescriptorSets[SetFrame][ctx.FrameIndex];
-        sets[1] = DescriptorSets[SetGeom][0];
-        sets[2] = Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex);
-        sets[3] = DescriptorSets[SetIbl][0];
-        if (ExtraSetCount > 0u) WriteExtraSets(sets + 4, ctx.FrameIndex);
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, 0, total, sets, 0, null);
+        // Four separate binds, because the occupied sets are no longer contiguous: set 1 is now an
+        // unused gap (the IO pair moved to the registry), and the subclass working set sits at 2.
+        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
+        var sceneSet = Registry.SceneSet(ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, ShaderSets.Scene, 1, &sceneSet, 1, &frameConstants);
+
+        if (ExtraSetCount > 0u)
+        {
+            var extra = stackalloc DescriptorSet[(int)ExtraSetCount];
+            WriteExtraSets(extra, ctx.FrameIndex);
+            Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, ShaderSets.GraphShared, ExtraSetCount, extra, 0, null);
+        }
+
+        var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+
+        var ioSet = Registry.FeatureSet(FeaturePtIo, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.RayTracingKhr, Layout, Registry.FeatureSetIndex(FeaturePtIo), 1, &ioSet, 0, null);
 
         RecordPushConstants(cmd);
 
@@ -524,11 +356,16 @@ public unsafe class RTPipeline : RtPipeline
             ctx.RenderExtent.Width, ctx.RenderExtent.Height, 1);
     }
 
+    // Pushes the staged PathFrameUBO into the per-frame constant arena and returns its dynamic
+    // offset. ReSTIR's compute passes (built on the shared layout) call this so they can bind the
+    // scene set with the same frame constants the RT Trace pass uses. Keeps PathFrameUBO private.
+    protected uint PushFrameConstants(uint frameIndex) =>
+        Registry.ConstantArena.Push(frameIndex, _frameUbo);
+
 
     public override void Dispose()
     {
         if (_sbtBuffer.Handle != 0) Gfx.DestroyBuffer(_sbtBuffer, _sbtAlloc);
-        foreach (var b in _frameUbos) Gfx.DestroyBuffer(b.buffer, b.alloc);
         base.Dispose();
     }
 }

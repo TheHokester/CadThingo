@@ -1,18 +1,26 @@
 using System.Numerics;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.RenderCores;
 using Silk.NET.Vulkan;
+
+// The graph type shares its name with its namespace; alias so bare references never have to
+// disambiguate type-vs-namespace (same trick as WavefrontPTCore).
+using PTGraph = CadThingo.VulkanEngine.Renderer.FrameGraph.FrameGraph;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 
 /// <summary>
-/// Shared base for the two progressive path-trace cores:  the compute
-/// (ray-query) path and the RT-pipeline path.<br/><br/> 
-///
-/// Subclasses bind the concrete pipeline via the protected hooks.
+/// Shared base for the two progressive megakernel path-trace cores: the compute (ray-query) path
+/// and the RT-pipeline path. GRAPH-RESIDENT like WavefrontPTCore / ReStirDICore: owns a
+/// <see cref="PTGraph"/> built from <see cref="PathTraceModule"/> (Trace -> Tonemap), so the
+/// barriers and the tonemap HDR-input set are graph-derived / graph-baked instead of hand-rolled.
+/// Subclasses bind the concrete pipeline via the protected hooks and call <see cref="BuildGraph"/>
+/// at the end of their ctor (after their pipeline field is assigned).
 /// </summary>
-internal abstract unsafe class PathTraceCoreBase : IRenderCore
+internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
 {
     protected readonly Renderer _host;
+    private PTGraph? _graph;
 
     // Previous-frame camera snapshot. Any change restarts progressive integration. Identity/zero
     // defaults mean the first frame after switching to this core always restarts (intended).
@@ -31,47 +39,59 @@ internal abstract unsafe class PathTraceCoreBase : IRenderCore
     public abstract Renderer.RenderMode Mode { get; }
 
     // ---- Pipeline-specific hooks (forwarded to PTComputePipeline / RTPipeline) ------------------
-    /// <summary>The stage that writes the accumulator / ptOutColor: compute vs ray-tracing. Used for
-    /// the pre-dispatch barrier's src (|fragment) + dst masks.</summary>
-    protected abstract PipelineStageFlags WriterStage { get; }
+    /// <summary>Compute (ray query) vs RayTrace (CmdTraceRays) -- selects the Trace pass type and
+    /// the stage the module's derived barriers target.</summary>
+    protected abstract PassType TracePassType { get; }
     protected abstract void PipelineMarkAccumulatorDirty();
     protected abstract bool PipelineUpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent);
     protected abstract void PipelineRecord(CommandBuffer cmd, in Renderer.FrameContext ctx);
-    protected abstract void PipelineWriteStorageImages(ImageView accumView, ImageView outColorView);
 
-    /// <summary>Re-point tonemap's shared HDR-input descriptor at ptOutColor (the PT scene-colour
-    /// image). Called by the host on mode switch / after a tonemap rebuild -- replaces the per-frame
-    /// _lastRenderMode rebind.</summary>
-    public void Activate()
+    /// <summary>(Re)build the Trace -> Tonemap graph. Imports the host accumulator / out-color /
+    /// FinalColor (re-read here so a resize picks up the fresh handles), then rebinds the
+    /// pipeline's storage-image descriptors to the SAME handles the graph just imported (which
+    /// also marks the accumulator dirty). Called from the subclass ctor + on every resize.</summary>
+    protected void BuildGraph()
     {
-        _host.tonemapPipeline.WriteHdrInputDescriptor(
-            _host.renderTargets.PtOutColor.ImageView, _host.gBufferSampler);
-        // The accumulator + ptOutColor are shared across all PT cores (compute / RT / wavefront),
-        // so on a switch into this core they still hold the previous core's progressive result.
-        // Restart integration deterministically here (after the host's DeviceWaitIdle) rather than
-        // leaning on the host accumulator-dirty flag, which otherwise lands a frame late and can
-        // leave the stale image visible.
+        _graph?.Dispose();
+        var fg = new PTGraph(_host.gfx);
+
+        var module = new PathTraceModule(_host.tonemapPipeline, TracePassType,
+            (CommandBuffer cmd, PassResources res, in Renderer.FrameContext f) => PipelineRecord(cmd, f));
+        module.Build(fg.RootScope().Child("PathTrace"),
+            new PathTraceModule.Inputs(
+                _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
+                _host.renderTargets.FinalColor),
+            out var o);
+
+        fg.MarkOutput(o.Final);
+        fg.Compile();
+        _graph = fg;
+
+        // The storage-image descriptors themselves are registry-owned (FeaturePTIO) and re-registered
+        // by the host on resize; all that is left here is dropping the sample count, since fresh
+        // images make any in-progress accumulation invalid by construction.
         PipelineMarkAccumulatorDirty();
     }
 
-    /// <summary>Rebind the pipeline's storage-image descriptors to the freshly-reallocated
-    /// accumulator + ptOutColor (WriteStorageImageDescriptors marks the accumulator dirty
-    /// internally, so the next dispatch clears the fresh memory rather than reading garbage).</summary>
-    public void Resize(Extent2D extent) =>
-        PipelineWriteStorageImages(
-            _host.renderTargets.PtAccumulator.ImageView, _host.renderTargets.PtOutColor.ImageView);
+    /// <summary>Restart progressive integration on activation. Tonemap's HDR input is graph-baked
+    /// by this core's composed TonemapModule from the imported PtOutColor, so no descriptor rebind
+    /// is needed. The accumulator is SHARED with the other PT cores, so resetting here --
+    /// deterministically, after the host's DeviceWaitIdle -- guarantees a fresh start instead of
+    /// `+=`-ing onto a stale image.</summary>
+    public void Activate() => PipelineMarkAccumulatorDirty();
+
+    /// <summary>Resize: rebuild the graph so it imports the freshly-reallocated PT/Final targets
+    /// (BuildGraph also rebinds the pipeline's storage-image descriptors + marks the accumulator
+    /// dirty).</summary>
+    public void Resize(Extent2D extent) => BuildGraph();
 
     public void Render(in RenderFrame frame)
     {
-        var cmd = frame.Cmd;
-        var ctx = frame.Frame;
+        var cmd    = frame.Cmd;
+        var ctx    = frame.Frame;
         var camera = _host.Camera;
         var scene  = _host.Scene;
-        uint currentFrame  = ctx.FrameIndex;
-        var renderExtent   = ctx.RenderExtent;
-
-        var ptAccumulator = _host.renderTargets.PtAccumulator;
-        var ptOutColor    = _host.renderTargets.PtOutColor;
+        uint currentFrame = ctx.FrameIndex;
 
         // Camera motion -> restart accumulation. Cheap structural-equality check against last
         // frame's snapshot. If Camera ever grows a built-in dirty flag, swap this out for that.
@@ -87,7 +107,7 @@ internal abstract unsafe class PathTraceCoreBase : IRenderCore
             }
         }
 
-        // Refresh per-frame SSBOs — lights AND materials (so inspector edits land in PT mode).
+        // Refresh per-frame SSBOs -- lights AND materials (so inspector edits land in PT mode).
         uint lightCount = _host.UpdateLights(currentFrame, scene);
         _host.UpdateMaterials(currentFrame, scene);
 
@@ -98,66 +118,28 @@ internal abstract unsafe class PathTraceCoreBase : IRenderCore
             _host.ClearAccumulatorDirty();
         }
 
-        PipelineUpdatePerFrame(currentFrame, camera!, lightCount, renderExtent);
+        PipelineUpdatePerFrame(currentFrame, camera!, lightCount, ctx.RenderExtent);
 
-        //  Pre-dispatch barrier
-        // ptAccumulator: previous frame's compute read+write -> this frame's same.
-        // ptOutColor:    previous frame's tonemap fragment read (or first-frame Undefined->General)
-        //                -> this frame's write. Both stay in General the whole time; tonemap reads
-        // ptOutColor in ShaderReadOnly between dispatch and end-of-frame, re-stamped to General
-        // before the next dispatch lands here.
-        var preBarriers = stackalloc ImageMemoryBarrier[2];
-        preBarriers[0] = new ImageMemoryBarrier
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.General,
-            NewLayout = ImageLayout.General,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = ptAccumulator.Image,
-            SrcAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
-            DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
-            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
-        };
-        preBarriers[1] = new ImageMemoryBarrier
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.General,
-            NewLayout = ImageLayout.General,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = ptOutColor.Image,
-            SrcAccessMask = AccessFlags.ShaderReadBit,
-            DstAccessMask = AccessFlags.ShaderWriteBit,
-            SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
-        };
-        _host.vk!.CmdPipelineBarrier(cmd,
-            WriterStage | PipelineStageFlags.FragmentShaderBit,
-            WriterStage,
-            0, 0, null, 0, null, 2, preBarriers);
-
-        PipelineRecord(cmd, ctx);
-
-        // Tonemap into FinalColor. Tonemap's HDR input descriptor was rebound to ptOutColor in
-        // Activate (mode switch). It expects the image in ShaderReadOnly and writes FinalColor as a
-        // color attachment.
-        _host.TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
-            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
-
-        var finalColor = _host.renderTargets.FinalColor;
-        _host.TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
-            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
-
-        _host.tonemapPipeline.Record(cmd, ctx, finalColor.ImageView);
-
-        _host.TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
-            ImageLayout.ColorAttachmentOptimal, ImageLayout.ShaderReadOnlyOptimal);
-
-        // ptOutColor back to General so next frame's dispatch + pre-barrier path are layout-uniform.
-        _host.TransitionImageLayout(cmd, ptOutColor.Image, ptOutColor._format,
-            ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
+        // Record Trace -> Tonemap; every barrier derived from the usage table.
+        _graph!.Execute(cmd, ctx);
     }
 
-    // PT cores own no GPU resources (pipelines + images are host-owned); nothing to free.
-    public void Dispose() { }
+    // ---- IGraphCore surface (Stats panel + gfx-chunk submission) ------------
+    public GraphStats? GraphStats => _graph?.Stats;
+    public string ToDot() => _graph?.ToDot() ?? "(no pathtrace frame graph)";
+    public bool CollectPipelineStats
+    {
+        get => _graph?.CollectPipelineStats ?? false;
+        set { if (_graph != null) _graph.CollectPipelineStats = value; }
+    }
+    public bool HasPendingGfxChunks => _graph?.HasPendingGfxChunks ?? false;
+    public void SubmitGfxChunks(Queue gfxQueue, SemaphoreSubmitInfo imgAvailWait,
+        SemaphoreSubmitInfo renderDoneSignal, CommandBuffer hostCmd, Fence fence)
+        => _graph!.SubmitGfxChunks(gfxQueue, imgAvailWait, renderDoneSignal, hostCmd, fence);
+
+    public void Dispose()
+    {
+        _graph?.Dispose();
+        _graph = null;
+    }
 }

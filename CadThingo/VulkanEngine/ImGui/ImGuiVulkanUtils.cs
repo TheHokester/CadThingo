@@ -237,7 +237,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
             Height = (uint)texHeight,
             Depth = 1
         };
-        fontTexture = Texture.CreateTextureFromMemory(renderer, fontData, (uint)texWidth,
+        fontTexture = Texture.CreateTextureFromMemory(renderer.gfx, fontData, (uint)texWidth,
             (uint)texHeight, Format.R8G8B8A8Unorm, fontExtent);
 
         // Eagerly allocate one vertex/index buffer per frame-in-flight at a
@@ -727,29 +727,21 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
 
     private void CreateImGuiPipeline()
     {
-        byte[] shaderCode = File.ReadAllBytes(ShaderPaths.Spv("ImGui"));
+        // ImGui.slang compiled at runtime through the shader library, like every engine pipeline.
+        // The reflected route emits one SPIR-V blob per entry point, so this is two modules where
+        // the old build-time .spv was one shared module holding both stages.
+        var program = renderer.Gpu.Shaders.GetProgram(
+            new Renderer.Shaders.ShaderCompileRequest("ImGui", ["VSMain", "PSMain"], [], []));
 
-        var shaderInfo = new ShaderModuleCreateInfo()
-        {
-            SType = StructureType.ShaderModuleCreateInfo,
-            CodeSize = (nuint)shaderCode.Length,
-        };
-        fixed (byte* pCode = shaderCode)
-        {
-            shaderInfo.PCode = (uint*)pCode;
-        }
+        ShaderModule vertShader = renderer.gfx.CreateShaderModule(program.Spirv(0).ToArray());
+        ShaderModule fragShader = renderer.gfx.CreateShaderModule(program.Spirv(1).ToArray());
 
-        if (vk!.CreateShaderModule(device, &shaderInfo, null, out var shader) != Result.Success)
-        {
-            throw new Exception("Failed to create shader module");
-        }
-
-        //config vertex stage 
+        //config vertex stage
         PipelineShaderStageCreateInfo vertShaderInfo = new()
         {
             SType = StructureType.PipelineShaderStageCreateInfo,
             Stage = ShaderStageFlags.VertexBit,
-            Module = shader,
+            Module = vertShader,
             PName = (byte*)SilkMarshal.StringToPtr("VSMain")
         };
         //config frag stage
@@ -757,7 +749,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         {
             SType = StructureType.PipelineShaderStageCreateInfo,
             Stage = ShaderStageFlags.FragmentBit,
-            Module = shader,
+            Module = fragShader,
             PName = (byte*)SilkMarshal.StringToPtr("PSMain")
         };
         var shaderStageCount = 2;
@@ -914,6 +906,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
             }
         }
 
-        vk!.DestroyShaderModule(device, shader, null);
+        vk!.DestroyShaderModule(device, vertShader, null);
+        vk!.DestroyShaderModule(device, fragShader, null);
     }
 }

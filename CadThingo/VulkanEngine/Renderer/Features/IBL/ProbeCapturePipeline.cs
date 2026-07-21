@@ -1,5 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -15,7 +17,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 /// to the geometry pass. Set 0 is a private per-frame UBO carrying the 6 view
 /// matrices + projection.
 /// </summary>
-public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
 {
     // CPU mirror of the UBO. Layout matches ProbeCapture.slang::CaptureUBO.
     [StructLayout(LayoutKind.Sequential)]
@@ -46,7 +48,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
 
     private UboBuffer[] _ubos = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
-    public ProbeCapturePipeline(Renderer renderer) : base(renderer)
+    public ProbeCapturePipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
         // Matches the capture depth attachment created by ReflectionProbeSystem.
         DepthAttachmentFormat = Format.D32Sfloat;
@@ -54,7 +56,7 @@ public sealed unsafe class ProbeCapturePipeline : Pipelines.GraphicsPipeline
 
     // GraphicsPipeline overrides
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("IBL", "ProbeCapture");
+    protected override ShaderCompileRequest? Program => new("IBL/ProbeCapture", ["VSMain", "PSMain"], [], []);
 
     protected override Format[] ColorAttachmentFormats { get; } = [ Format.R16G16B16A16Sfloat ];
 

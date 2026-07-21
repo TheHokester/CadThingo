@@ -8,35 +8,23 @@
 //   3. shades the surviving sample with one opaque shadow ray,
 //   4. sums it with sceneRadiance and folds the result into the progressive accumulator.
 //
-// Runs on the RT pipeline's SHARED layout (set 0 = frame/lights/tlas/accum/outColor, set 4 = the
-// ReSTIR working set + set 1 geom + set 2 bindless), binding the exact descriptor sets the Trace
-// pass uses -- the layouts carry ComputeBit on those sets. The shadow ray is ALPHA-TESTED (masked /
+// Runs on the RT pipeline's SHARED layout (set 0 = scene, set 1 = accum/outColor IO, set 2 = the
+// ReSTIR working set), binding the exact descriptor sets the Trace pass uses -- the scene-set layout
+// is All-stages and the IO/working sets carry ComputeBit. The shadow ray is ALPHA-TESTED (masked /
 // blended / transmissive geometry occludes exactly as in the other tracers, for parity).
 //
 // The shared types/helpers mirror ReStirDI.slang (kept in sync by hand; small + stable). Same-frame
 // spatial reuse is the coherence-friendly design: a uniform dispatch with a tiny register footprint
 // + one coherent shadow ray, vs burying the work in the divergent megakernel.
 
-import PTUtils;   // BRDF/light eval (evaluateFullBrdf, evaluateLight, LightSample), HitInfo, rand
+import PTUtils;        // BRDF/light eval (evaluateFullBrdf, evaluateLight, LightSample), HitInfo, rand
+import SceneBindings;  // scene set 0: sceneLights/sceneTlas/sceneEntityInfo/sceneVertices+sceneIndices/sceneMaterials+sceneTextures+sceneSamplers
+import ReStirBindings; // set 2 (graph-owned) working set + Reservoir/PackedHit record types
+import FeaturePTIO;    // feature set 5: accumulator + outColor
 
-// ---- Shared types (mirror ReStirDI.slang) --------------------------------------------------------
-struct Reservoir {
-    uint   sampleType;  // SAMPLE_NONE / SAMPLE_ANALYTIC / SAMPLE_EMISSIVE
-    uint   index;       // analytic: light index
-    float3 samplePos;   // emissive: sampled world point Q
-    float3 sampleLe;    // emissive: radiance Le at Q
-    float  sampleEsPdf; // emissive: NEE solid-angle pdf at build (for NEE<->BSDF MIS)
-    uint   M; float wSum; float W; float pHat;
-};
-struct PackedHit {
-    float3 worldPos; uint nOct; uint ngOct; uint baseIor; uint emisRG; uint scal0; uint scal1; uint matFlags;
-};
 // Resolved sample ready to shade (unified across analytic + emissive).
 struct ShadeSample { float3 L; float3 radiance; float dist; bool castShadows; float weight; bool valid; };
 
-static const uint  SAMPLE_NONE            = 0u;
-static const uint  SAMPLE_ANALYTIC        = 1u;
-static const uint  SAMPLE_EMISSIVE        = 2u;
 static const uint  TEMPORAL_M_CAP         = 30u;
 static const uint  RESTIR_SPATIAL_SAMPLES = 4u;
 static const float RESTIR_SPATIAL_RADIUS  = 16.0;
@@ -83,29 +71,12 @@ HitInfo unpackHit(PackedHit p, float3 rayOrigin) {
     return h;
 }
 
-// ---- Shared bindings (mirror ReStirDI.slang set 0 + set 4) ---------------------------------------
-[[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO>       frameUBO;
-[[vk::binding(1, 0)]] StructuredBuffer<PbrLight>         lights;
-[[vk::binding(2, 0)]] RaytracingAccelerationStructure    tlas;
-[[vk::binding(3, 0)]] StructuredBuffer<ShadowEntityInfo> entityInfo;   // alpha-tested shadow rays
-[[vk::binding(4, 0)]] RWTexture2D<float4>                accumulator;
-[[vk::binding(5, 0)]] RWTexture2D<float4>                outColor;
-
-// Geometry (set 1) + bindless materials/textures (set 2) -- needed so the shadow ray can alpha-test
-// masked/blended geometry exactly like the other tracers (parity). The pipeline already binds these
-// sets to the compute pass; the layouts carry ComputeBit (RTPipeline.Set0ExtraStages + the bindless
-// layout's compute stage).
-[[vk::binding(1, 1)]] ByteAddressBuffer globalVertices;
-[[vk::binding(2, 1)]] ByteAddressBuffer globalIndices;
-[[vk::binding(0, 2)]] StructuredBuffer<PbrMaterial> materials;
-[[vk::binding(2, 2)]] Texture2D                     textures[];
-[[vk::binding(3, 2)]] SamplerState                  samplers[];
-
-[[vk::binding(0, 4)]] RWStructuredBuffer<Reservoir> reservoirA;
-[[vk::binding(1, 4)]] RWStructuredBuffer<Reservoir> reservoirB;
-[[vk::binding(2, 4)]] RWStructuredBuffer<PackedHit> gbufferA;
-[[vk::binding(3, 4)]] RWStructuredBuffer<PackedHit> gbufferB;
-[[vk::binding(4, 4)]] RWStructuredBuffer<float4>    sceneRadiance;   // Trace's indirect+emissive+env
+// ---- Bindings -------------------------------------------------------------------------------------
+// Scene set 0 comes from the imported SceneBindings module (the alpha-tested shadow ray reads it
+// exactly like the other tracers; the scene-set layout carries All stages so it binds from compute).
+// The set-2 (graph-owned) working buffers come from ReStirBindings, and accumulator/outColor from
+// FeaturePTIO (feature set 5). Only the per-pass constant UBO is declared here.
+[[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
 
 struct ReStirPush { float4x4 prevViewProj; uint frameParity; uint hasHistory; uint pad0, pad1; };
 [[vk::push_constant]] ReStirPush rpc;
@@ -135,7 +106,7 @@ float diTarget(HitInfo hit, float3 V, float3 L, float3 radiance) {
 float targetAtSurface(Reservoir r, HitInfo hit, float3 V) {
     if (r.sampleType == SAMPLE_ANALYTIC) {
         LightSample ls;
-        if (!evaluateLight(lights[r.index], hit.worldPos, ls)) return 0.0;
+        if (!evaluateLight(sceneLights[r.index], hit.worldPos, ls)) return 0.0;
         return diTarget(hit, V, ls.L, ls.radiance);
     }
     if (r.sampleType == SAMPLE_EMISSIVE) {
@@ -153,7 +124,7 @@ float targetAtSurface(Reservoir r, HitInfo hit, float3 V) {
 bool sampleInDomain(Reservoir r, float3 worldPos, float3 N) {
     if (r.sampleType == SAMPLE_ANALYTIC) {
         LightSample ls;
-        if (!evaluateLight(lights[r.index], worldPos, ls)) return false;
+        if (!evaluateLight(sceneLights[r.index], worldPos, ls)) return false;
         return dot(N, ls.L) > 0.0;
     }
     if (r.sampleType == SAMPLE_EMISSIVE)
@@ -168,7 +139,7 @@ ShadeSample reservoirToShade(Reservoir r, float3 worldPos, float3 N) {
     if (r.sampleType == SAMPLE_NONE || r.W <= 0.0) return p;
     if (r.sampleType == SAMPLE_ANALYTIC) {
         LightSample ls;
-        if (!evaluateLight(lights[r.index], worldPos, ls)) return p;
+        if (!evaluateLight(sceneLights[r.index], worldPos, ls)) return p;
         p.L = ls.L; p.radiance = ls.radiance; p.dist = ls.distance; p.castShadows = ls.castShadows;
     } else {
         float3 d = r.samplePos - worldPos; float dist = length(d);
@@ -199,18 +170,18 @@ bool surfaceMatches(HitInfo h, PackedHit pg) {
 static const float ALPHA_LOD_SHADOW = 3.0;
 
 float2 computeUV(uint indexOffset, uint primIdx, float2 bary) {
-    uint i0 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 0u);
-    uint i1 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 1u);
-    uint i2 = fetchTriangleIndex(globalIndices, indexOffset, primIdx, 2u);
+    uint i0 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 0u);
+    uint i1 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 1u);
+    uint i2 = fetchTriangleIndex(sceneIndices, indexOffset, primIdx, 2u);
     float w0 = 1.0 - bary.x - bary.y;
-    return fetchVertexUV(globalVertices, i0) * w0
-         + fetchVertexUV(globalVertices, i1) * bary.x
-         + fetchVertexUV(globalVertices, i2) * bary.y;
+    return fetchVertexUV(sceneVertices, i0) * w0
+         + fetchVertexUV(sceneVertices, i1) * bary.x
+         + fetchVertexUV(sceneVertices, i2) * bary.y;
 }
 float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 bary, float lod) {
     if (mat.baseColorTex < 0 || mat.flags == 0) return 1.0;
     float2 uv = computeUV(indexOffset, primIdx, bary);
-    return textures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(samplers[0], uv, lod).a * mat.baseColorFactor.a;
+    return sceneTextures[NonUniformResourceIndex(mat.baseColorTex)].SampleLevel(sceneSamplers[0], uv, lod).a * mat.baseColorFactor.a;
 }
 
 // Alpha-tested occlusion query -- mirrors ReStirDI.slang's isOccluded so masked/blended geometry
@@ -220,17 +191,17 @@ float computeAlpha(PbrMaterial mat, uint indexOffset, uint primIdx, float2 bary,
 bool isOccluded(float3 origin, float3 dir, float tMax, inout uint rngState) {
     RayDesc r; r.Origin = origin; r.Direction = dir; r.TMin = 0.0; r.TMax = tMax;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, r);
+    q.TraceRayInline(sceneTlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, r);
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
-            ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
-            PbrMaterial      cmat = materials[cei.materialIndex];
+            ShadowEntityInfo cei = sceneEntityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
+            PbrMaterial      cmat = sceneMaterials[cei.materialIndex];
             float alpha = computeAlpha(cmat, cei.indexOffset, q.CandidatePrimitiveIndex(),
                                        q.CandidateTriangleBarycentrics(), ALPHA_LOD_SHADOW);
             float transmittance = cmat.transmissionFactor;
             if (cmat.transmissionTex >= 0) {
                 float2 uv = computeUV(cei.indexOffset, q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics());
-                transmittance *= textures[NonUniformResourceIndex(cmat.transmissionTex)].SampleLevel(samplers[0], uv, ALPHA_LOD_SHADOW).r;
+                transmittance *= sceneTextures[NonUniformResourceIndex(cmat.transmissionTex)].SampleLevel(sceneSamplers[0], uv, ALPHA_LOD_SHADOW).r;
             }
             float passAlpha = 1.0;
             if ((cmat.flags & 1u) != 0u) passAlpha = (alpha >= cmat.alphaCutoff) ? 1.0 : 0.0;

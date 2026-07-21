@@ -10,10 +10,9 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
 ///   SelectionMaskPipeline ray-query coverage mask of the selected entity
 ///   OutlinePipeline       composites an outer ring around that mask into FinalColor
 /// The coverage mask image itself lives on <see cref="RenderTargets"/> (resized
-/// with the swapchain); this system only binds it. All three pipelines borrow
-/// the renderer-owned TLAS + ShadowEntityInfo table, wired via
-/// <see cref="WriteTlasDescriptor"/> / <see cref="WriteEntityInfoDescriptor"/>
-/// once InitRayQuery has built them.
+/// with the swapchain); this system only binds it. The pick + mask pipelines read
+/// the TLAS + ShadowEntityInfo table from the registry-owned scene set (sceneTlas /
+/// sceneEntityInfo), so no per-pipeline TLAS/entity-info fan-out is needed.
 /// </summary>
 public unsafe sealed class SelectionSystem : IDisposable
 {
@@ -23,42 +22,26 @@ public unsafe sealed class SelectionSystem : IDisposable
     internal SelectionMaskPipeline selectionMaskPipeline;
     internal OutlinePipeline       outlinePipeline;
 
-    public SelectionSystem(Renderer renderer)
+    public SelectionSystem(GpuContext gpu, Renderer renderer)
     {
         _renderer = renderer;
 
         // Object picking owns only a tiny result SSBO; the TLAS is bound later.
-        pickPipeline = new PickPipeline(renderer);
+        pickPipeline = new PickPipeline( gpu, renderer);
         pickPipeline.Initialize();
 
         // Mask pipeline writes the coverage image; outline reads it back.
-        selectionMaskPipeline = new SelectionMaskPipeline(renderer);
+        selectionMaskPipeline = new SelectionMaskPipeline(gpu, renderer);
         selectionMaskPipeline.Initialize();
         selectionMaskPipeline.WriteMaskImageDescriptor(Mask.ImageView);
 
-        outlinePipeline = new OutlinePipeline(renderer);
+        outlinePipeline = new OutlinePipeline(gpu, renderer);
         outlinePipeline.Initialize();
         outlinePipeline.WriteMaskDescriptor(Mask.ImageView);
     }
 
     // The coverage mask is a RenderTargets-owned, size-dependent image.
     private ImageResource Mask => _renderer.renderTargets.SelectionMask;
-
-    /// Binds the TLAS into both ray-query pipelines. Called after InitRayQuery
-    /// builds (or rebuilds) the acceleration structure.
-    public void WriteTlasDescriptor(AccelerationStructureKHR tlas)
-    {
-        pickPipeline.WriteTlasDescriptor(tlas);
-        selectionMaskPipeline.WriteTlasDescriptor(tlas);
-    }
-
-    /// Binds the flat ShadowEntityInfo table both pipelines resolve hits through
-    /// (InstanceCustomIndex + GeometryIndex -> entity slot).
-    public void WriteEntityInfoDescriptor()
-    {
-        pickPipeline.WriteEntityInfoDescriptor();
-        selectionMaskPipeline.WriteEntityInfoDescriptor();
-    }
 
     /// Re-points the mask descriptors after a swapchain resize rebuilt the view
     /// (storage side on the compute pipeline, sampled side on the outline pass).

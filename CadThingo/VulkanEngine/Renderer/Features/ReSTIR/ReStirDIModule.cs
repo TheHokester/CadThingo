@@ -22,10 +22,9 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 ///
 /// "Import for barriers, bind for access" (as in WavefrontPTModule): the tracer touches the
 /// accumulator / out-color through the pipeline-owned descriptor sets; the graph imports the SAME
-/// handles only so it can sequence Trace -> Tonemap from the declared usages. Tonemap is a DIRECT
-/// pass (not TonemapModule, whose ExpectImage demands R16F while PtOutColor is R32F) reading the
-/// imported out-color (its HDR-input descriptor is re-pointed to PtOutColor in the core's Activate)
-/// and writing the imported FinalColor.
+/// handles only so it can sequence Trace -> Tonemap from the declared usages. Tonemap is the
+/// composed TonemapModule (HDR format parameterized to PtOutColor's R32F): its HDR-input set is
+/// graph-baked from the imported out-color, so no host-side rebind happens on core switch.
 /// </summary>
 internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReStirDIModule.Outputs>
 {
@@ -47,14 +46,18 @@ internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReSti
 
     public void Build(GraphScope scope, in Inputs inp, out Outputs o)
     {
-        // ---- Import the host-owned storage images (General, preserved) + FinalColor ----
+        // ---- Import the host-owned storage images (General, preserved) ----
+        // FinalColor is NOT imported here: the composed TonemapModule below imports it.
         var accum = scope.ImportImage(inp.Accumulator.Image, inp.Accumulator.ImageView, default,
             ImageLayout.General, "ptAccum");
-        var outColor = scope.ImportImage(inp.OutColor.Image, inp.OutColor.ImageView, default,
+        // Full desc (not default) so TonemapModule's ExpectImage port check can validate it.
+        var outColorDesc = new ImageDesc
+        {
+            Format = inp.OutColor._format, Mips = 1, Layers = 1,
+            Usage = ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
+        };
+        var outColor = scope.ImportImage(inp.OutColor.Image, inp.OutColor.ImageView, in outColorDesc,
             ImageLayout.General, "ptOutColor");
-        var finalDesc = new ImageDesc { Format = inp.FinalColor._format, Mips = 1, Layers = 1 };
-        var final = scope.ImportImage(inp.FinalColor.Image, inp.FinalColor.ImageView, in finalDesc,
-            ImageLayout.Undefined, "FinalColor", ImageLayout.ShaderReadOnlyOptimal);
 
         // ---- Import the pipeline-owned ping-pong reservoir + G-buffer buffers (P2 temporal) ----
         // The tracer reads PREV / writes CUR (parity-selected) through bound descriptors; the graph
@@ -65,6 +68,10 @@ internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReSti
         var gbufA    = scope.ImportBuffer(_pipe.GBufferA,      default, "gbufferA");
         var gbufB    = scope.ImportBuffer(_pipe.GBufferB,      default, "gbufferB");
         var sceneRad = scope.ImportBuffer(_pipe.SceneRadiance, default, "sceneRadiance");
+
+        // The set-2 working set is graph-owned: the graph allocates + writes it from the pipeline's
+        // buffer handles, and the core hands the baked set back to the pipeline after Compile.
+        scope.UseGraphSharedSet(_pipe.GraphSharedSpec);
 
         // ---- Trace (RT): path-trace to the fat G-buffer + sceneRadiance (indirect + emissive + env --
         // everything EXCEPT primary direct light). The reservoir build moved OUT of this megakernel
@@ -110,18 +117,10 @@ internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReSti
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordSpatialShade(cmd, f));
 
-        // ---- Tonemap: direct pass (out-color -> FinalColor). The tonemap pipeline samples
-        // PtOutColor through its own HDR-input descriptor (bound to PtOutColor in the core's
-        // Activate); the graph import of outColor here is only for barrier derivation. ----
-        scope.AddPass("Tonemap", PassType.Graphics, QueueClass.Graphics,
-            bld =>
-            {
-                bld.Read(outColor, ResourceUsage.SampledFragment);
-                final = bld.Write(final, ResourceUsage.ColorAttachment);
-            },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                _tonemap.Record(cmd, f, res.View(final)));
+        // ---- Tonemap: composed TonemapModule; HDR-input set graph-baked from out-color. ----
+        var tonemapModule = new TonemapModule(_tonemap, inp.OutColor._format);
+        tonemapModule.Build(scope, new TonemapModule.Input(outColor, inp.FinalColor), out var tm);
 
-        o = new Outputs(final);
+        o = new Outputs(tm.FinalColor);
     }
 }

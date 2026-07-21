@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
@@ -25,7 +27,8 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         public uint    _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Deferred", "CullDraws");
+    protected override ShaderCompileRequest? Program =>
+        new("Deferred/CullDraws", ["Main"], [], []);
 
     // Per-frame buffers owned by this pipeline. .
     private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
@@ -33,6 +36,19 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
 
     public Buffer GetIndirectCmdBuffer  (uint frame) => IndirectCmdBuffers[frame].buffer;
     public Buffer GetIndirectCountBuffer(uint frame) => IndirectCountBuffers[frame].buffer;
+    public Buffer GetRenderablesBuffer  (uint frame) => Renderer.gpuScene.GetRenderablesBuffer(frame);
+
+    // Pass-set contract for the deferred FrameGraph. The four
+    // storage buffers this compute shader binds are all graph resources -- the input renderable
+    // list plus the three post-cull outputs the graph imports -- so the graph allocates + writes
+    // the set; the pipeline just owns the layout (its VkPipelineLayout borrows it at set 0) and
+    // binds whatever set the graph hands Record. No scene set here, so this kernel's own set is
+    // set 0; contents and names both come from CullDraws.slang's set-0 declarations, which the
+    // CullPass Read/Write binds now match by name.
+    private const uint PassSetIndex = 0;
+
+    public PassSetSpec PassSet =>
+        new(PassSetIndex, DescriptorSetLayouts[PassSetIndex], ReflectedBindings(PassSetIndex));
 
     /// <summary>Renderables packed in the most recent Record() call — drives
     /// maxDrawCount on vkCmdDrawIndexedIndirectCount.</summary>
@@ -47,18 +63,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     /// Consumed by the TransparentPass; empty when no scene material is BLEND-mode.</summary>
     public IReadOnlyList<TransparentDraw> LastTransparentDraws => _transparentDraws;
 
-    public DrawCullPipeline(Renderer renderer) : base(renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.ComputeBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(CullPushConstants),
-            }
-        };
-    }
+    // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
+    // still matches the reflected size.
+    public DrawCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     public override void Dispose()
     {
@@ -69,33 +76,23 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        //4 storage buffers used
-        var bindings = stackalloc DescriptorSetLayoutBinding[4];
-        for (uint b = 0; b < 4; b++)
-        {
-            bindings[b] = new DescriptorSetLayoutBinding
-            {
-                Binding         = b,
-                DescriptorType  = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                StageFlags      = ShaderStageFlags.ComputeBit,
-                PImmutableSamplers = null,
-            };
-        }
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 4,
-            PBindings    = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
-            throw new Exception("Failed to create cull descriptor set layout");
-        DescriptorSetLayouts = new[] { layout };
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
+        // The pass-set layout (set 0): 4 storage buffers, borrowed by the deferred FrameGraph
+        // to allocate + write the descriptor set. The pipeline owns the layout; the graph owns
+        // the sets. Exposed to the graph via PassSet.
+        DescriptorSetLayouts = new[] { CreateReflectedSetLayout(PassSetIndex) };
+        OwnedDescriptorSetLayoutIndices = new[] { (int)PassSetIndex };
     }
 
     protected override void CreateResources()
     {
+        // Reflection cannot check this on its own: the C# mirror of CullParams has to keep
+        // matching the shader.
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(CullPushConstants))
+            throw new Exception(
+                $"CullPushConstants is {sizeof(CullPushConstants)} bytes but CullDraws.slang " +
+                $"reflects {reflected}");
+
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
             // Indirect-command buffer also needs IndirectBuffer usage so the
@@ -114,79 +111,17 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         }
     }
 
-    protected override void CreateDescriptorSets()
-    {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
-
-        DescriptorSetAllocateInfo alloc = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts        = layouts,
-        };
-        DescriptorSets = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* pSets = DescriptorSets[0])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &alloc, pSets) != Result.Success)
-                throw new Exception("Failed to allocate cull descriptor sets");
-        }
-    }
-
-    protected override void WriteDescriptors()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo bufIn = new()
-            {
-                Buffer = Renderer.gpuScene.GetRenderablesBuffer((uint)i), Offset = 0,
-                Range  = (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(RenderableInputGpu)),
-            };
-            DescriptorBufferInfo bufCmd = new()
-            {
-                Buffer = IndirectCmdBuffers[i].buffer, Offset = 0,
-                Range  = (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(DrawIndexedIndirectCommandGpu)),
-            };
-            DescriptorBufferInfo bufInst = new()
-            {
-                Buffer = Engine.ResourceManager.GetInstanceBuffer((uint)i), Offset = 0,
-                Range  = (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)),
-            };
-            DescriptorBufferInfo bufCount = new()
-            {
-                Buffer = IndirectCountBuffers[i].buffer, Offset = 0,
-                Range  = sizeof(uint),
-            };
-
-            var writes = stackalloc WriteDescriptorSet[4];
-            for (uint b = 0; b < 4; b++)
-            {
-                writes[b] = new WriteDescriptorSet
-                {
-                    SType           = StructureType.WriteDescriptorSet,
-                    DstSet          = DescriptorSets[0][i],
-                    DstBinding      = b,
-                    DescriptorType  = DescriptorType.StorageBuffer,
-                    DescriptorCount = 1,
-                };
-            }
-            writes[0].PBufferInfo = &bufIn;
-            writes[1].PBufferInfo = &bufCmd;
-            writes[2].PBufferInfo = &bufInst;
-            writes[3].PBufferInfo = &bufCount;
-
-            Vk.UpdateDescriptorSets(Device, 4, writes, 0, null);
-        }
-    }
+    // Descriptor sets are graph-owned now: the deferred FrameGraph allocates them from this
+    // pipeline's pass-set layout and writes the four storage buffers (renderables in +
+    // cmds/instances/count out) by name each Compile. No CreateDescriptorSets / WriteDescriptors
+    // here -- the pipeline binds whatever set Record is handed.
 
     /// <summary>CPU side of the cull pass.
     ///apply the view-dependent back-to-front sort
     /// to the BLEND candidates, read the opaque count, and record the frustum-cull
     /// dispatch + barriers.</summary> 
     /// <returns>The opaque count as a uint</returns>
-    public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam)
+    public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam, DescriptorSet passSet)
     {
         // View-dependent transparent sort
         _transparentDraws.Clear();
@@ -226,9 +161,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
             0, 0, null, 1, &fillBarrier, 0, null);
 
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, PipelineHandle);
-        var dset = DescriptorSets[0][frameIndex];
+        // Set 0 is the graph-baked pass set (the four cull storage buffers).
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute,
-            PipelineLayoutHandle, 0, 1, &dset, 0, null);
+            PipelineLayoutHandle, 0, 1, &passSet, 0, null);
 
         // Build frustum from the camera's view*proj. Deliberately use a non-Y-flipped
         // projection here: the visible volume is the same in both conventions, and
@@ -249,7 +184,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
             PlaneF = frustum.PlaneFar.Data,
             RenderableCount = count,
         };
-        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, ShaderStageFlags.ComputeBit,
+        // Stage mask comes from the reflected range the layout was built from: vkCmdPushConstants
+        // requires the two to agree, so neither side names a stage mask of its own.
+        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(CullPushConstants), &push);
 
         // 64 threads per group; ceil-divide so the last group covers the tail.

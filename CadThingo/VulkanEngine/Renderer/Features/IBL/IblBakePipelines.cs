@@ -1,50 +1,45 @@
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 
 // One generic compute pipeline used by every IBL bake step. The four bake
-// shaders share an almost-identical descriptor layout — set 0 binding 0 is an
+// shaders share an almost-identical descriptor layout - set 0 binding 0 is an
 // optional input sampler (cube or 2D), binding 1 is the output storage image
 // (cube layer + mip, or 2D LUT). Push constants carry the bake-specific args
 // (face size, roughness, etc.) in a tiny <16B block.
 //
 // Per-dispatch descriptor sets are allocated on demand from the global
 // descriptor pool (FreeDescriptorSetBit is on) and freed when the bake is
-// finished — these resources are entirely transient and don't survive past
+// finished - these resources are entirely transient and don't survive past
 // the single-time command submission that drove the bake.
 
 public sealed unsafe class IblBakePipeline : ComputePipeline
 {
-    readonly string _shaderPath;
+    readonly string _module;
     readonly bool   _hasInputSampler;
     readonly uint   _pushSize;
 
-    public IblBakePipeline(Renderer renderer, string shaderPath, bool hasInputSampler, uint pushSize)
-        : base(renderer)
+    public IblBakePipeline(GpuContext gpu, Renderer renderer, string module, bool hasInputSampler, uint pushSize)
+        : base(gpu, renderer)
     {
-        _shaderPath      = shaderPath;
+        _module          = module;
         _hasInputSampler = hasInputSampler;
         _pushSize        = pushSize;
-
-        if (_pushSize > 0)
-        {
-            PushConstantRanges = new[]
-            {
-                new PushConstantRange
-                {
-                    StageFlags = ShaderStageFlags.ComputeBit,
-                    Offset     = 0,
-                    Size       = _pushSize,
-                }
-            };
-        }
     }
 
-    protected override string ShaderPath => _shaderPath;
+    protected override ShaderCompileRequest? Program => new(_module, ["main"], [], []);
 
     protected override void CreateDescriptorSetLayouts()
     {
+        // Assigned here, not in the ctor: Initialize derives PushConstantRanges from reflection
+        // before this runs, so a ctor assignment would be overwritten. The caller's size is the
+        // authority because it is the size the bake dispatch actually pushes.
+        PushConstantRanges = _pushSize > 0
+            ? [new PushConstantRange { StageFlags = ShaderStageFlags.ComputeBit, Offset = 0, Size = _pushSize }]
+            : [];
+
         DescriptorSetLayouts            = new DescriptorSetLayout[1];
         OwnedDescriptorSetLayoutIndices = new[] { 0 };
 
@@ -80,7 +75,7 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
                 PBindings    = p,
             };
             if (Vk.CreateDescriptorSetLayout(Device, &info, null, out DescriptorSetLayouts[0]) != Result.Success)
-                throw new System.Exception($"Failed to create IBL bake set 0 layout for {_shaderPath}");
+                throw new System.Exception($"Failed to create IBL bake set 0 layout for {_module}");
         }
     }
 

@@ -42,17 +42,17 @@ void main(uint3 tid : SV_DispatchThreadID){
     for(uint b = pc.bounce; b < pc.maxBounces; b++){
         // ---- trace (inline alpha-test loop, mirrors Extend) ----
         RayQuery<RAY_FLAG_NONE> q;
-        q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+        q.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xFF, ray);
         while(q.Proceed()){
             if(q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE){
-                ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
+                ShadowEntityInfo cei = sceneEntityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
                 // Transmissive candidates commit straight through off the entity-record flags -- no
-                // materials[] read (closest-hit treats glass as opaque; see Extend). Only MASK/BLEND
+                // sceneMaterials[] read (closest-hit treats glass as opaque; see Extend). Only MASK/BLEND
                 // fetch the fat material to alpha-test.
                 if((cei.flags & 5u) == 0u){          // 5 = MASK(1) | BLEND(4)
                     q.CommitNonOpaqueTriangleHit();
                 } else {
-                    PbrMaterial cmat = materials[cei.materialIndex];
+                    PbrMaterial cmat = sceneMaterials[cei.materialIndex];
                     float alpha = computeAlpha(cmat, cei.indexOffset,
                                                q.CandidatePrimitiveIndex(),
                                                q.CandidateTriangleBarycentrics(),
@@ -84,7 +84,7 @@ void main(uint3 tid : SV_DispatchThreadID){
         // ---- emissive pickup, MIS-weighted against emissive NEE (mirrors Shade 2.3) ----
         float misEm = 1.0;
         if(!prevWasDelta && frameUBO.emissiveTriCount > 0u && frameUBO.totalEmissivePower > 0.0){
-            float lumLe = luminance(materials[h.matidx].emissiveFactor);
+            float lumLe = luminance(sceneMaterials[h.matidx].emissiveFactor);
             float cosL  = abs(dot(h.geometricNormal, ray.Direction));
             if(lumLe > 0.0 && cosL > 1e-4){
                 float pLight = lumLe * h.hitT * h.hitT / (frameUBO.totalEmissivePower * cosL);
@@ -149,7 +149,7 @@ void main(uint3 tid : SV_DispatchThreadID){
         if(!bs.isDelta) coneSpread += WF_CONE_SPREAD_K * max(h.roughness, 0.3);
 
         if(bs.transmit)
-            sigmaA = h.frontFace ? mediumSigmaA(materials[h.matidx]) : float3(0.0);
+            sigmaA = h.frontFace ? mediumSigmaA(sceneMaterials[h.matidx]) : float3(0.0);
 
         float3 oN = bs.transmit ? -h.geometricNormal : h.geometricNormal;
         ray.Origin    = h.worldPos + oN * 1e-3;

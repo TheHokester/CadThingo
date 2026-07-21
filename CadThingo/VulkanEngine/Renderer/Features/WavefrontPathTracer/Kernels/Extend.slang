@@ -35,7 +35,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
         ray.TMax      = INFINITY;
 
         RayQuery<EXTEND_RAY_FLAGS> q;
-        q.TraceRayInline(tlas, EXTEND_RAY_FLAGS, 0xFF, ray);
+        q.TraceRayInline(sceneTlas, EXTEND_RAY_FLAGS, 0xFF, ray);
 
         // Alpha-test loop. ForceNoOpaque-flagged instances (MASK / BLEND / transmissive) ride
         // through Proceed; pure-opaque hits never enter the body. MASK = hard cutoff; BLEND =
@@ -44,16 +44,16 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
         // candidates and this body runs zero times -- leaving only the BVH traversal.)
         while(q.Proceed()){
             if(q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE){
-                ShadowEntityInfo cei = entityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
+                ShadowEntityInfo cei = sceneEntityInfo[q.CandidateInstanceID() + q.CandidateGeometryIndex()];
                 // The MASK/BLEND bits live in the already-read, compact 64B entity record, so the fat
                 // ~112B PbrMaterial is fetched ONLY for the few candidates that actually alpha-test.
                 // Transmissive candidates (the bulk, with lots of glass) commit straight through with
-                // ZERO materials[] read -- that incoherent dependent fetch was the dominant loop cost.
+                // ZERO sceneMaterials[] read -- that incoherent dependent fetch was the dominant loop cost.
                 // Closest-hit treats glass as opaque; refraction is resolved later in Shade's BSDF.
                 if((cei.flags & 5u) == 0u){          // 5 = MASK(1) | BLEND(4)
                     q.CommitNonOpaqueTriangleHit();
                 } else {
-                    PbrMaterial cmat = materials[cei.materialIndex];
+                    PbrMaterial cmat = sceneMaterials[cei.materialIndex];
                     float alpha = computeAlpha(cmat, cei.indexOffset,
                                                q.CandidatePrimitiveIndex(),
                                                q.CandidateTriangleBarycentrics(),
@@ -100,8 +100,8 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 git : SV_GroupThreadID){
             // only -- no resolved texels, so it's cheap + conservative). Class c owns the slice
             // shadeQueue[c*pathCount, (c+1)*pathCount); the base is fixed so the append is a single
             // per-class atomic, no scan. pathCount is the alloc stride = the dense pixel count.
-            uint matidx    = entityInfo[recordIndex].materialIndex;
-            uint c         = classifyShadingClass(materials[matidx]);
+            uint matidx    = sceneEntityInfo[recordIndex].materialIndex;
+            uint c         = classifyShadingClass(sceneMaterials[matidx]);
             uint pathCount = uint(frameUBO.screenSize.x) * uint(frameUBO.screenSize.y);
             uint slot;
             InterlockedAdd(counters[SHADE_COUNT_0 + c], 1u, slot);

@@ -1,5 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -10,7 +12,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 //  EQUAL against 1.0 so it lights up only the cleared (sky) pixels of the
 //  depth buffer the geometry pass left behind.
 
-public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class SkyboxPipeline : GraphicsPipeline
 {
     // Mirrors Skybox.slang::SkyboxUBO. Std140 — invViewProj is 64B, then 16B
     // camPos, then intensity + 3×4B trailing pad to round to 96B total.
@@ -25,15 +27,15 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         public float     _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("IBL", "Skybox");
+    protected override ShaderCompileRequest? Program => new("IBL/Skybox", ["VSMain", "PSMain"], [], []);
 
     // Writes the same HDRColor as the lighting / transparent passes so it gets
     // tone-mapped with everything else.
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 
-    public SkyboxPipeline(Renderer renderer) : base(renderer)
+    public SkyboxPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
-        DepthAttachmentFormat = renderer.FindDepthFormat();
+        DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
 
     private UboBuffer[] FrameUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
@@ -75,10 +77,13 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdSetViewport(cmd, 0, 1, &vp);
         Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
 
-        var set = GetDescriptorSet(0, ctx.FrameIndex);
-        
-        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, 0, 1, &set, 0, null);
+        // Set 0 = private UBO; FeatureEnv (envCube) at its own reflected index (set 4). The
+        // intervening slots are gaps in the layout, never bound, so this is two separate binds.
+        var set0 = GetDescriptorSet(0, ctx.FrameIndex);
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Layout, 0, 1, &set0, 0, null);
+
+        var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
 
         Vk!.CmdDraw(cmd, 3, 1, 0, 0);
         
@@ -113,40 +118,26 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
     };
 
 
+    private const string FeatureEnv = "FeatureEnv";
+
     protected override void CreateDescriptorSetLayouts()
     {
-        DescriptorSetLayouts            = new DescriptorSetLayout[1];
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
+        // Private set 0: the skybox's own per-frame UBO (this pass is not on the scene set), so
+        // BuildPipelineSetLayouts is deliberately NOT used - it would force the scene layout into
+        // slot 0. envCube comes from the registry-owned FeatureEnv set, so the pipeline layout
+        // carries empty placeholders in every slot between (pass / graph-shared / FeatureIBL,
+        // none of which this pass uses).
+        var set0 = CreateReflectedSetLayout(0);
 
-        var bindings = new DescriptorSetLayoutBinding[]
-        {
-            new()
-            {
-                Binding         = 0,
-                DescriptorType  = DescriptorType.UniformBuffer,
-                DescriptorCount = 1,
-                StageFlags      = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
-            },
-            new()
-            {
-                Binding         = 1,
-                DescriptorType  = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
-                StageFlags      = ShaderStageFlags.FragmentBit,
-            },
-        };
-
-        fixed (DescriptorSetLayoutBinding* p = bindings)
-        {
-            DescriptorSetLayoutCreateInfo info = new()
-            {
-                SType        = StructureType.DescriptorSetLayoutCreateInfo,
-                BindingCount = (uint)bindings.Length,
-                PBindings    = p,
-            };
-            if (Vk.CreateDescriptorSetLayout(Device, &info, null, out DescriptorSetLayouts[0]) != Result.Success)
-                throw new System.Exception("Failed to create skybox descriptor set layout");
-        }
+        // Array sized to FeatureEnv's reflected index: private UBO at 0, the shared empty layout
+        // in every gap, FeatureEnv at its pinned index. Follows a module renumber automatically.
+        uint envIndex = Registry.FeatureSetIndex(FeatureEnv);
+        var layouts = new DescriptorSetLayout[envIndex + 1];
+        for (int i = 0; i < layouts.Length; i++) layouts[i] = Registry.EmptySetLayout;
+        layouts[0] = set0;
+        layouts[envIndex] = Registry.FeatureSetLayout(FeatureEnv);
+        DescriptorSetLayouts = layouts;
+        OwnedDescriptorSetLayoutIndices = new[] { 0 };   // only the private UBO layout
     }
 
     protected override void CreateResources()
@@ -179,13 +170,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
 
     protected override void WriteDescriptors()
     {
-        var envInfo = new DescriptorImageInfo
-        {
-            ImageView   = Renderer.Ibl.envCubeView,
-            Sampler     = Renderer.Ibl.iblCubeSampler,
-            ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
-        };
-
+        // Only the private UBO (set 0). envCube is registry-owned on FeatureEnv (set 3).
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
         {
             DescriptorBufferInfo frameInfo = new()
@@ -194,8 +179,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
                 Offset = 0,
                 Range  = (ulong)sizeof(SkyboxUBO),
             };
-            var writes = stackalloc WriteDescriptorSet[2];
-            writes[0] = new WriteDescriptorSet
+            var write = new WriteDescriptorSet
             {
                 SType           = StructureType.WriteDescriptorSet,
                 DstSet          = DescriptorSets[0][i],
@@ -205,17 +189,7 @@ public sealed unsafe class SkyboxPipeline : Pipelines.GraphicsPipeline
                 DescriptorCount = 1,
                 PBufferInfo     = &frameInfo,
             };
-            writes[1] = new WriteDescriptorSet
-            {
-                SType           = StructureType.WriteDescriptorSet,
-                DstSet          = DescriptorSets[0][i],
-                DstBinding      = 1,
-                DstArrayElement = 0,
-                DescriptorType  = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1,
-                PImageInfo      = &envInfo,
-            };
-            Vk.UpdateDescriptorSets(Device, 2, writes, 0, null);
+            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
         }
     }
 

@@ -38,7 +38,7 @@ internal struct PcProbePrefilter
 /// pass, prefilter dispatch, cluster grid, and shader integration are all
 /// downstream phases.
 /// </summary>
-public unsafe sealed class ReflectionProbeSystem : IDisposable
+public sealed unsafe class ReflectionProbeSystem : IDisposable
 {
     // Hard caps. Bumping MaxProbes resizes the cubemap array (one-time cost at
     // startup); bumping ProbeFaceSize costs 4× VRAM per size step. 16 × 256² is
@@ -47,8 +47,10 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     public const uint ProbeFaceSize = 256;
     public static readonly uint ProbeMipLevels =
         (uint)System.Math.Floor(System.Math.Log2(ProbeFaceSize)) + 1;
-
     private readonly Renderer _renderer;
+    private readonly GpuContext _gpu;
+    private readonly GraphicsDevice _gfx;
+    private readonly IblSystem _iblSystem;
     private readonly Vk       _vk;
     private readonly Device   _device;
 
@@ -84,10 +86,10 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     internal SubAlloc  captureDepthAlloc;
     internal ImageView captureDepthAttachmentView;
 
-    // Capture pipeline. Null when the compiled .spv isn't present at startup —
+    // Capture pipeline. Null when ProbeCapture failed to compile at startup —
     // in that state the system runs scheduler bookkeeping but skips the actual
     // draw recording. Lets the engine boot during shader iteration without a
-    // hard dependency on a freshly-compiled probe shader.
+    // hard dependency on a working probe shader.
     internal ProbeCapturePipeline? capturePipeline;
 
     // CPU-built per-cluster probe lists + the SSBOs the PBR shader will bind
@@ -115,14 +117,18 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     private readonly List<ReflectionProbeComponent> _probes = new();
     // Free-list of cube-array slots. Pop on Register, push on Unregister.
     private readonly Stack<int> _freeSlots = new();
+    
 
     public IReadOnlyList<ReflectionProbeComponent> Probes => _probes;
 
-    public ReflectionProbeSystem(Renderer renderer)
+    public ReflectionProbeSystem(GpuContext gpu, Renderer renderer, IblSystem iblSystem)
     {
+        _gpu = gpu;
         _renderer = renderer;
-        _vk = renderer.vk!;
-        _device = renderer.device;
+        _gfx = _gpu.Gfx;
+        _vk = _gpu.Gfx.Vk;
+        _device = _gpu.Gfx.Device;
+        _iblSystem = iblSystem;
 
         CreatePrefilteredArray();
         CreateSampler();
@@ -130,7 +136,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         CreateCaptureAttachments();
         TryCreateCapturePipeline();
         CreatePrefilterDescriptors();
-        clusterGrid = new ProbeClusterGrid(_renderer);
+        clusterGrid = new ProbeClusterGrid(_gfx);
 
         for (int i = (int)MaxProbes - 1; i >= 0; i--) _freeSlots.Push(i);
     }
@@ -143,9 +149,9 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     /// </summary>
     private void CreatePrefilterDescriptors()
     {
-        var bake = _renderer.Ibl.prefilterEnvPipeline;
+        var bake = _iblSystem.prefilterEnvPipeline;
         var inputView = captureCubeSampleView;
-        var inputSampler = _renderer.Ibl.iblCubeSampler;
+        var inputSampler = _iblSystem.iblCubeSampler;
 
         _prefilterStorageViews = new ImageView[MaxProbes, ProbeMipLevels];
         _prefilterSets         = new DescriptorSet[MaxProbes, ProbeMipLevels];
@@ -180,15 +186,20 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
 
     private void TryCreateCapturePipeline()
     {
-        string spv = ShaderPaths.Kernel("IBL", "ProbeCapture");
-        if (!System.IO.File.Exists(spv))
+        // ProbeCapture.slang is compiled here, at pipeline-create time. A syntax error in it
+        // used to be a missing .spv; now it is an exception out of ShaderLibrary. Either way the
+        // engine still boots -- probes keep their scheduler bookkeeping and skip the draw -- so
+        // shader iteration on the capture kernel does not take the whole editor down with it.
+        try
         {
-            Console.WriteLine("[Probe] ProbeCapture.spv not found — capture pipeline skipped. " +
-                              "Build the project (shaders compile automatically) to enable probe captures.");
-            return;
+            capturePipeline = new ProbeCapturePipeline(_gpu, _renderer);
+            capturePipeline.Initialize();
         }
-        capturePipeline = new ProbeCapturePipeline(_renderer);
-        capturePipeline.Initialize();
+        catch (Exception e)
+        {
+            capturePipeline = null;
+            Console.Error.WriteLine($"[Probe] capture pipeline skipped: {e.Message}");
+        }
     }
 
     // Registry
@@ -223,7 +234,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     /// as dirty. Wired by Phase 8's transform-change event hook so that moving an
     /// entity invalidates the probes that can see it.
     /// </summary>
-    public void MarkDirtyAt(System.Numerics.Vector3 worldPoint)
+    public void MarkDirtyAt(Vector3 worldPoint)
     {
         foreach (var p in _probes)
         {
@@ -259,7 +270,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         if (_vk.CreateImage(_device, &info, null, out prefilteredArrayImage) != Result.Success)
             throw new Exception("Failed to create reflection probe cubemap array image");
 
-        prefilteredArrayAlloc = _renderer.memAllocator.AllocateForImage(
+        prefilteredArrayAlloc = _gfx.Allocator.AllocateForImage(
             prefilteredArrayImage, MemoryPropertyFlags.DeviceLocalBit);
 
         ImageViewCreateInfo viewInfo = new()
@@ -284,7 +295,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         // this descriptor unconditionally even before any probe has been baked.
         // Empty content reads as zero specular, which falls back cleanly to the
         // global IBL term in the lighting shader.
-        var cmd = _renderer.BeginSingleTimeCommands();
+        var cmd = _gfx.BeginSingleTimeCommands();
         ImageMemoryBarrier barrier = new()
         {
             SType               = StructureType.ImageMemoryBarrier,
@@ -300,7 +311,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         _vk.CmdPipelineBarrier(cmd,
             PipelineStageFlags.TopOfPipeBit, PipelineStageFlags.FragmentShaderBit,
             0, 0, null, 0, null, 1, &barrier);
-        _renderer.EndSingleTimeCommands(cmd);
+        _gfx.EndSingleTimeCommands(cmd);
     }
 
     private void CreateSampler()
@@ -326,7 +337,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
     {
         ulong sizeBytes = MaxProbes * (ulong)sizeof(ProbeGpuRecord);
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            _renderer.CreateMappedStorageBuffer(sizeBytes, ref probeRecordBuffers[i]);
+            _gfx.CreateMappedStorageBuffer(sizeBytes, ref probeRecordBuffers[i]);
     }
 
     private void CreateCaptureAttachments()
@@ -353,7 +364,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         };
         if (_vk.CreateImage(_device, &colorInfo, null, out captureCubeImage) != Result.Success)
             throw new Exception("Failed to create probe capture cube image");
-        captureCubeAlloc = _renderer.memAllocator.AllocateForImage(captureCubeImage, MemoryPropertyFlags.DeviceLocalBit);
+        captureCubeAlloc = _gfx.Allocator.AllocateForImage(captureCubeImage, MemoryPropertyFlags.DeviceLocalBit);
 
         // 2D_ARRAY view for use as a color attachment in the capture pass.
         // Multiview directs gl_ViewIndex-tagged writes to layers 0..5.
@@ -397,7 +408,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         };
         if (_vk.CreateImage(_device, &depthInfo, null, out captureDepthImage) != Result.Success)
             throw new Exception("Failed to create probe capture depth image");
-        captureDepthAlloc = _renderer.memAllocator.AllocateForImage(captureDepthImage, MemoryPropertyFlags.DeviceLocalBit);
+        captureDepthAlloc = _gfx.Allocator.AllocateForImage(captureDepthImage, MemoryPropertyFlags.DeviceLocalBit);
 
         ImageViewCreateInfo depthViewInfo = new()
         {
@@ -536,7 +547,7 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
             if (p.CubeArraySlot < 0) continue;
             ptr[p.CubeArraySlot] = new ProbeGpuRecord
             {
-                PositionRadius = new System.Numerics.Vector4(p.WorldPosition, p.InfluenceRadius),
+                PositionRadius = new Vector4(p.WorldPosition, p.InfluenceRadius),
                 CubeArraySlot  = (uint)p.CubeArraySlot,
             };
         }
@@ -724,13 +735,13 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
             0, 0, null, 0, null, 2, postBarriers);
 
         // Prefilter dispatch: per-mip GGX importance sample into the slot
-        var prefilter = _renderer.Ibl.prefilterEnvPipeline;
+        var prefilter = _iblSystem.prefilterEnvPipeline;
         _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilter.Handle);
         uint slot = (uint)probe.CubeArraySlot;
         for (uint m = 0; m < ProbeMipLevels; m++)
         {
             uint mipSize = Math.Max(1u, ProbeFaceSize >> (int)m);
-            float roughness = ProbeMipLevels == 1 ? 0f : (float)m / (float)(ProbeMipLevels - 1);
+            float roughness = ProbeMipLevels == 1 ? 0f : m / (float)(ProbeMipLevels - 1);
 
             var set = _prefilterSets[slot, m];
             _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, prefilter.Layout,
@@ -798,21 +809,21 @@ public unsafe sealed class ReflectionProbeSystem : IDisposable
         capturePipeline?.Dispose();
 
         for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            _renderer.DestroyBuffer(probeRecordBuffers[i].buffer, probeRecordBuffers[i].alloc);
+            _gfx.DestroyBuffer(probeRecordBuffers[i].buffer, probeRecordBuffers[i].alloc);
 
         if (captureDepthAttachmentView.Handle != 0) _vk.DestroyImageView(_device, captureDepthAttachmentView, null);
         if (captureDepthImage.Handle          != 0) _vk.DestroyImage(_device, captureDepthImage, null);
-        _renderer.memAllocator.Free(captureDepthAlloc);
+        _gfx.Allocator.Free(captureDepthAlloc);
 
         if (captureCubeSampleView.Handle     != 0) _vk.DestroyImageView(_device, captureCubeSampleView, null);
         if (captureCubeAttachmentView.Handle != 0) _vk.DestroyImageView(_device, captureCubeAttachmentView, null);
         if (captureCubeImage.Handle          != 0) _vk.DestroyImage(_device, captureCubeImage, null);
-        _renderer.memAllocator.Free(captureCubeAlloc);
+        _gfx.Allocator.Free(captureCubeAlloc);
 
         if (prefilteredArraySampler.Handle != 0) _vk.DestroySampler(_device, prefilteredArraySampler, null);
         if (prefilteredArrayView.Handle    != 0) _vk.DestroyImageView(_device, prefilteredArrayView, null);
         if (prefilteredArrayImage.Handle   != 0) _vk.DestroyImage(_device, prefilteredArrayImage, null);
-        _renderer.memAllocator.Free(prefilteredArrayAlloc);
+        _gfx.Allocator.Free(prefilteredArrayAlloc);
 
         _probes.Clear();
         _freeSlots.Clear();

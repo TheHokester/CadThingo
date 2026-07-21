@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
@@ -31,7 +33,10 @@ public sealed unsafe class PickPipeline : ComputePipeline
         public uint      PixelY;        //  4
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Selection", "PickCompute");
+    // Ray-queried picking needs the capability at compile time: the TraceRayInline call site is
+    // in the shader unconditionally.
+    protected override ShaderCompileRequest? Program =>
+        new("Selection/PickCompute", ["main"], [], ["spvRayQueryKHR"]);
 
     // 4B result (entity index or PickNone). Host-visible + coherent so the
     // single-time submit's QueueWaitIdle is all the synchronisation the readback
@@ -40,18 +45,9 @@ public sealed unsafe class PickPipeline : ComputePipeline
     private SubAlloc _resultAlloc;
     private void*    _resultMapped;
 
-    public PickPipeline(Renderer renderer) : base(renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.ComputeBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(PickPushConstants),
-            }
-        };
-    }
+    // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
+    // still matches the reflected size.
+    public PickPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     public override void Dispose()
     {
@@ -60,31 +56,30 @@ public sealed unsafe class PickPipeline : ComputePipeline
         base.Dispose();
     }
 
+    // Set 0 borrowed from the registry (sceneTlas + sceneEntityInfo); set 1 owns the result SSBO.
+    private const int SetResult = (int)ShaderSets.Pass;
+
     protected override void CreateDescriptorSetLayouts()
     {
-        // Binding 0: TLAS. Binding 1: result SSBO (single uint). Binding 2:
-        // entityInfo SSBO — the hit resolves to an entity via
-        // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex now that
-        // instances are per-cluster (custom index is no longer the entity).
-        var bindings = stackalloc DescriptorSetLayoutBinding[3];
-        bindings[0] = new() { Binding = 0, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        bindings[1] = new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-        bindings[2] = new() { Binding = 2, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.ComputeBit };
-
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 3,
-            PBindings    = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
-            throw new Exception("Failed to create pick descriptor set layout");
-        DescriptorSetLayouts            = new[] { layout };
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
+        // Assemble [scene(0), pass(1)]. Scene is registry-owned; the pipeline owns only the pass
+        // layout (the result SSBO), built from PickCompute.slang's set-1 declaration. TLAS +
+        // entityInfo resolve through the scene set, so the hit still maps to an entity via
+        // sceneEntityInfo[InstanceCustomIndex + GeometryIndex].entityIndex.
+        var passLayout = CreateReflectedSetLayout(ShaderSets.Pass);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout);
+        OwnedDescriptorSetLayoutIndices = new[] { SetResult };
     }
 
     protected override void CreateResources()
     {
+        // Reflection cannot check this on its own: the C# mirror of PickParams has to keep
+        // matching the shader.
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(PickPushConstants))
+            throw new Exception(
+                $"PickPushConstants is {sizeof(PickPushConstants)} bytes but PickCompute.slang " +
+                $"reflects {reflected}");
+
         Gfx.CreateBuffer(sizeof(uint),
             BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
@@ -94,7 +89,8 @@ public sealed unsafe class PickPipeline : ComputePipeline
 
     protected override void CreateDescriptorSets()
     {
-        var layout = DescriptorSetLayouts[0];
+        // Set 0 is registry-owned; Record binds descriptorRegistry.SceneSet(frame).
+        var layout = DescriptorSetLayouts[SetResult];
         DescriptorSetAllocateInfo alloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
@@ -102,82 +98,50 @@ public sealed unsafe class PickPipeline : ComputePipeline
             DescriptorSetCount = 1,
             PSetLayouts        = &layout,
         };
-        DescriptorSets    = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[0])
+        // Scene slot stays null: Record binds Registry.SceneSet(frame) directly.
+        DescriptorSets                     = new DescriptorSet[2][];
+        DescriptorSets[ShaderSets.Scene]   = null;
+        DescriptorSets[SetResult]          = new DescriptorSet[1];
+        fixed (DescriptorSet* p = DescriptorSets[SetResult])
             if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
                 throw new Exception("Failed to allocate pick descriptor set");
     }
 
     protected override void WriteDescriptors()
     {
-        // Result buffer is owned here. The TLAS lives elsewhere and changes
-        // handle on every rebuild, so it's written separately via WriteTlasDescriptor.
+        // Result buffer is the only owned resource; TLAS + entityInfo ride the scene set.
         DescriptorBufferInfo info = new() { Buffer = _resultBuffer, Offset = 0, Range = sizeof(uint) };
         var write = new WriteDescriptorSet
         {
             SType           = StructureType.WriteDescriptorSet,
-            DstSet          = DescriptorSets[0][0],
-            DstBinding      = 1,
-            DescriptorType  = DescriptorType.StorageBuffer,
-            DescriptorCount = 1,
-            PBufferInfo     = &info,
-        };
-        Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-    }
-
-    /// <summary>Binding 2: the renderer-owned ShadowEntityInfo SSBO. Call after
-    /// InitRayQuery and whenever the buffer reallocates (resize).</summary>
-    public void WriteEntityInfoDescriptor()
-    {
-        var buf = Renderer.ShadowInfoBuffer;
-        if (buf.Handle == 0) return;
-        DescriptorBufferInfo info = new() { Buffer = buf, Offset = 0, Range = Renderer.ShadowInfoBufferSize };
-        var write = new WriteDescriptorSet
-        {
-            SType           = StructureType.WriteDescriptorSet,
-            DstSet          = DescriptorSets[0][0],
-            DstBinding      = 2,
-            DescriptorType  = DescriptorType.StorageBuffer,
-            DescriptorCount = 1,
-            PBufferInfo     = &info,
-        };
-        Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-    }
-
-    /// <summary>Binding 0: TLAS. Call after InitRayQuery and on every TLAS
-    /// rebuild that recreates the handle.</summary>
-    public void WriteTlasDescriptor(AccelerationStructureKHR tlas)
-    {
-        if (tlas.Handle == 0) return;
-        var tlasH = tlas;
-        var asWrite = new WriteDescriptorSetAccelerationStructureKHR
-        {
-            SType                      = StructureType.WriteDescriptorSetAccelerationStructureKhr,
-            AccelerationStructureCount = 1,
-            PAccelerationStructures    = &tlasH,
-        };
-        var write = new WriteDescriptorSet
-        {
-            SType           = StructureType.WriteDescriptorSet,
-            PNext           = &asWrite,
-            DstSet          = DescriptorSets[0][0],
+            DstSet          = DescriptorSets[SetResult][0],
             DstBinding      = 0,
-            DescriptorType  = DescriptorType.AccelerationStructureKhr,
+            DescriptorType  = DescriptorType.StorageBuffer,
             DescriptorCount = 1,
+            PBufferInfo     = &info,
         };
         Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
     }
 
     /// <summary>Records the 1×1×1 pick dispatch into <paramref name="cmd"/>.
     /// The caller submits the command buffer and waits (QueueWaitIdle) before
-    /// calling <see cref="ReadResult"/>.</summary>
+    /// calling <see cref="ReadResult"/>. Binds the scene set for the current frame:
+    /// picking runs out-of-band before this frame's BeginFrame, so that set still
+    /// holds the TLAS state that produced the image the user clicked on.</summary>
     public void Record(CommandBuffer cmd, in Matrix4x4 invViewProj, Vector3 camPos,
                        Vector2 screenSize, uint pixelX, uint pixelY)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, PipelineHandle);
-        var dset = DescriptorSets[0][0];
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, PipelineLayoutHandle, 0, 1, &dset, 0, null);
+
+        // Scene set (zero dynamic offset: pick params stay push constants, the (0,0)
+        // arena slot is unused here) + the owned result set.
+        uint zeroOffset = 0;
+        var sets = stackalloc DescriptorSet[2]
+        {
+            Registry.SceneSet(Renderer.currentFrame),
+            DescriptorSets[SetResult][0],
+        };
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);
 
         var push = new PickPushConstants
         {
@@ -187,7 +151,9 @@ public sealed unsafe class PickPipeline : ComputePipeline
             PixelX      = pixelX,
             PixelY      = pixelY,
         };
-        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, ShaderStageFlags.ComputeBit,
+        // Stage mask comes from the reflected range the layout was built from: vkCmdPushConstants
+        // requires the two to agree, so neither side names a stage mask of its own.
+        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(PickPushConstants), &push);
 
         Vk.CmdDispatch(cmd, 1, 1, 1);

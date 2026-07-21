@@ -1,7 +1,10 @@
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -11,9 +14,9 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 //
 //  ReSTIR direct-illumination pipeline (VK_KHR_ray_tracing_pipeline + a compute sibling).
 //
-//  Subclass of RTPipeline reusing its SBT / descriptor-set layout (sets 0-3) / per-frame UBO /
+//  Subclass of RTPipeline reusing its SBT / descriptor-set layout / per-frame UBO /
 //  CmdTraceRays dispatch, swapping the shader module for the forked ReStirDI tracer. On top it owns
-//  SET 4 (the ReSTIR working set) + a push constant, AND a second VkPipeline -- the SpatialShade
+//  SET 2 (the graph-shared ReSTIR working set) + a push constant, AND a second VkPipeline -- the SpatialShade
 //  COMPUTE shader -- built on the SAME pipeline layout (set 0 carries ComputeBit, so the exact
 //  descriptor sets the RT Trace pass uses are bindable from compute too).
 //
@@ -25,7 +28,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 //
 internal sealed unsafe class ReStirDIPipeline : RTPipeline
 {
-    private const int SetReStir = 4;
+    // Installed in the base's graph-shared slot (scene 0, IO 1, working 2; FeatureEnv at set 4).
+    private const int SetReStir = 2;
 
     // Per-pixel byte strides -- MUST match the Slang StructuredBuffer element STRIDE, which is
     // std430, NOT the tight field-sum: a float3 has 16-byte alignment and rounds the struct up to a
@@ -60,7 +64,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     private Pipeline _buildTemporalPipeline;   // BuildTemporal compute (reservoir build + temporal)
     private Pipeline _spatialPipeline;         // SpatialShade compute (spatial reuse + shade)
 
-    public ReStirDIPipeline(Renderer renderer) : base(renderer) { }
+    public ReStirDIPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     // Public handles for the graph module to import (barrier ordering across passes + frames).
     public Buffer ReservoirA    => _resA;
@@ -69,45 +73,61 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     public Buffer GBufferB      => _gbufB;
     public Buffer SceneRadiance => _sceneRad;
 
-    protected override string ShaderPath =>
-        ShaderPaths.Kernel("ReSTIR", Gfx.SerSupported ? "ReStirDI_SER" : "ReStirDI");
+    // The working set (set 2) is graph-owned: the pipeline owns the buffers + the layout, but the
+    // FrameGraph allocates + writes the descriptor set from this spec and hands it back after Compile.
+    private DescriptorSet _sharedSet;   // set by the core via SetGraphSharedSet after the graph compiles
+    public void SetGraphSharedSet(DescriptorSet set) => _sharedSet = set;
 
-    // Set 0 is shared with the SpatialShade compute pipeline -> needs ComputeBit.
-    protected override ShaderStageFlags Set0ExtraStages => ShaderStageFlags.ComputeBit;
+    /// The graph-shared working-set spec (layout + current buffer handles). Read by the module at
+    /// Build time; on resize the buffers realloc first, so the rebuilt graph bakes the new handles.
+    /// Binding index and type come from ReStirBindings' set-2 declarations; only the buffer each
+    /// name maps to is ours to state.
+    public GraphSharedSetSpec GraphSharedSpec => new(
+        ShaderSets.GraphShared, DescriptorSetLayouts[SetReStir],
+        ReflectedBindings(SetReStir)
+            .Select(b => new GraphSharedBinding(b.Binding, b.Type, BufferFor(b.Name)))
+            .ToArray());
+
+    // Throws rather than binding a default handle if the shader grows a set-2 buffer with no C#
+    // owner - a stale/null descriptor there would be a silent corruption.
+    private Buffer BufferFor(string name) => name switch
+    {
+        "reservoirA"    => _resA,
+        "reservoirB"    => _resB,
+        "gbufferA"      => _gbufA,
+        "gbufferB"      => _gbufB,
+        "sceneRadiance" => _sceneRad,
+        _ => throw new InvalidOperationException(
+            $"ReStirDIPipeline: ReStirBindings declares set-{SetReStir} buffer '{name}' with no backing buffer"),
+    };
+
+    protected override ShaderCompileRequest? Program => RtProgram("ReSTIR/ReStirDI");
+
+    // The two compute passes run on the SHARED RT pipeline layout, so they are separate programs
+    // rather than a second Program override (a pipeline has exactly one).
+    private static readonly ShaderCompileRequest BuildTemporalReq = new("ReSTIR/BuildTemporal", ["main"], [], []);
+    private static readonly ShaderCompileRequest SpatialShadeReq  = new("ReSTIR/SpatialShade", ["main"], [], ["spvRayQueryKHR"]);
+
+    // The IO set (accumulator/outColor) is shared with the SpatialShade compute pipeline (it folds
+    // the analytic direct into the accumulator) -> needs ComputeBit. The scene set is already
+    // All-stages via the registry, so it needs no override.
+    protected override ShaderStageFlags OwnedSetExtraStages => ShaderStageFlags.ComputeBit;
 
 
-    // ---- Set 4 layout + push-constant range, appended onto the base RTPipeline sets (0-3) -------
+    // ---- Working-set layout (set 2, the base's graph-shared slot) + push-constant range ---------
     protected override void CreateDescriptorSetLayouts()
     {
-        base.CreateDescriptorSetLayouts();   // sets 0-3 (set 0 now Raygen|...|Compute)
+        base.CreateDescriptorSetLayouts();   // [scene, IO, empty(2), empty(3), FeatureEnv(4)]; IO set now Raygen|...|Compute
 
-        const ShaderStageFlags s4 = ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.ComputeBit;
-        System.Array.Resize(ref DescriptorSetLayouts, SetReStir + 1);
-        var bindings = stackalloc DescriptorSetLayoutBinding[5];
-        for (uint b = 0; b < 5; b++)
-            bindings[b] = new() { Binding = b, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = s4 };
-        var info = new DescriptorSetLayoutCreateInfo
-        {
-            SType = StructureType.DescriptorSetLayoutCreateInfo, BindingCount = 5, PBindings = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out DescriptorSetLayouts[SetReStir]) != Result.Success)
-            throw new Exception("ReStirDIPipeline: failed to create set 4 layout");
+        // Overwrite the empty placeholder the base left in the graph-shared slot (set 2) with the
+        // working set reflected from ReStirBindings. ExtraStagesFor adds ComputeBit here too: the
+        // RT program reflects RT stages only, but both compute passes bind this set.
+        DescriptorSetLayouts[SetReStir] = CreateReflectedSetLayout(SetReStir);
 
         var owned = OwnedDescriptorSetLayoutIndices;
-        System.Array.Resize(ref owned, owned.Length + 1);
+        Array.Resize(ref owned, owned.Length + 1);
         owned[^1] = SetReStir;
         OwnedDescriptorSetLayoutIndices = owned;
-
-        // Push-constant range read by the base CreatePipelineLayout (runs after this). Visible to
-        // both the raygen Trace shader and the SpatialShade compute shader (shared layout).
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.ComputeBit,
-                Offset = 0, Size = (uint)sizeof(ReStirPush),
-            },
-        };
     }
 
     // Build the RT pipeline + SBT (base), then the two ReSTIR compute pipelines (BuildTemporal +
@@ -116,26 +136,27 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     protected override void CreatePipeline()
     {
         base.CreatePipeline();
-        _buildTemporalPipeline = CreateComputePipeline("BuildTemporal");
-        _spatialPipeline       = CreateComputePipeline("SpatialShade");
+        _buildTemporalPipeline = CreateComputePipeline(BuildTemporalReq);
+        _spatialPipeline       = CreateComputePipeline(SpatialShadeReq);
     }
 
-    private Pipeline CreateComputePipeline(string kernel)
+    private Pipeline CreateComputePipeline(in ShaderCompileRequest request)
     {
-        byte[] code   = File.ReadAllBytes(ShaderPaths.Kernel("ReSTIR", kernel));
-        var    module = Gfx.CreateShaderModule(code);
-        var    entry  = SilkMarshal.StringToPtr("main");
+        var program = Shaders.GetProgram(request);
+        var entryPoint = program.Reflection.EntryPoints[0];
+        var module = Gfx.CreateShaderModule(program.Spirv(0).ToArray());
+        var entry  = SilkMarshal.StringToPtr(entryPoint.Name);
         var stage = new PipelineShaderStageCreateInfo
         {
             SType = StructureType.PipelineShaderStageCreateInfo,
-            Stage = ShaderStageFlags.ComputeBit, Module = module, PName = (byte*)entry,
+            Stage = entryPoint.Stage, Module = module, PName = (byte*)entry,
         };
         var info = new ComputePipelineCreateInfo
         {
             SType = StructureType.ComputePipelineCreateInfo, Stage = stage, Layout = PipelineLayoutHandle,
         };
         if (Vk.CreateComputePipelines(Device, PipelineCacheHandle, 1, &info, null, out Pipeline pipeline) != Result.Success)
-            throw new Exception($"ReStirDIPipeline: failed to create {kernel} compute pipeline");
+            throw new Exception($"ReStirDIPipeline: failed to create {request.Module} compute pipeline");
         SilkMarshal.Free(entry);
         Vk.DestroyShaderModule(Device, module, null);
         return pipeline;
@@ -146,30 +167,6 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         base.CreateResources();   // per-frame UBO
         AllocBuffers(Renderer.RenderExtent);
     }
-
-    protected override void CreateDescriptorSets()
-    {
-        base.CreateDescriptorSets();   // sets 0/1/3 (2 = borrowed bindless)
-
-        System.Array.Resize(ref DescriptorSets, SetReStir + 1);
-        var layout = DescriptorSetLayouts[SetReStir];
-        var alloc = new DescriptorSetAllocateInfo
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = Gfx.DescriptorPool, DescriptorSetCount = 1, PSetLayouts = &layout,
-        };
-        DescriptorSets[SetReStir] = new DescriptorSet[1];
-        fixed (DescriptorSet* p = DescriptorSets[SetReStir])
-            if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
-                throw new Exception("ReStirDIPipeline: failed to allocate set 4");
-    }
-
-    protected override void WriteDescriptors()
-    {
-        base.WriteDescriptors();
-        WriteReStirDescriptors();
-    }
-
 
     // ---- ReSTIR working-set buffers (extent-sized, device-local, ping-ponged) -------------------
     private void AllocBuffers(Extent2D extent)
@@ -194,31 +191,13 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         _resA = default; _resB = default; _gbufA = default; _gbufB = default; _sceneRad = default;
     }
 
-    private void WriteReStirDescriptors()
-    {
-        var set = DescriptorSets[SetReStir][0];
-        Span<Buffer> bufs = stackalloc Buffer[5] { _resA, _resB, _gbufA, _gbufB, _sceneRad };
-        var infos  = stackalloc DescriptorBufferInfo[5];
-        var writes = stackalloc WriteDescriptorSet[5];
-        for (uint b = 0; b < 5; b++)
-        {
-            infos[b] = new DescriptorBufferInfo { Buffer = bufs[(int)b], Offset = 0, Range = Vk.WholeSize };
-            writes[b] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = set, DstBinding = b,
-                DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &infos[b],
-            };
-        }
-        Vk.UpdateDescriptorSets(Device, 5, writes, 0, null);
-    }
-
-    /// <summary>Resize path: reallocate the per-pixel working set to the new extent + rewrite set 4.
-    /// Resets the history gate. Called by the core's Resize before the graph rebuild.</summary>
+    /// <summary>Resize path: reallocate the per-pixel working set to the new extent. Resets the
+    /// history gate. Called by the core's Resize before the graph rebuild, which re-bakes the
+    /// graph-owned set 2 from the fresh buffer handles (see GraphSharedSpec).</summary>
     public void ReallocReStirBuffers(Extent2D extent)
     {
         FreeBuffers();
         AllocBuffers(extent);
-        WriteReStirDescriptors();
     }
 
 
@@ -248,8 +227,11 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
 
     protected override void RecordPushConstants(CommandBuffer cmd)
     {
+        // Must cover the range's FULL stage mask, not just the stage doing the work: the range is
+        // shared with the compute passes, and vkCmdPushConstants requires the mask to include every
+        // stage of each range it overlaps.
         var p = _push;
-        Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.RaygenBitKhr, 0, (uint)sizeof(ReStirPush), &p);
+        Vk.CmdPushConstants(cmd, Layout, PushConstantRanges[0].StageFlags, 0, (uint)sizeof(ReStirPush), &p);
     }
 
     /// <summary>Records the BuildTemporal compute pass: reconstruct the surface from the G-buffer,
@@ -262,33 +244,42 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     public void RecordSpatialShade(CommandBuffer cmd, in Renderer.FrameContext ctx)
         => RecordComputePass(cmd, ctx, _spatialPipeline);
 
-    // Binds the SAME descriptor sets (0-4) the Trace pass uses on the shared layout, pushes the
-    // per-frame ReSTIR state, and dispatches a full-screen 8x8 grid. Both ReSTIR compute passes share
-    // this; which buffers each actually touches is decided by its shader's declared bindings.
+    // Binds the SAME descriptor sets the Trace pass uses on the shared layout, pushes the per-frame
+    // ReSTIR state, and dispatches a full-screen 8x8 grid. Both ReSTIR compute passes share this;
+    // which buffers each actually touches is decided by its shader's declared bindings. The scene set
+    // carries the frame-UBO arena slot, so its bind supplies the same dynamic offset the RT Trace
+    // pass uses. envCube (FeatureEnv) binds at set 4 for the passes that sample the background.
     private void RecordComputePass(CommandBuffer cmd, in Renderer.FrameContext ctx, Pipeline pipeline)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
 
-        var sets = stackalloc DescriptorSet[5];
-        sets[0] = DescriptorSets[0][ctx.FrameIndex];                       // frame / lights / tlas / entityInfo / emissive
-        sets[1] = DescriptorSets[1][0];                                    // geom (vertices / indices)
-        sets[2] = Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex);  // bindless materials / textures
-        sets[3] = DescriptorSets[3][0];                                    // ibl (unused by compute)
-        sets[4] = DescriptorSets[SetReStir][0];                           // reservoirs / gbuffers / sceneRadiance
-        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, 0, 5, sets, 0, null);
+        // Set 1 is an unused gap since the IO pair moved to the registry, so scene and the
+        // graph-owned working set bind separately rather than as one contiguous run.
+        uint frameConstants = PushFrameConstants(ctx.FrameIndex);
+        var sceneSet = Registry.SceneSet(ctx.FrameIndex);  // frame UBO + lights / tlas / entityInfo / vb+ib / emissive / bindless
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, ShaderSets.Scene, 1, &sceneSet, 1, &frameConstants);
+
+        var shared = _sharedSet;                           // reservoirs / gbuffers / sceneRadiance (graph-owned)
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, ShaderSets.GraphShared, 1, &shared, 0, null);
+
+        var envSet = Registry.FeatureSet(FeatureEnv, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeatureEnv), 1, &envSet, 0, null);
+
+        var ioSet = Registry.FeatureSet(FeaturePtIo, ctx.FrameIndex);
+        Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, Layout, Registry.FeatureSetIndex(FeaturePtIo), 1, &ioSet, 0, null);
 
         var p = _push;
-        Vk.CmdPushConstants(cmd, Layout, ShaderStageFlags.ComputeBit, 0, (uint)sizeof(ReStirPush), &p);
+        Vk.CmdPushConstants(cmd, Layout, PushConstantRanges[0].StageFlags, 0, (uint)sizeof(ReStirPush), &p);
 
         Vk.CmdDispatch(cmd, (ctx.RenderExtent.Width + 7) / 8, (ctx.RenderExtent.Height + 7) / 8, 1);
     }
 
 
-    // ---- Bind set 4 after the base sets (RTPipeline.Record, RT path) -----------------------------
+    // ---- Install the graph-owned working set in the base's graph-shared slot (set 2, RTPipeline.Record) --
     protected override uint ExtraSetCount => 1u;
     protected override void WriteExtraSets(DescriptorSet* dst, uint frame)
     {
-        dst[0] = DescriptorSets[SetReStir][0];
+        dst[0] = _sharedSet;
     }
 
     protected override void ReleaseGpuResources()

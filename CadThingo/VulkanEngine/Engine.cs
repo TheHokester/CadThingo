@@ -1,4 +1,7 @@
-﻿using System.Net.Sockets;
+﻿global using Buffer = Silk.NET.Vulkan.Buffer;
+global using Semaphore = Silk.NET.Vulkan.Semaphore;
+global using VkImage = Silk.NET.Vulkan.Image;
+using System.Net.Sockets;
 using System.Numerics;
 using Silk.NET.Input;
 using Silk.NET.Maths;
@@ -110,8 +113,9 @@ public class Engine
 
     private void Shutdown()
     {
+        //only cleanup renderer here, defer window!.dispose() until
+        //mainloop is finished
         renderer.Cleanup();
-        window!.Dispose();
     }
 
 
@@ -119,6 +123,7 @@ public class Engine
     {
         Start();
         MainLoop();
+        window!.Dispose();
     }
 
     private void MainLoop()
@@ -127,6 +132,10 @@ public class Engine
         // Update/Render events until the window closes. Hook once then Run once.
         window!.Update += delta =>
         {
+            //guard against calling a frame when resources have already been destroyed 
+            //during close
+            if (window!.IsClosing) return;
+
             // Tick global frame timer first so any system reading Engine.DeltaTime
             // / Engine.TotalTime this frame sees fresh values.
             double now = _frameTimer.Elapsed.TotalSeconds;
@@ -139,8 +148,13 @@ public class Engine
             renderer.Camera.Tick((float)delta);
             EventBus.ProcessEvents();
         };
+
         window!.Render += delta =>
         {
+            //see update handler above
+            if (window!.IsClosing) return;
+            
+            
             renderer.Update(delta);
         };
         window.Run();

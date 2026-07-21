@@ -17,9 +17,10 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 /// read-after-write dependency on the core's last HDR write. FinalColor is touched only here, so
 /// the module imports it directly from the host-owned <see cref="ImageResource"/>.
 ///
-/// The pipeline is injected. The module is a pure graph
-/// builder; the host resolves the HDR view post-Compile and binds tonemap's HDR-input descriptor
-/// (that view also feeds the PT&lt;-&gt;deferred flip + operator rebind, so it stays host-side).
+/// The pipeline is injected. The HDR-input descriptor (set 0) is graph-baked: this module names
+/// the HDR read, so the graph allocates + writes tonemap's set from the upstream resource and no
+/// host-side rebind is needed. Every core is graph-resident and composes this module, so this is
+/// the only binding path.
 /// </summary>
 public sealed class TonemapModule : IGraphModule<TonemapModule.Input, TonemapModule.Output>
 {
@@ -31,15 +32,22 @@ public sealed class TonemapModule : IGraphModule<TonemapModule.Input, TonemapMod
     public readonly record struct Output(GraphImage FinalColor);
 
     private readonly TonemapPipeline _tonemap;
+    // The expected upstream HDR format for the wire-time port check. Defaults to the deferred
+    // chain's R16F scene-colour transient; the PT graph cores pass PtOutColor's R32F. The shader
+    // just samples a float4, so any float colour format tonemaps correctly.
+    private readonly Format _hdrFormat;
 
-    public TonemapModule(TonemapPipeline tonemap) => _tonemap = tonemap;
+    public TonemapModule(TonemapPipeline tonemap, Format hdrFormat = Format.R16G16B16A16Sfloat)
+    {
+        _tonemap = tonemap;
+        _hdrFormat = hdrFormat;
+    }
 
     public void Build(GraphScope scope, in Input inputs, out Output outputs)
     {
-        // Wire-time port check: the upstream HDR must be a sampleable RGBA16F image. A format /
-        // usage mismatch is a build-time throw, not a runtime corruption.
-        var hdr = scope.ExpectImage(inputs.SceneColorHdr,
-            Format.R16G16B16A16Sfloat, ImageUsageFlags.SampledBit);
+        // Wire-time port check: the upstream HDR must be a sampleable image of the declared
+        // format. A format / usage mismatch is a build-time throw, not a runtime corruption.
+        var hdr = scope.ExpectImage(inputs.SceneColorHdr, _hdrFormat, ImageUsageFlags.SampledBit);
 
         // FinalColor: imported (host/RenderTargets-owned; the swapchain blit + ImGui viewport
         // sample it), handed back in ShaderReadOnly. Undefined incoming == discard (tonemap
@@ -54,11 +62,13 @@ public sealed class TonemapModule : IGraphModule<TonemapModule.Input, TonemapMod
         scope.AddPass("TonemapPass", PassType.Graphics, QueueClass.Graphics,
             b =>
             {
-                b.Read(hdr, ResourceUsage.SampledFragment);
+                // HDR-input set (set 0) is graph-baked; name matches TonemapPipeline.PassSet.
+                b.UsePassSet(_tonemap.PassSet);
+                b.Read(hdr, ResourceUsage.SampledFragment, "hdrInput");
                 final = b.Write(final, ResourceUsage.ColorAttachment);
             },
             (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                _tonemap.Record(cmd, f, res.View(final)));
+                _tonemap.Record(cmd, f, res.View(final), res.PassSet));
 
         outputs = new Output(final);
     }

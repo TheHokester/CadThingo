@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 
@@ -187,6 +188,33 @@ public unsafe class FrameGraph : IDisposable
         _passes.Add(pass);
         CurrentPassIndex = _passes.Count - 1;
         setup(new GraphBuilder(this, pass)); //Read/Write mutate version ledger + pass lists
+        ValidatePassBindings(pass);
+    }
+
+    // Fail-loud at authoring time: a named Read/Write must have a matching UsePassSet binding.
+    // Order-independent (UsePassSet may follow the named accesses in the setup lambda).
+    private static void ValidatePassBindings(GraphPass pass)
+    {
+        bool anyNamed = false;
+        foreach (var a in pass.Reads)  anyNamed |= a.Bind != null;
+        foreach (var a in pass.Writes) anyNamed |= a.Bind != null;
+        if (!anyNamed) return;
+
+        if (pass.PassSet is null)
+            throw new InvalidOperationException(
+                $"FrameGraph: pass '{pass.Name}' names a pass-set binding but never called UsePassSet.");
+
+        var spec = pass.PassSet.Value;
+        void Check(string? bind)
+        {
+            if (bind is null) return;
+            foreach (var b in spec.Bindings) if (b.Name == bind) return;
+            throw new InvalidOperationException(
+                $"FrameGraph: pass '{pass.Name}' binds '{bind}' but its pass set has no such parameter " +
+                $"(known: {string.Join(", ", spec.Bindings.Select(b => b.Name))}).");
+        }
+        foreach (var a in pass.Reads)  Check(a.Bind);
+        foreach (var a in pass.Writes) Check(a.Bind);
     }
 
     /// <summary>
@@ -345,6 +373,14 @@ public unsafe class FrameGraph : IDisposable
         // are now the frozen plan; Execute() replays them with no per-frame analysis.
         BakeSync();
 
+        // ---- Graph-baked pass descriptor sets (opt-in via UsePassSet) ------------
+        // Allocate + fill each opting pass's per-frame set from the now-resolved handles.
+        BakePassSets();
+
+        // ---- Graph-owned shared set (opt-in via UseGraphSharedSet) ---------------
+        // One set for the whole graph, shared by every pass (the PT working set).
+        BakeGraphSharedSet();
+
         // ---- Debug instrumentation: query pools, labels, object names ------------
         SetupDebug();
 
@@ -386,18 +422,18 @@ public unsafe class FrameGraph : IDisposable
         }
     }
 
-    // ---- Step 3.5: queue assignment + submit chunking ----------------------------
-    // Collapse declared queues onto what the device has, then split the schedule into
-    // per-queue submit chunks at the cross-queue edges. Rules:
-    //  - a graphics pass with an async producer (any RAW/WAW/WAR pred) starts a NEW chunk
-    //    whose submit waits that producer chunk's timeline value (a wait gates the whole
-    //    submit, so passes that must NOT wait stay in earlier chunks);
-    //  - a graphics pass with an async CONSUMER closes its chunk with a signal right after
-    //    it, so the consumer has something to wait on;
-    //  - every async pass is its own chunk (v1) and always signals -- graphics consumers
-    //    and next-frame transitive ordering hang off that value.
-    // Cross-queue MEMORY sync rides the semaphores (signal makes all writes available, wait
-    // makes them visible), so BakeSync skips barriers on cross-queue transitions.
+    /// ---- Step 3.5: queue assignment + submit chunking ----------------------------
+    /// Collapse declared queues onto what the device has, then split the schedule into
+    /// per-queue submit chunks at the cross-queue edges. Rules:
+    ///  - a graphics pass with an async producer (any RAW/WAW/WAR pred) starts a NEW chunk
+    ///    whose submit waits that producer chunk's timeline value (a wait gates the whole
+    ///    submit, so passes that must NOT wait stay in earlier chunks);
+    ///  - a graphics pass with an async CONSUMER closes its chunk with a signal right after
+    ///    it, so the consumer has something to wait on;
+    ///  - every async pass is its own chunk (v1) and always signals -- graphics consumers
+    ///    and next-frame transitive ordering hang off that value.
+    /// Cross-queue MEMORY sync rides the semaphores (signal makes all writes available, wait
+    /// makes them visible), so BakeSync skips barriers on cross-queue transitions.
     private void PlanChunks()
     {
         _chunks.Clear();
@@ -574,9 +610,9 @@ public unsafe class FrameGraph : IDisposable
         _gfxCursor = _cmpCursor = 0;
     }
 
-    // ---- Physical-handle resolution (used by PassResources during Execute) --------
-    // Valid only after Compile()'s step 5 has populated the phys handles; until then
-    // these throw, which is the correct signal that Execute ran before allocation.
+    /// ---- Physical-handle resolution (used by PassResources during Execute) --------
+    /// Valid only after Compile()'s step 5 has populated the phys handles; until then
+    /// these throw, which is the correct signal that Execute ran before allocation.
     internal ImageView ResolveView(GraphImage h) =>
         _resources[h.resourceId].PhysView ?? throw new InvalidOperationException(
             $"FrameGraph: image '{_resources[h.resourceId].Name}' has no view (not allocated/imported).");
@@ -827,6 +863,192 @@ public unsafe class FrameGraph : IDisposable
         f is Format.D32Sfloat or Format.D24UnormS8Uint or Format.D16Unorm
           or Format.D32SfloatS8Uint or Format.D16UnormS8Uint;
 
+    // ---- Graph-baked pass descriptor sets  ---------
+    // Owns the pass sets because their lifetime IS the graph's: allocated here at Compile
+    // (which runs under device-idle on init/resize) and freed in Dispose. Each opting pass
+    // gets one set per frame-in-flight from its pipeline-owned layout; every binding a named
+    // Read/Write referenced is written NOW with that frame's resolved handle. No per-frame
+    // rewrite is needed -- the sets are never mutated in flight (a resize rebuilds the whole
+    // graph), so Execute only hands the right frame's set to the pass body. The scene set (a
+    // frame-lifetime, in-flight-mutated set) stays with DescriptorRegistry; these do not.
+    private DescriptorPool _passSetPool;
+
+    private void BakePassSets()
+    {
+        uint frames = Renderer.MAX_CONCURRENT_FRAMES;
+
+        var opting = new List<GraphPass>();
+        foreach (var idx in _executionOrder)
+            if (_passes[idx].PassSet is not null) opting.Add(_passes[idx]);
+        if (opting.Count == 0) return;
+
+        // Pool sized to the exact per-type descriptor demand across every opting pass * frames.
+        var poolSizes = new Dictionary<DescriptorType, uint>();
+        uint maxSets = 0;
+        foreach (var pass in opting)
+        {
+            var spec = pass.PassSet!.Value;
+            maxSets += frames;
+            foreach (var a in NamedAccesses(pass))
+            {
+                var b = FindBinding(spec, a.Bind!);
+                poolSizes[b.Type] = poolSizes.GetValueOrDefault(b.Type) + frames;
+            }
+        }
+
+        var sizes = poolSizes.Select(kv => new DescriptorPoolSize { Type = kv.Key, DescriptorCount = kv.Value }).ToArray();
+        fixed (DescriptorPoolSize* pSizes = sizes)
+        {
+            var poolInfo = new DescriptorPoolCreateInfo
+            {
+                SType = StructureType.DescriptorPoolCreateInfo,
+                PoolSizeCount = (uint)sizes.Length,
+                PPoolSizes = pSizes,
+                MaxSets = maxSets,
+            };
+            if (gfx.Vk.CreateDescriptorPool(gfx.Device, &poolInfo, null, out _passSetPool) != Result.Success)
+                throw new Exception("FrameGraph: failed to create pass-set descriptor pool");
+        }
+
+        // One layout-array scratch reused per pass (every set in a pass shares its layout).
+        var layouts = stackalloc DescriptorSetLayout[(int)frames];
+        foreach (var pass in opting)
+        {
+            var spec = pass.PassSet!.Value;
+
+            for (int f = 0; f < frames; f++) layouts[f] = spec.Layout;
+            var alloc = new DescriptorSetAllocateInfo
+            {
+                SType = StructureType.DescriptorSetAllocateInfo,
+                DescriptorPool = _passSetPool,
+                DescriptorSetCount = frames,
+                PSetLayouts = layouts,
+            };
+            var sets = new DescriptorSet[frames];
+            fixed (DescriptorSet* pSets = sets)
+                if (gfx.Vk.AllocateDescriptorSets(gfx.Device, &alloc, pSets) != Result.Success)
+                    throw new Exception($"FrameGraph: failed to allocate pass set for '{pass.Name}'");
+            pass.PassSets = sets;
+
+            foreach (var a in NamedAccesses(pass))
+                for (uint f = 0; f < frames; f++)
+                    WritePassBinding(sets[f], spec, in a, f);
+        }
+    }
+
+    // ---- Graph-owned shared set  ---------
+    // ONE descriptor set for the whole graph, shared by every pass (vs pass sets, one per pass).
+    // Fits a technique whose passes all touch the same working buffers (the PT SoA / ReSTIR
+    // reservoirs): the pipeline still owns the buffers + the layout, the graph owns just the set.
+    // Single instance (not per-frame): the handles never change in flight -- a resize rebuilds the
+    // whole graph -- and the buffer contents are ordered by the passes' declared barriers. The core
+    // reads GraphSharedSet after Compile and hands it to the pipeline for its record-time binds.
+    private GraphSharedSetSpec? _graphSharedSpec;
+    private DescriptorSet _graphSharedSet;
+    private DescriptorPool _graphSharedPool;
+
+    /// <summary>Opts the graph into owning one shared descriptor set (see <see cref="GraphSharedSetSpec"/>),
+    /// allocated + written at Compile from the pipeline-supplied buffer handles. Call once during Build.</summary>
+    public void UseGraphSharedSet(in GraphSharedSetSpec spec) => _graphSharedSpec = spec;
+
+    /// <summary>The graph-owned shared set, valid after <see cref="Compile"/> (default handle if the
+    /// graph never opted in). Bound by the pipeline at the spec's set index.</summary>
+    public DescriptorSet GraphSharedSet => _graphSharedSet;
+
+    private void BakeGraphSharedSet()
+    {
+        if (_graphSharedSpec is not { } spec || spec.Bindings.Count == 0) return;
+
+        var poolSizes = new Dictionary<DescriptorType, uint>();
+        foreach (var b in spec.Bindings) poolSizes[b.Type] = poolSizes.GetValueOrDefault(b.Type) + 1;
+        var sizes = poolSizes.Select(kv => new DescriptorPoolSize { Type = kv.Key, DescriptorCount = kv.Value }).ToArray();
+        fixed (DescriptorPoolSize* pSizes = sizes)
+        {
+            var poolInfo = new DescriptorPoolCreateInfo
+            {
+                SType = StructureType.DescriptorPoolCreateInfo,
+                PoolSizeCount = (uint)sizes.Length, PPoolSizes = pSizes, MaxSets = 1,
+            };
+            if (gfx.Vk.CreateDescriptorPool(gfx.Device, &poolInfo, null, out _graphSharedPool) != Result.Success)
+                throw new Exception("FrameGraph: failed to create graph-shared descriptor pool");
+        }
+
+        var layout = spec.Layout;
+        var alloc = new DescriptorSetAllocateInfo
+        {
+            SType = StructureType.DescriptorSetAllocateInfo,
+            DescriptorPool = _graphSharedPool, DescriptorSetCount = 1, PSetLayouts = &layout,
+        };
+        fixed (DescriptorSet* p = &_graphSharedSet)
+            if (gfx.Vk.AllocateDescriptorSets(gfx.Device, &alloc, p) != Result.Success)
+                throw new Exception("FrameGraph: failed to allocate graph-shared set");
+
+        foreach (var b in spec.Bindings)
+        {
+            var info = new DescriptorBufferInfo { Buffer = b.Buffer, Offset = 0, Range = Vk.WholeSize };
+            var write = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet, DstSet = _graphSharedSet,
+                DstBinding = b.Binding, DescriptorType = b.Type, DescriptorCount = 1, PBufferInfo = &info,
+            };
+            gfx.Vk.UpdateDescriptorSets(gfx.Device, 1, &write, 0, null);
+        }
+    }
+
+    // The named (pass-set) accesses of a pass, reads then writes.
+    private static IEnumerable<ResourceAccess> NamedAccesses(GraphPass pass)
+    {
+        foreach (var a in pass.Reads)  if (a.Bind != null) yield return a;
+        foreach (var a in pass.Writes) if (a.Bind != null) yield return a;
+    }
+
+    private static BindingDesc FindBinding(in PassSetSpec spec, string name)
+    {
+        foreach (var b in spec.Bindings) if (b.Name == name) return b;
+        throw new InvalidOperationException($"FrameGraph: pass set has no binding named '{name}'.");
+    }
+
+    // Writes one binding of a baked pass set for frame f. Image layout is derived from the
+    // access usage (the same UsageTable entry that baked the barrier), so the descriptor
+    // layout and the barrier's target layout can never drift. A CombinedImageSampler binding
+    // gets its sampler from the pipeline-owned layout's IMMUTABLE sampler (the write's sampler
+    // field is then ignored by Vulkan) -- so every image case writes just view + layout and the
+    // graph never has to own or plumb a sampler.
+    private void WritePassBinding(DescriptorSet set, in PassSetSpec spec, in ResourceAccess a, uint frame)
+    {
+        var b   = FindBinding(spec, a.Bind!);
+        var res = _resources[a.ResourceId];
+        var write = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = set,
+            DstBinding = b.Binding,
+            DescriptorType = b.Type,
+            DescriptorCount = 1,
+        };
+
+        if (a.IsImage)
+        {
+            var info = new DescriptorImageInfo
+            {
+                ImageView = res.PhysView ?? throw new InvalidOperationException(
+                    $"FrameGraph: pass-set image '{res.Name}' has no view."),
+                ImageLayout = UsageTable.Of(a.Usage).Layout,
+            };
+            write.PImageInfo = &info;
+            gfx.Vk.UpdateDescriptorSets(gfx.Device, 1, &write, 0, null);
+        }
+        else
+        {
+            var buf = res.PhysBufferFrames is { } fr ? fr[frame]
+                    : res.PhysBuffer ?? throw new InvalidOperationException(
+                        $"FrameGraph: pass-set buffer '{res.Name}' not allocated.");
+            var info = new DescriptorBufferInfo { Buffer = buf, Offset = 0, Range = Vk.WholeSize };
+            write.PBufferInfo = &info;
+            gfx.Vk.UpdateDescriptorSets(gfx.Device, 1, &write, 0, null);
+        }
+    }
+
     /// <summary>
     /// Replays the baked plan: per scheduled pass, emit its barrier batch then record its
     /// body; finally hand imported images back in their declared final layout. No
@@ -845,7 +1067,6 @@ public unsafe class FrameGraph : IDisposable
         if (_chunked) { ExecuteChunked(in frame); return; }
 
         _debug?.BeginFrame(cmd, frame.FrameIndex);
-        var resources = new PassResources(this);
         for (int i = 0; i < _executionOrder.Count; i++)
         {
             var pass = _passes[_executionOrder[i]];
@@ -856,6 +1077,8 @@ public unsafe class FrameGraph : IDisposable
             _debug?.BeginPass(cmd, frame.FrameIndex, i);   // debug label + begin timestamp/stats
 
             EmitBarriers(cmd, pass.ImageBarriers, pass.BufferBarriers);
+            var resources = new PassResources(this,
+                pass.PassSets.Length > 0 ? pass.PassSets[frame.FrameIndex] : default);
             pass.Execute(cmd, resources, in frame);
             _debug?.EndPass(cmd, frame.FrameIndex, i);      // end timestamp/stats + pop label
         }
@@ -871,7 +1094,6 @@ public unsafe class FrameGraph : IDisposable
     {
         uint fr = frame.FrameIndex;
         var vk = gfx.Vk;
-        var resources = new PassResources(this);
 
         bool firstGfx = true;
         for (int c = 0; c < _chunks.Count; c++)
@@ -904,6 +1126,8 @@ public unsafe class FrameGraph : IDisposable
 
                 _debug?.BeginPass(cb, fr, pos);
                 EmitBarriers(cb, pass.ImageBarriers, pass.BufferBarriers);
+                var resources = new PassResources(this,
+                    pass.PassSets.Length > 0 ? pass.PassSets[fr] : default);
                 pass.Execute(cb, resources, in frame);
                 _debug?.EndPass(cb, fr, pos);
             }
@@ -1365,6 +1589,10 @@ public unsafe class FrameGraph : IDisposable
         if (_cmpChunkPool.Handle != 0) vk.DestroyCommandPool(dev, _cmpChunkPool, null);
         if (_gfxTimeline.Handle  != 0) vk.DestroySemaphore(dev, _gfxTimeline, null);
         if (_cmpTimeline.Handle  != 0) vk.DestroySemaphore(dev, _cmpTimeline, null);
+
+        // Graph-baked pass sets + the graph-owned shared set: freed with their pools.
+        if (_passSetPool.Handle != 0) vk.DestroyDescriptorPool(dev, _passSetPool, null);
+        if (_graphSharedPool.Handle != 0) vk.DestroyDescriptorPool(dev, _graphSharedPool, null);
 
         foreach (var res in _resources.Values)
         {

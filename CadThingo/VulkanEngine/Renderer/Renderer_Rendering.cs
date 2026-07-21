@@ -106,15 +106,17 @@ public unsafe partial class Renderer
         // re-binds its lighting + tonemap descriptors); the PT cores rebind their storage images
         // (which marks the accumulator dirty so the next dispatch clears fresh memory).
         renderTargets.ReallocateSizeDependent(new Extent2D(width, height));
+        // Fresh accumulator / out-color views: re-register before the cores rebuild, so the
+        // FeaturePTIO set points at the new images.
+        RegisterPathTraceIoBindings();
         // Every registered core rebuilds its size-dependent state: DeferredCore/WavefrontPTCore
         // re-compile their graphs (fresh transients, re-import FinalColor, re-bind descriptors);
         // the PT/RT cores rebind their storage images (which marks the accumulator dirty so the
         // next dispatch clears fresh memory).
         foreach (var core in _renderCores) core.Resize(renderExtent);
 
-        // Re-point tonemap's HDR input at the ACTIVE core's fresh scene-colour source (deferred
-        // HDR vs PT ptOutColor). Subsumes the old per-mode branch: DeferredCore.Resize just bound
-        // tonemap to the new deferred HDR, so in a PT mode we must override it back to ptOutColor.
+        // Tonemap's HDR input is graph-baked, re-pointed by each core's graph rebuild above;
+        // Activate restarts the active PT core's progressive accumulation on the fresh targets.
         _activeCore.Activate();
 
         // FinalColor ImageView is fresh - re-bind it for the ImGui viewport panel.
@@ -196,11 +198,10 @@ public unsafe partial class Renderer
         //     so it sits here before the per-frame command buffer is recorded.
         selection.ProcessPickRequest();
 
-        // 0d. Render-mode change: swap the active core. Its Activate() rebinds tonemap's HDR
-        //     input to the core's scene-colour source (deferred HDR vs PT ptOutColor).
-        //     DeviceWaitIdle ensures no in-flight frame is still using the old binding. Mode
-        //     flips are user-driven (ImGui combo), so the hitch is acceptable. This replaces the
-        //     old per-frame _lastRenderMode tonemap-rebind check.
+        // 0d. Render-mode change: swap the active core. Tonemap's HDR input is graph-baked per
+        //     core, so Activate() only restarts the PT cores' progressive accumulation.
+        //     DeviceWaitIdle ensures no in-flight frame straddles the switch. Mode flips are
+        //     user-driven (ImGui combo), so the hitch is acceptable.
         var desiredCore = _renderCores[_desiredCoreIndex];
         if (!ReferenceEquals(desiredCore, _activeCore))
         {
@@ -218,6 +219,10 @@ public unsafe partial class Renderer
         };
         // 1. CPU/GPU sync for this slot
         vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
+
+        // This frame's scene set is provably idle now: apply queued registry rewrites and
+        // reset its constant-arena slice.
+        descriptorRegistry.BeginFrame(currentFrame);
 
         // 2. Acquire swapchain image
         var acquireResult = swapchain.AcquireNextImage(imageAvailableSemaphores[currentFrame], out uint imageIndex);

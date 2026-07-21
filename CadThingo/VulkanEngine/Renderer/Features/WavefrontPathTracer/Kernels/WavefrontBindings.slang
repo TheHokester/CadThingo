@@ -1,9 +1,12 @@
-﻿//set 4 - wavefront working set
+﻿//set 2 - wavefront working set (graph-shared)
 module WavefrontBindings;
 
 __exported import PTUtils;
 __exported import PbrUtils;
 __exported import CommonTypes;
+__exported import SceneBindings;   // scene set 0: materials/lights/tlas/geometry/emissive/textures/samplers
+__exported import FeatureEnv;      // feature set 4: envCube
+__exported import FeaturePTIO;     // feature set 5: accumulator + outColor
 
 
 public static const uint RAY_COUNT = 0, SHADE_COUNT_0 = 1, SHADOW_COUNT = 5, NEXT_RAY_COUNT = 6;
@@ -29,27 +32,11 @@ public void wrRay(uint i, uint v){
     else rayQueue1[i]=v; 
 }
 
-// Set 0 — per-frame IO (binding indices match PTCompute set 0).
-public [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO>       frameUBO;
-public [[vk::binding(1, 0)]] StructuredBuffer<PbrLight>         lights;
-public [[vk::binding(2, 0)]] RaytracingAccelerationStructure    tlas;
-public [[vk::binding(3, 0)]] StructuredBuffer<ShadowEntityInfo> entityInfo;
-public [[vk::binding(4, 0)]] RWTexture2D<float4>                accumulator;
-public [[vk::binding(5, 0)]] RWTexture2D<float4>                outColor;
-public [[vk::binding(6, 0)]] StructuredBuffer<EmissiveTri>      emissiveTris;
-public [[vk::binding(7, 0)]] StructuredBuffer<AliasEntry>       emissiveAlias;
+// Set 0 - frameUBO on the reserved (0,0) constant-arena slot; every other scene
+// resource (lights/tlas/entityInfo/emissive/geometry/materials/textures/samplers)
+// comes from the imported SceneBindings module.
+public [[vk::binding(0, 0)]] ConstantBuffer<PathFrameUBO> frameUBO;
 
-// Set 1 — geometry streams.
-public [[vk::binding(1, 1)]] ByteAddressBuffer globalVertices;
-public [[vk::binding(2, 1)]] ByteAddressBuffer globalIndices;
-
-// Set 2 — bindless materials + textures.
-public [[vk::binding(0, 2)]] StructuredBuffer<PbrMaterial> materials;
-public [[vk::binding(2, 2)]] Texture2D                     textures[];
-public [[vk::binding(3, 2)]] SamplerState                  samplers[];
-
-// Set 3 — full-res environment cube (binding 3 matches PTCompute).
-public [[vk::binding(3, 3)]] SamplerCube envCube;
 
 
 
@@ -79,26 +66,26 @@ public float  wfPackCone(float width, float spread) { return asfloat(wfPackHalf2
 public float2 wfUnpackCone(float packed)            { return wfUnpackHalf2(asuint(packed)); }
 
 // Persistent path state — survives every bounce. Indexed by pathIdx (= pixel index).
-public [[vk::binding(0,4)]]  RWStructuredBuffer<float4> psRayOrigin;  // xyz = ray O          (w free)
-public [[vk::binding(1,4)]]  RWStructuredBuffer<float4> psRayDir;     // xyz = ray D          (w = prevBsdfPdf, P2 MIS)
-public [[vk::binding(2,4)]]  RWStructuredBuffer<uint2>  psThroughput; // PACKED half4: xyz = β, w = flags (1 = prevWasDelta, -1 = escaped w/ env stash)
-public [[vk::binding(3,4)]]  RWStructuredBuffer<uint2>  psRadiance;   // PACKED half4: xyz = radiance L
-public [[vk::binding(4,4)]]  RWStructuredBuffer<uint>   psRng;        // PRNG state (own array: frequent RMW, perfect coalescing)
-public [[vk::binding(5,4)]]  RWStructuredBuffer<uint2>  psSigmaA;     // PACKED half4: xyz = medium σ_a
+public [[vk::binding(0,2)]]  RWStructuredBuffer<float4> psRayOrigin;  // xyz = ray O          (w free)
+public [[vk::binding(1,2)]]  RWStructuredBuffer<float4> psRayDir;     // xyz = ray D          (w = prevBsdfPdf, P2 MIS)
+public [[vk::binding(2,2)]]  RWStructuredBuffer<uint2>  psThroughput; // PACKED half4: xyz = β, w = flags (1 = prevWasDelta, -1 = escaped w/ env stash)
+public [[vk::binding(3,2)]]  RWStructuredBuffer<uint2>  psRadiance;   // PACKED half4: xyz = radiance L
+public [[vk::binding(4,2)]]  RWStructuredBuffer<uint>   psRng;        // PRNG state (own array: frequent RMW, perfect coalescing)
+public [[vk::binding(5,2)]]  RWStructuredBuffer<uint2>  psSigmaA;     // PACKED half4: xyz = medium σ_a
 
 // Compact hit — transient Extend→Shade. Indexed by pathIdx (NOT by queue slot): a material
 // sort/bin reorders the index list, so the hit must stay reachable from pathIdx, not from a
 // position that the sort destroys (see "Material-sorted shading"). Everything else recomputed.
-public [[vk::binding(6,4)]]  RWStructuredBuffer<uint2>  hitRecPrim;   // x = recordIndex (instanceID+geometryIndex), y = primIdx
-public [[vk::binding(7,4)]]  RWStructuredBuffer<float>  hitT;         // committed ray t
-public [[vk::binding(8,4)]]  RWStructuredBuffer<uint>   hitBary;      // PACKED half2: committed barycentrics
+public [[vk::binding(6,2)]]  RWStructuredBuffer<uint2>  hitRecPrim;   // x = recordIndex (instanceID+geometryIndex), y = primIdx
+public [[vk::binding(7,2)]]  RWStructuredBuffer<float>  hitT;         // committed ray t
+public [[vk::binding(8,2)]]  RWStructuredBuffer<uint>   hitBary;      // PACKED half2: committed barycentrics
 
 // Work queues — index lists (this is the ONLY thing a material sort reshuffles; state stays put).
 // rayQueue ping-pongs by bounce parity (src/dst via push constant). shadeQueue is a single bin in
 // P1; P3 replaces it with one bin per shading class (below).
-public [[vk::binding(9,4)]]  RWStructuredBuffer<uint>   rayQueue0;
-public [[vk::binding(10,4)]] RWStructuredBuffer<uint>   rayQueue1;
-public [[vk::binding(11,4)]] RWStructuredBuffer<uint>   shadeQueue;   // pathIdx that hit this bounce
+public [[vk::binding(9,2)]]  RWStructuredBuffer<uint>   rayQueue0;
+public [[vk::binding(10,2)]] RWStructuredBuffer<uint>   rayQueue1;
+public [[vk::binding(11,2)]] RWStructuredBuffer<uint>   shadeQueue;   // pathIdx that hit this bounce
 
 // Shadow records — Shade→Connect. Indexed by SHADOW SLOT (dense [0,shadowCount)). ≤1 record
 // per path per bounce ⇒ shadowPath values are unique ⇒ Connect's radiance add needs no atomics.
@@ -107,20 +94,20 @@ public [[vk::binding(11,4)]] RWStructuredBuffer<uint>   shadeQueue;   // pathIdx
 // against Shade(b+1) and its async overlap window stretches to Extend(b+1)+Shade(b+1)+
 // Extend(b+2) (its real downstream consumer is Shade(b+2), which reuses set b&1).
 // Access through the rdShadow*/wrShadowRec helpers below, never the raw arrays.
-public [[vk::binding(12,4)]] RWStructuredBuffer<uint>   shadowPath0;   // target pathIdx
-public [[vk::binding(13,4)]] RWStructuredBuffer<float4> shadowOrigin0; // xyz = O, w = tMax (fp32: positions + distances)
-public [[vk::binding(14,4)]] RWStructuredBuffer<uint2>  shadowDir0;    // PACKED half4: xyz = D, w = castShadows
-public [[vk::binding(15,4)]] RWStructuredBuffer<uint2>  shadowLe0;     // PACKED half4: xyz = precomputed β·f·W·Le·cosθ contribution
-public [[vk::binding(19,4)]] RWStructuredBuffer<uint>   shadowPath1;
-public [[vk::binding(20,4)]] RWStructuredBuffer<float4> shadowOrigin1;
-public [[vk::binding(21,4)]] RWStructuredBuffer<uint2>  shadowDir1;
-public [[vk::binding(22,4)]] RWStructuredBuffer<uint2>  shadowLe1;
+public [[vk::binding(12,2)]] RWStructuredBuffer<uint>   shadowPath0;   // target pathIdx
+public [[vk::binding(13,2)]] RWStructuredBuffer<float4> shadowOrigin0; // xyz = O, w = tMax (fp32: positions + distances)
+public [[vk::binding(14,2)]] RWStructuredBuffer<uint2>  shadowDir0;    // PACKED half4: xyz = D, w = castShadows
+public [[vk::binding(15,2)]] RWStructuredBuffer<uint2>  shadowLe0;     // PACKED half4: xyz = precomputed β·f·W·Le·cosθ contribution
+public [[vk::binding(19,2)]] RWStructuredBuffer<uint>   shadowPath1;
+public [[vk::binding(20,2)]] RWStructuredBuffer<float4> shadowOrigin1;
+public [[vk::binding(21,2)]] RWStructuredBuffer<uint2>  shadowDir1;
+public [[vk::binding(22,2)]] RWStructuredBuffer<uint2>  shadowLe1;
 
 // Connect's NEE contributions accumulate HERE, not in psRadiance: Connect is then the only
 // writer of this buffer all frame (Generate zeroes it, Finalize folds it into the path
 // radiance), so it conflicts with no graphics pass at all -- the other half of the wide
 // async window. PACKED half4: xyz = summed visible NEE contribution for this path.
-public [[vk::binding(24,4)]] RWStructuredBuffer<uint2>  shadowRadiance;
+public [[vk::binding(24,2)]] RWStructuredBuffer<uint2>  shadowRadiance;
 
 public uint   rdShadowPath  (uint par, uint i) { return par == 0u ? shadowPath0[i]   : shadowPath1[i]; }
 public float4 rdShadowOrigin(uint par, uint i) { return par == 0u ? shadowOrigin0[i] : shadowOrigin1[i]; }
@@ -138,8 +125,8 @@ public void wrShadowRec(uint par, uint s, uint path, float4 origin, float4 dir, 
 
 // Counters + indirect args. Both array-shaped so the shade stage can fan out to one entry
 // per shading class in P3 (shadeCount[c] / shade-args[c]) with sizing-only changes.
-public [[vk::binding(16,4)]] RWStructuredBuffer<uint>   counters;     // rayCount, shadeCount[C], shadowCount, nextRayCount  (C=1 in P1/P2)
-public [[vk::binding(17,4)]] RWStructuredBuffer<uint>   dispatchArgs; // VkDispatchIndirectCommand[]: extend, shade[C], connect(DEBUG-only, see below)
+public [[vk::binding(16,2)]] RWStructuredBuffer<uint>   counters;     // rayCount, shadeCount[C], shadowCount, nextRayCount  (C=1 in P1/P2)
+public [[vk::binding(17,2)]] RWStructuredBuffer<uint>   dispatchArgs; // VkDispatchIndirectCommand[]: extend, shade[C], connect(DEBUG-only, see below)
 
 // Connect's OWN indirect-args buffers (decoupling): Connect(b) overlaps the next bounce's
 // workers, and Extend's fused tail writes dispatchArgs (shade-args[b+1]) -- if Connect's
@@ -150,8 +137,8 @@ public [[vk::binding(17,4)]] RWStructuredBuffer<uint>   dispatchArgs; // VkDispa
 // flight). PING-PONGED BY BOUNCE PARITY like the shadow records (Shade(b+1)'s tail writes
 // the other buffer, so Connect(b)'s indirect read has no WAR against it). The dispatchArgs
 // connect slot is still written, but ONLY for the Stats-panel readback.
-public [[vk::binding(18,4)]] RWStructuredBuffer<uint>   connectArgs0;
-public [[vk::binding(23,4)]] RWStructuredBuffer<uint>   connectArgs1;
+public [[vk::binding(18,2)]] RWStructuredBuffer<uint>   connectArgs0;
+public [[vk::binding(23,2)]] RWStructuredBuffer<uint>   connectArgs1;
 
 
 // ---- Fused dispatch-arg generation (replaces the standalone PrepareArgs dispatches) --------

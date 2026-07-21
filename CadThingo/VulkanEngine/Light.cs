@@ -12,7 +12,7 @@ public enum LightType : uint
 /// <summary>
 /// Per-entity light data. Scene gathers all enabled LightComponents each frame
 /// into the per-frame StructuredBuffer&lt;PbrLight&gt; consumed by PbrShader.slang.
-/// Color is linear and NOT pre-multiplied by intensity — the shader does
+/// Color is linear and NOT pre-multiplied by intensity - the shader does
 /// color * intensity so artists can tune intensity without re-saturating color.
 /// </summary>
 public unsafe class LightComponent : Component

@@ -2,7 +2,7 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using CadThingo.GraphicsPipeline;
+// using CadThingo.GraphicsPipeline;
 using CadThingo.VulkanEngine;
 using CadThingo.VulkanEngine.Renderer;
 using Silk.NET.Vulkan;
@@ -203,7 +203,16 @@ public unsafe class ResourceManager
     
     private UboBuffer[] MaterialStorageBuffers = new UboBuffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
     private UboBuffer[] InstanceStorageBuffers = new UboBuffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-     
+
+    // GPU block-compression encoder for material textures. Lives here rather than on
+    // GraphicsDevice: it compiles a shader at construction, and the RHI layer has no business
+    // reaching up into the shader layer. Lazy, so runs that never load a BC asset never build
+    // the PSO (and never touch slang).
+    private Renderer.Features.TextureCompression.BcEncoder? _bcEncoder;
+    internal Renderer.Features.TextureCompression.BcEncoder BcEncoder => _bcEncoder ??= new(
+        (_renderer ?? throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called")).Gpu);
+
+
     public void Initialize(Renderer.Renderer renderer)
     {
         _renderer = renderer;
@@ -383,6 +392,7 @@ public unsafe class ResourceManager
     public void Dispose()
     {
         ReleaseAll();
+        _bcEncoder?.Dispose();
         if (_renderer != null)
         {
             _renderer.DestroyBuffer(globalVertexBuffer, globalVertexBufferAlloc);
@@ -403,6 +413,7 @@ public unsafe class ResourceManager
     }
     public DescriptorSetLayout GetBindlessLayout() => MaterialBindlessLayout;
     public DescriptorSet GetBindlessSet(uint frameIndex) => bindlessDescriptorSets[frameIndex];
+    internal Sampler DefaultSampler => defaultBindlessSampler;
     public Buffer GetMaterialBuffer(int frameIndex) => MaterialStorageBuffers[frameIndex].buffer;
     public Buffer GetInstanceBuffer(uint frameIndex) => InstanceStorageBuffers[frameIndex].buffer;
     public void* GetMaterialMapped(uint frameIndex) => MaterialStorageBuffers[frameIndex].mapped;

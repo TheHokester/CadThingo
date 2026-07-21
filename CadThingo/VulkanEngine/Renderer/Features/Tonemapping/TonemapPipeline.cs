@@ -1,10 +1,13 @@
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
+using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 
-// Matches the TONEMAP_OPERATOR spec constant in Tonemap.slang. Read once at
-// pipeline build; changing the operator requires Dispose + rebuild.
+// Values must match the TONEMAP_OPERATOR branch in Tonemap.slang. Read once at pipeline build;
+// changing the operator requires a rebuild.
 public enum TonemapOperator : uint
 {
     Reinhard = 0,
@@ -13,14 +16,11 @@ public enum TonemapOperator : uint
 
 // 
 //  Tone-map / post pass — samples HDRColor, writes FinalColor (LDR)
-// Base type is namespace-qualified: the dead VulkanTut `CadThingo.GraphicsPipeline`
-// namespace would otherwise shadow the `GraphicsPipeline` base from an enclosing-namespace
-// lookup here under Features.
-public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class TonemapPipeline : GraphicsPipeline
 {
-    // Push constants — fragment-only, 8 bytes total, well under the 128B
-    // guaranteed minimum. Kept off the per-frame UBO because exposure/gamma
-    // change rarely and don't deserve a descriptor binding of their own.
+    // Mirrors TonemapParams in Tonemap.slang. Kept off the per-frame UBO because exposure/gamma
+    // change rarely and don't deserve a descriptor binding of their own. The reflected push range
+    // drives the layout; Initialize asserts this struct still matches it.
     [StructLayout(LayoutKind.Sequential)]
     struct TonemapPushConstants
     {
@@ -28,7 +28,8 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         public float Gamma;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Tonemapping", "Tonemap");
+    protected override ShaderCompileRequest? Program =>
+        new("Tonemapping/Tonemap", ["VSMain", "PSMain"], [], []);
 
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R8G8B8A8Unorm };
 
@@ -37,32 +38,37 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
     public float Exposure { get; set; } = 4.5f;
     public float Gamma    { get; set; } = 2.0f;
 
-    /// <summary>Selects the tone-map curve via <c>constant_id 0</c> in
-    /// Tonemap.slang. Read at each pipeline build; set then call
-    /// <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
+    /// <summary>Selects the tone-map curve via the TONEMAP_OPERATOR spec constant. Read at each
+    /// pipeline build; set then call <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
     public TonemapOperator Operator { get; set; } = TonemapOperator.Filmic;
 
-    public TonemapPipeline(Renderer renderer) : base(renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.FragmentBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(TonemapPushConstants),
-            }
-        };
-    }
+    // Graph-baked pass set: the single HDR-input sampler, filled by each core's TonemapModule from
+    // its scene-colour source. Contents AND set index both come from reflection, so hdrInput's
+    // declaration in Tonemap.slang is the only place either is stated. Every core is graph-resident
+    // now, so this is the ONLY way the HDR input is bound.
+    private uint PassSetIndex => Reflected!.Reflection.Bindings.Select(b => b.Set).Distinct().Single();
 
-    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor)
+    public PassSetSpec PassSet =>
+        new(PassSetIndex, DescriptorSetLayouts[PassSetIndex], ReflectedBindings(PassSetIndex));
+
+    public TonemapPipeline(GpuContext gpu, Renderer renderer) : base( gpu, renderer) { }
+
+    // The graph writes only the view into the pass set, so the sampler is pinned here.
+    protected override Sampler? ImmutableSamplerFor(in BindingDesc binding) 
+        => binding.Name == "hdrInput" ? Renderer.gBufferSampler : null;
+
+    protected override SpecValues? Specialization =>
+        new SpecValues().Set("TONEMAP_OPERATOR", (uint)Operator);
+
+    // TonemapModule passes its graph-baked HDR set (see PassSet).
+    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor, DescriptorSet hdrSet)
     {
         BeginRendering(cmd,
             ctx.RenderExtent,
             [finalColor],
             colorLoad: AttachmentLoadOp.DontCare
             );
-       
+
         Vk!.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, Handle);
 
         Viewport vp = new()
@@ -75,13 +81,12 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdSetViewport(cmd, 0, 1, &vp);
         Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
 
-        var set = GetDescriptorSet(0, 0);
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, 0, 1, &set, 0, null);
+            Layout, 0, 1, &hdrSet, 0, null);
         PushConstants(cmd);
 
         Vk!.CmdDraw(cmd, 3, 1, 0, 0);
-        
+
         EndRendering(cmd);
     }
     
@@ -109,110 +114,40 @@ public sealed unsafe class TonemapPipeline : Pipelines.GraphicsPipeline
         DepthBiasEnable         = false,
     };
 
-    // Wire constant_id 0 (TONEMAP_OPERATOR) on the fragment stage. The slang
-    // declaration is uint, so we pack the enum value into a 4-byte slot.
-    protected override int FillSpecializationData(
-        int stageIdx,
-        SpecializationMapEntry* entries,
-        byte* data,
-        out uint dataSize)
-    {
-        // ShaderStages default: [0]=VS, [1]=FS. Spec constant lives on FS only.
-        if (stageIdx == 1)
-        {
-            entries[0] = new SpecializationMapEntry
-            {
-                ConstantID = 0,
-                Offset     = 0,
-                Size       = sizeof(uint),
-            };
-            *(uint*)data = (uint)Operator;
-            dataSize = sizeof(uint);
-            return 1;
-        }
-        dataSize = 0;
-        return 0;
-    }
-
-    //  Descriptor layout — set 0, binding 0 = HDR input sampler
-    
+    // Only the pass set is real; any index below it is a gap this pipeline never binds.
     protected override void CreateDescriptorSetLayouts()
     {
-        DescriptorSetLayouts = new DescriptorSetLayout[1];
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
-
-        var binding = new DescriptorSetLayoutBinding
-        {
-            Binding         = 0,
-            DescriptorType  = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags      = ShaderStageFlags.FragmentBit,
-        };
-        var layoutInfo = new DescriptorSetLayoutCreateInfo
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 1,
-            PBindings    = &binding,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &layoutInfo, null, out DescriptorSetLayouts[0]) != Result.Success)
-            throw new Exception("Failed to create tonemap descriptor set layout");
+        uint set = PassSetIndex;
+        DescriptorSetLayouts = new DescriptorSetLayout[set + 1];
+        for (int i = 0; i < set; i++) DescriptorSetLayouts[i] = Registry.EmptySetLayout;
+        DescriptorSetLayouts[set] = CreateReflectedSetLayout(set);
+        OwnedDescriptorSetLayoutIndices = new[] { (int)set };
     }
 
     // No per-frame mapped buffers — the HDR image is graph-owned, single-buffered,
-    // and tunables ride in push constants.
-    protected override void CreateResources() { }
-
-    protected override void CreateDescriptorSets()
+    // and tunables ride in push constants. The size check is the one thing reflection cannot
+    // enforce on its own: the C# mirror of TonemapParams has to keep matching the shader.
+    protected override void CreateResources()
     {
-        // Single shared set — HDR image is single-buffered like FinalColor.
-        var layout = DescriptorSetLayouts[0];
-        DescriptorSetAllocateInfo allocInfo = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts        = &layout,
-        };
-        DescriptorSets = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[1];
-        fixed (DescriptorSet* pSet = DescriptorSets[0])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &allocInfo, pSet) != Result.Success)
-                throw new Exception("Failed to allocate tonemap descriptor set");
-        }
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(TonemapPushConstants))
+            throw new Exception(
+                $"TonemapPushConstants is {sizeof(TonemapPushConstants)} bytes but Tonemap.slang " +
+                $"reflects {reflected}");
     }
 
-    // Descriptor target (HDRColor view) only exists after the render graph compiles,
-    // so the renderer calls WriteHdrInputDescriptor explicitly post-setup and on
-    // every swapchain recreate.
+    // No pipeline-owned sets: every core's TonemapModule graph-bakes the HDR-input set (PassSet).
+    protected override void CreateDescriptorSets() { }
+
     protected override void WriteDescriptors() { }
 
-    public void WriteHdrInputDescriptor(ImageView hdrView, Sampler sampler)
-    {
-        DescriptorImageInfo imageInfo = new()
-        {
-            ImageView   = hdrView,
-            Sampler     = sampler,
-            ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
-        };
-        WriteDescriptorSet write = new()
-        {
-            SType           = StructureType.WriteDescriptorSet,
-            DstSet          = DescriptorSets[0][0],
-            DstBinding      = 0,
-            DstArrayElement = 0,
-            DescriptorType  = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            PImageInfo      = &imageInfo,
-        };
-        Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-    }
-
+    // Stages come from the same reflected range the layout was built from: vkCmdPushConstants
+    // requires the two to agree, so neither side is allowed to name a stage mask of its own.
     public void PushConstants(CommandBuffer cmd)
     {
         var pc = new TonemapPushConstants { Exposure = Exposure, Gamma = Gamma };
         Vk.CmdPushConstants(cmd, Layout,
-            ShaderStageFlags.FragmentBit,
+            PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(TonemapPushConstants), &pc);
     }
 }

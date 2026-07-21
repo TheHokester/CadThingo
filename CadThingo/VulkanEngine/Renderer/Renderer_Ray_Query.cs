@@ -428,7 +428,9 @@ public unsafe partial class Renderer
     private void BuildEmissiveBuffers(List<EmissiveTriGpu> tris, List<float> weights, float totalPower)
     {
         int n = tris.Count;
-        emissiveBuffersResized = EnsureEmissiveCapacity((uint)n);
+        // Sticky until consumed at the re-register site: a later no-resize rebuild
+        // must not erase a pending reallocation notice.
+        emissiveBuffersResized |= EnsureEmissiveCapacity((uint)n);
         emissiveTriCount   = (uint)n;
         totalEmissivePower = totalPower;
 
@@ -828,7 +830,7 @@ public unsafe partial class Renderer
         // 3. Capacities: one TLAS instance per cluster; one shadowInfo + transform
         //    slot per primitive, laid out flat and cluster-contiguous.
         EnsureInstanceCapacity((uint)Math.Max(1, clusters.Count));
-        shadowInfoBufferResized = EnsureShadowInfoCapacity((uint)Math.Max(1, n));
+        shadowInfoBufferResized |= EnsureShadowInfoCapacity((uint)Math.Max(1, n));
         EnsureClusterTransformCapacity((uint)Math.Max(1, n));
 
         var dst  = (AccelerationStructureInstanceKHR*)tlasInstanceMapped;
@@ -882,7 +884,11 @@ public unsafe partial class Renderer
             };
         }
 
-        if (instCount == 0 && PreviousCount == 0)
+        // An empty scene still builds a real zero-instance TLAS on the first pass:
+        // the scene set's sceneTlas binding must hold a valid handle before an RT
+        // core can be selected (rays just miss). Skip only re-building an already
+        // existing TLAS with nothing.
+        if (instCount == 0 && PreviousCount == 0 && tlas.Handle != 0)
         {
             tlasDirty = false;
             return;
@@ -1034,27 +1040,14 @@ public unsafe partial class Renderer
         // BLASes, so newly-joined meshes are picked up automatically.
         RebuildTlas();
 
-        // TLAS handle changes on every rebuild — re-bind it on every consumer
-        // descriptor set even when the shadow-info buffer didn't grow.
+        // TLAS handle changes on every rebuild - one scene-set re-register covers every
+        // consumer 
         if (tlas.Handle != 0)
-        {
-            PbrDeferredPipeline?.WriteTlasDescriptor(tlas);
-            transparentPipeline?.WriteTlasDescriptor(tlas);
-            ptComputePipeline?.WriteTlasDescriptor(tlas);
-            wavefrontPipeline?.WriteTlasDescriptor(tlas);
-            rtPipeline?.WriteTlasDescriptor(tlas);
-            reStirPipeline?.WriteTlasDescriptor(tlas);
-            selection?.WriteTlasDescriptor(tlas);
-        }
+            descriptorRegistry.RegisterTlas("sceneTlas", tlas);
 
         if (shadowInfoBufferResized)
         {
-            PbrDeferredPipeline?.WriteShadowAlphaDescriptors();
-            ptComputePipeline?.WriteShadowInfoDescriptor();
-            wavefrontPipeline?.WriteShadowInfoDescriptor();
-            rtPipeline?.WriteShadowInfoDescriptor();
-            reStirPipeline?.WriteShadowInfoDescriptor();
-            selection?.WriteEntityInfoDescriptor();
+            descriptorRegistry.RegisterBuffer("sceneEntityInfo", shadowInfoBuffer);
             shadowInfoBufferResized = false;
         }
 
@@ -1063,10 +1056,8 @@ public unsafe partial class Renderer
         // re-write is only needed on resize.
         if (emissiveBuffersResized)
         {
-            ptComputePipeline?.WriteEmissiveDescriptors();
-            wavefrontPipeline?.WriteEmissiveDescriptors();
-            rtPipeline?.WriteEmissiveDescriptors();
-            reStirPipeline?.WriteEmissiveDescriptors();
+            descriptorRegistry.RegisterBuffer("sceneEmissiveTris", emissiveTriBuffer);
+            descriptorRegistry.RegisterBuffer("sceneEmissiveAlias", emissiveAliasBuffer);
             emissiveBuffersResized = false;
         }
     }

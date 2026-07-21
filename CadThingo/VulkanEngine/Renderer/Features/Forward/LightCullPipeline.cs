@@ -1,6 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
@@ -18,36 +21,39 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         public Vector2   ScreenSize;
         public uint      TileCountX;
         public uint      TileCountY;
-        public uint      LightCount; 
+        public uint      LightCount;
         public uint      _pad0;
         public uint      _pad1;
         public uint      _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Forward", "LightCulling");
+    protected override ShaderCompileRequest? Program =>
+        new("Forward/LightCulling", ["Main"], [], []);
 
-    // Tile-cull per-frame outputs owned by this pipeline. TileLightCount[tileIdx]
-    // is the number of lights overlapping each tile; TileLightIndices[tileIdx*MAX + slot]
-    // is the flat index into the lights SSBO. The lighting pass reads both, keyed by
-    // tileIdx = (gl_FragCoord / TILE_SIZE).
+    // Set 0 - unified scene set (sceneLights is the only read; this pass keeps
+    //         its params in push constants so the (0,0) slot goes unused and the
+    //         bind supplies a zero dynamic offset).
+    // Set 1 - pass-local outputs owned by this pipeline. TileLightCount[tileIdx]
+    //         is the number of lights overlapping each tile;
+    //         TileLightIndices[tileIdx*MAX + slot] is the flat index into the
+    //         lights SSBO. The lighting passes read both, keyed by
+    //         tileIdx = (gl_FragCoord / TILE_SIZE).
     private UboBuffer[] TileLightCountBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
     private UboBuffer[] TileLightIndicesBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
 
     public Buffer GetTileLightCountBuffer  (uint frame) => TileLightCountBuffers[frame].buffer;
     public Buffer GetTileLightIndicesBuffer(uint frame) => TileLightIndicesBuffers[frame].buffer;
 
-    public LightCullPipeline(Renderer renderer) : base(renderer)
-    {
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.ComputeBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(LightCullPushConstants),
-            }
-        };
-    }
+    // Graph-baked pass set: the two tile-cull outputs, filled by the deferred FrameGraph (they
+    // are graph imports this pass writes). Both the layout and the names the graph matches
+    // against come from LightCulling.slang's set-1 declarations, so the LightCullPass Write
+    // binds name the shader globals; the pipeline owns only the layout.
+    public PassSetSpec PassSet =>
+        new(ShaderSets.Pass, DescriptorSetLayouts[ShaderSets.Pass], ReflectedBindings(ShaderSets.Pass));
+
+    // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
+    // still matches the reflected size.
+    public LightCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
     public override void Dispose()
     {
@@ -58,33 +64,23 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // 3 storage buffers: lights (read), tileLightCount (write), tileLightIndices (write).
-        var bindings = stackalloc DescriptorSetLayoutBinding[3];
-        for (uint b = 0; b < 3; b++)
-        {
-            bindings[b] = new DescriptorSetLayoutBinding
-            {
-                Binding         = b,
-                DescriptorType  = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                StageFlags      = ShaderStageFlags.ComputeBit,
-                PImmutableSamplers = null,
-            };
-        }
-        DescriptorSetLayoutCreateInfo info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 3,
-            PBindings    = bindings,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &info, null, out var layout) != Result.Success)
-            throw new Exception("Failed to create light-cull descriptor set layout");
-        DescriptorSetLayouts = new[] { layout };
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
+        // Assemble [scene(0), pass(1)]. Scene is registry-owned; the pipeline owns only the pass
+        // layout, built from LightCulling.slang's set-1 declarations.
+        var passLayout = CreateReflectedSetLayout(ShaderSets.Pass);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout);
+        OwnedDescriptorSetLayoutIndices = new[] { (int)ShaderSets.Pass };
     }
 
     protected override void CreateResources()
     {
+        // Reflection cannot check this on its own: the C# mirror of CullParams has to keep
+        // matching the shader.
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(LightCullPushConstants))
+            throw new Exception(
+                $"LightCullPushConstants is {sizeof(LightCullPushConstants)} bytes but " +
+                $"LightCulling.slang reflects {reflected}");
+
         // Tile-cull buffers sized for worst-case tile count (MAX_TILE_COUNT).
         // Per frame: TileLightCount = MAX × 4B, TileLightIndices = MAX × MAX_LIGHTS_PER_TILE × 4B.
         for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
@@ -98,123 +94,41 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         }
     }
 
-    protected override void CreateDescriptorSets()
-    {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
-
-        DescriptorSetAllocateInfo alloc = new()
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts        = layouts,
-        };
-        DescriptorSets = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* pSets = DescriptorSets[0])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &alloc, pSets) != Result.Success)
-                throw new Exception("Failed to allocate light-cull descriptor sets");
-        }
-    }
-
-    /// <summary>
-    /// Rewrites just binding 0 (the lights SSBO that PbrDeferredPipeline owns).
-    /// Called by RebuildPbrPipelines - when PBR is disposed + recreated the old
-    /// VkBuffer this descriptor pointed at is gone, so the consumer side has to
-    /// re-bind to the fresh handle.
-    /// </summary>
-    public void RewriteLightsBinding()
-    {
-        var pbr = Renderer.PbrDeferredPipeline
-                  ?? throw new InvalidOperationException("PbrDeferredPipeline not initialized.");
-
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo bufLights = new()
-            {
-                Buffer = Renderer.GetLightStorageBuffer((uint)i), Offset = 0,
-                Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
-            };
-            var write = new WriteDescriptorSet
-            {
-                SType           = StructureType.WriteDescriptorSet,
-                DstSet          = DescriptorSets[0][i],
-                DstBinding      = 0,
-                DescriptorType  = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                PBufferInfo     = &bufLights,
-            };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    protected override void WriteDescriptors()
-    {
-        // PbrDeferredPipeline owns the lights SSBO; this binding is the consumer side.
-        var pbr = Renderer.PbrDeferredPipeline
-                  ?? throw new InvalidOperationException(
-                      "LightCullPipeline must be initialized AFTER PbrDeferredPipeline so the lights SSBO is available.");
-
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo bufLights = new()
-            {
-                Buffer = Renderer.GetLightStorageBuffer((uint)i), Offset = 0,
-                Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
-            };
-            DescriptorBufferInfo bufTileCount = new()
-            {
-                Buffer = TileLightCountBuffers[i].buffer, Offset = 0,
-                Range  = (ulong)(Renderer.MAX_TILE_COUNT * sizeof(uint)),
-            };
-            DescriptorBufferInfo bufTileIdx = new()
-            {
-                Buffer = TileLightIndicesBuffers[i].buffer, Offset = 0,
-                Range  = (ulong)(Renderer.MAX_TILE_COUNT * Renderer.MAX_LIGHTS_PER_TILE * sizeof(uint)),
-            };
-
-            var writes = stackalloc WriteDescriptorSet[3];
-            for (uint b = 0; b < 3; b++)
-            {
-                writes[b] = new WriteDescriptorSet
-                {
-                    SType           = StructureType.WriteDescriptorSet,
-                    DstSet          = DescriptorSets[0][i],
-                    DstBinding      = b,
-                    DescriptorType  = DescriptorType.StorageBuffer,
-                    DescriptorCount = 1,
-                };
-            }
-            writes[0].PBufferInfo = &bufLights;
-            writes[1].PBufferInfo = &bufTileCount;
-            writes[2].PBufferInfo = &bufTileIdx;
-
-            Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
-        }
-    }
+    // Descriptor sets are graph-owned now: the deferred FrameGraph allocates set 1 from this
+    // pipeline's pass-set layout and writes the two tile buffers by name each Compile. The
+    // scene set (sceneLights) comes from the registry. No CreateDescriptorSets / WriteDescriptors.
 
     // CPU side. Computes invViewProj + tile counts from the current
-    // camera/swapchain extent, pushes them, dispatches one group per tile, and
-    // barriers compute-write -> fragment-read on the two tile buffers.
+    // camera/swapchain extent, pushes them, and dispatches one group per tile.
+    // (The compute-write -> fragment-read barrier on the tile buffers is derived
+    // by the graph from the LightCullPass Write + the lighting-pass Read.)
     public void Record(CommandBuffer cmd, uint frameIndex, Camera cam,
-                       uint lightCount, uint tileCountX, uint tileCountY)
+                       uint lightCount, uint tileCountX, uint tileCountY, DescriptorSet tileSet)
     {
         if (tileCountX == 0 || tileCountY == 0) return;
 
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, PipelineHandle);
-        var dset = DescriptorSets[0][frameIndex];
+
+        // The scene-set layout carries the (0,0) dynamic constant slot even
+        // though this shader doesn't declare it (params ride push constants),
+        // so the bind must still supply one dynamic offset - zero is valid.
+        // Set 1 is the graph-baked tile-output pass set.
+        uint zeroOffset = 0;
+        var sets = stackalloc DescriptorSet[2]
+        {
+            Registry.SceneSet(frameIndex),
+            tileSet,
+        };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute,
-            PipelineLayoutHandle, 0, 1, &dset, 0, null);
+            PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);
 
         Matrix4x4 view = cam.GetViewMatrix();
         Matrix4x4 proj = cam.GetProjectionMatrix(
             (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
         // The lighting fragment shader sees a Y-flipped projection (the geometry
-        // pipeline flips proj.M22 in UpdateUbo). Build invViewProj from the SAME
-        // flipped matrix so the cull frustum lines up with where pixels actually
-        // sample world positions from the g-buffer.
+        // pipeline flips proj.M22 in its frame constants). Build invViewProj from
+        // the SAME flipped matrix so the cull frustum lines up with where pixels
+        // actually sample world positions from the g-buffer.
         proj.M22 *= -1f;
         Matrix4x4 vp = view * proj;
         if (!Matrix4x4.Invert(vp, out Matrix4x4 invVP))
@@ -229,12 +143,14 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
             TileCountY  = tileCountY,
             LightCount  = lightCount,
         };
-        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, ShaderStageFlags.ComputeBit,
+        // Stage mask comes from the reflected range the layout was built from: vkCmdPushConstants
+        // requires the two to agree, so neither side names a stage mask of its own.
+        Vk.CmdPushConstants(cmd, PipelineLayoutHandle, PushConstantRanges[0].StageFlags,
             0, (uint)sizeof(LightCullPushConstants), &push);
 
         // One thread group per tile (each group is 16×16 = 256 threads).
         Vk.CmdDispatch(cmd, tileCountX, tileCountY, 1);
 
-       
+
     }
 }

@@ -13,19 +13,14 @@ using Silk.NET.Windowing;
 public class Program
 {
     private static IWindow? window;
-    private const bool IsTutorial = false;
-    private static void Main()
+    private static void Main(string[] args)
     {
-        if (IsTutorial)
-        {
-            var app = new App();
-            app.Run();
-        }
-        else
-        {
-            var app = new Engine();
-            app.Run();
-            
-        }
+        // Headless developer tools: compile + reflect every kernel, or exercise the Slang
+        // interop, without bringing up a device.
+        if (args.Contains("--shader-audit")) { VulkanEngine.Renderer.Shaders.ShaderAudit.Run(); return; }
+        if (args.Contains("--slang-smoke")) { VulkanEngine.Renderer.Shaders.SlangSmokeTest.Run(); return; }
+
+        var app = new Engine();
+        app.Run();
     }
 }

@@ -1,7 +1,9 @@
 using System.Linq;
 using System.Numerics;
+using System.Reflection;
 using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.RenderCores;
 using CadThingo.VulkanEngine.Renderer.Features.Deferred;
@@ -12,6 +14,7 @@ using CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Features.Selection;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -41,11 +44,11 @@ public unsafe partial class Renderer
     // repoints land (L1 of the renderer refactor).a
     internal GraphicsDevice gfx = null!;
 
-    public bool initialized = false;
+    private bool initialized = false;
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private bool enableValidationLayers = false; 
+    private readonly bool enableValidationLayers = false;
     private IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------
@@ -66,8 +69,8 @@ public unsafe partial class Renderer
     internal bool descriptorIndexEnabled => gfx.DescriptorIndexingEnabled;
     internal bool multiviewEnabled       => gfx.MultiviewEnabled;
 
-    // Read-only handle accessor — pipelines that load their own device-extension
-    // dispatch tables (e.g. RtPipeline → KhrRayTracingPipeline) need the instance
+    // Read-only handle accessor - pipelines that load their own device-extension
+    // dispatch tables (e.g. RtPipeline -> KhrRayTracingPipeline) need the instance
     // for vk.TryGetDeviceExtension. Generic, not tied to any one extension.
     internal Instance GetVkInstance() => gfx.GetVkInstance();
 
@@ -120,7 +123,7 @@ public unsafe partial class Renderer
     // pipelines. Host-owned; pipelines and cores read its views/samplers.
     internal IblSystem Ibl = null!;
 
-    // Runtime reflection probes — GPU resources + CPU registry. Allocated after
+    // Runtime reflection probes - GPU resources + CPU registry. Allocated after
     // the IBL cubemaps because it reuses the same prefilter pipeline. Phase 2
     // stops at resource allocation; capture / shader integration come later.
     internal ReflectionProbeSystem reflectionProbeSystem = null!;
@@ -166,6 +169,16 @@ public unsafe partial class Renderer
     // AS buffers + the scene descriptor set fold in over the later L2 steps.
     internal GpuScene gpuScene = null!;
 
+    // Descriptor-system track (docs/descriptor-system.md): runtime shader compile+cache
+    // (Phase A) and the unified scene set + constant arena (Phase B). Pipelines migrate
+    // onto these shader-by-shader; until then the registry's sets are written but unbound.
+    internal ShaderLibrary shaderLibrary = null!;
+    internal DescriptorRegistry descriptorRegistry = null!;
+
+    /// The device-services handles, bundled for injection. Valid once Initialize has built the
+    /// device, shader library, and registry - construct pipelines after that point.
+    internal GpuContext Gpu; 
+
     // Render target extent — the size at which the deferred chain (gbuffers,
     // HDRColor, FinalColor) and the lighting tile grid are sized. Distinct from
     // swapChainExtent because the editor's viewport panel can be smaller than
@@ -183,7 +196,7 @@ public unsafe partial class Renderer
     RenderingAttachmentInfo depthAttachment;
     
     
-    //pipelines — each owns its own VkPipeline, layouts, descriptor sets, and per-pipeline buffers
+    //pipelines - each owns its own VkPipeline, layouts, descriptor sets, and per-pipeline buffers
     internal GeometryPipeline     geometryPipeline;
     internal DrawCullPipeline     drawCullPipeline;
     internal LightCullPipeline    lightCullPipeline;
@@ -197,10 +210,7 @@ public unsafe partial class Renderer
     internal ReStirDIPipeline?    reStirPipeline;        // opt-in ReSTIR DI tracer, RT-pipeline (null when unsupported)
     internal SelectionSystem      selection = null!;     // host-owned editor selection: pick + coverage mask + outline
 
-    // GPU block-compression encoder for material textures (lazy: created on the first compressed
-    // texture load, so it costs nothing for runs that never load a BC-formatted asset).
-    private Features.TextureCompression.BcEncoder? _bcEncoder;
-    internal Features.TextureCompression.BcEncoder BcEncoder => _bcEncoder ??= new Features.TextureCompression.BcEncoder(gfx);
+    
 
     // Specialization-constant gate for soft (PCSS-style) ray-queried shadows.
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
@@ -279,6 +289,15 @@ public unsafe partial class Renderer
         SetupDynamicRendering();
 
         CreateDescriptorPool();
+
+        // Reflects SceneBindings.slang into the canonical scene set layout and allocates
+        // the per-frame set instances. Providers register at the end of Initialize
+        // (RegisterSceneBindings) once they exist.
+        shaderLibrary = ShaderLibrary.CreateDefault();
+        descriptorRegistry = new DescriptorRegistry(gfx, shaderLibrary, MAX_CONCURRENT_FRAMES);
+        
+        Gpu = new(gfx, descriptorRegistry, shaderLibrary);
+        
         Engine.ResourceManager.Initialize(this);
 
         // Depth + g-buffers are ImageResource objects only — the render graph allocates
@@ -290,29 +309,29 @@ public unsafe partial class Renderer
         // binds the lights buffer, and before the first per-frame Extract.
         gpuScene = new GpuScene(gfx);
         gpuScene.CreateLightBuffers();
-        // Cull-input SSBO — must exist before DrawCullPipeline binds it (binding 0).
+        // Cull-input SSBO - must exist before DrawCullPipeline binds it (binding 0).
         gpuScene.CreateRenderableBuffers();
 
         // IBL images allocated up-front, cleared to black. The PBR lighting set
         // binds them unconditionally; the compute bake passes fill the content
         // when an HDR is loaded via Ibl.LoadEnvironmentHdr. The ctor also bakes
         // the view-independent BRDF LUT once.
-        Ibl = new IblSystem(this);
+        Ibl = new IblSystem(Gpu, this);
 
         // Reflection-probe GPU resources (cubemap array + per-probe SSBO).
         // Reuses the IBL prefilter pipeline at capture time, so it has to be
         // constructed after the IblSystem.
-        reflectionProbeSystem = new ReflectionProbeSystem(this);
+        reflectionProbeSystem = new ReflectionProbeSystem(Gpu, this, Ibl);
 
         // Pipelines that don't depend on allocated g-buffer image views 
         // Render-graph pass closures (registered in SetupDeferredRenderer) read
         // `geometryPipeline` / `drawCullPipeline` / `PbrDeferredPipeline` through
         // `this`, so they must exist (be non-null) by the time the closures *run*
         // (per frame in DrawFrame), not when they're declared.
-        geometryPipeline = new GeometryPipeline(this);
+        geometryPipeline = new GeometryPipeline(Gpu, this);
         geometryPipeline.Initialize();
 
-        drawCullPipeline = new DrawCullPipeline(this);
+        drawCullPipeline = new DrawCullPipeline(Gpu, this);
         drawCullPipeline.Initialize();
 
         scene = new Scene(vk, device, physicalDevice);//initialise scene
@@ -329,38 +348,22 @@ public unsafe partial class Renderer
         imGuiUtils?.WriteViewportDescriptor(renderTargets.FinalColor.ImageView);
 
         //  Lighting + light-cull pipelines (depend on allocated g-buffer / lights SSBO) 
-        PbrDeferredPipeline = new PbrDeferredPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
+        PbrDeferredPipeline = new PbrDeferredPipeline(Gpu, this) { SoftShadowsEnabled = softShadowsEnabled };
         PbrDeferredPipeline.Initialize();
 
-        lightCullPipeline = new LightCullPipeline(this);
+        lightCullPipeline = new LightCullPipeline(Gpu, this);
         lightCullPipeline.Initialize();
-        
-        // Wire light-cull tile buffers into the PBR lighting set now that both exist.
-        PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
-        // Same idea for the reflection-probe bindings — the cube array, probe
-        // records SSBO, cluster range / index list SSBOs are all stable for the
-        // renderer's lifetime so we write once at init.
-        PbrDeferredPipeline.WriteProbeDescriptors();
-        
-        
-        ptComputePipeline = new PTComputePipeline(this);
+
+        // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come from the
+        // scene set; the accumulator / out-color pair from the registry-owned FeaturePTIO set.
+        ptComputePipeline = new PTComputePipeline(Gpu, this);
         ptComputePipeline.Initialize();
-        ptComputePipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-        ptComputePipeline.WriteGeometryDescriptors();
-        ptComputePipeline.WriteLightsDescriptor();
-        // Same as the transparent / deferred pipelines: IBL images are Renderer-
-        // owned and stable across rebakes, so set 3 only needs writing once.
-        ptComputePipeline.WriteIblDescriptors();
 
         // Wavefront path tracer (RenderMode.RayWavefront). Shares the same accumulator /
-        // out-color images + scene buffers as the megakernel; the set-4 SoA working set is
-        // pipeline-owned. Set 1 / set 4 / frame UBO are written by Initialize; storage images +
-        // lights + IBL here, and TLAS / shadow / emissive below after InitRayQuery.
-        wavefrontPipeline = new WavefrontPTPipeline(this);
+        // out-color images as the megakernel via FeaturePTIO; scene buffers come from the scene
+        // set. The SoA working set is pipeline-owned; envCube rides FeatureEnv.
+        wavefrontPipeline = new WavefrontPTPipeline(Gpu, this);
         wavefrontPipeline.Initialize();
-        wavefrontPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-        wavefrontPipeline.WriteLightsDescriptor();
-        wavefrontPipeline.WriteIblDescriptors();
 
         // Opt-in RT-pipeline path tracer (RenderMode.RayTrace). Shares the same
         // accumulator/outColor images + scene buffers as the compute path; only
@@ -368,52 +371,40 @@ public unsafe partial class Renderer
         // are bound below after InitRayQuery, mirroring the compute pipeline.
         if (RayTracePipelineSupported)
         {
-            rtPipeline = new RTPipeline(this);
+            // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come from
+            // the scene set; envCube rides FeatureEnv, accumulator / out-color ride FeaturePTIO.
+            rtPipeline = new RTPipeline(Gpu, this);
             rtPipeline.Initialize();
-            rtPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-            rtPipeline.WriteGeometryDescriptors();
-            rtPipeline.WriteLightsDescriptor();
-            rtPipeline.WriteIblDescriptors();
 
             // ReSTIR DI tracer (RenderMode.ReStirDI). Same RT-pipeline machinery as rtPipeline
             // (it subclasses RTPipeline), forked only at the shader; shares the same accumulator /
-            // outColor + scene buffers. TLAS/shadow/emissive sets bound below with rtPipeline's.
-            reStirPipeline = new ReStirDIPipeline(this);
+            // outColor + scene set.
+            reStirPipeline = new ReStirDIPipeline(Gpu, this);
             reStirPipeline.Initialize();
-            reStirPipeline.WriteStorageImageDescriptors(ptAccumulator.ImageView, ptOutColor.ImageView);
-            reStirPipeline.WriteGeometryDescriptors();
-            reStirPipeline.WriteLightsDescriptor();
-            reStirPipeline.WriteIblDescriptors();
         }
 
         // Editor selection - object picking + ray-query coverage mask + outline
         // composite. Host-owned; the TLAS / entity-info descriptors are bound
         // below after InitRayQuery. No-op at runtime when ray queries aren't
         // supported (ProcessPickRequest / RecordOutline gate on a valid TLAS).
-        selection = new SelectionSystem(this);
+        selection = new SelectionSystem(Gpu, this);
 
         // Tone-map / post pass - reads the FrameGraph's HDRColor transient, writes the LDR
         // FinalColor that the swapchain blit sources. Its HDR-input descriptor is bound from the
         // graph's freshly-allocated HDR view when DeferredCore compiles its graph (and re-pointed
         // per active core via IRenderCore.Activate), so no descriptor write here.
-        tonemapPipeline = new TonemapPipeline(this) { Operator = tonemapOperator };
+        tonemapPipeline = new TonemapPipeline(Gpu, this) { Operator = tonemapOperator };
         tonemapPipeline.Initialize();
 
         // Transparent forward+ pass — renders BLEND-mode materials between the lighting
-        // pass and the tonemap pass. Shares the lights SSBO + TLAS + tile cull buffers
-        // with PbrDeferredPipeline; shares the bindless set with GeometryPipeline.
-        transparentPipeline = new TransparentPipeline(this) { SoftShadowsEnabled = softShadowsEnabled };
+        // pass and the tonemap pass. Lights / TLAS / bindless come from the scene set;
+        // the tile cull buffers are wired from LightCullPipeline below.
+        transparentPipeline = new TransparentPipeline(Gpu, this) { SoftShadowsEnabled = softShadowsEnabled };
         transparentPipeline.Initialize();
-        transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
-        // IBL bindings live on Renderer-owned VkImages that exist before any
-        // pipeline initializes; write them straight after Initialize.
-        transparentPipeline.WriteIblDescriptors();
-        // Probe bindings — same stable-handle story as IBL. Wired once at init.
-        transparentPipeline.WriteProbeDescriptors();
 
         // Skybox renders the envCube into HDRColor between lighting and transparent.
         // EditorState.SkyboxEnabled gates the draw without re-recording the graph.
-        skyboxPipeline = new SkyboxPipeline(this);
+        skyboxPipeline = new SkyboxPipeline(Gpu, this);
         skyboxPipeline.Initialize();
 
         // Per-frame command buffers + sync ring.
@@ -426,44 +417,27 @@ public unsafe partial class Renderer
         // Build BLAS / TLAS for ray-traced shadows. Gated on RayShadowsSupported
         // inside InitRayQuery — safe to call even when ray queries aren't available.
         InitRayQuery();
-        // Bind the TLAS into the lighting descriptor sets — both the deferred lighting
-        // pass and the forward+ transparent pass walk it for ray-traced shadows.
-        if (tlas.Handle != 0)
-        {
-            PbrDeferredPipeline.WriteTlasDescriptor(tlas);
-            transparentPipeline.WriteTlasDescriptor(tlas);
-            ptComputePipeline.WriteTlasDescriptor(tlas);
-            wavefrontPipeline.WriteTlasDescriptor(tlas);
-            rtPipeline?.WriteTlasDescriptor(tlas);
-            reStirPipeline?.WriteTlasDescriptor(tlas);
-            selection.WriteTlasDescriptor(tlas);
-            // Bind the ShadowEntityInfo SSBO + global vb/ib for the alpha-test
-            // path in the PBR lighting shadow rays. Has to happen after
-            // InitRayQuery because the SSBO is allocated inside RebuildTlas.
-            PbrDeferredPipeline.WriteShadowAlphaDescriptors();
-            ptComputePipeline.WriteShadowInfoDescriptor();
-            wavefrontPipeline.WriteShadowInfoDescriptor();
-            rtPipeline?.WriteShadowInfoDescriptor();
-            reStirPipeline?.WriteShadowInfoDescriptor();
-            // Pick + selection resolve the hit entity through the same flat
-            // ShadowEntityInfo table (per-cluster instances → entity via
-            // entityInfo[InstanceCustomIndex + GeometryIndex].entityIndex).
-            selection.WriteEntityInfoDescriptor();
-            // Emissive area-light buffers (built inside RebuildTlas, always
-            // allocated with ≥1 slot so the binding is valid even with no emitters).
-            ptComputePipeline.WriteEmissiveDescriptors();
-            wavefrontPipeline.WriteEmissiveDescriptors();
-            rtPipeline?.WriteEmissiveDescriptors();
-            reStirPipeline?.WriteEmissiveDescriptors();
-        }
+        
 
-        // Stand up the L3 render cores (eager). Each ctor registers the core into _renderCores
+        // Scene-set registrations: every provider that exists
+        // at init, matched by SceneBindings parameter name. Runtime handle changes
+        // re-register at their rebuild sites; the dump shows any remaining holes.
+        RegisterSceneBindings();
+        RegisterFeatureBindings();
+        RegisterPathTraceIoBindings();
+        Console.WriteLine(descriptorRegistry.DumpBindings());
+
+        // Cross-check every migrated pipeline's reflected bindings against what the registry owns
+        // and was handed. Runs here because it needs both sides complete: pipelines built above,
+        // providers registered on the two lines before. Throws on a real mismatch.
+        Console.WriteLine(descriptorRegistry.Validate(ReflectedPrograms()));
+        var lc = gfx.LayoutCache;
+        Console.WriteLine($"[layout-cache] set layouts {lc.SetLayoutCount}/{lc.SetLayoutRequests} distinct, " +
+                          $"pipeline layouts {lc.PipelineLayoutCount}/{lc.PipelineLayoutRequests} distinct");
+
+        // Stand up the render cores. Each ctor registers the core into _renderCores
         // (RegisterCore) -- construction order IS the list/combo order, so Deferred (index 0) is
-        // the boot default + fallback. DeferredCore's ctor builds + compiles the deferred FrameGraph
-        // (which OWNS the g-buffers / depth / HDR transients and imports FinalColor) and rebinds the
-        // lighting g-buffer + tonemap-HDR descriptors from the fresh transient views. The PT/RT cores
-        // wrap the renderer-owned PT pipelines; the RT-pipeline-only cores (RayTrace, ReSTIR DI) are
-        // built only when the device exposed the feature, so they self-exclude from the combo.
+        // the boot default + fallback. 
         new DeferredCore(this);
         new PathtraceComputeCore(this);
         if (rtPipeline != null)     new PathtraceRTCore(this);
@@ -494,7 +468,7 @@ public unsafe partial class Renderer
         SpawnTestProbe();
     }
 
-    // Phase 3 smoke test — a single reflection probe at the scene origin. Once
+    // Reflection probe test - a single reflection probe at the scene origin. Once
     // Phase 4 lands its capture shader, this probe will start producing actual
     // prefiltered cubemap content. Until then the registration / scheduler path
     // is what gets exercised.
@@ -586,16 +560,18 @@ public unsafe partial class Renderer
     /// Rebuild the deferred + transparent PBR pipelines. Use this after toggling
     /// softShadowsEnabled — that flag is a fragment-stage specialization constant
     /// so changes don't apply to a live pipeline. Cross-pipeline descriptor
-    /// writes (TLAS, tile buffers, shadow-alpha, IBL) are re-issued because the
-    /// new VkPipeline owns brand-new descriptor sets.
+    /// writes (tile buffers, IBL, probes, transparent's TLAS) are re-issued
+    /// because the new VkPipeline owns brand-new descriptor sets; scene-set
+    /// bindings live on the registry and need no rewire.
     /// </summary>
     public void RebuildPbrPipelines()
     {
         if (!initialized) return;
         vk!.DeviceWaitIdle(device);
 
-        // In-place rebuild: same pipeline objects, fresh GPU handles -- so the DeferredModule
-        // (and any other holder of these refs) stays valid without rebuilding the graph.
+        // In-place rebuild: same pipeline objects, fresh GPU handles. Pipeline-ref holders stay
+        // valid, but Rebuild recreates the set-1 layout handle, so the deferred graph's baked
+        // g-buffer set must be re-baked (OnPbrPipelineRebuilt below rebuilds the graph).
         // SoftShadowsEnabled is a spec constant, read by Rebuild's Initialize.
         PbrDeferredPipeline.SoftShadowsEnabled = softShadowsEnabled;
         PbrDeferredPipeline.Rebuild();
@@ -603,42 +579,30 @@ public unsafe partial class Renderer
         transparentPipeline.SoftShadowsEnabled = softShadowsEnabled;
         transparentPipeline.Rebuild();
 
-        // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets.
-        // Set 1 (g-buffer samplers) is no longer written by Initialize — the views live on the
-        // deferred FrameGraph — so let DeferredCore rebind it from its cached transient views.
+        // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets. The
+        // g-buffer set (set 1) is graph-owned now, so DeferredCore re-bakes it by rebuilding
+        // the deferred graph against PBR's new layout.
         _renderCores.OfType<DeferredCore>().FirstOrDefault()?.OnPbrPipelineRebuilt();
-        PbrDeferredPipeline.WriteTileBufferDescriptors(lightCullPipeline);
-        PbrDeferredPipeline.WriteProbeDescriptors();
-        transparentPipeline.WriteSharedLightingDescriptors(lightCullPipeline);
-        transparentPipeline.WriteIblDescriptors();
-        transparentPipeline.WriteProbeDescriptors();
-        // LightCullPipeline survives the rebuild but its set 0 binding 0 still
-        // points at the freed PBR light SSBO — fix it up.
-        lightCullPipeline.RewriteLightsBinding();
-        if (tlas.Handle != 0)
-        {
-            PbrDeferredPipeline.WriteTlasDescriptor(tlas);
-            transparentPipeline.WriteTlasDescriptor(tlas);
-            PbrDeferredPipeline.WriteShadowAlphaDescriptors();
-        }
+        
     }
 
     /// <summary>
     /// Rebuild the tonemap pipeline. Use this after changing tonemapOperator —
-    /// the operator selection is a fragment-stage spec constant. HDRColor view
-    /// is re-bound because Initialize() allocated a fresh descriptor set.
+    /// the operator selection is a fragment-stage spec constant.
     /// </summary>
     public void RebuildTonemapPipeline()
     {
         if (!initialized) return;
         vk!.DeviceWaitIdle(device);
 
-        // In-place rebuild (stable object identity, fresh GPU handles) so the DeferredModule's
+        // In-place rebuild (stable object identity, fresh GPU handles) so each core module's
         // tonemap ref stays valid. Operator is a spec constant, read by Rebuild's Initialize.
         tonemapPipeline.Operator = tonemapOperator;
         tonemapPipeline.Rebuild();
-        // Rebind the fresh tonemap descriptor set to the ACTIVE core's HDR source (deferred HDR vs
-        // PT ptOutColor) — fixes the old always-rebind-to-deferred bug in PT mode.
+        // Every core's graph-baked HDR set survives the in-place rebuild -- a set outlives its
+        // source layout and binds by pipeline-layout compatibility (identical definition), and
+        // the HDR view is unchanged -- so no graph rebuild is needed. Activate restarts the PT
+        // cores' progressive accumulation.
         _activeCore.Activate();
     }
 
@@ -648,11 +612,100 @@ public unsafe partial class Renderer
         DrawFrame();
     }
 
-    // Centralized teardown (L1.6). Each lifetime-scoped owner (FrameRing, RenderTargets,
+    // Registers the current owners' handles into the unified scene set by SceneBindings
+    // parameter name. Idempotent (registrations are queued, fence-safe rewrites); runtime
+    // handle changes re-register just the changed name at their rebuild sites.
+    private void RegisterSceneBindings()
+    {
+        var rm = Engine.ResourceManager;
+        var materials = new Buffer[MAX_CONCURRENT_FRAMES];
+        var instances = new Buffer[MAX_CONCURRENT_FRAMES];
+        var lights = new Buffer[MAX_CONCURRENT_FRAMES];
+        for (uint i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            materials[i] = rm.GetMaterialBuffer((int)i);
+            instances[i] = rm.GetInstanceBuffer(i);
+            lights[i] = gpuScene.GetLightStorageBuffer(i);
+        }
+        descriptorRegistry.RegisterBufferPerFrame("sceneMaterials", materials);
+        descriptorRegistry.RegisterBufferPerFrame("sceneInstances", instances);
+        descriptorRegistry.RegisterBufferPerFrame("sceneLights", lights);
+        descriptorRegistry.RegisterBuffer("sceneVertices", rm.GlobalVertexBuffer);
+        descriptorRegistry.RegisterBuffer("sceneIndices", rm.GlobalIndexBuffer);
+        // Engine shaders only ever index samplers[0]; fill the whole array with the default
+        // sampler anyway so no element of the (non-PartiallyBound) binding is left invalid.
+        for (int s = 0; s < 16; s++)
+            descriptorRegistry.RegisterSampler("sceneSamplers", rm.DefaultSampler, s);
+        if (tlas.Handle != 0)
+        {
+            descriptorRegistry.RegisterTlas("sceneTlas", tlas);
+            descriptorRegistry.RegisterBuffer("sceneEntityInfo", ShadowInfoBuffer);
+            descriptorRegistry.RegisterBuffer("sceneEmissiveTris", EmissiveTriBuffer);
+            descriptorRegistry.RegisterBuffer("sceneEmissiveAlias", EmissiveAliasBuffer);
+        }
+    }
+
+    // Every reflected program the renderer's pipelines resolved, for the registry cross-check.
+    // Found by walking the renderer's own PipelineBase-typed fields rather than a hand-kept list:
+    // a new pipeline joins the check by existing, not by someone remembering to add it.
+    private IEnumerable<ProgramUse> ReflectedPrograms()
+        => GetType()
+            .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Where(f => typeof(PipelineBase).IsAssignableFrom(f.FieldType))
+            .Select(f => f.GetValue(this) as PipelineBase)
+            .Where(p => p?.ReflectedProgram != null)
+            .Select(p => new ProgramUse(p!.ReflectedProgram!, p.PrivateSetIndices))
+            .DistinctBy(u => u.Program);
+
+    // The progressive-accumulation IO pair (FeaturePTIO, set 5), shared by all four tracers -- they
+    // all write the SAME two renderer-owned images, so this is one registry set rather than the
+    // identical pass set each pipeline used to build and write for itself. Called after every
+    // (re)allocation of the size-dependent targets, since resize replaces both views; the registry
+    // queue applies the rewrite when each frame slot is provably idle.
+    internal void RegisterPathTraceIoBindings()
+    {
+        descriptorRegistry.RegisterImage("accumulator", renderTargets.PtAccumulator.ImageView, ImageLayout.General);
+        descriptorRegistry.RegisterImage("outColor",    renderTargets.PtOutColor.ImageView,    ImageLayout.General);
+    }
+
+    // Registers the FeatureIBL set (set 2): the global IBL split-sum + reflection-probe resources
+    // consumed by the raster lighting shaders. Owned by IblSystem / ReflectionProbeSystem; their
+    // views and (max-sized) buffers are stable for the renderer's lifetime and rebakes overwrite
+    // content not handles, so registering once at init is enough. FeatureEnv's envCube registers
+    // from IblSystem in a later step.
+    private void RegisterFeatureBindings()
+    {
+        var r = descriptorRegistry;
+        r.RegisterImage("irradianceCube",  Ibl.irradianceCubeView,  ImageLayout.ShaderReadOnlyOptimal, Ibl.iblCubeSampler);
+        r.RegisterImage("prefilteredCube", Ibl.prefilteredCubeView, ImageLayout.ShaderReadOnlyOptimal, Ibl.iblCubeSampler);
+        r.RegisterImage("brdfLut",         Ibl.brdfLutView,         ImageLayout.ShaderReadOnlyOptimal, Ibl.iblLutSampler);
+
+        var probeSys = reflectionProbeSystem;
+        r.RegisterImage("probeCubeArray", probeSys.prefilteredArrayView, ImageLayout.ShaderReadOnlyOptimal, probeSys.prefilteredArraySampler);
+
+        var probes       = new Buffer[MAX_CONCURRENT_FRAMES];
+        var clusterRange = new Buffer[MAX_CONCURRENT_FRAMES];
+        var indexList    = new Buffer[MAX_CONCURRENT_FRAMES];
+        for (int i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        {
+            probes[i]       = probeSys.probeRecordBuffers[i].buffer;
+            clusterRange[i] = probeSys.clusterGrid.GetClusterRangeBuffer((uint)i);
+            indexList[i]    = probeSys.clusterGrid.GetProbeIndexBuffer((uint)i);
+        }
+        r.RegisterBufferPerFrame("probes", probes);
+        r.RegisterBufferPerFrame("probeClusterRange", clusterRange);
+        r.RegisterBufferPerFrame("probeIndexList", indexList);
+
+        // FeatureEnv (set 3): the raw environment cube, owned by IblSystem and consumed by the
+        // skybox + path tracers. Stable handle (rebakes overwrite content), registered once.
+        r.RegisterImage("envCube", Ibl.envCubeView, ImageLayout.ShaderReadOnlyOptimal, Ibl.iblCubeSampler);
+    }
+
+    // Centralized teardown. Each lifetime-scoped owner (FrameRing, RenderTargets,
     // Swapchain, GraphicsDevice) frees only what it owns; the orchestrator owns the
-    // *order*. The one hard rule: GraphicsDevice.Dispose() runs strictly last — it frees
+    // *order*. The one hard rule: GraphicsDevice.Dispose() runs strictly last - it frees
     // every VkDeviceMemory block + the device itself, so everything that allocated
-    // through it must already be gone. Globals.vk is a process-wide singleton — never
+    // through it must already be gone. Globals.vk is a process-wide singleton - never
     // disposed here. The window is owned by Engine and disposed by Engine.Shutdown.
     public void Cleanup()
     {
@@ -663,6 +716,10 @@ public unsafe partial class Renderer
 
         //  Frame sync + per-frame command buffers
         frameRing.Dispose();
+
+        //  Scene set + constant arena, then the shader library (drops slang.dll if loaded)
+        descriptorRegistry.Dispose();
+        shaderLibrary.Dispose();
 
         if (testEntity != null)
         {
@@ -701,7 +758,6 @@ public unsafe partial class Renderer
         selection?.Dispose();
 
         // Pipelines (each pipeline disposes its own buffers, sets, layouts)
-        _bcEncoder           ?.Dispose();
         reStirPipeline     ?.Dispose();
         rtPipeline         ?.Dispose();
         wavefrontPipeline  ?.Dispose();
@@ -717,7 +773,7 @@ public unsafe partial class Renderer
         // Swap chain + image views
         swapchain.Dispose();
 
-        // RHI context — strictly last. GraphicsDevice.Dispose() destroys the
+        // RHI context - strictly last. GraphicsDevice.Dispose() destroys the
         // descriptor pool, command pool, frees every VkDeviceMemory block, then
         // tears down device → debug → surface → instance in order. Every resource
         // freed above allocated through it, so it has to outlive them all.

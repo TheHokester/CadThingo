@@ -1,7 +1,10 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.IBL;   // ReflectionProbeSystem, ProbeGpuRecord
 using Silk.NET.Vulkan;
 
@@ -13,12 +16,11 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
 //  src-alpha / one-minus-src-alpha blending, depth-tested LE against the
 //  geometry pass's depth buffer (no depth write).
 //
-// Base type qualified: the dead VulkanTut `CadThingo.GraphicsPipeline` namespace would
-// otherwise shadow the GraphicsPipeline base via enclosing-namespace lookup under Features.
-public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
+public sealed unsafe class TransparentPipeline : GraphicsPipeline
 {
-    // Matches Transparent.slang::FrameUBO. View+proj feed the VS; camPos +
-    // tile state feed the FS.
+    // Matches Transparent.slang::FrameUBO — pushed into the scene set's (0,0)
+    // constant arena slot each frame. View+proj feed the VS; camPos + tile
+    // state feed the FS.
     [StructLayout(LayoutKind.Sequential)]
     struct TransparentFrameUBO
     {
@@ -53,43 +55,57 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         public uint      _pad2;
     }
 
-    protected override string ShaderPath { get; } = ShaderPaths.Kernel("Forward", "Transparent");
+    // Ray-queried shadows need the capability at compile time even when SOFT_SHADOWS is off:
+    // the traceRayInline call sites are in the shader either way.
+    protected override ShaderCompileRequest? Program =>
+        new("Forward/Transparent", ["VSMain", "PSMain"], [], ["spvRayQueryKHR"]);
 
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 
     public bool SoftShadowsEnabled { get; set; } = true;
 
-    private const int SetFrame    = 0;
-    private const int SetBindless = 1;
+    // Set 0 - unified scene set (registry-owned): lights, TLAS, bindless
+    //         materials/textures/samplers. Frame constants ride its (0,0) dynamic slot.
+    // Set 1 - graph-baked pass set: the tile-cull outputs.
+    // Set 3 - FeatureIBL (registry-owned): global IBL split-sum + reflection probes.
+    //         (Set 2 is the graph-shared slot this pass doesn't use - a gap in the layout.)
+    private const string FeatureIbl = "FeatureIBL";
 
-    private UboBuffer[] FrameUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    // Graph-baked pass set: the two tile-cull outputs (the only graph resources the
+    // TransparentPass reads). Both the layout and the names the graph matches against come from
+    // Transparent.slang's set-1 declarations, so the TransparentPass Read binds name the shader
+    // globals.
+    public PassSetSpec PassSet =>
+        new(ShaderSets.Pass, DescriptorSetLayouts[ShaderSets.Pass], ReflectedBindings(ShaderSets.Pass));
 
-    public TransparentPipeline(Renderer renderer) : base(renderer)
+    // Frame constants staged by UpdatePerFrame, pushed into the constant arena
+    // by Record (which runs later the same frame inside the graph).
+    private TransparentFrameUBO _frameUbo;
+
+    public TransparentPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
-        DepthAttachmentFormat = renderer.FindDepthFormat();
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(TransparentPushConstants),
-            }
-        };
+        DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
 
-    protected override void ReleaseGpuResources()
+    // No owned buffers — frame constants ride the scene set's arena and per-draw state is pushed.
+    // The size check is the one thing reflection cannot enforce on its own: the C# mirror of
+    // DrawPC has to keep matching the shader.
+    protected override void CreateResources()
     {
-        foreach (var b in FrameUniformBuffers) Gfx.DestroyBuffer(b.buffer, b.alloc);
-        base.ReleaseGpuResources();
+        uint reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(TransparentPushConstants))
+            throw new Exception(
+                $"TransparentPushConstants is {sizeof(TransparentPushConstants)} bytes but " +
+                $"Transparent.slang reflects {reflected}");
     }
+
     internal readonly ref struct Attachments(ImageView hdrColor, ImageView depth)
     {
         internal readonly ImageView HdrColor = hdrColor;
         internal readonly ImageView Depth = depth;
     }
 
-    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, IReadOnlyList<TransparentDraw> transparentDraws,Attachments attachments)
+    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, IReadOnlyList<TransparentDraw> transparentDraws, Attachments attachments, DescriptorSet tileSet)
     {
         BeginRendering(cmd,
             ctx.RenderExtent,
@@ -110,13 +126,21 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         Vk!.CmdSetViewport(cmd, 0, 1, &vp);
         Vk!.CmdSetScissor(cmd, 0, 1, &scissor);
 
-        // Set 0: own frame UBO + shared lights/TLAS/tile buffers.
-        // Set 1: bindless materials/instances/textures/samplers (shared with GeometryPipeline).
-        var frameSet    = GetDescriptorSet(0, ctx.FrameIndex);
-        var bindlessSet = Engine.ResourceManager.GetBindlessSet(ctx.FrameIndex);
-        var sets = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
+        // Set 0 = scene set with the frame constants' dynamic offset (arena push of the UBO
+        // staged by UpdatePerFrame). Set 1 = graph-baked tile pass set. FeatureIBL sits at its
+        // own reflected index (set 3) with a gap at set 2, so it binds separately.
+        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, _frameUbo);
+        var sets = stackalloc DescriptorSet[2]
+        {
+            Registry.SceneSet(ctx.FrameIndex),
+            tileSet,
+        };
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            Layout, 0, 2, sets, 0, null);
+            Layout, 0, 2, sets, 1, &frameConstants);
+
+        var iblSet = Registry.FeatureSet(FeatureIbl, ctx.FrameIndex);
+        Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
+            Layout, Registry.FeatureSetIndex(FeatureIbl), 1, &iblSet, 0, null);
 
         // Bind global VB/IB once — every BLEND entity references offsets into these.
         var vb = Engine.ResourceManager.GlobalVertexBuffer;
@@ -127,7 +151,7 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
 
         // One push-constant + draw per BLEND entity, in back-to-front order
         // set by DrawCullPipeline.Record.
-        
+
         for (int di = 0; di < transparentDraws.Count; di++)
         {
             var d = transparentDraws[di];
@@ -137,28 +161,8 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
 
         EndRendering(cmd);
     }
-    // Wire constant_id 0 (SOFT_SHADOWS) on the fragment stage — mirrors PbrDeferredPipeline.
-    protected override int FillSpecializationData(
-        int stageIdx,
-        SpecializationMapEntry* entries,
-        byte* data,
-        out uint dataSize)
-    {
-        if (stageIdx == 1)
-        {
-            entries[0] = new SpecializationMapEntry
-            {
-                ConstantID = 0,
-                Offset     = 0,
-                Size       = sizeof(uint),
-            };
-            *(uint*)data = SoftShadowsEnabled ? 1u : 0u;
-            dataSize = sizeof(uint);
-            return 1;
-        }
-        dataSize = 0;
-        return 0;
-    }
+    protected override SpecValues? Specialization =>
+        new SpecValues().Set("SOFT_SHADOWS", SoftShadowsEnabled);
 
     // Pipeline state overrides
 
@@ -213,263 +217,19 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        DescriptorSetLayouts = new DescriptorSetLayout[2];
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
-
-        // Set 0 — own frame UBO + cross-pipeline lighting handles + IBL samplers.
-        var set0Bindings = new DescriptorSetLayoutBinding[]
-        {
-            new() { Binding = 0, DescriptorType = DescriptorType.UniformBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit },
-            new() { Binding = 1, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            new() { Binding = 2, DescriptorType = DescriptorType.AccelerationStructureKhr, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            new() { Binding = 3, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            new() { Binding = 4, DescriptorType = DescriptorType.StorageBuffer,            DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            // IBL — mirrors PbrDeferredPipeline slots 5/6/7. Mirror is intentional:
-            // PBR + Transparent each own a distinct set 0 layout, both pointing at
-            // the same renderer-wide IBL VkImages.
-            new() { Binding = 5, DescriptorType = DescriptorType.CombinedImageSampler,     DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            new() { Binding = 6, DescriptorType = DescriptorType.CombinedImageSampler,     DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            new() { Binding = 7, DescriptorType = DescriptorType.CombinedImageSampler,     DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            // Reflection probes — mirrors PbrDeferredPipeline slots 8/9/10/11.
-            new() { Binding = 8,  DescriptorType = DescriptorType.CombinedImageSampler,    DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            new() { Binding = 9,  DescriptorType = DescriptorType.StorageBuffer,           DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            new() { Binding = 10, DescriptorType = DescriptorType.StorageBuffer,           DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-            new() { Binding = 11, DescriptorType = DescriptorType.StorageBuffer,           DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit },
-        };
-
-        fixed (DescriptorSetLayoutBinding* pSet0 = set0Bindings)
-        {
-            var set0LayoutInfo = new DescriptorSetLayoutCreateInfo
-            {
-                SType        = StructureType.DescriptorSetLayoutCreateInfo,
-                BindingCount = (uint)set0Bindings.Length,
-                PBindings    = pSet0,
-            };
-            if (Vk.CreateDescriptorSetLayout(Device, &set0LayoutInfo, null, out DescriptorSetLayouts[SetFrame]) != Result.Success)
-                throw new Exception("Failed to create transparent set 0 layout");
-        }
-
-        // Set 1 — bindless, borrowed from ResourceManager (matches GeometryPipeline).
-        DescriptorSetLayouts[SetBindless] = Engine.ResourceManager.GetBindlessLayout();
+        // Assemble [scene(0), pass(1), empty(2), FeatureIBL(3)]. Scene + FeatureIBL are
+        // registry-owned; the pipeline owns only the pass layout, built from Transparent.slang's
+        // set-1 declarations. The deferred FrameGraph owns + writes the SETS allocated from it.
+        var passLayout = CreateReflectedSetLayout(ShaderSets.Pass);
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passLayout, FeatureIbl);
+        OwnedDescriptorSetLayoutIndices = new[] { (int)ShaderSets.Pass };
     }
 
-    protected override void CreateResources()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            Gfx.CreateMappedUniformBuffer(sizeof(TransparentFrameUBO), ref FrameUniformBuffers[i]);
-        }
-    }
-
-    protected override void CreateDescriptorSets()
-    {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[SetFrame];
-
-        var allocInfo = new DescriptorSetAllocateInfo
-        {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts        = layouts,
-        };
-        DescriptorSets = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* pSets = DescriptorSets[0])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &allocInfo, pSets) != Result.Success)
-                throw new Exception("Failed to allocate transparent descriptor sets");
-        }
-    }
-
-    // Only binding 0 (own UBO) is written here. Bindings 1–4 (lights / TLAS / tile
-    // buffers) point at PbrDeferredPipeline / LightCullPipeline's buffers and are
-    // written by the renderer after those pipelines exist.
-    protected override void WriteDescriptors()
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo frameInfo = new()
-            {
-                Buffer = FrameUniformBuffers[i].buffer,
-                Offset = 0,
-                Range  = (ulong)sizeof(TransparentFrameUBO),
-            };
-            var write = new WriteDescriptorSet
-            {
-                SType           = StructureType.WriteDescriptorSet,
-                DstSet          = DescriptorSets[0][i],
-                DstBinding      = 0,
-                DstArrayElement = 0,
-                DescriptorType  = DescriptorType.UniformBuffer,
-                DescriptorCount = 1,
-                PBufferInfo     = &frameInfo,
-            };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    /// <summary>Bind the per-frame lights SSBO + the tile cull output buffers
-    /// produced by LightCullPipeline. Call once at startup after both producer
-    /// pipelines exist.</summary>
-    public void WriteSharedLightingDescriptors(LightCullPipeline lightCull)
-    {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo lightsInfo = new()
-            {
-                Buffer = Renderer.GetLightStorageBuffer((uint)i),
-                Offset = 0,
-                Range  = (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
-            };
-            DescriptorBufferInfo tileCountInfo = new()
-            {
-                Buffer = lightCull.GetTileLightCountBuffer((uint)i),
-                Offset = 0,
-                Range  = (ulong)(Renderer.MAX_TILE_COUNT * sizeof(uint)),
-            };
-            DescriptorBufferInfo tileIdxInfo = new()
-            {
-                Buffer = lightCull.GetTileLightIndicesBuffer((uint)i),
-                Offset = 0,
-                Range  = (ulong)(Renderer.MAX_TILE_COUNT * Renderer.MAX_LIGHTS_PER_TILE * sizeof(uint)),
-            };
-
-            var writes = stackalloc WriteDescriptorSet[3];
-            writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i], DstBinding = 1, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &lightsInfo };
-            writes[1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i], DstBinding = 3, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &tileCountInfo };
-            writes[2] = new() { SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i], DstBinding = 4, DescriptorType = DescriptorType.StorageBuffer, DescriptorCount = 1, PBufferInfo = &tileIdxInfo };
-            Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
-        }
-    }
-
-    /// <summary>Mirror of PbrDeferredPipeline.WriteIblDescriptors — same renderer-
-    /// wide images, separate descriptor sets. Called once at startup after the
-    /// IBL resources exist; doesn't need re-running on rebake because the VkImage
-    /// handles persist.</summary>
-    public void WriteIblDescriptors()
-    {
-        var imageInfos = stackalloc DescriptorImageInfo[3]
-        {
-            new() { ImageView = Renderer.Ibl.irradianceCubeView,  Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.prefilteredCubeView, Sampler = Renderer.Ibl.iblCubeSampler, ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-            new() { ImageView = Renderer.Ibl.brdfLutView,         Sampler = Renderer.Ibl.iblLutSampler,  ImageLayout = ImageLayout.ShaderReadOnlyOptimal },
-        };
-
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            var writes = stackalloc WriteDescriptorSet[3];
-            for (uint b = 0; b < 3; b++)
-            {
-                writes[b] = new WriteDescriptorSet
-                {
-                    SType           = StructureType.WriteDescriptorSet,
-                    DstSet          = DescriptorSets[0][i],
-                    DstBinding      = 5 + b,
-                    DstArrayElement = 0,
-                    DescriptorType  = DescriptorType.CombinedImageSampler,
-                    DescriptorCount = 1,
-                    PImageInfo      = &imageInfos[b],
-                };
-            }
-            Vk.UpdateDescriptorSets(Device, 3, writes, 0, null);
-        }
-    }
-
-    /// <summary>Mirror of PbrDeferredPipeline.WriteProbeDescriptors — writes
-    /// bindings 8/9/10/11 on each per-frame transparent set. Call once after
-    /// the probe system exists; underlying handles are stable for the
-    /// renderer's lifetime so no per-frame rewrites needed.</summary>
-    public void WriteProbeDescriptors()
-    {
-        var probeSys = Renderer.reflectionProbeSystem;
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorImageInfo cubeArrayInfo = new()
-            {
-                Sampler     = probeSys.prefilteredArraySampler,
-                ImageView   = probeSys.prefilteredArrayView,
-                ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
-            };
-            DescriptorBufferInfo recordsInfo = new()
-            {
-                Buffer = probeSys.probeRecordBuffers[i].buffer,
-                Offset = 0,
-                Range  = ReflectionProbeSystem.MaxProbes * (ulong)sizeof(ProbeGpuRecord),
-            };
-            DescriptorBufferInfo clusterRangeInfo = new()
-            {
-                Buffer = probeSys.clusterGrid.GetClusterRangeBuffer((uint)i),
-                Offset = 0,
-                Range  = probeSys.clusterGrid.ClusterRangeBufferSize,
-            };
-            DescriptorBufferInfo indexListInfo = new()
-            {
-                Buffer = probeSys.clusterGrid.GetProbeIndexBuffer((uint)i),
-                Offset = 0,
-                Range  = probeSys.clusterGrid.ProbeIndexBufferSize,
-            };
-
-            var writes = stackalloc WriteDescriptorSet[4];
-            writes[0] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i],
-                DstBinding = 8, DescriptorType = DescriptorType.CombinedImageSampler,
-                DescriptorCount = 1, PImageInfo = &cubeArrayInfo,
-            };
-            writes[1] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i],
-                DstBinding = 9, DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1, PBufferInfo = &recordsInfo,
-            };
-            writes[2] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i],
-                DstBinding = 10, DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1, PBufferInfo = &clusterRangeInfo,
-            };
-            writes[3] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet, DstSet = DescriptorSets[0][i],
-                DstBinding = 11, DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1, PBufferInfo = &indexListInfo,
-            };
-            Vk.UpdateDescriptorSets(Device, 4, writes, 0, null);
-        }
-    }
-
-    /// <summary>Mirror of PbrDeferredPipeline.WriteTlasDescriptor — call after InitRayQuery
-    /// and on every TLAS recreate.</summary>
-    public void WriteTlasDescriptor(AccelerationStructureKHR tlas)
-    {
-        if (tlas.Handle == 0) return;
-
-        var tlasHandle = tlas;
-        var asWrite = new WriteDescriptorSetAccelerationStructureKHR
-        {
-            SType = StructureType.WriteDescriptorSetAccelerationStructureKhr,
-            AccelerationStructureCount = 1,
-            PAccelerationStructures = &tlasHandle,
-        };
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            var write = new WriteDescriptorSet
-            {
-                SType           = StructureType.WriteDescriptorSet,
-                PNext           = &asWrite,
-                DstSet          = DescriptorSets[0][i],
-                DstBinding      = 2,
-                DescriptorType  = DescriptorType.AccelerationStructureKhr,
-                DescriptorCount = 1,
-            };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    /// <summary>Fill the per-frame FrameUBO from the current camera + tile counts.
-    /// Call once per frame from DrawFrame; tileCount / lightCount come from
-    /// PbrDeferredPipeline.UpdatePerFrame so the two pipelines stay coherent.</summary>
+    
+    /// <summary>Fill the frame constants from the current camera + tile counts,
+    /// staged for Record's arena push. Call once per frame from DrawFrame;
+    /// tileCount / lightCount come from PbrDeferredPipeline.UpdatePerFrame so
+    /// the two pipelines stay coherent.</summary>
     public void UpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, uint tileCountX, uint tileCountY)
     {
         TransparentFrameUBO ubo = new();
@@ -505,8 +265,7 @@ public sealed unsafe class TransparentPipeline : Pipelines.GraphicsPipeline
         ubo.probeClusterDimsZ = grid.DimsZ;
         ubo.probeMipLevels    = ReflectionProbeSystem.ProbeMipLevels;
 
-        void* data = FrameUniformBuffers[frameIndex].mapped;
-        new Span<TransparentFrameUBO>(data, 1).Fill(ubo);
+        _frameUbo = ubo;
     }
 
     /// <summary>Push the per-draw model matrix + material index. Called once per transparent draw.</summary>

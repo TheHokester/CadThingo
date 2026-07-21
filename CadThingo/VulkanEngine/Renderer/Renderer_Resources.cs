@@ -42,7 +42,7 @@ namespace CadThingo.VulkanEngine.Renderer;
    is keyed by Mesh* for exactly this reason.
 
   TLAS (Top-Level) — built per scene. Doesn't hold triangles at all. Each entry is a tiny record: a 3×4 transform + a pointer to a BLAS. So 100 viking rooms = one BLAS + 100 small TLAS records. When a viking room moves, you
-   only rebuild the TLAS (cheap — it's effectively a scene graph in spatial form). The BLAS is untouched.
+   only rebuild the TLAS (cheap - it's effectively a scene graph in spatial form). The BLAS is untouched.
  */
 public unsafe partial class Renderer
 {
@@ -165,14 +165,14 @@ public unsafe partial class Renderer
     /// <summary>Number of valid lights packed by the most recent UpdateLights.</summary>
     public uint LightCount => gpuScene.LightCount;
 
-    // Scene → GPU packing moved to GpuScene.Extract (L2). These forwarders keep the
+    // Scene -> GPU packing moved to GpuScene.Extract. These forwarders keep the
     // per-frame DrawX call sites + PbrDeferredPipeline.Record compiling unchanged.
 
     /// <summary>Forwards to <see cref="GpuScene.UpdateMaterials"/>. See there.</summary>
     public uint UpdateMaterials(uint frameIndex, Scene scene) => gpuScene.UpdateMaterials(frameIndex, scene);
 
     /// <summary>Forwards to <see cref="GpuScene.UpdateLights"/>. See there.</summary>
-    public uint UpdateLights(uint frameIndex, Scene scene) => gpuScene.UpdateLights(frameIndex, scene);
+    public uint  UpdateLights(uint frameIndex, Scene scene) => gpuScene.UpdateLights(frameIndex, scene);
 
    
 
@@ -191,6 +191,10 @@ public unsafe partial class Renderer
     {
         if (index < 0 || index >= MAX_BINDLESS_TEXTURES)
             throw new ArgumentOutOfRangeException(nameof(index), $"bindless texture index {index} out of [0, {MAX_BINDLESS_TEXTURES}).");
+
+        // Mirror into the unified scene set's texture table at the same slot index, so
+        // material rows resolve identically once shaders migrate to SceneBindings.
+        descriptorRegistry?.SetBindlessSlot(index, texture.View);
 
         DescriptorImageInfo imgInfo = new()
         {
@@ -469,14 +473,14 @@ public unsafe class Texture : IDisposable
     /// <summary>
     /// Loads a 2D RGBA texture from disk into a device-local image + linear sampler.
     /// </summary>
-    public static Texture CreateTextureFromPath(Renderer renderer, string path, Format format)
+    public static Texture CreateTextureFromPath(GraphicsDevice gfx, string path, Format format)
     {
         using var img = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgba32>(path);
         var pixels = new SixLabors.ImageSharp.PixelFormats.Rgba32[img.Width * img.Height];
         img.CopyPixelDataTo(pixels);
         fixed (SixLabors.ImageSharp.PixelFormats.Rgba32* p = pixels)
         {
-            return CreateTextureFromMemory(renderer, (byte*)p,
+            return CreateTextureFromMemory(gfx, (byte*)p,
                 (uint)img.Width, (uint)img.Height, format,
                 new Extent3D((uint)img.Width, (uint)img.Height, 1));
         }
@@ -487,22 +491,22 @@ public unsafe class Texture : IDisposable
     /// <paramref name="width"/>/<paramref name="height"/> size the staging copy;
     /// <paramref name="extent"/> sizes the destination image.
     /// </summary>
-    public static Texture CreateTextureFromMemory(Renderer renderer, byte* pixels,
+    public static Texture CreateTextureFromMemory(GraphicsDevice gfx, byte* pixels,
         uint width, uint height, Format format, Extent3D extent)
     {
-        var vk = Globals.vk!;
-        var device = renderer.device;
-        var physicalDevice = renderer.physicalDevice;
+        var vk = gfx.Vk!;
+        var device = gfx.Device;
+        var physicalDevice = gfx.PhysicalDevice;
 
         ulong imageSize = (ulong)width * (ulong)height * 4UL;
         uint mipLevels = (uint)Math.Floor(Math.Log2(Math.Max(width, height))) + 1;
 
         // Stage pixels in a host-visible buffer.
-        renderer.CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
+        gfx.CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out var staging, out var stagingAlloc);
 
-        void* mapped = renderer.memAllocator.GetMapped(stagingAlloc);
+        void* mapped = gfx.Allocator.GetMapped(stagingAlloc);
         System.Buffer.MemoryCopy(pixels, mapped, (long)imageSize, (long)imageSize);
 
         const ImageUsageFlags usage = ImageUsageFlags.TransferDstBit |ImageUsageFlags.TransferSrcBit | ImageUsageFlags.SampledBit;
@@ -526,11 +530,11 @@ public unsafe class Texture : IDisposable
         if (vk.CreateImage(device, &imageInfo, null, out var image) != Result.Success)
             throw new Exception("Failed to create image for texture");
 
-        var imageAlloc = renderer.memAllocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
+        var imageAlloc = gfx.Allocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
         // Transition → copy → transition (single-time command).
-        var cmd = renderer.BeginSingleTimeCommands();
-        renderer.TransitionImageLayout(cmd, image, format, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels: mipLevels);
+        var cmd = gfx.BeginSingleTimeCommands();
+        gfx.TransitionImageLayout(cmd, image, format, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels: mipLevels);
         BufferImageCopy region = new()
         {
             BufferOffset = 0,
@@ -547,10 +551,10 @@ public unsafe class Texture : IDisposable
             ImageExtent = extent,
         };
         vk.CmdCopyBufferToImage(cmd, staging, image, ImageLayout.TransferDstOptimal, 1, &region);
-        renderer.GenerateMipMaps(cmd, image, format, width, height,mipLevels);
-        renderer.EndSingleTimeCommands(cmd);
+        gfx.GenerateMipMaps(cmd, image, format, width, height,mipLevels);
+        gfx.EndSingleTimeCommands(cmd);
 
-        renderer.DestroyBuffer(staging, stagingAlloc);
+        gfx.DestroyBuffer(staging, stagingAlloc);
 
         ImageViewCreateInfo viewInfo = new()
         {
@@ -626,11 +630,12 @@ public unsafe class Texture : IDisposable
     /// sRGB-ness for the final sample (no double decode). Two single-time submits: the queue-idle
     /// between them makes the mip chain visible to the encoder without a cross-stage barrier.
     /// </summary>
-    public static Texture CreateCompressedTexture(Renderer renderer, byte* pixels,
+    public static Texture CreateCompressedTexture(GraphicsDevice gfx,
+        Features.TextureCompression.BcEncoder encoder, byte* pixels,
         uint width, uint height, Format bcFormat)
     {
-        var vk     = Globals.vk!;
-        var device = renderer.device;
+        var vk     = gfx.Vk!;
+        var device = gfx.Device;
         var mode   = BcModeFor(bcFormat);
 
         ulong imageSize = (ulong)width * height * 4UL;
@@ -642,10 +647,10 @@ public unsafe class Texture : IDisposable
         const Format srcFormat = Format.R8G8B8A8Unorm;
         const ImageUsageFlags srcUsage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.TransferSrcBit | ImageUsageFlags.SampledBit;
 
-        renderer.CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
+        gfx.CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out var staging, out var stagingAlloc);
-        System.Buffer.MemoryCopy(pixels, renderer.memAllocator.GetMapped(stagingAlloc), (long)imageSize, (long)imageSize);
+        System.Buffer.MemoryCopy(pixels, gfx.Allocator.GetMapped(stagingAlloc), (long)imageSize, (long)imageSize);
 
         ImageCreateInfo srcInfo = new()
         {
@@ -656,10 +661,10 @@ public unsafe class Texture : IDisposable
         };
         if (vk.CreateImage(device, &srcInfo, null, out var srcImage) != Result.Success)
             throw new Exception("Failed to create BC encode source image");
-        var srcAlloc = renderer.memAllocator.AllocateForImage(srcImage, MemoryPropertyFlags.DeviceLocalBit);
+        var srcAlloc = gfx.Allocator.AllocateForImage(srcImage, MemoryPropertyFlags.DeviceLocalBit);
 
-        var cmd1 = renderer.BeginSingleTimeCommands();
-        renderer.TransitionImageLayout(cmd1, srcImage, srcFormat, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels);
+        var cmd1 = gfx.BeginSingleTimeCommands();
+        gfx.TransitionImageLayout(cmd1, srcImage, srcFormat, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels);
         BufferImageCopy mip0 = new()
         {
             BufferOffset = 0, BufferRowLength = 0, BufferImageHeight = 0,
@@ -667,9 +672,9 @@ public unsafe class Texture : IDisposable
             ImageOffset = new Offset3D(0, 0, 0), ImageExtent = extent,
         };
         vk.CmdCopyBufferToImage(cmd1, staging, srcImage, ImageLayout.TransferDstOptimal, 1, &mip0);
-        renderer.GenerateMipMaps(cmd1, srcImage, srcFormat, width, height, mipLevels);   // leaves ShaderReadOnlyOptimal
-        renderer.EndSingleTimeCommands(cmd1);
-        renderer.DestroyBuffer(staging, stagingAlloc);
+        gfx.GenerateMipMaps(cmd1, srcImage, srcFormat, width, height, mipLevels);   // leaves ShaderReadOnlyOptimal
+        gfx.EndSingleTimeCommands(cmd1);
+        gfx.DestroyBuffer(staging, stagingAlloc);
 
         ImageViewCreateInfo srcViewInfo = new()
         {
@@ -680,7 +685,7 @@ public unsafe class Texture : IDisposable
 
         // ---- 2. BC destination image + packed block buffer -----------------------------------
         ulong packedBytes = Features.TextureCompression.BcEncoder.PackedSize(mode, width, height, mipLevels);
-        renderer.CreateBuffer(packedBytes, BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit,
+        gfx.CreateBuffer(packedBytes, BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.DeviceLocalBit, out var blockBuf, out var blockAlloc);
 
         const ImageUsageFlags dstUsage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit;
@@ -693,11 +698,11 @@ public unsafe class Texture : IDisposable
         };
         if (vk.CreateImage(device, &dstInfo, null, out var bcImage) != Result.Success)
             throw new Exception("Failed to create BC texture image");
-        var bcAlloc = renderer.memAllocator.AllocateForImage(bcImage, MemoryPropertyFlags.DeviceLocalBit);
+        var bcAlloc = gfx.Allocator.AllocateForImage(bcImage, MemoryPropertyFlags.DeviceLocalBit);
 
         // ---- 3. Encode each mip, then copy the blocks into the BC image ----------------------
-        var cmd2 = renderer.BeginSingleTimeCommands();
-        renderer.BcEncoder.RecordEncode(cmd2, srcView, blockBuf, mode, width, height, mipLevels);
+        var cmd2 = gfx.BeginSingleTimeCommands();
+        encoder.RecordEncode(cmd2, srcView, blockBuf, mode, width, height, mipLevels);
 
         BufferMemoryBarrier toCopy = new()
         {
@@ -708,7 +713,7 @@ public unsafe class Texture : IDisposable
         };
         vk.CmdPipelineBarrier(cmd2, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.TransferBit, 0, 0, null, 1, &toCopy, 0, null);
 
-        renderer.TransitionImageLayout(cmd2, bcImage, bcFormat, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels);
+        gfx.TransitionImageLayout(cmd2, bcImage, bcFormat, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels);
         for (uint m = 0; m < mipLevels; m++)
         {
             uint mw = Math.Max(1u, width >> (int)m), mh = Math.Max(1u, height >> (int)m);
@@ -721,14 +726,14 @@ public unsafe class Texture : IDisposable
             };
             vk.CmdCopyBufferToImage(cmd2, blockBuf, bcImage, ImageLayout.TransferDstOptimal, 1, &region);
         }
-        renderer.TransitionImageLayout(cmd2, bcImage, bcFormat, ImageLayout.TransferDstOptimal, ImageLayout.ShaderReadOnlyOptimal, mipLevels);
-        renderer.EndSingleTimeCommands(cmd2);
+        gfx.TransitionImageLayout(cmd2, bcImage, bcFormat, ImageLayout.TransferDstOptimal, ImageLayout.ShaderReadOnlyOptimal, mipLevels);
+        gfx.EndSingleTimeCommands(cmd2);
 
         // ---- 4. Free the transient source + block buffer; build the sampled BC texture -------
-        renderer.DestroyBuffer(blockBuf, blockAlloc);
+        gfx.DestroyBuffer(blockBuf, blockAlloc);
         vk.DestroyImageView(device, srcView, null);
         vk.DestroyImage(device, srcImage, null);
-        renderer.memAllocator.Free(srcAlloc);
+        gfx.Allocator.Free(srcAlloc);
 
         ImageViewCreateInfo bcViewInfo = new()
         {
@@ -737,7 +742,7 @@ public unsafe class Texture : IDisposable
         };
         vk.CreateImageView(device, &bcViewInfo, null, out var bcView);
 
-        vk.GetPhysicalDeviceProperties(renderer.physicalDevice, out var props);
+        vk.GetPhysicalDeviceProperties(gfx.PhysicalDevice, out var props);
         SamplerCreateInfo samplerInfo = new()
         {
             SType = StructureType.SamplerCreateInfo, MagFilter = Filter.Linear, MinFilter = Filter.Linear,
