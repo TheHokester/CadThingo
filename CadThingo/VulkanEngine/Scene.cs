@@ -28,7 +28,7 @@ public unsafe struct Mesh
 
 public class Scene
 {
-    private static Camera Cam;
+    private Camera Cam;
 
     // Entity* stored as nint so the managed List doesn't need pinning.
     private readonly List<nint> _entityList = new();

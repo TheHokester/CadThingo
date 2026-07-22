@@ -737,7 +737,7 @@ public unsafe partial class Renderer
         return new BlasEntry { Handle = cHandle, Storage = cStorage, StorageAlloc = cAlloc, DeviceAddress = cAddr };
     }
     //tlas previous entry count(ensures that if all are removed old tlas isnt used)
-    private static uint PreviousCount = 0;
+    private uint PreviousCount = 0;
     private void RebuildTlas()
     {
         // Reconcile renderable identity (L2 step 2) on the same cadence as the AS:

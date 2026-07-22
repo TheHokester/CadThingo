@@ -19,7 +19,7 @@ public class Engine
 
 
     //Renderer, Singleton?
-    public static Renderer.Renderer renderer;
+    public static Renderer.Renderer renderer {get; private set;}
     //singleton event bus that all systems can subscribe to
     public static EventBus EventBus = new();
 
