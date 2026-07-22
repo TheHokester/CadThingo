@@ -13,7 +13,7 @@
 // needs as input.
 
 import CommonTypes;   // PbrMaterial, InstanceData
-
+import SceneBindings;
 struct CaptureUBO {
     float4x4 views[6];   // one per cube face, picked via SV_ViewID
     float4x4 proj;
@@ -41,13 +41,7 @@ struct VSOutput {
 [[vk::push_constant]] PushConst pc;
 [[vk::binding(0, 0)]] ConstantBuffer<CaptureUBO> frame;
 
-// Set 1 mirrors the bindless layout owned by ResourceManager so we can reuse
-// the same descriptor set this whole pass long. We only sample baseColor here;
-// the metallic/normal/etc. fields stay unused.
-[[vk::binding(0, 1)]] StructuredBuffer<PbrMaterial>  materials;
-[[vk::binding(1, 1)]] StructuredBuffer<InstanceData> instances;
-[[vk::binding(2, 1)]] Texture2D                      textures[];
-[[vk::binding(3, 1)]] SamplerState                   samplers[];
+
 
 [[shader("vertex")]]
 VSOutput VSMain(VSInput input, uint viewIndex : SV_ViewID)
@@ -67,10 +61,10 @@ VSOutput VSMain(VSInput input, uint viewIndex : SV_ViewID)
 [[shader("fragment")]]
 float4 PSMain(VSOutput input) : SV_TARGET
 {
-    PbrMaterial mat = materials[pc.materialIndex];
-    SamplerState s  = samplers[0];
+    PbrMaterial mat = sceneMaterials[pc.materialIndex];
+    SamplerState s  = sceneSamplers[0];
 
-    float4 baseColor = textures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV)
+    float4 baseColor = sceneTextures[NonUniformResourceIndex(mat.baseColorTex)].Sample(s, input.UV)
                        * mat.baseColorFactor;
 
     // MASK alpha test — discards transparent texels so silhouettes survive

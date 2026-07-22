@@ -49,7 +49,7 @@ float4 PSMain(VSOut input) : SV_TARGET
     float3 world  = worldH.xyz / worldH.w;
     float3 dir    = normalize(world - ubo.camPos.xyz);
 
-    // Sample mip 0 of the env cube — we want the sharp environment, not the
+    // Sample mip 0 of the env cube - we want the sharp environment, not the
     // prefiltered roughness chain. The cube is already in HDR-linear space so
     // the downstream tonemap pass handles exposure + gamma uniformly.
     float3 color = envCube.SampleLevel(dir, 0).rgb * ubo.intensity;

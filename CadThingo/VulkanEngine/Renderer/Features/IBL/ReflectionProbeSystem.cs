@@ -591,7 +591,10 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             View3 = views[3], View4 = views[4], View5 = views[5],
             Proj  = proj,
         };
-        capturePipeline.WriteUbo(frameIndex, in ubo);
+        // ProbeCapture.slang reads this at (0,0) - the scene set's dynamic constant slot -
+        // so it goes through the arena, and the returned byte offset is the dynamic offset
+        // the CmdBindDescriptorSets below must supply.
+        uint captureUboOffset = _gpu.Registry.ConstantArena.Push(frameIndex, in ubo);
 
         // Layout transitions: cube + depth to attachment layouts
         ImageMemoryBarrier* preBarriers = stackalloc ImageMemoryBarrier[2];
@@ -662,11 +665,12 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
         _vk.CmdSetViewport(cmd, 0, 1, &vp);
         _vk.CmdSetScissor (cmd, 0, 1, &scissor);
 
-        var frameSet    = capturePipeline.GetFrameSet(frameIndex);
-        var bindlessSet = Engine.ResourceManager.GetBindlessSet(frameIndex);
-        var sets        = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
+        var frameSet = _gpu.Registry.SceneSet(frameIndex);
+        var sets        = stackalloc DescriptorSet[1] { frameSet };
+        // The scene set's binding 0 is the arena's UniformBufferDynamic slot, so exactly one
+        // dynamic offset must accompany it - the CaptureUbo slice pushed above.
         _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            capturePipeline.Layout, 0, 2, sets, 0, null);
+            capturePipeline.Layout, 0, 1, sets, 1, &captureUboOffset);
 
         var vb = Engine.ResourceManager.GlobalVertexBuffer;
         var ib = Engine.ResourceManager.GlobalIndexBuffer;
@@ -699,9 +703,9 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
         _vk.CmdEndRendering(cmd);
 
-        // Transition cube → ShaderReadOnly so prefilter compute can sample it 
+        // Transition cube -> ShaderReadOnly so prefilter compute can sample it 
         // Also transition the destination probe slot's layers in the prefiltered
-        // array from ShaderReadOnly → General for storage writes. Combined into
+        // array from ShaderReadOnly -> General for storage writes. Combined into
         // one CmdPipelineBarrier so we pay the sync cost once.
         ImageMemoryBarrier* postBarriers = stackalloc ImageMemoryBarrier[2];
         postBarriers[0] = new()
