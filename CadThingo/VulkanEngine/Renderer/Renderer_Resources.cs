@@ -95,8 +95,8 @@ public unsafe partial class Renderer
             // vb/ib, and the 25-binding set-4 SoA working set: ping-ponged shadow records
             // + connectArgs + shadowRadiance on top of the original 18). Round up generously.
             new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 128 },
-            new() { Type = DescriptorType.SampledImage,             DescriptorCount = MAX_BINDLESS_TEXTURES * MAX_CONCURRENT_FRAMES },
-            new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * MAX_CONCURRENT_FRAMES + 4 },
+            new() { Type = DescriptorType.SampledImage,             DescriptorCount = RenderConfig.MAX_BINDLESS_TEXTURES * RenderConfig.MAX_CONCURRENT_FRAMES },
+            new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * RenderConfig.MAX_CONCURRENT_FRAMES + 4 },
             // 5 g-buffer samplers (set 1) + 3 IBL samplers × MAX_FRAMES on set 0
             // for both PBR + Transparent pipelines + ImGui viewport + headroom.
             // Probe prefilter sets reuse iblCubeSampler — one CombinedImageSampler
@@ -120,31 +120,7 @@ public unsafe partial class Renderer
     }
    
 
-    // Pipeline-wide size budgets. The actual GPU buffers these size are owned by
-    // the pipelines that need them (DrawCullPipeline, LightCullPipeline,
-    // PbrDeferredPipeline) or by ResourceManager (materials/instances/bindless
-    // textures).
-    internal const uint MAX_MATERIALS         = 256;
-    internal const uint MAX_INSTANCES         = 4096;
-    // Must match ResourceManager.MAX_BINDLESS_TEXTURES — both bound the same
-    // descriptor array. 9 = worst-case textures per material post-extensions
-    // (5 core + transmission + 3× clearcoat).
-    internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 9;
-
-    // Lighting pipeline set 0 binding 1 — per-frame StructuredBuffer<PbrLight>.
-    // Cap chosen to keep the SSBO at 64KB (1024 × 64B); raise if needed.
-    internal const uint MAX_LIGHTS = 1024;
-
-    // Tiled light culling. Tile size matches the compute group
-    // (16×16 threads collaborating on one tile). MAX_LIGHTS_PER_TILE bounds the
-    // worst-case per-tile slot count; lights past this are dropped (the cull
-    // shader saturates the count).
-    internal const uint TILE_SIZE           = 16;
-    internal const uint MAX_LIGHTS_PER_TILE = 64;
-    // Hard cap on tile count — covers up to 3840×2160(4K) (240*135 tiles). The actual
-    // per-frame tileCountX/Y depends on swapChainExtent and is uploaded via the
-    // frame UBO each frame.
-    internal const uint MAX_TILE_COUNT      = 240 * 135;
+    
 
     // Allocates a host-visible, coherent, persistently-mapped SSBO. Optional extra
     // usage bits let callers turn the same buffer into an indirect-cmd / indirect-
@@ -189,8 +165,8 @@ public unsafe partial class Renderer
     /// <exception cref="ArgumentOutOfRangeException"></exception>
     public void WriteBindlessTexture(int index, Texture texture, DescriptorSet[] sets, uint binding)
     {
-        if (index < 0 || index >= MAX_BINDLESS_TEXTURES)
-            throw new ArgumentOutOfRangeException(nameof(index), $"bindless texture index {index} out of [0, {MAX_BINDLESS_TEXTURES}).");
+        if (index < 0 || index >= RenderConfig.MAX_BINDLESS_TEXTURES)
+            throw new ArgumentOutOfRangeException(nameof(index), $"bindless texture index {index} out of [0, {RenderConfig.MAX_BINDLESS_TEXTURES}).");
 
         // Mirror into the unified scene set's texture table at the same slot index, so
         // material rows resolve identically once shaders migrate to SceneBindings.

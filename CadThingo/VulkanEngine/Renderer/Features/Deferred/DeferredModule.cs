@@ -84,13 +84,13 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         // Per-frame compute-output buffers, imported so the graph derives the cull->geometry
         // and light-cull->lighting barriers + ordering. Renderables is the cull INPUT, imported
         // too so it can fill the cull pass set's binding 0 (matched by name below).
-        var renderablesF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var indirectCmdF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var indirectCountF = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var instanceF      = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var tileCountF     = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var tileIndicesF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        for (uint i = 0; i < HostRenderer.MAX_CONCURRENT_FRAMES; i++)
+        var renderablesF   = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var indirectCmdF   = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var indirectCountF = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var instanceF      = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var tileCountF     = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var tileIndicesF   = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (uint i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             renderablesF[i]   = _cull.GetRenderablesBuffer(i);
             indirectCmdF[i]   = _cull.GetIndirectCmdBuffer(i);

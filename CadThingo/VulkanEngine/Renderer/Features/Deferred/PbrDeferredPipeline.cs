@@ -169,8 +169,8 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         // the current scene. Other rendering paths call the same method.
         uint count = Renderer.UpdateLights(frameIndex, scene);
 
-        uint tileX = (Renderer.renderExtent.Width  + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
-        uint tileY = (Renderer.renderExtent.Height + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
+        uint tileX = (Renderer.renderExtent.Width  + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
+        uint tileY = (Renderer.renderExtent.Height + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
 
         LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);

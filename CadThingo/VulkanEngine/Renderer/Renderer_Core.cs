@@ -146,9 +146,7 @@ public unsafe partial class Renderer
     public bool SerSupported => gfx.SerSupported;
 
 
-    //frames-in-flight count. Referenced pervasively as Renderer.MAX_CONCURRENT_FRAMES;
-    //FrameRing takes it as a ctor arg (L1.4) rather than depending back on Renderer.
-    internal const uint MAX_CONCURRENT_FRAMES = 2;
+    
 
     // Presentation resources (L1.3). Renderer keeps the former field names as
     // delegating accessors so the frame body / ImGui / command-buffer sizing read
@@ -294,11 +292,11 @@ public unsafe partial class Renderer
         // the per-frame set instances. Providers register at the end of Initialize
         // (RegisterSceneBindings) once they exist.
         shaderLibrary = ShaderLibrary.CreateDefault();
-        descriptorRegistry = new DescriptorRegistry(gfx, shaderLibrary, MAX_CONCURRENT_FRAMES);
+        descriptorRegistry = new DescriptorRegistry(gfx, shaderLibrary, RenderConfig.MAX_CONCURRENT_FRAMES);
         
         Gpu = new(gfx, descriptorRegistry, shaderLibrary);
         
-        Engine.ResourceManager.Initialize(this);
+        Engine.ResourceManager.Initialize(Gpu);
 
         // Depth + g-buffers are ImageResource objects only — the render graph allocates
         // their VkImages inside Compile() (SetupDeferredRenderer below). The PT /
@@ -408,7 +406,7 @@ public unsafe partial class Renderer
         skyboxPipeline.Initialize();
 
         // Per-frame command buffers + sync ring.
-        frameRing = new FrameRing(gfx, MAX_CONCURRENT_FRAMES);
+        frameRing = new FrameRing(gfx, RenderConfig.MAX_CONCURRENT_FRAMES);
         frameRing.CreateCommandBuffers(swapChainImages.Length);
         frameRing.CreateSyncObjects();
 
@@ -618,10 +616,10 @@ public unsafe partial class Renderer
     private void RegisterSceneBindings()
     {
         var rm = Engine.ResourceManager;
-        var materials = new Buffer[MAX_CONCURRENT_FRAMES];
-        var instances = new Buffer[MAX_CONCURRENT_FRAMES];
-        var lights = new Buffer[MAX_CONCURRENT_FRAMES];
-        for (uint i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        var materials = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var instances = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var lights = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (uint i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             materials[i] = rm.GetMaterialBuffer((int)i);
             instances[i] = rm.GetInstanceBuffer(i);
@@ -683,10 +681,10 @@ public unsafe partial class Renderer
         var probeSys = reflectionProbeSystem;
         r.RegisterImage("probeCubeArray", probeSys.prefilteredArrayView, ImageLayout.ShaderReadOnlyOptimal, probeSys.prefilteredArraySampler);
 
-        var probes       = new Buffer[MAX_CONCURRENT_FRAMES];
-        var clusterRange = new Buffer[MAX_CONCURRENT_FRAMES];
-        var indexList    = new Buffer[MAX_CONCURRENT_FRAMES];
-        for (int i = 0; i < MAX_CONCURRENT_FRAMES; i++)
+        var probes       = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var clusterRange = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var indexList    = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             probes[i]       = probeSys.probeRecordBuffers[i].buffer;
             clusterRange[i] = probeSys.clusterGrid.GetClusterRangeBuffer((uint)i);

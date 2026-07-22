@@ -46,7 +46,7 @@ public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
         public uint Pad2;
     }
 
-    private UboBuffer[] _ubos = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] _ubos = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     public ProbeCapturePipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
     {
@@ -123,24 +123,24 @@ public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
 
     protected override void CreateResources()
     {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             Gfx.CreateMappedUniformBuffer(sizeof(CaptureUbo), ref _ubos[i]);
     }
 
     protected override void CreateDescriptorSets()
     {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
+        var layouts = stackalloc DescriptorSetLayout[(int)RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
 
         DescriptorSetAllocateInfo alloc = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
             DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
+            DescriptorSetCount = RenderConfig.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = layouts,
         };
         DescriptorSets = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
+        DescriptorSets[0] = new DescriptorSet[RenderConfig.MAX_CONCURRENT_FRAMES];
         fixed (DescriptorSet* p = DescriptorSets[0])
         {
             if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
@@ -150,7 +150,7 @@ public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
 
     protected override void WriteDescriptors()
     {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             DescriptorBufferInfo bufInfo = new()
             {
@@ -174,7 +174,7 @@ public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
 
     public override void Dispose()
     {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             Gfx.DestroyBuffer(_ubos[i].buffer, _ubos[i].alloc);
         base.Dispose();
     }

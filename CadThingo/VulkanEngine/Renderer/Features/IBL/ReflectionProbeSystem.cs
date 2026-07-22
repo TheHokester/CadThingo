@@ -67,7 +67,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     // Per-probe SSBO. Host-visible mapped so the system can write fresh records
     // each frame (cheap: MaxProbes×32B = 512B). One ring per frame-in-flight
     // because the shader reads it during draw and we'd race a writer otherwise.
-    internal UboBuffer[] probeRecordBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    internal UboBuffer[] probeRecordBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     // Transient capture cube. The scene is rendered into this image with multiview
     // (one draw → 6 layers), then the prefilter pass samples it via captureCubeSampleView
@@ -336,7 +336,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     private void CreateProbeRecordBuffers()
     {
         ulong sizeBytes = MaxProbes * (ulong)sizeof(ProbeGpuRecord);
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             _gfx.CreateMappedStorageBuffer(sizeBytes, ref probeRecordBuffers[i]);
     }
 
@@ -808,7 +808,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
         capturePipeline?.Dispose();
 
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             _gfx.DestroyBuffer(probeRecordBuffers[i].buffer, probeRecordBuffers[i].alloc);
 
         if (captureDepthAttachmentView.Handle != 0) _vk.DestroyImageView(_device, captureDepthAttachmentView, null);

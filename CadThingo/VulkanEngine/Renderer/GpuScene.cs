@@ -141,7 +141,7 @@ public sealed unsafe class GpuScene : IDisposable
     // PT, RT). Persistently mapped, stable for the renderer's lifetime. Owned here
     // (not by the deferred lighting pipeline) so non-deferred paths can read it
     // without that pipeline existing.
-    private readonly UboBuffer[] _lightBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private readonly UboBuffer[] _lightBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
     private readonly List<LightComponent> _lightScratch = new();
 
     /// <summary>Number of valid lights packed by the most recent <see cref="UpdateLights"/>.</summary>
@@ -150,7 +150,7 @@ public sealed unsafe class GpuScene : IDisposable
     // Per-frame cull-input SSBO — one RenderableInputGpu row per OPAQUE/MASK
     // renderable. Formerly owned + packed by DrawCullPipeline; now extracted here
     // (L2 step 4) so the cull compute pass is pure frustum cull over this buffer.
-    private readonly UboBuffer[] _renderableBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private readonly UboBuffer[] _renderableBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
     // BLEND-mode renderables, captured during extraction WITHOUT a sort key — the
     // back-to-front sort is view-dependent (camera), so it stays downstream in the
     // cull pass which owns the camera. This list is the extraction half only.
@@ -161,7 +161,7 @@ public sealed unsafe class GpuScene : IDisposable
     public uint ExtractedRenderableCount { get; private set; }
 
     //dirty driven scene extraction
-    private const uint AllSlotsDirty = (1u << (int)Renderer.MAX_CONCURRENT_FRAMES) - 1u;
+    private const uint AllSlotsDirty = (1u << (int)RenderConfig.MAX_CONCURRENT_FRAMES) - 1u;
     private uint _materialDirty   = AllSlotsDirty;
     private uint _lightDirty      = AllSlotsDirty;
     private uint _renderableDirty = AllSlotsDirty;
@@ -330,10 +330,10 @@ public sealed unsafe class GpuScene : IDisposable
     /// pipeline binds them.</summary>
     public void CreateLightBuffers()
     {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             _gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_LIGHTS * (uint)sizeof(PbrLightGpu)),
+                RenderConfig.MAX_LIGHTS * (uint)sizeof(PbrLightGpu),
                 ref _lightBuffers[i], preferDeviceLocal: true);
         }
     }
@@ -351,10 +351,10 @@ public sealed unsafe class GpuScene : IDisposable
     /// the cull pipeline binds them.</summary>
     public void CreateRenderableBuffers()
     {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             _gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(RenderableInputGpu)),
+                RenderConfig.MAX_INSTANCES * (uint)sizeof(RenderableInputGpu),
                 ref _renderableBuffers[i]);
         }
     }
@@ -415,8 +415,8 @@ public sealed unsafe class GpuScene : IDisposable
                 continue;
             }
 
-            if (count >= Renderer.MAX_INSTANCES)
-                throw new InvalidOperationException($"Renderable count exceeds MAX_INSTANCES ({Renderer.MAX_INSTANCES}).");
+            if (count >= RenderConfig.MAX_INSTANCES)
+                throw new InvalidOperationException($"Renderable count exceeds MAX_INSTANCES ({RenderConfig.MAX_INSTANCES}).");
 
             inputPtr[count] = new RenderableInputGpu
             {
@@ -448,9 +448,9 @@ public sealed unsafe class GpuScene : IDisposable
         if (!TakeSlot(ref _materialDirty, frameIndex)) return _lastMaterialCount;
 
         int matCount = scene.MaterialCount;
-        if (matCount + 1 > (int)Renderer.MAX_MATERIALS)
+        if (matCount + 1 > (int)RenderConfig.MAX_MATERIALS)
             throw new InvalidOperationException(
-                $"Scene material count ({matCount}) exceeds MAX_MATERIALS ({Renderer.MAX_MATERIALS}).");
+                $"Scene material count ({matCount}) exceeds MAX_MATERIALS ({RenderConfig.MAX_MATERIALS}).");
 
         PbrMaterial* matPtr = (PbrMaterial*)Engine.ResourceManager.GetMaterialMapped(frameIndex);
         for (int mi = 0; mi < matCount; mi++) matPtr[mi] = scene.Materials[mi];
@@ -499,7 +499,7 @@ public sealed unsafe class GpuScene : IDisposable
         uint count = 0;
         foreach (var light in _lightScratch)
         {
-            if (count >= Renderer.MAX_LIGHTS) break;
+            if (count >= RenderConfig.MAX_LIGHTS) break;
 
             // World-space position from the owner transform if present. Cached
             // (L2 step 5); WorldOf returns identity for an owner without a

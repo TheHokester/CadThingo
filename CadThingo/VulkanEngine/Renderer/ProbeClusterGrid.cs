@@ -41,8 +41,8 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
 
     // Per-frame-in-flight rings so the CPU can overwrite this frame's data
     // while the GPU still consumes the previous frame's. Host-visible mapped.
-    internal UboBuffer[] clusterRangeBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
-    internal UboBuffer[] probeIndexBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    internal UboBuffer[] clusterRangeBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    internal UboBuffer[] probeIndexBuffers   = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     // Snapshot of last Build's dimensionality. Phase 7 reads these to compute
     // the cluster index in the lighting shader.
@@ -60,7 +60,7 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
         _scratchPerCluster = new List<int>[MaxClusters];
         for (int i = 0; i < MaxClusters; i++) _scratchPerCluster[i] = new List<int>((int)MaxProbesPerCluster);
 
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             _gfx.CreateMappedStorageBuffer(MaxClusters * (ulong)sizeof(ClusterRange), ref clusterRangeBuffers[i]);
             _gfx.CreateMappedStorageBuffer(MaxLinks    * sizeof(uint),                 ref probeIndexBuffers[i]);
@@ -199,9 +199,9 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
         }
     }
 
-    public void Dispose()
+     public void Dispose()
     {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             _gfx.DestroyBuffer(clusterRangeBuffers[i].buffer, clusterRangeBuffers[i].alloc);
             _gfx.DestroyBuffer(probeIndexBuffers  [i].buffer, probeIndexBuffers  [i].alloc);

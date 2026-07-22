@@ -38,7 +38,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
         DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
 
-    private UboBuffer[] FrameUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] FrameUniformBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     public override void Dispose()
     {
@@ -142,25 +142,25 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
 
     protected override void CreateResources()
     {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             Gfx.CreateMappedUniformBuffer(sizeof(SkyboxUBO), ref FrameUniformBuffers[i]);
     }
 
     protected override void CreateDescriptorSets()
     {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
+        var layouts = stackalloc DescriptorSetLayout[(int)RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
 
         DescriptorSetAllocateInfo allocInfo = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
             DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
+            DescriptorSetCount = RenderConfig.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = layouts,
         };
 
         DescriptorSets    = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
+        DescriptorSets[0] = new DescriptorSet[RenderConfig.MAX_CONCURRENT_FRAMES];
         fixed (DescriptorSet* pSets = DescriptorSets[0])
         {
             if (Vk.AllocateDescriptorSets(Device, &allocInfo, pSets) != Result.Success)
@@ -171,7 +171,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
     protected override void WriteDescriptors()
     {
         // Only the private UBO (set 0). envCube is registry-owned on FeatureEnv (set 3).
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             DescriptorBufferInfo frameInfo = new()
             {

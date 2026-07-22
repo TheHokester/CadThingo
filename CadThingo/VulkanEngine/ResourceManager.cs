@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 // using CadThingo.GraphicsPipeline;
 using CadThingo.VulkanEngine;
 using CadThingo.VulkanEngine.Renderer;
+using CadThingo.VulkanEngine.Renderer.Features.TextureCompression;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 
@@ -120,9 +121,9 @@ public unsafe class ResourceManager
     }
     Dictionary<Type, Dictionary<string, ResourceData>> _refCounts = new();
 
-    // Global vertex/index buffers — all meshes are packed into these shared device-local buffers.
-    // Indices are rebased by the current vertex-write offset on upload so draws use vertexOffset=0.
-    private Renderer.Renderer _renderer;
+    private GpuContext _gpu; 
+    private GraphicsDevice _gfx;
+    
 
     private Buffer globalVertexBuffer;
     private SubAlloc globalVertexBufferAlloc;
@@ -189,7 +190,7 @@ public unsafe class ResourceManager
     private Vk vk;
     private Device device;
     private DescriptorPool descriptorPool;
-    private DescriptorSet[] bindlessDescriptorSets = new DescriptorSet[(int)Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    private DescriptorSet[] bindlessDescriptorSets = new DescriptorSet[RenderConfig.MAX_CONCURRENT_FRAMES];
     private Sampler defaultBindlessSampler;
     
     internal const uint MAX_MATERIALS         = 256;
@@ -201,39 +202,40 @@ public unsafe class ResourceManager
     
     DescriptorSetLayout MaterialBindlessLayout;
     
-    private UboBuffer[] MaterialStorageBuffers = new UboBuffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    private UboBuffer[] InstanceStorageBuffers = new UboBuffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] MaterialStorageBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] InstanceStorageBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     // GPU block-compression encoder for material textures. Lives here rather than on
     // GraphicsDevice: it compiles a shader at construction, and the RHI layer has no business
     // reaching up into the shader layer. Lazy, so runs that never load a BC asset never build
     // the PSO (and never touch slang).
-    private Renderer.Features.TextureCompression.BcEncoder? _bcEncoder;
-    internal Renderer.Features.TextureCompression.BcEncoder BcEncoder => _bcEncoder ??= new(
-        (_renderer ?? throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called")).Gpu);
+    private BcEncoder? _bcEncoder;
+
+    internal BcEncoder BcEncoder => _bcEncoder ??= new(_gpu);
 
 
-    public void Initialize(Renderer.Renderer renderer)
+    public void Initialize(GpuContext gpu)
     {
-        _renderer = renderer;
-        vk = renderer.vk;
-        device = renderer.device;
+        _gpu = gpu;
+        _gfx = gpu.Gfx;
+        vk = _gfx.Vk;
+        device = _gfx.Device;
         ulong vbSize = (ulong)(MAX_VERTICES * sizeof(Vertex));
-        ulong ibSize = (ulong)(MAX_INDICES  * sizeof(uint));
+        ulong ibSize = (MAX_INDICES  * sizeof(uint));
 
         // StorageBufferBit so the PBR lighting shadow-ray alpha-test path can bind
         // these as ByteAddressBuffers and pull UVs / indices at hit time.
         // High residency priority: the global VB/IB back every raster draw AND every
         // path-trace hit (bound as ByteAddressBuffers + AS build input) — keep this
         // live geometry resident ahead of cold resources under WDDM budget pressure.
-        renderer.CreateBuffer(vbSize,
+        _gfx.CreateBuffer(vbSize,
             BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
             BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
             out globalVertexBuffer, out globalVertexBufferAlloc, Renderer.GpuMemoryAllocator.PriorityHigh);
 
-        renderer.CreateBuffer(ibSize,
+        _gfx.CreateBuffer(ibSize,
             BufferUsageFlags.IndexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
             BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
@@ -241,10 +243,10 @@ public unsafe class ResourceManager
             out globalIndexBuffer, out globalIndexBufferAlloc, Renderer.GpuMemoryAllocator.PriorityHigh);
         
         CreateBindlessDescriptorSetLayout();
-        for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
-            renderer.CreateMappedStorageBuffer((ulong)(Renderer.Renderer.MAX_MATERIALS * (uint)sizeof(PbrMaterial)),     ref MaterialStorageBuffers[i], preferDeviceLocal: true);
-            renderer.CreateMappedStorageBuffer((ulong)(Renderer.Renderer.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)), ref InstanceStorageBuffers[i], preferDeviceLocal: true);
+            _gfx.CreateMappedStorageBuffer(RenderConfig.MAX_MATERIALS * (uint)sizeof(PbrMaterial),     ref MaterialStorageBuffers[i], preferDeviceLocal: true);
+            _gfx.CreateMappedStorageBuffer(RenderConfig.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU), ref InstanceStorageBuffers[i], preferDeviceLocal: true);
         }
         CreateDefaultBindlessSampler();
         CreateBindlessDescriptorSets();
@@ -252,7 +254,7 @@ public unsafe class ResourceManager
 
     public Mesh UploadMesh(Vertex[] vertices, uint[] indices)
     {
-        if (_renderer == null)
+        if (_gfx == null)
             throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called");
 
         int vbOffset = AllocateRange(_vbFreeList, vertices.Length, ref vertexWriteOffset, MAX_VERTICES, "vertex");
@@ -271,9 +273,9 @@ public unsafe class ResourceManager
         ulong ibDstOffset = (ulong)(ibOffset * sizeof(uint));
 
         fixed (Vertex* vPtr = vertices)
-            _renderer.UploadBufferData(globalVertexBuffer, (long)vbDstOffset, vPtr, vbBytes);
+            _gfx.UploadBufferData(globalVertexBuffer, (long)vbDstOffset, vPtr, vbBytes);
         fixed (uint* iPtr = rebased)
-            _renderer.UploadBufferData(globalIndexBuffer, (long)ibDstOffset, iPtr, ibBytes);
+            _gfx.UploadBufferData(globalIndexBuffer, (long)ibDstOffset, iPtr, ibBytes);
 
         // Bounding sphere in mesh-local space — center = AABB center, radius =
         // max distance from center to any vertex. Looser than Welzl's but O(n)
@@ -393,16 +395,16 @@ public unsafe class ResourceManager
     {
         ReleaseAll();
         _bcEncoder?.Dispose();
-        if (_renderer != null)
+        if (_gfx != null)
         {
-            _renderer.DestroyBuffer(globalVertexBuffer, globalVertexBufferAlloc);
-            _renderer.DestroyBuffer(globalIndexBuffer,  globalIndexBufferAlloc);
+            _gfx.DestroyBuffer(globalVertexBuffer, globalVertexBufferAlloc);
+            _gfx.DestroyBuffer(globalIndexBuffer,  globalIndexBufferAlloc);
 
             vk!.DestroySampler(device, defaultBindlessSampler, null);
-            for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+            for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             {
-                _renderer.DestroyBuffer(MaterialStorageBuffers[i].buffer, MaterialStorageBuffers[i].alloc);
-                _renderer.DestroyBuffer(InstanceStorageBuffers[i].buffer, InstanceStorageBuffers[i].alloc);
+                _gfx.DestroyBuffer(MaterialStorageBuffers[i].buffer, MaterialStorageBuffers[i].alloc);
+                _gfx.DestroyBuffer(InstanceStorageBuffers[i].buffer, InstanceStorageBuffers[i].alloc);
             }
 
             // Bindless descriptor set layout is created in CreateBindlessDescriptorSetLayout
@@ -427,7 +429,7 @@ public unsafe class ResourceManager
     /// </summary>
     public int RegisterBindless(Texture tex)
     {
-        if (_renderer == null)
+        if (_gfx == null)
             throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called");
 
         // Same Texture handle → same bindless index. Reference equality is what
@@ -449,7 +451,7 @@ public unsafe class ResourceManager
         }
 
         _bindlessIndexByTexture[tex] = index;
-        _renderer.WriteBindlessTexture(index, tex, bindlessDescriptorSets, 2);
+        _gfx.WriteBindlessTexture(index, tex, bindlessDescriptorSets, 2);
         // Only newly-allocated slots land on the manifest; dedup hits returned
         // above without writing a fresh descriptor, so the caller-file doesn't
         // own those slots and shouldn't unregister them later.
@@ -466,7 +468,7 @@ public unsafe class ResourceManager
     /// </summary>
     public void UnregisterBindless(int index, Texture fallback)
     {
-        if (_renderer == null) return;
+        if (_gfx == null) return;
         if (index < 0 || index >= _bindlessTable.Count) return;
 
         var existing = _bindlessTable[index];
@@ -479,7 +481,7 @@ public unsafe class ResourceManager
         // Point the descriptor at a known-good default. Validation would yell
         // if a shader sampled a slot whose underlying VkImage we destroyed
         // before this rewrite landed — callers must DeviceWaitIdle first.
-        _renderer.WriteBindlessTexture(index, fallback, bindlessDescriptorSets, 2);
+        _gfx.WriteBindlessTexture(index, fallback, bindlessDescriptorSets, 2);
     }
 
     /// <summary>
@@ -541,7 +543,7 @@ public unsafe class ResourceManager
         // hit/miss/raygen stages too — but only when ray tracing pipelines are
         // actually supported, since declaring RT stage bits on a device without
         // the extension is invalid.
-        if (_renderer.RayTracePipelineSupported)
+        if (_gfx.RayTracePipelineSupported)
         {
             var rt = ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.MissBitKhr |
                      ShaderStageFlags.ClosestHitBitKhr | ShaderStageFlags.AnyHitBitKhr;
@@ -556,7 +558,7 @@ public unsafe class ResourceManager
 
         fixed (DescriptorSetLayoutBinding* pBindings = bindings)
         {
-            if (_renderer.descriptorIndexEnabled)
+            if (_gfx.descriptorIndexEnabled)
             {
                 // Only the bindless texture array (binding 2) needs UpdateAfterBind +
                 // PartiallyBound — RegisterBindless writes new texture slots while the set
@@ -581,7 +583,7 @@ public unsafe class ResourceManager
                 BindingCount = (uint)bindings.Length,
                 PBindings = pBindings,
             };
-            if (_renderer.descriptorIndexEnabled)
+            if (_gfx.descriptorIndexEnabled)
             {
                 layoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
                 layoutInfo.PNext = &flagsCreateInfo;
@@ -598,14 +600,14 @@ public unsafe class ResourceManager
     // sampler at samplers[0]. Texture array (binding 2) is populated lazily by RegisterBindless.
     private void CreateBindlessDescriptorSets()
     {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = MaterialBindlessLayout;
+        var layouts = stackalloc DescriptorSetLayout[(int)RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++) layouts[i] = MaterialBindlessLayout;
 
         DescriptorSetAllocateInfo alloc = new()
         {
             SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = _renderer.descriptorPool,
-            DescriptorSetCount = Renderer.Renderer.MAX_CONCURRENT_FRAMES,
+            DescriptorPool = _gfx.descriptorPool,
+            DescriptorSetCount = RenderConfig.MAX_CONCURRENT_FRAMES,
             PSetLayouts = layouts,
         };
         fixed (DescriptorSet* pSets = bindlessDescriptorSets)
@@ -614,17 +616,17 @@ public unsafe class ResourceManager
                 throw new Exception("Failed to allocate bindless descriptor sets");
         }
 
-        for (var i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             DescriptorBufferInfo matInfo = new()
             {
                 Buffer = MaterialStorageBuffers[i].buffer, Offset = 0,
-                Range = (ulong)(MAX_MATERIALS * (uint)sizeof(PbrMaterial)),
+                Range = MAX_MATERIALS * (uint)sizeof(PbrMaterial),
             };
             DescriptorBufferInfo instInfo = new()
             {
                 Buffer = InstanceStorageBuffers[i].buffer, Offset = 0,
-                Range = (ulong)(MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)),
+                Range = MAX_INSTANCES * (uint)sizeof(InstanceDataGPU),
             };
             DescriptorImageInfo samplerInfo = new()
             {

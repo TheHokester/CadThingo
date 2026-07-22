@@ -18,15 +18,15 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
     // still executing. Capacities track per-slot allocated count (not the
     // current frame's required count) so we only grow, never thrash on
     // alternating big/small frames.
-    readonly Buffer[]       vertexBuffers      = new Buffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    readonly Buffer[]       indexBuffers       = new Buffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    readonly SubAlloc[]     vertexBufferAllocs = new SubAlloc[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    readonly SubAlloc[]     indexBufferAllocs  = new SubAlloc[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly Buffer[]       vertexBuffers      = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    readonly Buffer[]       indexBuffers       = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    readonly SubAlloc[]     vertexBufferAllocs = new SubAlloc[RenderConfig.MAX_CONCURRENT_FRAMES];
+    readonly SubAlloc[]     indexBufferAllocs  = new SubAlloc[RenderConfig.MAX_CONCURRENT_FRAMES];
     // Mapped pointers held as nint because C# doesn't allow void*[] fields.
-    readonly nint[]         vertexBufferMapped = new nint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    readonly nint[]         indexBufferMapped  = new nint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    readonly uint[]         vertexCapacities   = new uint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    readonly uint[]         indexCapacities    = new uint[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    readonly nint[]         vertexBufferMapped = new nint[RenderConfig.MAX_CONCURRENT_FRAMES];
+    readonly nint[]         indexBufferMapped  = new nint[RenderConfig.MAX_CONCURRENT_FRAMES];
+    readonly uint[]         vertexCapacities   = new uint[RenderConfig.MAX_CONCURRENT_FRAMES];
+    readonly uint[]         indexCapacities    = new uint[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     //texture for the UI font, contains the sampler, image, image view and memory.
     Texture fontTexture;
@@ -144,7 +144,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         //Destroy resources in reverse creation order
         fontTexture.Dispose();
 
-        for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             if (indexBufferAllocs[i].IsValid)
                 renderer.DestroyBuffer(indexBuffers[i], indexBufferAllocs[i]);
@@ -245,7 +245,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         // cost. updateBuffers() grows them on demand at 2x per growth.
         const uint initialVertexCount = 8192;
         const uint initialIndexCount  = 16384;
-        for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             AllocateVertexSlot(i, initialVertexCount);
             AllocateIndexSlot(i,  initialIndexCount);

@@ -573,8 +573,8 @@ public unsafe class FrameGraph : IDisposable
         _gfxChunkPool = MakePool(_plan.Graphics.Family);
         _cmpChunkPool = MakePool(_plan.AsyncCompute!.Value.Family);
 
-        _chunkCmds = new CommandBuffer[Renderer.MAX_CONCURRENT_FRAMES][];
-        for (int f = 0; f < Renderer.MAX_CONCURRENT_FRAMES; f++)
+        _chunkCmds = new CommandBuffer[RenderConfig.MAX_CONCURRENT_FRAMES][];
+        for (int f = 0; f < RenderConfig.MAX_CONCURRENT_FRAMES; f++)
         {
             _chunkCmds[f] = new CommandBuffer[_chunks.Count];
             for (int c = 0; c < _chunks.Count; c++)
@@ -875,7 +875,7 @@ public unsafe class FrameGraph : IDisposable
 
     private void BakePassSets()
     {
-        uint frames = Renderer.MAX_CONCURRENT_FRAMES;
+        uint frames = RenderConfig.MAX_CONCURRENT_FRAMES;
 
         var opting = new List<GraphPass>();
         foreach (var idx in _executionOrder)
@@ -1378,7 +1378,7 @@ public unsafe class FrameGraph : IDisposable
             _barrierCount += _passes[idx].ImageBarriers.Length + _passes[idx].BufferBarriers.Length;
 
         _debug = new GraphDebug(gfx);
-        _debug.Initialize(names, queues, types, eligible, Renderer.MAX_CONCURRENT_FRAMES);
+        _debug.Initialize(names, queues, types, eligible, RenderConfig.MAX_CONCURRENT_FRAMES);
 
         // Name physical resources so captures read "GBuffer_Position" instead of a raw handle.
         foreach (var res in _resources.Values)

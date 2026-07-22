@@ -31,8 +31,8 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         new("Deferred/CullDraws", ["Main"], [], []);
 
     // Per-frame buffers owned by this pipeline. .
-    private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
-    private UboBuffer[] IndirectCountBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] IndirectCountBuffers   = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     public Buffer GetIndirectCmdBuffer  (uint frame) => IndirectCmdBuffers[frame].buffer;
     public Buffer GetIndirectCountBuffer(uint frame) => IndirectCountBuffers[frame].buffer;
@@ -93,12 +93,12 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
                 $"CullPushConstants is {sizeof(CullPushConstants)} bytes but CullDraws.slang " +
                 $"reflects {reflected}");
 
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             // Indirect-command buffer also needs IndirectBuffer usage so the
             // vkCmdDraw...IndirectCount call can read it without validation errors.
             Gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(DrawIndexedIndirectCommandGpu)),
+                RenderConfig.MAX_INSTANCES * (uint)sizeof(DrawIndexedIndirectCommandGpu),
                 ref IndirectCmdBuffers[i],
                 BufferUsageFlags.IndirectBufferBit);
 

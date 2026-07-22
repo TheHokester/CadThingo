@@ -38,8 +38,8 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
     //         TileLightIndices[tileIdx*MAX + slot] is the flat index into the
     //         lights SSBO. The lighting passes read both, keyed by
     //         tileIdx = (gl_FragCoord / TILE_SIZE).
-    private UboBuffer[] TileLightCountBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
-    private UboBuffer[] TileLightIndicesBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] TileLightCountBuffers   = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] TileLightIndicesBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     public Buffer GetTileLightCountBuffer  (uint frame) => TileLightCountBuffers[frame].buffer;
     public Buffer GetTileLightIndicesBuffer(uint frame) => TileLightIndicesBuffers[frame].buffer;
@@ -83,13 +83,13 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
         // Tile-cull buffers sized for worst-case tile count (MAX_TILE_COUNT).
         // Per frame: TileLightCount = MAX × 4B, TileLightIndices = MAX × MAX_LIGHTS_PER_TILE × 4B.
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             Gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_TILE_COUNT * sizeof(uint)),
+                (ulong)(RenderConfig.MAX_TILE_COUNT * sizeof(uint)),
                 ref TileLightCountBuffers[i]);
             Gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_TILE_COUNT * Renderer.MAX_LIGHTS_PER_TILE * sizeof(uint)),
+                (ulong)(RenderConfig.MAX_TILE_COUNT * RenderConfig.MAX_LIGHTS_PER_TILE * sizeof(uint)),
                 ref TileLightIndicesBuffers[i]);
         }
     }
