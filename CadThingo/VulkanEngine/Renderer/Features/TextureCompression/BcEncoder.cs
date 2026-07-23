@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -58,7 +59,7 @@ public sealed unsafe class BcEncoder : IDisposable
 
         // Single-entry compute kernel: slang names the SPIR-V entry point "main" regardless of the
         // source function name, so the reflected name and the PName below agree.
-        var program = gpu.Shaders.GetProgram(new Shaders.ShaderCompileRequest("TextureCompression/BcEncode", ["main"], [], []));
+        var program = gpu.Shaders.GetProgram(new ShaderCompileRequest("TextureCompression/BcEncode", ["main"], [], []));
         var module = _gfx.CreateShaderModule(program.Spirv(0).ToArray());
         var entry  = SilkMarshal.StringToPtr(program.Reflection.EntryPoints[0].Name);
         var stage  = new PipelineShaderStageCreateInfo

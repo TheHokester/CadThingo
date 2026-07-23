@@ -109,6 +109,7 @@ Everything a system might grab off `Renderer` sorts into exactly one channel.
 | Constants (MAX_*, TILE_SIZE)                      | `RenderConfig`      | static; no injection                             |
 | Per-frame state (extent, camera, renderables)    | `RenderFrame` / `RenderView` | produced by the draw loop; read at record time |
 | UI -> engine intent                              | `EventBus`          | fire-and-forget events (no state on the panel)   |
+| Off-thread notification (worker -> engine)       | `EventBus`          | publish from any thread; drained on the bus thread |
 
 `GpuContext` is deliberately capped and never grows:
 
@@ -265,16 +266,87 @@ accessor rather than `SceneAS` re-walking the scene -- still one source of truth
 
 ## UI via events
 
-The UI emits intent and owns no renderer state. `EventBus` (currently input/window-oriented) gains a
-render/editor category. Boundary: **events are fire-and-forget intents/notifications only**
-(`TonemapSettingsChanged`, `SceneMutated`, `AccumulatorInvalidated`, `EntitySelected`) -- never for
-request-response data (that stays a direct call to a narrow interface). Do not over-eventify: when
-there is one clear owner and synchronous ordering matters, an intent method (the `RequestCoreIndex`
-style) is clearer. Events earn their keep exactly when the publisher should not know who handles it,
-which is the UI's situation.
+The UI emits intent and owns no renderer state. Boundary: **events are fire-and-forget
+intents/notifications only** (`TonemapFilterChangedEvent`, `SceneDirtyEvent`,
+`PathTracingAccumulatorInvalidatedEvent`, `SceneEntitySelectedEvent`) -- never for request-response
+data (that stays a direct call to a narrow interface). Do not over-eventify: when there is one clear
+owner and synchronous ordering matters, an intent method (the `RequestCoreIndex` style) is clearer.
+Events earn their keep exactly when the publisher should not know who handles it, which is the UI's
+situation.
 
-This retires A1 and G1 (settings-panel flag flips + duplicate pending flags -> `TonemapSettingsChanged`,
-owner holds one flag) and G4 (editor render-settings -> events/`RenderConfig` data).
+This retires A1 and G1 (settings-panel flag flips + duplicate pending flags ->
+`TonemapFilterChangedEvent`, owner holds one flag) and G4 (editor render-settings ->
+events/`RenderConfig` data).
+
+### The bus (done)
+
+`EventBus` was input/window-oriented and had three properties that would not survive renderer
+traffic. All three are fixed; the rewrite is in `VulkanEngine/Events/`.
+
+**Deleted.** `EventDispatcher` resolved an event's type and then called `handler.OnEvent(evt)` --
+the same untyped entry point -- so the type parameter bought nothing and the handler re-switched
+anyway; it also compared types exactly, silently missing subclasses. `EventSystem` was a second
+competing bus reachable only from the commented-out `PhysicsComponent` (its "uses stackalloc" doc
+comment was untrue). `Event.GetEventType()` was redundant with `GetType()`. `Event.Clone()` existed
+only to copy into the deferred queue, defending against a mutation that never happens -- publishers
+build an event and drop it -- and three of the renderer events implemented it as
+`throw new NotImplementedException()`, so the only existing renderer event hard-crashed the moment
+anything queued it. Events are now `sealed` with `readonly` payload instead, and `Clone` is gone.
+
+**Fixed.**
+
+- *Reentrancy.* Dispatch iterated the live listener dictionary, so any handler that subscribed or
+  unsubscribed threw `InvalidOperationException`. Subscription state is now copy-on-write: writers
+  rebuild an array under a lock and publish it by reference, the dispatch loop iterates a snapshot
+  that cannot change under it. A late unsubscribe still takes effect mid-event through a volatile
+  `Alive` flag rather than waiting for the next publish.
+- *Category matching was subset, not intersection.* `(flags & mask) == mask` meant a listener's mask
+  had to be a **subset** of the event's bits, so a panel subscribing to `Renderer | Editor` would
+  have received nothing. Now `!= 0`. `AddListener` also used `Dictionary.Add`, so a second subscribe
+  threw and one listener could not hold two masks; subscriptions are independent entries now.
+- *Half-present thread safety.* `Monitor.Pulse` with no `Wait` anywhere was a no-op, publish did not
+  lock while drain did, and the whole drain ran inside the lock so a handler that published fed the
+  loop it was inside. See threading below.
+
+**Delivery is per category, not one global `immediateMode` flag.** The old bool defaulted to true,
+which made `ProcessEvents` dead code and left the queued path untested. Input/window/editor stay
+immediate (latency, and it is the previous behaviour); `Renderer` is queued, so a UI callback cannot
+rebuild a pipeline part-way through a frame. An event carrying several bits queues if any bit is
+queued -- delivery is a safety property, the stricter bit wins. `SetDelivery` overrides per category;
+resolution is one masked compare against a `uint`, no lock and no allocation, because publish is on
+the mouse-move path.
+
+**Threading / async.** Publishing is safe from any thread; delivery is not, since every handler
+touches Vulkan, ImGui or scene state. `BindToCurrentThread` (called from `Engine.Start`) names the
+delivery thread, and anything published from off it is queued regardless of category and drained in
+the next `ProcessEvents`. That is the channel `AsyncResourceManager`'s worker needs -- its load
+callbacks currently fire *on the worker thread*, so today they cannot touch the renderer at all.
+`ProcessEvents` double-buffers the queue and dispatches outside the lock; a handler that publishes
+lands in the next pass, capped at 8 passes so a publish cycle is a logged warning rather than a hung
+frame. `NextAsync<T>(ct)` completes on the next `T` for async flows that want to wait on a point in
+the frame; its continuation resumes on the thread pool, never inline on the drain, so getting back
+onto the bus thread means publishing an event.
+
+**Two ways to subscribe, both returning a disposable token.** `AddListener(listener, category)` is
+the broadcast path, for consumers that want a whole stream in order and switch on it themselves
+(ImGui, `Camera`) -- the C# `switch` pattern-match they already use is what `EventDispatcher` should
+have been. `Subscribe<T>(handler)` is one type, one delegate, for single-owner intents where a
+category switch is noise; it walks the base chain, so a future grouping base type still fires. The
+token matters more than the typing: features are created and disposed by `FeatureHost` (step 7), and
+a disposed feature left on the listener list would be handed an event and dereference GPU handles it
+has already destroyed. Features hold tokens and dispose them with themselves.
+
+**Ordering + `Handled`.** Subscriptions carry an `order` and an optional `skipHandled`; broadcast
+runs before typed, since broadcast is where input capture decides consumption. This is the mechanism
+for step 4's G4 work: `Camera.OnEvent` currently gates on `EditorState.ViewportFocused` /
+`ViewportHovered`, which is a hand-rolled substitute for event consumption and a live instance of
+render code reading editor globals. With ImGui ordered ahead of `Camera` and setting `Handled` when
+`io.WantCaptureKeyboard`/`WantCaptureMouse`, `Camera` stops reading `EditorState` entirely. The
+rewiring itself is still open.
+
+Note the category enum already carried `Editor` and `Renderer` bits before this work -- the "gains a
+render/editor category" framing was wrong. The categories existed; the mechanics above were what was
+missing.
 
 ## Pipeline ownership
 
@@ -315,8 +387,13 @@ Ordered so early steps shrink later ones. Each step ships green.
    arg; migrate `ResourceManager` and `BcEncoder` off `Renderer` (and move `BcEncoder` *ownership*
    off `GraphicsDevice` into the texture path -- device enables the BC capability, the resource layer
    owns the tooling). Pipelines stop taking `Renderer`.
-3. **Events channel.** Add the render/editor `EventBus` category + core event types. Foundational:
-   makes steps 4 and 9 collapse into publish/subscribe instead of interim hacks.
+3. **Events channel.** *(done)* `EventBus` rewrite -- dead `EventDispatcher`/`EventSystem`/`Clone`
+   deleted, reentrancy + category-matching + threading fixed, per-category delivery, thread-safe
+   publish with main-thread drain, typed `Subscribe<T>` with disposable tokens, `NextAsync<T>`,
+   ordering + `Handled`. Renderer event types declared (`SceneDirtyEvent`,
+   `TonemapFilterChangedEvent`, `PathTracingAccumulatorInvalidatedEvent`,
+   `SceneEntitySelectedEvent`); nothing publishes or subscribes to them yet -- that is step 4.
+   Foundational: makes steps 4 and 9 collapse into publish/subscribe instead of interim hacks.
 4. **A/D quick wins on events** (G1, A1-partial, G4). Delete the panel's duplicate rebuild flags
    (publish `TonemapSettingsChanged`; one owner flag); render code stops reading `EditorState`
    globals (skybox/IBL intensities via `RenderConfig`/frame settings, selection via event).
