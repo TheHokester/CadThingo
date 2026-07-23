@@ -173,6 +173,10 @@ sealed class TonemapFilterChangedEvent : Event
     public override EventCategory Category => EventCategory.Renderer;
 }
 
+sealed class PbrSoftShadowingChangedEvent : Event
+{
+    public override EventCategory Category => EventCategory.Renderer;
+}
 sealed class PathTracingAccumulatorInvalidatedEvent : Event
 {
     public override EventCategory Category => EventCategory.Renderer;
