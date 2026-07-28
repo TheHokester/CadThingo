@@ -22,9 +22,16 @@ public unsafe sealed class SelectionSystem : IDisposable
     internal SelectionMaskPipeline selectionMaskPipeline;
     internal OutlinePipeline       outlinePipeline;
 
+    // Selection changes arrive as events, from here (the viewport pick) and from the panels
+    // (outliner click, probe spawn). This system applying them is what keeps
+    // EditorState.SelectedEntity single-writer - publishers state the intent and nothing else.
+    private readonly IDisposable _selectionSub;
+
     public SelectionSystem(GpuContext gpu, Renderer renderer)
     {
         _renderer = renderer;
+
+        _selectionSub = Engine.EventBus.Subscribe<SceneEntitySelectedEvent>(OnEntitySelected);
 
         // Object picking owns only a tiny result SSBO; the TLAS is bound later.
         pickPipeline = new PickPipeline( gpu, renderer);
@@ -91,8 +98,22 @@ public unsafe sealed class SelectionSystem : IDisposable
         _renderer.EndSingleTimeCommands(cmd);   // QueueWaitIdle - result buffer is now valid
 
         uint idx = pickPipeline.ReadResult();
-        ImGui.EditorState.SelectedEntity =
-            idx == PickPipeline.PickNone ? null : _renderer.gpuScene.ResolveSlot(idx);
+        Engine.EventBus.PublishEvent(new SceneEntitySelectedEvent(
+            idx == PickPipeline.PickNone ? null : _renderer.gpuScene.ResolveSlot(idx)));
+    }
+
+    /// <summary>
+    /// Applies a selection change. Editor-category events deliver immediately, so the store is
+    /// updated before the publishing panel's next line runs and the outliner highlight lands on
+    /// the same frame as the click. The accumulator restart is because the outline composites
+    /// into FinalColor - a different selection is a different image.
+    /// </summary>
+    private void OnEntitySelected(SceneEntitySelectedEvent e)
+    {
+        if (ImGui.EditorState.SelectedEntity == e.GetEntity) return;
+
+        ImGui.EditorState.SelectedEntity = e.GetEntity;
+        _renderer.MarkAccumulatorDirty();
     }
 
     /// <summary>
@@ -153,6 +174,7 @@ public unsafe sealed class SelectionSystem : IDisposable
 
     public void Dispose()
     {
+        _selectionSub.Dispose();
         outlinePipeline?.Dispose();
         selectionMaskPipeline?.Dispose();
         pickPipeline?.Dispose();

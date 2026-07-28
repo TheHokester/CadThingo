@@ -29,10 +29,22 @@ public static class RendererSettingsPanel
     static int      _hdrSelected   = -1;
     static bool     _hdrListLoaded = false;
 
-    // Pending-spec-constant tracking. Lit when the user flips a toggle that
-    // requires a pipeline rebuild; reset by the Apply button.
-    static bool _pbrRebuildPending     = false;
-    static bool _tonemapRebuildPending = false;
+    // Staged spec-constant edits. These are panel state only - "the user moved this
+    // control and hasn't hit Apply", which is what decides whether the Apply button
+    // shows and what the widget displays meanwhile. The renderer is not told anything
+    // until Apply publishes the intent, and it owns the rebuild flag from there. The
+    // panel used to keep these *and* write the renderer's pending-rebuild fields, which
+    // put one intent in two flags on two classes.
+    static bool             _pbrRebuildPending     = false;
+    static bool             _tonemapRebuildPending = false;
+    static bool             _stagedSoftShadows;
+    static TonemapOperator  _stagedTonemapOperator;
+
+    // Every control here that changes what the camera sees without changing the scene
+    // restarts progressive integration. Published rather than called so the panel does
+    // not need the renderer for it; the renderer subscribes and owns the dirty flag.
+    static void InvalidateAccumulator() =>
+        Engine.EventBus.PublishEvent(new PathTracingAccumulatorInvalidatedEvent());
 
     public static void Draw()
     {
@@ -88,7 +100,7 @@ public static class RendererSettingsPanel
                     renderer.RequestCoreIndex(i);
                     // Mode switch invalidates whatever was in FinalColor — drop any in-progress PT
                     // accumulation so we don't get a frame of stale pixels when toggling back on.
-                    renderer.MarkAccumulatorDirty();
+                    InvalidateAccumulator();
                 }
                 if (selected) ImGuiNET.ImGui.SetItemDefaultFocus();
             }
@@ -139,7 +151,7 @@ public static class RendererSettingsPanel
             if (ImGuiNET.ImGui.SliderInt("Bounce cap", ref bounceTmp, 1, (int)pt.MaxBouncesHardCap))
             {
                 pt.BounceCap = (uint)bounceTmp;
-                renderer.MarkAccumulatorDirty();
+                InvalidateAccumulator();
             }
 
             DrawFov(renderer);
@@ -173,7 +185,7 @@ public static class RendererSettingsPanel
     {
         ImGuiNET.ImGui.Text($"Samples accumulated: {samples}");
         ImGuiNET.ImGui.SameLine();
-        if (ImGuiNET.ImGui.SmallButton("Restart")) renderer.MarkAccumulatorDirty();
+        if (ImGuiNET.ImGui.SmallButton("Restart")) InvalidateAccumulator();
     }
 
     // FOV is the camera's vertical FOV (degrees), shared with the raster modes so
@@ -186,7 +198,7 @@ public static class RendererSettingsPanel
         if (ImGuiNET.ImGui.SliderFloat("FOV (deg)", ref fov, 1f, 120f, "%.1f"))
         {
             renderer.Camera.Fov = fov;
-            renderer.MarkAccumulatorDirty();
+            InvalidateAccumulator();
         }
     }
 
@@ -199,7 +211,7 @@ public static class RendererSettingsPanel
         if (ImGuiNET.ImGui.Combo("Camera mode", ref modeIdx, _cameraModeLabels, _cameraModeLabels.Length))
         {
             cam.Mode = (PTComputePipeline.CameraMode)modeIdx;
-            renderer.MarkAccumulatorDirty();
+            InvalidateAccumulator();
         }
 
         // Branch on the just-set Mode so the UI updates the same frame.
@@ -228,13 +240,13 @@ public static class RendererSettingsPanel
         if (ImGuiNET.ImGui.SliderFloat("Aperture radius", ref aperture, 0f, 0.5f, "%.3f"))
         {
             cam.Aperture = aperture;
-            renderer.MarkAccumulatorDirty();
+            InvalidateAccumulator();
         }
         float focus = cam.FocusDistance;
         if (ImGuiNET.ImGui.SliderFloat("Focus distance", ref focus, 0.1f, 50f, "%.2f"))
         {
             cam.FocusDistance = focus;
-            renderer.MarkAccumulatorDirty();
+            InvalidateAccumulator();
         }
         ImGuiNET.ImGui.TextDisabled("aperture = focalLength / (2 * fStop) - set to 0 to disable DoF.");
         ImGuiNET.ImGui.Unindent();
@@ -247,13 +259,13 @@ public static class RendererSettingsPanel
         if (ImGuiNET.ImGui.SliderFloat("Panini distance (d)", ref d, 0f, 1f, "%.2f"))
         {
             cam.PaniniDistance = d;
-            renderer.MarkAccumulatorDirty();
+            InvalidateAccumulator();
         }
         float vc = cam.VerticalCompression;
         if (ImGuiNET.ImGui.SliderFloat("Vertical compression", ref vc, 0f, 1f, "%.2f"))
         {
             cam.VerticalCompression = vc;
-            renderer.MarkAccumulatorDirty();
+            InvalidateAccumulator();
         }
         ImGuiNET.ImGui.TextDisabled("d=0 collapses to pinhole; d=1 is the classic Panini look.");
         ImGuiNET.ImGui.Unindent();
@@ -323,8 +335,8 @@ public static class RendererSettingsPanel
         if (probe != null) probeSys.Register(probe);
 
         // Auto-select the newly spawned probe so the user immediately sees its
-        // component in the Inspector and can tweak the radius.
-        EditorState.SelectedEntity = e;
+        //editor events immediately fire so inspector will immediately show the probe
+        Engine.EventBus.PublishEvent(new SceneEntitySelectedEvent(e));
     }
 
     //  Environment / IBL 
@@ -420,13 +432,12 @@ public static class RendererSettingsPanel
         if (ImGuiNET.ImGui.SliderFloat("Gamma",    ref gamma,    1.0f, 3f, "%.2f"))
             tm.Gamma = gamma;
 
-        // Operator is a spec constant — changing it needs a pipeline rebuild
-        // (it doesn't actually rebuild here; we just flag _tonemapRebuildPending
-        // until the user clicks Apply).
-        int opIdx = (int)renderer.tonemapOperator;
+        // Operator is a spec constant - changing it needs a pipeline rebuild, so the
+        // combo only stages a value locally and the renderer hears nothing until Apply.
+        int opIdx = (int)(_tonemapRebuildPending ? _stagedTonemapOperator : renderer.tonemapOperator);
         if (ImGuiNET.ImGui.Combo("Operator", ref opIdx, new[] { "Reinhard", "Filmic" }, 2))
         {
-            renderer.tonemapOperator = (TonemapOperator)opIdx;
+            _stagedTonemapOperator = (TonemapOperator)opIdx;
             _tonemapRebuildPending = true;
         }
         if (_tonemapRebuildPending)
@@ -434,11 +445,12 @@ public static class RendererSettingsPanel
             ImGuiNET.ImGui.SameLine();
             if (ImGuiNET.ImGui.Button("Apply##tonemap"))
             {
-                // Queue the rebuild for the top of the next frame — running it
-                // here would tear down a pipeline this frame's command buffer
-                // has already bound, which is a use-after-free at submit time.
-                renderer.pendingTonemapRebuild = true;
-                _tonemapRebuildPending         = false;
+                // Fire-and-forget: the renderer stores the operator and rebuilds at the
+                // top of the next frame. Rebuilding inline would tear down a pipeline
+                // this frame's command buffer has already bound - a use-after-free at
+                // submit time - which is why this is a queued event rather than a call.
+                Engine.EventBus.PublishEvent(new TonemapFilterChangedEvent(_stagedTonemapOperator));
+                _tonemapRebuildPending = false;
             }
         }
     }
@@ -455,10 +467,10 @@ public static class RendererSettingsPanel
             return;
         }
 
-        bool soft = renderer.softShadowsEnabled;
+        bool soft = _pbrRebuildPending ? _stagedSoftShadows : renderer.softShadowsEnabled;
         if (ImGuiNET.ImGui.Checkbox("Soft (PCSS-style) shadows", ref soft))
         {
-            renderer.softShadowsEnabled = soft;
+            _stagedSoftShadows = soft;
             _pbrRebuildPending = true;
         }
         ImGuiNET.ImGui.TextDisabled("Trades a few hundred microseconds per pixel for distance-to-occluder penumbra.");
@@ -467,9 +479,9 @@ public static class RendererSettingsPanel
         {
             if (ImGuiNET.ImGui.Button("Apply##pbr"))
             {
-                // Defer to next frame — see tonemap apply for reasoning.
-                renderer.pendingPbrRebuild = true;
-                _pbrRebuildPending         = false;
+                // Deferred to next frame by the bus - see tonemap apply for reasoning.
+                Engine.EventBus.PublishEvent(new PbrSoftShadowingChangedEvent(_stagedSoftShadows));
+                _pbrRebuildPending = false;
             }
         }
     }

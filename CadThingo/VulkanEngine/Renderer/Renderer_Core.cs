@@ -214,11 +214,16 @@ public unsafe partial class Renderer
     // Threaded into PbrDeferredPipeline.SoftShadowsEnabled at construction time.
     public bool softShadowsEnabled = true;
 
-    // Pending rebuild flags posted by the Renderer Settings panel. Consumed at
-    // the top of DrawFrame so the rebuild never races a command buffer that
-    // already bound the old pipeline.
+    // Pending rebuild flags, set by the event handlers below. Consumed at the top
+    // of DrawFrame so the rebuild never races a command buffer that already bound
+    // the old pipeline. These are the single owner of "a rebuild is due" - the
+    // settings panel used to keep its own copies and write these directly.
     internal bool pendingPbrRebuild     = false;
     internal bool pendingTonemapRebuild = false;
+
+    // Bus subscriptions, disposed in Cleanup so a torn-down renderer stops being
+    // handed events (the bus outlives it - Engine owns the bus).
+    private readonly List<IDisposable> eventSubscriptions = new();
 
     // Tone-map curve selector — threaded into TonemapPipeline.Operator at
     // construction time as a specialization constant. Toggling requires a
@@ -264,6 +269,46 @@ public unsafe partial class Renderer
     // consume-and-clear is the PT core's job (bridged into its pipeline's accumulator reset).
     internal bool AccumulatorDirty => accumulatorDirty;
     internal void ClearAccumulatorDirty() => accumulatorDirty = false;
+
+    /// <summary>
+    /// Subscribes the renderer to the editor's intents. Everything here is Renderer-category, so
+    /// the bus queues it and drains in Engine's Update pass - ahead of DrawFrame, which is where
+    /// the flags these handlers set get consumed. Publishers therefore never touch renderer state
+    /// directly and never need to know about the frame boundary.
+    /// </summary>
+    private void SubscribeToEvents()
+    {
+        var bus = Engine.EventBus;
+
+        // Scene edits invalidate both the acceleration structure and any in-progress
+        // integration; a pure view change invalidates only the latter.
+        eventSubscriptions.Add(bus.Subscribe<SceneDirtyEvent>(_ =>
+        {
+            MarkTlasDirty();
+            MarkAccumulatorDirty();
+        }));
+        eventSubscriptions.Add(bus.Subscribe<PathTracingAccumulatorInvalidatedEvent>(
+            _ => MarkAccumulatorDirty()));
+
+        // Both of these are specialization constants baked at pipeline build, so the handler
+        // stores the value and flags the rebuild rather than applying it live.
+        eventSubscriptions.Add(bus.Subscribe<TonemapFilterChangedEvent>(e =>
+        {
+            tonemapOperator       = e.GetOperator;
+            pendingTonemapRebuild = true;
+        }));
+        eventSubscriptions.Add(bus.Subscribe<PbrSoftShadowingChangedEvent>(e =>
+        {
+            softShadowsEnabled = e.GetEnabled;
+            pendingPbrRebuild  = true;
+        }));
+    }
+
+    private void UnsubscribeFromEvents()
+    {
+        foreach (var sub in eventSubscriptions) sub.Dispose();
+        eventSubscriptions.Clear();
+    }
 
     // (The previous-frame camera snapshot that drove PT accumulator restarts now lives in
     // PathTraceCoreBase, the owner of the PT render technique.)
@@ -448,6 +493,9 @@ public unsafe partial class Renderer
         // Activate the boot core (index 0 = Deferred unless RequestCoreIndex ran before init).
         _activeCore = _renderCores[_desiredCoreIndex];
         _activeCore.Activate();
+
+        // Last, so no handler can fire against half-built pipelines.
+        SubscribeToEvents();
 
         initialized = true;
     }
@@ -708,6 +756,10 @@ public unsafe partial class Renderer
     public void Cleanup()
     {
         if (!initialized) return;
+
+        // Off the bus first: the bus outlives the renderer, and a queued intent drained after
+        // this point would run its handler against destroyed pipelines.
+        UnsubscribeFromEvents();
 
         // Drain GPU work so nothing references resources we're about to destroy.
         vk!.DeviceWaitIdle(device);

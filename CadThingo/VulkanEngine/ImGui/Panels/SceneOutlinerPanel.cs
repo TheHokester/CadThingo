@@ -89,9 +89,9 @@ public static unsafe class SceneOutlinerPanel
 
         bool open = ImGuiNET.ImGui.TreeNodeEx(label, flags);
         // IsItemToggledOpen filters out the arrow-click that just expands the
-        // node — we don't want expanding to also change selection.
+        // node - we don't want expanding to also change selection.
         if (ImGuiNET.ImGui.IsItemClicked() && !ImGuiNET.ImGui.IsItemToggledOpen())
-            EditorState.SelectedEntity = entity;
+            Engine.EventBus.PublishEvent(new SceneEntitySelectedEvent(entity));
 
         if (pushedColor) ImGuiNET.ImGui.PopStyleColor();
 

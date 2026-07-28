@@ -58,7 +58,9 @@ Renderer-coupling anti-patterns:
 - **A1. UI mutating renderer internals** (`RendererSettingsPanel`). Flips raw fields
   (`pendingTonemapRebuild`, `tonemapOperator`, `softShadowsEnabled`, `renderMode`) and pokes
   individual pipelines. Fix: intent events / a command facade. `InspectorPanel` is the model:
-  only `MarkAccumulatorDirty` / `MarkTlasDirty`.
+  only `MarkAccumulatorDirty` / `MarkTlasDirty`. *(Partly done: the four raw-field flips and the
+  accumulator reaches are now published intents. The pipeline pokes -- `tm.Exposure`, `cam.Mode`,
+  `pt.BounceCap`, `probeSys` -- remain, and are step 9.)*
 - **A2. Systems that only need the RHI** (`ResourceManager`). Every reach is device territory
   (`CreateBuffer`, `UploadBufferData`, `GpuMemoryAllocator`, `device`, `descriptorPool`,
   `WriteBindlessTexture`). Fix: inject `GpuContext`; drop `Renderer`.
@@ -75,7 +77,8 @@ Non-Renderer anti-patterns (broader coherence):
 - **G1. Double-bookkeeping of the rebuild flags.** `RendererSettingsPanel` keeps its own
   `static _pbrRebuildPending` / `_tonemapRebuildPending` (`:34-35`) and copies them into the
   renderer's separate `pendingPbrRebuild` / `pendingTonemapRebuild` (`Renderer_Core.cs:221-222`).
-  One intent, two flags, two classes. Fix: publish an event; a single owner holds one flag.
+  One intent, two flags, two classes. Fix: publish an event; a single owner holds one flag. *(Done.
+  The panel's flags survive but now mean "Apply is pending", not "a rebuild is due".)*
 - **G2. `Engine.renderer` public static mutable global** (68 reaches / 8 files). Ambient access
   and a `public` settable static (any code can reassign the renderer). Mostly falls out as UI moves
   to events + narrow interfaces; regardless, make it `{ get; private set; }` immediately.
@@ -348,6 +351,45 @@ Note the category enum already carried `Editor` and `Renderer` bits before this 
 render/editor category" framing was wrong. The categories existed; the mechanics above were what was
 missing.
 
+### Wiring (done)
+
+| Event                                    | Published by                                                        | Handled by       | Effect                                        |
+|------------------------------------------|---------------------------------------------------------------------|------------------|-----------------------------------------------|
+| `SceneDirtyEvent`                        | `FileBrowserPanel` (visibility toggle)                              | `Renderer`       | `MarkTlasDirty` + `MarkAccumulatorDirty`      |
+| `PathTracingAccumulatorInvalidatedEvent` | `RendererSettingsPanel` (mode switch, restart, FOV, lens, bounce)   | `Renderer`       | `MarkAccumulatorDirty`                        |
+| `TonemapFilterChangedEvent`              | `RendererSettingsPanel` (Apply)                                     | `Renderer`       | stores operator, sets `pendingTonemapRebuild` |
+| `PbrSoftShadowingChangedEvent`           | `RendererSettingsPanel` (Apply)                                     | `Renderer`       | stores flag, sets `pendingPbrRebuild`         |
+| `SceneEntitySelectedEvent`               | `SceneOutlinerPanel`, `RendererSettingsPanel`, `SelectionSystem`    | `SelectionSystem`| writes `EditorState.SelectedEntity`, restarts accumulation |
+
+`Renderer` subscribes in `SubscribeToEvents` (last thing in `Initialize`, so no handler can fire
+against half-built pipelines) and disposes its tokens first thing in `Cleanup` -- the bus outlives
+the renderer, and a queued intent drained afterwards would run against destroyed pipelines.
+`SelectionSystem` holds its own token and disposes it with itself.
+
+**Timing is unchanged.** `ProcessEvents` runs in Engine's Update pass, ahead of `DrawFrame`, which
+is where `pendingPbrRebuild` / `pendingTonemapRebuild` / the accumulator flag are consumed. A panel
+publishing while drawing frame N is applied at the top of frame N+1 -- exactly where the panel's
+direct field writes landed before.
+
+**On G1.** The panel keeps `_pbrRebuildPending` / `_tonemapRebuildPending`, but they now mean
+something different and genuinely panel-local: *the user moved this control and has not hit Apply*,
+which is what decides whether the Apply button shows and which value the widget displays. The staged
+value rides in the event; the renderer holds the one rebuild flag. What is gone is the panel writing
+`renderer.softShadowsEnabled`, `renderer.tonemapOperator`, `renderer.pendingPbrRebuild` and
+`renderer.pendingTonemapRebuild` -- four of A1's raw-field flips, and the duplicated rebuild intent.
+
+**Selection is now single-writer.** Nothing assigns `EditorState.SelectedEntity` except
+`SelectionSystem.OnEntitySelected`; the outliner, the probe spawn and the viewport pick all publish.
+Because `Editor` is an immediate category, the store updates before the publishing panel's next line
+runs, so the outliner highlight and the Inspector binding still land on the click's own frame. The
+handler no-ops when the selection did not actually change, so re-clicking the selected row no longer
+costs an accumulator restart.
+
+`InspectorPanel`'s ~35 `MarkAccumulatorDirty` / `MarkTlasDirty` calls are deliberately untouched:
+the audit already rates that panel as fine, those are intent methods with one clear owner, and
+turning them into events would be churn for no decoupling. The events exist for publishers that
+should not be holding a `Renderer` at all.
+
 ## Pipeline ownership
 
 - **Technique-private pipeline** (one core: `geometry`, `drawCull`, `lightCull` -> Deferred; the
@@ -392,11 +434,13 @@ Ordered so early steps shrink later ones. Each step ships green.
    publish with main-thread drain, typed `Subscribe<T>` with disposable tokens, `NextAsync<T>`,
    ordering + `Handled`. Renderer event types declared (`SceneDirtyEvent`,
    `TonemapFilterChangedEvent`, `PathTracingAccumulatorInvalidatedEvent`,
-   `SceneEntitySelectedEvent`); nothing publishes or subscribes to them yet -- that is step 4.
-   Foundational: makes steps 4 and 9 collapse into publish/subscribe instead of interim hacks.
-4. **A/D quick wins on events** (G1, A1-partial, G4). Delete the panel's duplicate rebuild flags
-   (publish `TonemapSettingsChanged`; one owner flag); render code stops reading `EditorState`
-   globals (skybox/IBL intensities via `RenderConfig`/frame settings, selection via event).
+   `SceneEntitySelectedEvent`, `PbrSoftShadowingChangedEvent`). Foundational: makes steps 4 and 9
+   collapse into publish/subscribe instead of interim hacks.
+4. **A/D quick wins on events** (G1, A1-partial, G4). *(mostly done -- see Wiring above.)* The
+   rebuild-flag duplication is gone (panel stages, event carries the value, renderer owns the one
+   flag) and selection flows as an event with a single writer. Still open: render code reading the
+   remaining `EditorState` globals (skybox / IBL intensities via `RenderConfig` or frame settings),
+   and `Camera` gating on `ViewportFocused` / `ViewportHovered` instead of ImGui setting `Handled`.
 5. **GpuScene single source + `RenderView` extraction.** Move `BeginTransforms`/`ExtractRenderables`
    into the draw loop, produce `RenderView`, cores consume it; move `ShadowEntityInfo` authorship to
    GpuScene. Collapses step 7's SceneAS work (it will read the world cache instead of re-deriving).

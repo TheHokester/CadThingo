@@ -252,8 +252,9 @@ public static unsafe class FileBrowserPanel
         // RebuildTlas now skips !IsActive entities, so a visibility toggle
         // genuinely removes them from the ray-traced shadow set after the next
         // TLAS flush. PT accumulator restarts because the lit scene changed.
-        Engine.renderer?.MarkAccumulatorDirty();
-        Engine.renderer?.MarkTlasDirty();
+        // Both of those are what SceneDirtyEvent means, so the panel states the
+        // fact and leaves the renderer to decide what it invalidates.
+        Engine.EventBus.PublishEvent(new SceneDirtyEvent());
     }
 
     static void Detach(LoadedSceneFile f)

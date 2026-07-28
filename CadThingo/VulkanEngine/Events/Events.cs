@@ -1,3 +1,4 @@
+using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using Silk.NET.Input;
 
 namespace CadThingo.VulkanEngine;
@@ -162,23 +163,55 @@ sealed class MouseScrollEvent : Event
 // These carry the Renderer category, which the bus delivers queued: they are published from UI
 // callbacks and from the resource worker, and their handlers rebuild pipelines or touch GPU
 // state, so they must land at the frame's drain point rather than part-way through a frame.
+// Drain runs in Engine's Update handler, ahead of DrawFrame, so an intent raised while drawing
+// frame N is applied at the top of frame N+1 - the same timing the pending-flag fields had.
 
+/// <summary>
+/// The scene's contents or transforms changed: the TLAS is stale and any progressive
+/// integration has to restart. Publish this instead of reaching for MarkTlasDirty +
+/// MarkAccumulatorDirty from code that has no business holding a Renderer.
+/// </summary>
 sealed class SceneDirtyEvent : Event
 {
     public override EventCategory Category => EventCategory.Renderer;
 }
 
-sealed class TonemapFilterChangedEvent : Event
+/// <summary>
+/// Something changed what the camera sees without changing the scene, so accumulation restarts
+/// but the TLAS stands. Lighter than <see cref="SceneDirtyEvent"/> - use that one for edits.
+/// </summary>
+sealed class PathTracingAccumulatorInvalidatedEvent : Event
 {
     public override EventCategory Category => EventCategory.Renderer;
 }
 
-sealed class PbrSoftShadowingChangedEvent : Event
+/// <summary>
+/// Requests the tonemap curve. The operator is a specialization constant, so the handler stores
+/// it and flags a pipeline rebuild rather than applying it live.
+/// </summary>
+sealed class TonemapFilterChangedEvent : Event
 {
+    private readonly TonemapOperator _operator;
+
+    public TonemapFilterChangedEvent(TonemapOperator op) => _operator = op;
+
+    public TonemapOperator GetOperator => _operator;
+
     public override EventCategory Category => EventCategory.Renderer;
 }
-sealed class PathTracingAccumulatorInvalidatedEvent : Event
+
+/// <summary>
+/// Requests PCSS-style soft shadows on or off. Also a specialization constant, and it feeds two
+/// pipelines (deferred PBR + transparent forward), so it is a rebuild rather than a live flag.
+/// </summary>
+sealed class PbrSoftShadowingChangedEvent : Event
 {
+    private readonly bool _enabled;
+
+    public PbrSoftShadowingChangedEvent(bool enabled) => _enabled = enabled;
+
+    public bool GetEnabled => _enabled;
+
     public override EventCategory Category => EventCategory.Renderer;
 }
 
