@@ -1,4 +1,4 @@
-using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.RenderCores;
@@ -29,15 +29,14 @@ internal interface IGraphCore
 }
 
 /// <summary>
-/// The per-frame context handed to an <see cref="IRenderCore"/> (renderer-refactor.md L3).
-/// A thin composition of the recording command buffer + the host <see cref="Renderer.FrameContext"/>
-/// (camera / frame index / scene / render extent). It folds into L2's RenderView later -- the
-/// FrameGraph already accepts a FrameContext in Execute, so the seam is forward-compatible.
+/// The per-frame context handed to an <see cref="IRenderCore"/>: the recording command buffer plus
+/// the host's <see cref="RenderView"/> snapshot (camera / frame index / render extent / the counts
+/// the draw loop's extraction produced). A core reads the view; it never re-derives what is in it.
 /// </summary>
 internal readonly ref struct RenderFrame
 {
-    public CommandBuffer        Cmd   { get; init; }
-    public Renderer.FrameContext Frame { get; init; }
+    public CommandBuffer Cmd  { get; init; }
+    public RenderView    View { get; init; }
 }
 
 /// <summary>

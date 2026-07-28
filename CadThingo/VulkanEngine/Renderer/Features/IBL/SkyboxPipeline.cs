@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Shaders;
@@ -52,7 +52,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
         public readonly ImageView Depth = depth;
     }
     
-    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx , Attachments attachments)
+    internal void Record(CommandBuffer cmd, in RenderView ctx , Attachments attachments)
     {
         if (!ImGui.EditorState.SkyboxEnabled) return;
 

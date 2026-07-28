@@ -119,14 +119,18 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     /// <summary>CPU side of the cull pass.
     ///apply the view-dependent back-to-front sort
     /// to the BLEND candidates, read the opaque count, and record the frustum-cull
-    /// dispatch + barriers.</summary> 
+    /// dispatch + barriers. Both the candidates and the opaque count come from the frame's
+    /// <see cref="RenderView"/> - extraction already ran in the draw loop.</summary>
     /// <returns>The opaque count as a uint</returns>
-    public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam, DescriptorSet passSet)
+    public uint Record(CommandBuffer cmd, in RenderView view, DescriptorSet passSet)
     {
+        uint frameIndex = view.FrameIndex;
+        Camera cam      = view.Camera;
+
         // View-dependent transparent sort
         _transparentDraws.Clear();
         Matrix4x4 viewMat = cam != null ? cam.GetViewMatrix() : Matrix4x4.Identity;
-        foreach (var c in Renderer.gpuScene.TransparentCandidates)
+        foreach (var c in view.TransparentCandidates)
         {
             var worldOrigin = new Vector4(c.Model.M41, c.Model.M42, c.Model.M43, 1f);
             float viewZ = Vector4.Transform(worldOrigin, viewMat).Z;
@@ -136,7 +140,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         }
         _transparentDraws.Sort((a, b) => a.ViewDepth.CompareTo(b.ViewDepth));
 
-        uint count = Renderer.gpuScene.ExtractedRenderableCount;
+        uint count = view.RenderableCount;
         LastRenderableCount = count;
         if (count == 0) return 0;
 
@@ -168,10 +172,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         // Build frustum from the camera's view*proj. Deliberately use a non-Y-flipped
         // projection here: the visible volume is the same in both conventions, and
         // Frustum.FromViewProjection assumes standard row-major Vulkan NDC.
-        Matrix4x4 view = cam.GetViewMatrix();
         Matrix4x4 proj = cam.GetProjectionMatrix(
-            (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
-        Matrix4x4 vp   = view * proj;
+            (float)view.RenderExtent.Width / view.RenderExtent.Height, 0.1f, 100.0f);
+        Matrix4x4 vp   = viewMat * proj;
         var frustum    = Frustum.FromViewProjection(vp, vulkanNDC: true);
 
         var push = new CullPushConstants

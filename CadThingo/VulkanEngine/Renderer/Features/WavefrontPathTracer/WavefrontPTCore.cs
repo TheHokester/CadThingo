@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.RenderCores;
 using Silk.NET.Vulkan;
@@ -92,28 +92,27 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
     public void Render(in RenderFrame frame)
     {
         var cmd    = frame.Cmd;
-        var ctx    = frame.Frame;
-        var camera = _host.Camera;
-        var scene  = _host.Scene;
-        uint currentFrame = ctx.FrameIndex;
+        var view   = frame.View;
+        var camera = view.Camera;
+        uint currentFrame = view.FrameIndex;
 
         // Camera motion -> restart accumulation (structural compare against last frame's snapshot).
         if (camera != null)
         {
-            var view = camera.GetViewMatrix();
+            var camView = camera.GetViewMatrix();
             var pos  = camera.GetPosition();
             var fov  = camera.Fov;
-            if (view != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
+            if (camView != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
             {
                 _host.MarkAccumulatorDirty();
-                _lastCamView = view; _lastCamPos = pos; _lastCamFov = fov;
+                _lastCamView = camView; _lastCamPos = pos; _lastCamFov = fov;
             }
         }
 
-        // Per-frame SSBO refresh -- lights (for the UBO count + future NEE) AND materials (so
-        // inspector edits land; resolveHit reads materials/textures every bounce).
-        uint lightCount = _host.UpdateLights(currentFrame, scene);
-        _host.UpdateMaterials(currentFrame, scene);
+        // Lights + materials were packed by the draw loop's extraction (resolveHit reads materials
+        // and textures every bounce, so inspector edits land through that); the count only feeds
+        // the pipeline's frame UBO.
+        uint lightCount = view.LightCount;
 
         // Bridge the host's dirty signal into the pipeline's accumulator reset.
         if (_host.AccumulatorDirty)
@@ -122,11 +121,11 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
             _host.ClearAccumulatorDirty();
         }
 
-        _pipe.UpdatePerFrame(currentFrame, camera!, lightCount, ctx.RenderExtent);
+        _pipe.UpdatePerFrame(currentFrame, camera!, lightCount, view.RenderExtent);
 
         // Record Generate -> (PrepExtend->Extend->PrepShade->Shade->PrepConnect->Connect) x8 ->
         // Finalize -> Tonemap; every barrier derived from the usage table.
-        _graph!.Execute(cmd, ctx);
+        _graph!.Execute(cmd, view);
 
         // TEMP/debug: copy the per-bounce indirect args to the readback staging so the Stats panel
         // can show compaction in-app. Remove with the pipeline's _argsReadback feature.

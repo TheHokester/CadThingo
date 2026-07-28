@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
@@ -54,7 +54,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     /// <param name="indirectCount"></param>
     /// <param name="drawCount"></param>
     /// <param name="attachments"></param>
-    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, Buffer indirectCmd,
+    internal void Record(CommandBuffer cmd, in RenderView ctx, Buffer indirectCmd,
         Buffer indirectCount, uint drawCount, Attachments attachments)
     {
         BeginRendering(cmd,

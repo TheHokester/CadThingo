@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
@@ -237,11 +237,11 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     /// <summary>Records the BuildTemporal compute pass: reconstruct the surface from the G-buffer,
     /// build the unified DI reservoir (RIS) + temporal reuse, write the cur reservoir. Runs after
     /// Trace (G-buffer RAW), before SpatialShade (reservoir RAW).</summary>
-    public void RecordBuildTemporal(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void RecordBuildTemporal(CommandBuffer cmd, in RenderView ctx)
         => RecordComputePass(cmd, ctx, _buildTemporalPipeline);
 
     /// <summary>Records the SpatialShade compute pass: spatial reuse + deferred shade + accumulation.</summary>
-    public void RecordSpatialShade(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void RecordSpatialShade(CommandBuffer cmd, in RenderView ctx)
         => RecordComputePass(cmd, ctx, _spatialPipeline);
 
     // Binds the SAME descriptor sets the Trace pass uses on the shared layout, pushes the per-frame
@@ -249,7 +249,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     // which buffers each actually touches is decided by its shader's declared bindings. The scene set
     // carries the frame-UBO arena slot, so its bind supplies the same dynamic offset the RT Trace
     // pass uses. envCube (FeatureEnv) binds at set 4 for the passes that sample the background.
-    private void RecordComputePass(CommandBuffer cmd, in Renderer.FrameContext ctx, Pipeline pipeline)
+    private void RecordComputePass(CommandBuffer cmd, in RenderView ctx, Pipeline pipeline)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
 

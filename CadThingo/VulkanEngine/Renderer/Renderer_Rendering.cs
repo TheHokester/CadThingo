@@ -144,14 +144,6 @@ public unsafe partial class Renderer
         vk!.DeviceWaitIdle(device);
         RebuildRenderTargets(width, height);
     }
-    public readonly ref struct FrameContext
-    {
-        public readonly uint     FrameIndex { get; init;}
-        public readonly Camera   Camera { get; init;}
-        public readonly Scene    Scene { get; init;}
-        public readonly Extent2D RenderExtent { get; init;}
-        // bindless descriptor set, current view/proj/inv matrices precomputed, etc.
-    }
     /// <summary>
     /// Core function called within the Render loop
     /// </summary>
@@ -210,13 +202,6 @@ public unsafe partial class Renderer
             _activeCore.Activate();
         }
 
-        var ctx = new FrameContext()
-        {
-            FrameIndex = currentFrame,
-            Camera = camera,
-            RenderExtent = renderExtent,
-            Scene = scene
-        };
         // 1. CPU/GPU sync for this slot
         vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
 
@@ -242,14 +227,34 @@ public unsafe partial class Renderer
         if (vk!.BeginCommandBuffer(cmd, &beginInfo) != Result.Success)
             throw new Exception("Failed to begin command buffer");
 
-        // Open this frame's world-transform cache  - one reset covers
-        // every render mode below; the active DrawX's extract reads served from it.
-        // (RebuildTlas, which runs out-of-band above, manages its own window.)
+        // 5. Scene extraction. Technique-independent, so it runs here exactly once instead of
+        //    inside whichever core happens to be active - a core consumes the result and never
+        //    re-triggers it. Order is load-bearing: BeginTransforms opens the world-matrix cache
+        //    window that the light and renderable walks below read through, so every entity's
+        //    parent chain is composed at most once this frame.
+        //    (RebuildTlas runs out-of-band above and opens its own window.)
         gpuScene.BeginTransforms();
+        uint materialCount   = gpuScene.UpdateMaterials(currentFrame, scene);
+        uint lightCount      = gpuScene.UpdateLights(currentFrame, scene);
+        uint renderableCount = gpuScene.ExtractRenderables(currentFrame, scene);
+
+        // The per-frame snapshot every consumer downstream reads. Built after extraction so the
+        // counts in it are this frame's, not last frame's.
+        var view = new RenderView
+        {
+            FrameIndex            = currentFrame,
+            Camera                = camera,
+            Scene                 = scene,
+            RenderExtent          = renderExtent,
+            RenderableCount       = renderableCount,
+            LightCount            = lightCount,
+            MaterialCount         = materialCount,
+            TransparentCandidates = gpuScene.TransparentCandidates,
+        };
 
         // Dispatch the active render core. It records its technique into cmd and leaves
-        // FinalColor in ShaderReadOnlyOptimal for upcoming commands. 
-        _activeCore.Render(new RenderFrame { Cmd = cmd, Frame = ctx });
+        // FinalColor in ShaderReadOnlyOptimal for upcoming commands.
+        _activeCore.Render(new RenderFrame { Cmd = cmd, View = view });
 
         // 6b. Selection outline.
         selection.RecordOutline(cmd);

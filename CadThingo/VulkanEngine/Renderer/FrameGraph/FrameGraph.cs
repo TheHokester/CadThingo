@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using CadThingo.VulkanEngine.Renderer.Shaders;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
@@ -164,7 +164,7 @@ public unsafe class FrameGraph : IDisposable
 
     /// <summary>Imports a double-buffered buffer (one handle per frame-in-flight). The
     /// graph derives barriers as usual; at Execute it resolves the right per-frame handle.
-    /// <paramref name="perFrame"/> must be indexable by <c>FrameContext.FrameIndex</c>.</summary>
+    /// <paramref name="perFrame"/> must be indexable by <c>RenderView.FrameIndex</c>.</summary>
     public GraphBuffer ImportBufferPerFrame(Buffer[] perFrame, in BufferDesc desc, string name)
     {
         int id = _nextResourceId++;
@@ -1060,7 +1060,7 @@ public unsafe class FrameGraph : IDisposable
     /// <paramref name="cmd"/> and submitted later on the graphics queue executes after the
     /// chunks by submission order, exactly as it did when the passes lived inside it.
     /// </summary>
-    public void Execute(CommandBuffer cmd, in Renderer.FrameContext frame)
+    public void Execute(CommandBuffer cmd, in RenderView frame)
     {
         if (!Compiled) throw new InvalidOperationException("FrameGraph: call Compile() before Execute().");
 
@@ -1090,7 +1090,7 @@ public unsafe class FrameGraph : IDisposable
     /// with <see cref="SubmitGfxChunks"/> to merge them with its own host command buffer into
     /// one vkQueueSubmit2, giving profilers (Nsight, RenderDoc) a single unified gfx submission
     /// to show all graphics passes alongside the blit and UI work.</summary>
-    private void ExecuteChunked(in Renderer.FrameContext frame)
+    private void ExecuteChunked(in RenderView frame)
     {
         uint fr = frame.FrameIndex;
         var vk = gfx.Vk;

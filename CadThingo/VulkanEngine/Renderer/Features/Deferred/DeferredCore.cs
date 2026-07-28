@@ -92,22 +92,20 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
 
     public void Render(in RenderFrame frame)
     {
-        var cmd   = frame.Cmd;
-        var ctx   = frame.Frame;
-        var camera = _host.Camera;
-        var scene  = _host.Scene;
-        uint currentFrame = ctx.FrameIndex;
+        var cmd    = frame.Cmd;
+        var view   = frame.View;
+        var camera = view.Camera;
+        var scene  = view.Scene;
+        uint currentFrame = view.FrameIndex;
+        uint lightCount   = view.LightCount;   // packed by the draw loop's extraction
 
         // Reflection-probe scheduler bookkeeping.
         _host.reflectionProbeSystem.Tick(_host.frameCounter, scene);
 
-        // Per-frame material SSBO snapshot
-        _host.UpdateMaterials(currentFrame, scene);
-
         // Geometry's view+proj now rides the scene set's (0,0) arena slot, pushed inside
         // its Record call - no per-frame UBO update needed here anymore.
-        var (lightCount, tileCountX, tileCountY) =
-            _host.PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, scene);
+        var (tileCountX, tileCountY) =
+            _host.PbrDeferredPipeline.UpdatePerFrame(currentFrame, camera, lightCount);
         _host.transparentPipeline.UpdatePerFrame(currentFrame, camera, lightCount, tileCountX, tileCountY);
         // Stash for the module's LightCullPass body (it runs inside the graph, below).
         _frameLightCount = lightCount; _frameTileCountX = tileCountX; _frameTileCountY = tileCountY;
@@ -115,7 +113,7 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
         _host.skyboxPipeline.UpdatePerFrame(currentFrame, camera, ImGui.EditorState.SkyboxIntensity);
 
         // Reflection-probe cluster cull. Tile-only today (zSlices=1). Cheap CPU work.
-        float aspect = (float)ctx.RenderExtent.Width / ctx.RenderExtent.Height;
+        float aspect = (float)view.RenderExtent.Width / view.RenderExtent.Height;
         _host.reflectionProbeSystem.BuildClusters(currentFrame, camera, aspect, 0.1f, 100f,
             tileCountX, tileCountY);
         // Refresh the per-probe SSBO read by the PBR lighting shader.
@@ -124,13 +122,11 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
         // Reflection-probe capture for the next dirty probe (if any), bounded to one probe/frame.
         _host.reflectionProbeSystem.RecordCapture(cmd, currentFrame, _host.frameCounter, scene);
 
-        // Scene extraction
-        _host.gpuScene.ExtractRenderables(currentFrame, scene);
-
         // Record the deferred chain via the graph: cull -> light-cull -> geometry -> lighting ->
         // skybox -> transparent -> tonemap. Cull/light-cull run as compute passes and every barrier
-        // is derived from the usage table.
-        _graph!.Execute(cmd, ctx);
+        // is derived from the usage table. The cull pass reads the renderables the draw loop
+        // already extracted into the view.
+        _graph!.Execute(cmd, view);
     }
 
     // ---- IGraphCore surface (Stats panel + gfx-chunk submission) ---------------

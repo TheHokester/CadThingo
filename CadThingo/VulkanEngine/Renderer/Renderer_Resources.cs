@@ -129,30 +129,11 @@ public unsafe partial class Renderer
         BufferUsageFlags extraUsage = 0, bool preferDeviceLocal = false)
         => gfx.CreateMappedStorageBuffer(sizeBytes, ref ubo, extraUsage, preferDeviceLocal);
 
-    // Lights SSBO — owned by GpuScene (L2). These forwarders keep the former
-    // Renderer.GetLightStorageBuffer / Renderer.LightCount call sites (LightCull,
-    // PBR-deferred, Transparent, PT, RT pipelines) compiling unchanged.
+    // Scene -> GPU packing lives on GpuScene and is driven once per frame by DrawFrame's
+    // extraction phase; the results reach consumers through the frame's RenderView. There is
+    // deliberately no Renderer.UpdateLights/UpdateMaterials forwarder any more - a core or
+    // pipeline that re-triggered a pack mid-frame is exactly what that phase exists to prevent.
 
-    /// <summary>Buffer holding packed PbrLightGpu records for the given frame
-    /// slot. Bound by every pipeline that needs scene lighting. Stable for the
-    /// renderer's lifetime.</summary>
-    public Buffer GetLightStorageBuffer(uint frame) => gpuScene.GetLightStorageBuffer(frame);
-
-    /// <summary>Number of valid lights packed by the most recent UpdateLights.</summary>
-    public uint LightCount => gpuScene.LightCount;
-
-    // Scene -> GPU packing moved to GpuScene.Extract. These forwarders keep the
-    // per-frame DrawX call sites + PbrDeferredPipeline.Record compiling unchanged.
-
-    /// <summary>Forwards to <see cref="GpuScene.UpdateMaterials"/>. See there.</summary>
-    public uint UpdateMaterials(uint frameIndex, Scene scene) => gpuScene.UpdateMaterials(frameIndex, scene);
-
-    /// <summary>Forwards to <see cref="GpuScene.UpdateLights"/>. See there.</summary>
-    public uint  UpdateLights(uint frameIndex, Scene scene) => gpuScene.UpdateLights(frameIndex, scene);
-
-   
-
-    
 
     /// <summary>
     /// Writes a bindless texture to the given descriptor set at the given binding.

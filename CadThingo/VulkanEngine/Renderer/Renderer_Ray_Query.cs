@@ -746,10 +746,12 @@ public unsafe partial class Renderer
         // below and resolved back by pick / selection (L2 step 6).
         gpuScene.SyncRenderables(scene);
 
-        // Open a fresh world-transform cache window for this rebuild (L2 step 5).
-        // RebuildTlas runs out-of-band (edit-driven, before the per-frame reset), so
-        // it owns its own BeginTransforms — otherwise the gather below would read the
-        // previous cycle's stale matrices.
+        // Open a fresh world-transform cache window for this rebuild. Unlike the per-frame
+        // extraction, RebuildTlas is edit-driven and reachable from outside DrawFrame (the
+        // asset/visibility paths call OnSceneEntitiesChanged directly), so it cannot assume the
+        // draw loop opened a window for it - without this the gather below would read whatever
+        // cycle ran last. Folds into the draw loop's single window once the AS becomes a
+        // request-driven bake at a fixed pump point.
         gpuScene.BeginTransforms();
 
         // World-space cluster BLASes depend on the current transforms, so free

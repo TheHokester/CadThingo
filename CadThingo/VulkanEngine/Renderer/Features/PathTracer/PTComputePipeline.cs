@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
@@ -248,7 +248,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     ///   - Transitioning the accumulator and outColor images to GENERAL
     ///     before this call (and to ShaderReadOnly afterwards if Tonemap
     ///     samples outColor as a CombinedImageSampler).</summary>
-    public void Record(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void Record(CommandBuffer cmd, in RenderView ctx)
     {
         // Orthographic falls back to Pinhole until the helper lands in PTUtils.
         int modeIdx = (int)Mode;

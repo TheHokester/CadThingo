@@ -1,4 +1,4 @@
-using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
@@ -27,6 +27,6 @@ internal sealed class PathtraceRTCore : PathTraceCoreBase
     protected override void PipelineMarkAccumulatorDirty() => _pipeline.MarkAccumulatorDirty();
     protected override bool PipelineUpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent) =>
         _pipeline.UpdatePerFrame(frameIndex, camera, lightCount, renderExtent);
-    protected override void PipelineRecord(CommandBuffer cmd, in Renderer.FrameContext ctx) =>
+    protected override void PipelineRecord(CommandBuffer cmd, in RenderView ctx) =>
         _pipeline.Record(cmd, ctx);
 }

@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
@@ -539,7 +539,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
     /// <summary>Dense primary-ray generation (one PSO per camera mode).</summary>
-    public void RecordGenerate(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void RecordGenerate(CommandBuffer cmd, in RenderView ctx)
     {
         int modeIdx = (int)Mode;
         if (modeIdx < 0 || modeIdx >= _generatePsos.Length) modeIdx = 0;
@@ -591,7 +591,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
     /// <summary>Dense finalize: accumulate radiance, normalize into outColor.</summary>
-    public void RecordFinalize(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void RecordFinalize(CommandBuffer cmd, in RenderView ctx)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _finalizePso);
         BindSets(cmd, ctx.FrameIndex);

@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
@@ -74,7 +74,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
     public PbrDeferredPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
 
-    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, ImageView HdrTarget, DescriptorSet gBufferSet)
+    internal void Record(CommandBuffer cmd, in RenderView ctx, ImageView HdrTarget, DescriptorSet gBufferSet)
     {
         //configure single color output for final lighting result
 
@@ -158,17 +158,13 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     }
 
     // Per-frame upload
-    // Walks scene lights into the per-frame Light SSBO and stages the frame
-    // constants for Record's arena push. Returns (lightCount, tileX, tileY) so
-    // the renderer can drive the light-cull dispatch without recomputing.
+    // Stages the frame constants for Record's arena push. Takes the light count the draw loop's
+    // extraction already produced - packing the light SSBO is not this pipeline's job. Returns
+    // (tileX, tileY) so the caller can drive the light-cull dispatch without recomputing.
 
-    public (uint lightCount, uint tileCountX, uint tileCountY) UpdatePerFrame(
-        uint frameIndex, Camera camera, Scene scene)
+    public (uint tileCountX, uint tileCountY) UpdatePerFrame(
+        uint frameIndex, Camera camera, uint count)
     {
-        // Lights SSBO is renderer-owned; this just refreshes its contents from
-        // the current scene. Other rendering paths call the same method.
-        uint count = Renderer.UpdateLights(frameIndex, scene);
-
         uint tileX = (Renderer.renderExtent.Width  + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
         uint tileY = (Renderer.renderExtent.Height + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
 
@@ -194,6 +190,6 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
         _frameUbo = ubo;
 
-        return (count, tileX, tileY);
+        return (tileX, tileY);
     }
 }

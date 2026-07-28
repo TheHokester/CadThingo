@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Shaders;
@@ -61,7 +61,7 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
         new SpecValues().Set("TONEMAP_OPERATOR", (uint)Operator);
 
     // TonemapModule passes its graph-baked HDR set (see PassSet).
-    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor, DescriptorSet hdrSet)
+    internal void Record(CommandBuffer cmd, RenderView ctx, ImageView finalColor, DescriptorSet hdrSet)
     {
         BeginRendering(cmd,
             ctx.RenderExtent,

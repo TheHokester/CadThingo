@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
@@ -105,7 +105,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         internal readonly ImageView Depth = depth;
     }
 
-    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, IReadOnlyList<TransparentDraw> transparentDraws, Attachments attachments, DescriptorSet tileSet)
+    internal void Record(CommandBuffer cmd, RenderView ctx, IReadOnlyList<TransparentDraw> transparentDraws, Attachments attachments, DescriptorSet tileSet)
     {
         BeginRendering(cmd,
             ctx.RenderExtent,

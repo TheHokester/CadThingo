@@ -1,6 +1,5 @@
-using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
-using FrameContext = CadThingo.VulkanEngine.Renderer.Renderer.FrameContext;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 
@@ -67,7 +66,7 @@ public sealed class TonemapModule : IGraphModule<TonemapModule.Input, TonemapMod
                 b.Read(hdr, ResourceUsage.SampledFragment, "hdrInput");
                 final = b.Write(final, ResourceUsage.ColorAttachment);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+            (CommandBuffer cmd, PassResources res, in RenderView f) =>
                 _tonemap.Record(cmd, f, res.View(final), res.PassSet));
 
         outputs = new Output(final);

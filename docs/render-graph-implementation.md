@@ -25,8 +25,8 @@ sync, queue classes, modules). Everything here assumes that vocabulary.
 | Allocator | `Renderer/GpuMemoryAllocator.cs` | `AllocateForBuffer/Image`, `Free`, `GetMapped`, dedicated + suballoc blocks |
 | Device surface | `Renderer/GraphicsDevice.cs` | `Vk/Device/PhysicalDevice/Allocator`, 4 queues, `QueueFamilyIndices`, caps. **Sync2 + timeline semaphores already enabled** (`vulkan13Features.Synchronization2`, `vulkan12Features.TimelineSemaphore`). |
 | Queue discovery | `GraphicsDevice.FindQueueFamilies` | has the exact "compute family == graphics family @ index 0" trap §3 of the design warns about |
-| Scene mirror (L2) | `Renderer/GpuScene.cs` | owns light + renderable SSBOs, `RenderableHandle` allocator, `RenderView` (stub), `Extract*` |
-| Frame ctx | `Renderer_Rendering.cs` → `FrameContext` | `FrameIndex/Camera/Scene/RenderExtent` |
+| Scene mirror (L2) | `Renderer/GpuScene.cs` | owns light + renderable SSBOs, `RenderableHandle` allocator, `Extract*` |
+| Frame ctx | `Renderer/RenderView.cs` → `RenderView` | `FrameIndex/Camera/Scene/RenderExtent` + extraction counts |
 | Graph wiring | `Renderer_Rendering.cs` → `SetupDeferredRenderer` | declares g-buffers/HDR/Final, 5 passes (Geometry→Lighting→Skybox→Transparent→Tonemap) |
 | Hand-recorded (NOT in graph) | `Renderer_Rendering.cs` → `DrawPathtraced`, `DrawRayTraced`, `ProcessPickRequest`, `RecordSelectionOutline`; `DrawDeferred` for cull/light-cull | manual `CmdPipelineBarrier` everywhere |
 | New scaffold (started) | `Renderer/FrameGraph/QueuePlan.cs`, `IGraphBuilder.cs`, `IGraphModule.cs` | **stubs** — `QueuePlan` fields are private and unpopulated, `IGraphBuilder` is empty, `IGraphModule.Build` has `in TOutputs` (should be `out`) |
@@ -224,9 +224,7 @@ Notes specific to this codebase:
 public enum PassType { Graphics, Compute, RayTrace, Transfer }
 
 public delegate void PassSetup(IGraphBuilder b);
-public delegate void PassExecute(CommandBuffer cmd, PassResources res, in FrameContext frame);
-// NOTE: keep FrameContext for Phase 1 (camera/frame/scene). Swap to RenderView when
-// GpuScene's RenderView lands (L2 step done) — same shape, narrower surface.
+public delegate void PassExecute(CommandBuffer cmd, PassResources res, in RenderView frame);
 
 internal struct ResourceAccess
 {

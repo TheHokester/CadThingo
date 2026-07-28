@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.RenderCores;
 using Silk.NET.Vulkan;
@@ -44,7 +44,7 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
     protected abstract PassType TracePassType { get; }
     protected abstract void PipelineMarkAccumulatorDirty();
     protected abstract bool PipelineUpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent);
-    protected abstract void PipelineRecord(CommandBuffer cmd, in Renderer.FrameContext ctx);
+    protected abstract void PipelineRecord(CommandBuffer cmd, in RenderView ctx);
 
     /// <summary>(Re)build the Trace -> Tonemap graph. Imports the host accumulator / out-color /
     /// FinalColor (re-read here so a resize picks up the fresh handles), then rebinds the
@@ -56,7 +56,7 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
         var fg = new PTGraph(_host.gfx);
 
         var module = new PathTraceModule(_host.tonemapPipeline, TracePassType,
-            (CommandBuffer cmd, PassResources res, in Renderer.FrameContext f) => PipelineRecord(cmd, f));
+            (CommandBuffer cmd, PassResources res, in RenderView f) => PipelineRecord(cmd, f));
         module.Build(fg.RootScope().Child("PathTrace"),
             new PathTraceModule.Inputs(
                 _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
@@ -88,28 +88,27 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
     public void Render(in RenderFrame frame)
     {
         var cmd    = frame.Cmd;
-        var ctx    = frame.Frame;
-        var camera = _host.Camera;
-        var scene  = _host.Scene;
-        uint currentFrame = ctx.FrameIndex;
+        var view   = frame.View;
+        var camera = view.Camera;
+        uint currentFrame = view.FrameIndex;
 
         // Camera motion -> restart accumulation. Cheap structural-equality check against last
         // frame's snapshot. If Camera ever grows a built-in dirty flag, swap this out for that.
         if (camera != null)
         {
-            var view = camera.GetViewMatrix();
+            var camView = camera.GetViewMatrix();
             var pos  = camera.GetPosition();
             var fov  = camera.Fov;
-            if (view != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
+            if (camView != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
             {
                 _host.MarkAccumulatorDirty();
-                _lastCamView = view; _lastCamPos = pos; _lastCamFov = fov;
+                _lastCamView = camView; _lastCamPos = pos; _lastCamFov = fov;
             }
         }
 
-        // Refresh per-frame SSBOs -- lights AND materials (so inspector edits land in PT mode).
-        uint lightCount = _host.UpdateLights(currentFrame, scene);
-        _host.UpdateMaterials(currentFrame, scene);
+        // Lights + materials were packed by the draw loop's extraction (which is what makes
+        // inspector edits land in PT mode); the count only feeds the pipeline's frame UBO.
+        uint lightCount = view.LightCount;
 
         // Bridge the host's dirty signal into the pipeline's accumulator reset.
         if (_host.AccumulatorDirty)
@@ -118,10 +117,10 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
             _host.ClearAccumulatorDirty();
         }
 
-        PipelineUpdatePerFrame(currentFrame, camera!, lightCount, ctx.RenderExtent);
+        PipelineUpdatePerFrame(currentFrame, camera!, lightCount, view.RenderExtent);
 
         // Record Trace -> Tonemap; every barrier derived from the usage table.
-        _graph!.Execute(cmd, ctx);
+        _graph!.Execute(cmd, view);
     }
 
     // ---- IGraphCore surface (Stats panel + gfx-chunk submission) ------------

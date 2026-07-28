@@ -53,6 +53,10 @@ many distinct = god-object use.
 | `DeferredCore`          | 31 / 21            | Orchestrator fishing sibling pipelines from host   |
 | `GpuScene`              | 13 / 5             | Constants + one behavior reach                     |
 
+Counts are from the original audit and are not re-measured each step; `PbrDeferredPipeline`,
+`DeferredCore` and `DrawCullPipeline` are all lighter than shown since step 5 (extraction and the
+light/material packs no longer route through `Renderer`).
+
 Renderer-coupling anti-patterns:
 
 - **A1. UI mutating renderer internals** (`RendererSettingsPanel`). Flips raw fields
@@ -70,7 +74,10 @@ Renderer-coupling anti-patterns:
   etc., yet its own `DeferredModule` already takes those by explicit injection. Fix: the core
   owns/constructs its pipelines and hands them to the module; never re-reads them from `host`.
 - **A5. Behavior reach-through** (`UpdateLights`, `UpdateMaterials`). A subsystem's behavior parked
-  on Renderer. Fix: a feature with a contract interface, resolved like IBL.
+  on Renderer. Fix: a feature with a contract interface, resolved like IBL. *(Done for the two
+  named: both forwarders are deleted, the bodies are GpuScene's, and the draw loop is the only
+  caller. What remains under this heading is the AS path -- `SyncRenderables` and `RebuildTlas`
+  hanging off `Renderer` -- which step 8 resolves as `SceneAS`.)*
 
 Non-Renderer anti-patterns (broader coherence):
 
@@ -232,14 +239,38 @@ generation-checked `RenderableHandle` registry, world-transform cache). It is al
 best-factored subsystem; keep it a data owner and do not put Vulkan AS API in it. Its only cleanup
 is A3 (constants -> `RenderConfig`) and A5 (`UpdateLights` -> a lights feature).
 
-**Extraction is owned by the draw loop, runs once, and is consumed downstream.** Today it is smeared:
-`DeferredCore.cs:128` drives `ExtractRenderables`, `Renderer_Rendering.cs:245` drives
-`BeginTransforms`, and `Renderer_Ray_Query.cs:747-753` re-drives `SyncRenderables` + its own
-`BeginTransforms` out of band. Target: the skeleton runs `BeginTransforms -> ExtractRenderables`
-once and produces a `RenderView { RenderablesBuffer, Count, TransparentCandidates, ... }` handed
-into `core.Render`. Cores and `DrawCullPipeline` read extraction *outputs* from the `RenderView`
-(`DrawCullPipeline.cs:39,129,139`), never call `ExtractRenderables`. Stable *queries*
-(`ResolveSlot`, `TryGetHandle`) remain open to anyone.
+**Extraction is owned by the draw loop, runs once, and is consumed downstream.** *(Done.)* It used
+to be smeared: `DeferredCore` drove `ExtractRenderables`, each of the four PT/RT cores drove its own
+`UpdateLights` + `UpdateMaterials`, `PbrDeferredPipeline.UpdatePerFrame` drove a *third*
+`UpdateLights`, and the draw loop drove `BeginTransforms` for all of them. Now `DrawFrame` has one
+extraction phase --
+`BeginTransforms -> UpdateMaterials -> UpdateLights -> ExtractRenderables` -- and builds the frame's
+`RenderView` from its results. Cores read counts off the view; `DrawCullPipeline.Record` takes the
+view and reads `RenderableCount` + `TransparentCandidates` from it instead of reaching into
+`Renderer.gpuScene`. `Renderer.UpdateLights` / `UpdateMaterials` / `LightCount` /
+`GetLightStorageBuffer` are deleted, so there is no longer a way to re-trigger a pack off the host
+(which mattered: extraction is dirty-driven per frame slot, so a second call in the same frame
+returns a *stale cached count*, not a fresh pack). Stable *queries* (`ResolveSlot`, `TryGetHandle`)
+remain open to anyone.
+
+Two consequences worth knowing. Extraction now runs in every render mode, not just deferred -- the
+PT/RT modes pack a cull buffer they do not read. It is dirty-gated, so on a static scene that costs
+nothing after the first `MAX_CONCURRENT_FRAMES` frames, and it is the price of the phase being
+technique-independent. And `RebuildTlas` still opens its own `BeginTransforms` window, because the
+asset / visibility paths call `OnSceneEntitiesChanged` directly from UI callbacks, outside
+`DrawFrame`. That folds into the single window when `SceneAS` turns the rebuild into a
+request-driven bake at a fixed pump point.
+
+**`RenderView` is the per-frame snapshot, and it is the old `FrameContext`.** Rather than have both,
+`Renderer.FrameContext` was renamed into the `RenderView` stub that had been sitting dead in
+`GpuScene.cs` and given the extraction outputs (`RenderableCount`, `LightCount`, `MaterialCount`,
+`TransparentCandidates`) alongside the frame index / camera / scene / extent it already carried. It
+now flows unchanged through `RenderFrame` -> `core.Render` -> `FrameGraph.Execute` -> every
+`PassExecute` body, so a pass that needs frame state has it in hand rather than reaching for a host.
+Deliberately *not* in it: stable buffers, descriptor sets, pipelines -- those are not frame state.
+Also deferred: precomputing `View`/`Proj`/`ViewProj` on the view. The call sites disagree today on
+aspect, near/far and Y-flip convention, so unifying them changes pixels and wants to be its own
+verified change, not a rider on a plumbing step.
 
 ## Acceleration structure: verb / policy split
 
@@ -441,9 +472,15 @@ Ordered so early steps shrink later ones. Each step ships green.
    flag) and selection flows as an event with a single writer. Still open: render code reading the
    remaining `EditorState` globals (skybox / IBL intensities via `RenderConfig` or frame settings),
    and `Camera` gating on `ViewportFocused` / `ViewportHovered` instead of ImGui setting `Handled`.
-5. **GpuScene single source + `RenderView` extraction.** Move `BeginTransforms`/`ExtractRenderables`
-   into the draw loop, produce `RenderView`, cores consume it; move `ShadowEntityInfo` authorship to
-   GpuScene. Collapses step 7's SceneAS work (it will read the world cache instead of re-deriving).
+5. **GpuScene single source + `RenderView` extraction.** *(Done, except `ShadowEntityInfo`.)* One
+   extraction phase in `DrawFrame`; `FrameContext` promoted to `RenderView` carrying the extraction
+   outputs; cores + `DrawCullPipeline` consume it; the `UpdateLights`/`UpdateMaterials`/`LightCount`/
+   `GetLightStorageBuffer` forwarders on `Renderer` are gone (A5 is now only `SyncRenderables` and
+   the AS path). **`ShadowEntityInfo` authorship deliberately stayed put:** the packing is
+   cluster-block layout (`baseSlot`, contiguous per-cluster geometry ranges), which is AS *policy*,
+   not scene data, and its buffer + capacity growth live in the AS path. Moving it now would move it
+   twice -- it belongs in step 8 where `SceneAS` is built. What step 5 owed step 8 is delivered
+   anyway: the world cache is populated before the AS gather and `RebuildTlas` already reads it.
 6. **AS verbs -> `GfxDevice`.** Move the thin AS wrappers to a `gfx.As.*` facet. Makes the SceneAS
    feature (next) pure policy.
 7. **Feature lifecycle** (A4-enabling). `IRenderFeature` + phase interfaces + `INeedsGpu` /

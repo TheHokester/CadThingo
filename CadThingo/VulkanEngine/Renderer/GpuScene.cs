@@ -101,33 +101,21 @@ public readonly struct RenderableHandle
     }
 }
 
-readonly ref struct RenderView
-{
-    private readonly uint FrameIndex;
-    private readonly Extent2D RenderExtent;
-
-    private readonly Matrix4x4 View, Proj, ViewProj, InvView, InvProj, InvViewProj;
-    private readonly Vector3 CamPos;
-
-    private readonly uint RenderableCount, LightCount, MaterialCount;
-    private readonly DescriptorSet SceneSet;
-}
-
 /// <summary>
 /// the canonical GPU-resident mirror of the scene's render-relevant data and
 /// (as the refactor progresses) the single place that reads the ECS for rendering.
 ///
-/// Migration is incremental (renderer-refactor.md, L2 steps 1–8). This first slice
-/// owns the per-frame light SSBO and hosts the light + material *extractors* (the
-/// former <c>Renderer.UpdateLights</c> / <c>UpdateMaterials</c> bodies, moved here
-/// verbatim). <see cref="Renderer"/> keeps same-named forwarders so existing call
-/// sites — the consuming pipelines and the DrawX paths — compile unchanged.
+/// It owns the per-frame light + cull-input SSBOs, the light / material / renderable
+/// extractors, the stable <see cref="RenderableHandle"/> registry, and the per-cycle
+/// world-transform cache. The three extractors are driven ONCE per frame by the draw
+/// loop's extraction phase, in the order they depend on each other; their results reach
+/// consumers through that frame's <see cref="RenderView"/>. Nothing downstream calls an
+/// extractor - a second call per frame would either re-walk the scene or (because
+/// extraction is dirty-driven per frame slot) silently return a stale count.
 ///
-/// Still to fold in over the later steps: renderable packing (out of
-/// <c>DrawCullPipeline.Record</c>), the acceleration-structure buffers, stable
-/// <see cref="RenderableHandle"/> identity, the cached transform pass, and the
-/// single bindless scene descriptor set. Those buffer fields are intentionally
-/// NOT declared yet — they arrive with the step that populates them.
+/// Still to fold in: the acceleration-structure buffers and the single bindless scene
+/// descriptor set. Those buffer fields are intentionally NOT declared yet — they arrive
+/// with the step that populates them.
 ///
 /// Depends only on <see cref="GraphicsDevice"/>; the <see cref="Scene"/> is passed
 /// per-extract, never retained.

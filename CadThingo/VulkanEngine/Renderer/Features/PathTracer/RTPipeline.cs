@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
@@ -326,7 +326,7 @@ public unsafe class RTPipeline : RtPipeline
     // CreateDescriptorSetLayouts (PushConstantRanges) so the pipeline layout includes it.
     protected virtual void RecordPushConstants(CommandBuffer cmd) { }
 
-    public void Record(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void Record(CommandBuffer cmd, in RenderView ctx)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.RayTracingKhr, PipelineHandle);
 

@@ -90,27 +90,26 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore
     public void Render(in RenderFrame frame)
     {
         var cmd    = frame.Cmd;
-        var ctx    = frame.Frame;
-        var camera = _host.Camera;
-        var scene  = _host.Scene;
-        uint currentFrame = ctx.FrameIndex;
+        var view   = frame.View;
+        var camera = view.Camera;
+        uint currentFrame = view.FrameIndex;
 
         // Camera motion -> restart accumulation (structural compare against last frame's snapshot).
         if (camera != null)
         {
-            var view = camera.GetViewMatrix();
-            var pos  = camera.GetPosition();
-            var fov  = camera.Fov;
-            if (view != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
+            var camView = camera.GetViewMatrix();
+            var pos     = camera.GetPosition();
+            var fov     = camera.Fov;
+            if (camView != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
             {
                 _host.MarkAccumulatorDirty();
-                _lastCamView = view; _lastCamPos = pos; _lastCamFov = fov;
+                _lastCamView = camView; _lastCamPos = pos; _lastCamFov = fov;
             }
         }
 
-        // Per-frame SSBO refresh -- lights (UBO count + NEE) AND materials (so inspector edits land).
-        uint lightCount = _host.UpdateLights(currentFrame, scene);
-        _host.UpdateMaterials(currentFrame, scene);
+        // Lights + materials were packed by the draw loop's extraction (which is what makes
+        // inspector edits land); the count feeds the pipeline's frame UBO and NEE.
+        uint lightCount = view.LightCount;
 
         // Bridge the host's dirty signal into the pipeline's accumulator reset.
         if (_host.AccumulatorDirty)
@@ -119,10 +118,10 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore
             _host.ClearAccumulatorDirty();
         }
 
-        _pipe.UpdatePerFrame(currentFrame, camera!, lightCount, ctx.RenderExtent);
+        _pipe.UpdatePerFrame(currentFrame, camera!, lightCount, view.RenderExtent);
 
         // Record Trace (CmdTraceRays) -> Tonemap; every barrier derived from the usage table.
-        _graph!.Execute(cmd, ctx);
+        _graph!.Execute(cmd, view);
     }
 
     // ---- IGraphCore surface (Stats panel + gfx-chunk submission) ------------
