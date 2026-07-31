@@ -1,5 +1,6 @@
 ﻿using System.Numerics;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
 
@@ -17,9 +18,19 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 /// Subclasses bind the concrete pipeline via the protected hooks; the base resolves that pipeline
 /// and builds the graph in <see cref="Initialize"/>, once the host is wired.
 /// </summary>
-internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore, INeedsHost
+internal abstract class PathTraceCoreBase
+    : IRenderCore, IGraphCore, INeedsGpu, INeedsHost, INeedsFeature<ISharedPipelines>
 {
-    // Transitional: the PT cores compose against renderer-owned pipelines + render targets.
+    // Each PT core builds and owns its own tracer pipeline through this.
+    protected GpuContext _gpu;
+    GpuContext INeedsGpu.Gpu { set => _gpu = value; }
+
+    // The tonemap this core's graph ends with. One instance, shared with every other core - which
+    // is exactly why it arrives as a collaborator rather than being constructed here.
+    protected ISharedPipelines _shared = null!;
+    ISharedPipelines INeedsFeature<ISharedPipelines>.Dependency { set => _shared = value; }
+
+    // Transitional: the PT cores still compose against renderer-owned render targets.
     protected Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
 
@@ -35,18 +46,23 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore, INeedsHost
     public abstract string Name { get; }
     public abstract Renderer.RenderMode Mode { get; }
 
-    /// <summary>Resolves the subclass's pipeline off the (now-wired) host, then builds the graph.
-    /// Split this way so the ctor stays empty and the pipeline field is assigned exactly once,
-    /// before the graph that closes over it is compiled.</summary>
+    /// <summary>Builds the subclass's tracer pipeline, then the graph that closes over it. Split
+    /// this way so the ctor stays empty and the pipeline field is assigned exactly once, before the
+    /// graph is compiled.</summary>
     public void Initialize()
     {
-        BindPipeline();
+        CreatePipeline();
         BuildGraph();
     }
 
     // ---- Pipeline-specific hooks (forwarded to PTComputePipeline / RTPipeline) ------------------
-    /// <summary>Assigns the concrete pipeline from the host. Runs first in Initialize.</summary>
-    protected abstract void BindPipeline();
+    /// <summary>Constructs and initializes this core's tracer pipeline. It is technique-private -
+    /// nothing outside this core records with it - so the core owns it outright rather than the
+    /// host building it and handing it over.</summary>
+    protected abstract void CreatePipeline();
+    /// <summary>Frees whatever <see cref="CreatePipeline"/> built. Called from the base Dispose so
+    /// every subclass tears down in the same order relative to its graph.</summary>
+    protected abstract void DestroyPipeline();
     /// <summary>Compute (ray query) vs RayTrace (CmdTraceRays) -- selects the Trace pass type and
     /// the stage the module's derived barriers target.</summary>
     protected abstract PassType TracePassType { get; }
@@ -63,7 +79,7 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore, INeedsHost
         _graph?.Dispose();
         var fg = new PTGraph(_host.gfx);
 
-        var module = new PathTraceModule(_host.tonemapPipeline, TracePassType,
+        var module = new PathTraceModule(_shared.Tonemap, TracePassType,
             (CommandBuffer cmd, PassResources res, in RenderView f) => PipelineRecord(cmd, f));
         module.Build(fg.RootScope().Child("PathTrace"),
             new PathTraceModule.Inputs(
@@ -146,7 +162,9 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore, INeedsHost
 
     public void Dispose()
     {
+        // Graph first: its passes hold references to the pipeline they record with.
         _graph?.Dispose();
         _graph = null;
+        DestroyPipeline();
     }
 }

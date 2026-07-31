@@ -33,7 +33,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         public uint    _pad0;
         public Vector2 screenSize;
         // Repurposed from former trailing 8B pad — matches LightingFrameUBO IBL
-        // params byte-for-byte so the same Renderer.Ibl.prefilteredCubeMipLevels +
+        // params byte-for-byte so the same Renderer.PrefilteredCubeMipLevels +
         // scaleIBLAmbient story applies on the transparent pass.
         public float   prefilteredCubeMipLevels;
         public float   scaleIBLAmbient;
@@ -253,7 +253,7 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         ubo.tileCountX = tileCountX;
         ubo.tileCountY = tileCountY;
         ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
-        ubo.prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels;
+        ubo.prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels;
         ubo.scaleIBLAmbient          = EditorState.IblIntensity;
 
         // Probe cluster dims — built once per frame by ReflectionProbeSystem.

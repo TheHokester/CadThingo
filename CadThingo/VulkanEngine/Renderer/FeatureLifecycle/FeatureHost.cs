@@ -35,6 +35,11 @@ internal sealed class FeatureHost : IDisposable
     /// <summary>The render cores, in descriptor Order. Index into this is the mode-combo index.</summary>
     public IReadOnlyList<IRenderCore> Cores => _cores;
 
+    /// <summary>Every built feature, in Order. For whole-set inspection only - the boot-time
+    /// registry cross-check walks it to find the pipelines features own. Resolve a specific
+    /// feature with <see cref="Get{T}"/>, not by scanning this.</summary>
+    public IReadOnlyList<IRenderFeature> All => _all;
+
     public FeatureHost(GpuContext gpu, Renderer host)
     {
         _gpu  = gpu;
@@ -124,7 +129,7 @@ internal sealed class FeatureHost : IDisposable
             if (f is IPostDrawFeature)   roles.Add("postDraw");
             if (f is IResizeFeature and not IRenderCore) roles.Add("resize");
             if (f is INeedsHost)         roles.Add("NEEDS-HOST");
-            sb.AppendLine($"  {f.Name,-28} {string.Join(' ', roles)}");
+            sb.AppendLine($"  {f.Name,-36} {string.Join(' ', roles)}");
         }
         return sb.ToString().TrimEnd();
     }

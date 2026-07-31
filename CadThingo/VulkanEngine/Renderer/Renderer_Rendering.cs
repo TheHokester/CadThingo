@@ -124,10 +124,6 @@ public unsafe partial class Renderer
         // FinalColor ImageView is fresh - re-bind it for the ImGui viewport panel.
         imGuiUtils?.WriteViewportDescriptor(renderTargets.FinalColor.ImageView);
 
-        // Selection mask view is fresh - re-bind it on both the compute (storage
-        // image) and outline (sampled image) sides.
-        selection?.RebindMask();
-
         // Diagnostic: sample allocator occupancy now that old targets are freed and
         // new ones allocated - the steady post-resize state for the history plot.
         RecordMemorySample();
@@ -164,38 +160,13 @@ public unsafe partial class Renderer
             ImGui.EditorState.RequestedRenderExtent = null;
         }
 
-        // 0b. Apply any pending pipeline rebuilds posted by the Renderer Settings
-        //     panel. Has to happen here (before command-buffer recording) because
-        //     mid-frame disposal of a bound pipeline would corrupt the in-flight
-        //     command buffer's references.
-        if (pendingPbrRebuild)     { RebuildPbrPipelines();     pendingPbrRebuild     = false; }
-        if (pendingTonemapRebuild) { RebuildTonemapPipeline();  pendingTonemapRebuild = false; }
-
-        // 0c. Stale TLAS flush. tlasDirty is flipped by editor mutations
-        //     (transform sliders, visibility toggles) and consumed here so we
-        //     do at most one RebuildTlas per frame regardless of how many
-        //     slider ticks landed last frame. OnSceneEntitiesChanged also
-        //     re-runs the BLAS build pass for any new meshes and re-binds the
-        //     TLAS / shadow-info descriptors.
-        if (tlasDirty)
-        {
-            OnSceneEntitiesChanged();
-            // RebuildTlas already clears tlasDirty on success; for hardware
-            // paths where ray shadows aren't supported (RebuildTlas never runs)
-            // we still need to clear it so the next frame doesn't re-enter.
-            tlasDirty = false;
-        }
-
-        // 0c-bis. Object pick. Consumes a click posted by ViewportPanel and runs
-        //     a one-ray compute dispatch against the (now up-to-date) TLAS,
-        //     setting EditorState.SelectedEntity. Out-of-band single-time submit,
-        //     so it sits here before the per-frame command buffer is recorded.
-        selection.ProcessPickRequest();
-
-        // 0c-ter. Service any feature whose baked content went stale (IBL, probes, the scene AS).
-        //     Request-driven and ordered, the same shape as the two rebuild flags above - a
-        //     feature with nothing pending costs one bool test. No implementers until those
-        //     subsystems become features; the pump exists so that migration needs no edit here.
+        // 0b. Service any feature whose baked content went stale: the scene acceleration structure
+        //     after an editor mutation, the shared tonemap after a curve change, the deferred PBR
+        //     pipelines after a soft-shadow toggle. This is the only place a pipeline is torn down
+        //     and rebuilt, and it is before any recording starts - mid-frame disposal of a bound
+        //     pipeline would corrupt the in-flight command buffer's references. Request-driven and
+        //     ordered: a feature with nothing pending costs one bool test, and however many edits
+        //     landed last frame collapse into a single rebuild here.
         _features.ServiceBakes();
 
         // 0d. Render-mode change: swap the active core. Tonemap's HDR input is graph-baked per
@@ -269,10 +240,6 @@ public unsafe partial class Renderer
         _activeCore.Render(new RenderFrame { Cmd = cmd, View = view });
 
         _features.PostDraw(cmd, view);
-
-        // 6b. Selection outline. Becomes a PostDraw feature in the next step; until then it is
-        //     recorded here, in the same place in the sequence the pump occupies.
-        selection.RecordOutline(cmd);
 
         // 7. Blit FinalColor -> swapchain image
         var swapImage = swapChainImages[imageIndex];

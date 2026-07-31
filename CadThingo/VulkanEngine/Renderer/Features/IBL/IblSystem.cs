@@ -1,5 +1,8 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -11,13 +14,31 @@ namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 //   prefilteredCube 128² × 6, 5 mips        GGX importance-sampled specular (per-roughness mip)
 //   brdfLut         512² × 1                split-sum 2D LUT (NdotV × roughness)
 //
-// Owned by the host Renderer (constructed once at init). The images are
-// allocated + cleared to black up front; the compute bake passes fill their
-// content when an HDR is loaded via LoadEnvironmentHdr. The PBR pipeline binds
-// the cube views unconditionally — black content yields zero IBL contribution
-// until an HDR is loaded.
-public unsafe sealed class IblSystem : IDisposable
+// A feature (Order 1 - the lowest thing built), because the reflection probes reuse its prefilter
+// kernel and its sampler, and Order is what guarantees those exist by the time the probes
+// initialize. The images are allocated + cleared to black up front; the compute bake passes fill
+// their content when an HDR is loaded via LoadEnvironmentHdr. The PBR pipeline binds the cube views
+// unconditionally - black content yields zero IBL contribution until an HDR is loaded.
+//
+// It publishes its four images into the registry itself rather than having the host do it: the
+// handles are stable for the renderer's lifetime (a rebake overwrites content, not handles), so one
+// registration in Initialize is the whole story, and no other file has to know these bindings exist.
+public unsafe sealed class IblSystem
+    : IIblProvider, ISelfRegisteringFeature<IblSystem>, INeedsGpu, INeedsHost
 {
+    public static FeatureDesc Desc =>
+        new(Order: 1, Gate: _ => true, Make: () => new IblSystem());
+
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<IblSystem>();
+
+    public string Name => "IBL (split-sum)";
+
+    // ---- IIblProvider ------------------------------------------------------
+    uint    IIblProvider.PrefilteredCubeMipLevels => prefilteredCubeMipLevels;
+    Sampler IIblProvider.CubeSampler              => iblCubeSampler;
+    IblBakePipeline IIblProvider.PrefilterPipeline => prefilterEnvPipeline;
+
     // Face sizes. envCube needs to be large enough that prefilter taps don't
     // alias; 512 is the standard sweet spot. brdfLut at 512 gives plenty of
     // resolution along both axes without measurable cost.
@@ -26,11 +47,16 @@ public unsafe sealed class IblSystem : IDisposable
     internal const uint PrefilteredCubeFaceSize = 128;
     internal const uint BrdfLutSize            = 512;
 
-    private readonly Renderer _renderer;
-    private readonly GpuContext _gpu;
-    private readonly GraphicsDevice _gfx;
-    private readonly Vk       _vk;
-    private readonly Device   _device;
+    private Renderer   _renderer = null!;
+    private GpuContext _gpu;
+    GpuContext INeedsGpu.Gpu   { set => _gpu      = value; }
+    Renderer   INeedsHost.Host { set => _renderer = value; }
+
+    // Shorthands over the injected context. Properties rather than fields copied in Initialize so
+    // there is no window where a partially-wired instance holds a default Vk/Device.
+    private GraphicsDevice _gfx    => _gpu.Gfx;
+    private Vk             _vk     => _gpu.Gfx.Vk!;
+    private Device         _device => _gpu.Gfx.Device;
 
     // Image handles. Held as raw Vulkan handles (rather than ImageResource)
     // because ImageResource hard-codes 2D / single layer / single mip — cubemaps
@@ -59,14 +85,8 @@ public unsafe sealed class IblSystem : IDisposable
     internal Sampler        iblCubeSampler;
     internal Sampler        iblLutSampler;
 
-    public IblSystem(GpuContext gpu, Renderer renderer)
+    public void Initialize()
     {
-        _renderer = renderer;
-        _gpu = gpu;
-        _gfx       = gpu.Gfx;
-        _vk       = _gfx.Vk!;
-        _device   = _gfx.Device;
-
         // IBL images allocated up-front, cleared to black. The PBR lighting set
         // binds them unconditionally; the compute bake passes fill the content
         // when an HDR is loaded via LoadEnvironmentHdr.
@@ -75,6 +95,28 @@ public unsafe sealed class IblSystem : IDisposable
         // BRDF LUT is view-independent - bake once at init and reuse for every
         // environment that gets loaded later.
         BakeBrdfLut();
+
+        RegisterBindings();
+
+        // First-launch convenience: bake from whatever .hdr is already sitting in Assets/Textures.
+        // Owned here rather than by the host's scene setup - which .hdr is loaded is IBL's business,
+        // and the Renderer Settings panel can swap it at any time afterwards.
+        TryAutoLoadEnvironment();
+    }
+
+    /// <summary>
+    /// Publishes the split-sum set (FeatureIBL, set 2) and the raw environment cube (FeatureEnv,
+    /// set 3) by binding name, so the lighting / skybox / path-trace shaders resolve them without
+    /// anything naming this class. Once is enough: a rebake overwrites image content, and the views
+    /// and samplers registered here outlive every rebake.
+    /// </summary>
+    private void RegisterBindings()
+    {
+        var r = _gpu.Registry;
+        r.RegisterImage("irradianceCube",  irradianceCubeView,  ImageLayout.ShaderReadOnlyOptimal, iblCubeSampler);
+        r.RegisterImage("prefilteredCube", prefilteredCubeView, ImageLayout.ShaderReadOnlyOptimal, iblCubeSampler);
+        r.RegisterImage("brdfLut",         brdfLutView,         ImageLayout.ShaderReadOnlyOptimal, iblLutSampler);
+        r.RegisterImage("envCube",         envCubeView,         ImageLayout.ShaderReadOnlyOptimal, iblCubeSampler);
     }
 
     void CreateIblResources()

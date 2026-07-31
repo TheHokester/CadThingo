@@ -292,7 +292,7 @@ public unsafe class RTPipeline : RtPipeline
             screenSize               = new Vector2(renderExtent.Width, renderExtent.Height),
             fov                      = fovRad,
             tanHalfFov               = tanHalfFov,
-            prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels,
+            prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels,
             scaleIBLAmbient          = EditorState.IblIntensity,
             focusDistance            = FocusDistance,
             aperture                 = Aperture,

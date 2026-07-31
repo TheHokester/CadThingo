@@ -187,7 +187,8 @@ value at record time so rebakes never leave a stale copy.
 
 ## Feature lifecycle and the closed base renderer
 
-*(Machinery done; the cores are on it. Non-core subsystems migrate in step 8.)* Cores already proved
+*(Done, and exercised: eleven features, every phase pump with at least one implementer, and
+`INeedsFeature<T>` resolving two contracts.)* Cores already proved
 two thirds of the pattern (self-register via `RegisterCore`, list-disposed). It is now generalized,
 and `DrawFrame`/`Cleanup`/`Initialize` no longer change per feature. Lives in
 `Renderer/FeatureLifecycle/`.
@@ -522,13 +523,76 @@ and splits global operator/exposure settings, while the per-core bit (HDR input)
 module's job. Duplicate instances only when a pipeline is technique-private *and* cheap *and*
 carries no shared settings.
 
+*(Done. Five deferred pipelines belong to `DeferredCore`, one tracer each to the four PT/RT cores.
+The shared pair is a feature -- `SharedPipelines`, Order 5 -- rather than raw fields on the host,
+because "the tonemap must exist and be initialized before any core builds the graph that composes
+it" is an ordering guarantee, and `Order` is the machinery that already states ordering guarantees.
+Cores take it as `INeedsFeature<ISharedPipelines>`. Both spec-constant rebuilds became bakes: the
+tone curve on `SharedPipelines`, soft shadows on `DeferredCore`, each subscribing to its own event.
+That deleted `RebuildPbrPipelines` / `RebuildTonemapPipeline` / `pendingPbrRebuild` /
+`pendingTonemapRebuild` / `softShadowsEnabled` / `tonemapOperator` from the host, and left
+`DrawFrame` with one `ServiceBakes()` where three rebuild paths used to be spelled out.)*
+
+## Step 8 as built
+
+**Selection** implements `IPreDrawFeature` + `IPostDrawFeature` + `IResizeFeature`, which is the
+whole of what the host used to call by name (`ProcessPickRequest` / `RecordOutline` / `RebindMask`).
+Order 100 puts it after every core, so "FinalColor exists by now" holds for the outline composite
+without the host sequencing it. Pick moved from before the command buffer opens to the PreDraw pump,
+which is later but strictly safer -- it now runs after the in-flight fence wait rather than before.
+
+**IBL is a provider.** `IIblProvider` is deliberately three members: consumers of *bindable*
+resources go through the registry and never name the producer, so the split-sum images are absent
+from it. What is left is one scalar the shaders need as a uniform (`PrefilteredCubeMipLevels`) and
+the two handles the probes reuse rather than duplicate (the prefilter kernel and the cube sampler).
+Probes take it as `INeedsFeature<IIblProvider>` at Order 2, which is what dissolved the old
+`new ReflectionProbeSystem(gpu, renderer, iblSystem)` argument -- `Order` now carries the "IBL is
+fully built first" guarantee that the constructor parameter was standing in for.
+
+Both features register their own descriptor bindings during `Initialize`, so `RegisterFeatureBindings`
+is deleted outright and `RegisterSceneBindings` keeps only what the ResourceManager and GpuScene own.
+This is why `FeatureHost.BuildAll` had to move *ahead* of the scene setup and the registry
+cross-check in `Initialize`: features are providers now, and the check cannot run before they have
+published. The five pipelines that read `Renderer.Ibl.prefilteredCubeMipLevels` read one narrow
+`Renderer.PrefilteredCubeMipLevels` accessor instead, resolved through the interface at record time
+so a rebake can never leave a stale copy.
+
+**`SceneAS`** is the AS policy half, gated on ray query + acceleration structure, so on a device
+without them it is never constructed and none of its buffers are allocated. It publishes `sceneTlas`
+/ `sceneEntityInfo` / `sceneEmissiveTris` / `sceneEmissiveAlias` itself after every rebuild, which
+is what let the host stop knowing they exist. Rebuilds are an `IBakeFeature`: the `tlasDirty` flag
+and the `if (tlasDirty) OnSceneEntitiesChanged()` block at the top of `DrawFrame` are gone, replaced
+by the bake pump, which gives the same "at most one rebuild per frame however many slider ticks
+landed" guarantee with none of the host-side bookkeeping. `Renderer_Ray_Query.cs` became
+`Renderer_SceneAsBridge.cs`: ~980 lines down to a handful of null-tolerant forwarders for the editor
+panels and the path-trace pipelines that still name the Renderer.
+
+Two things step 8 did *not* do, on purpose:
+
+- **`SceneAS` still walks the scene rather than consuming GpuScene's extracted renderable set.** It
+  already consumes GpuScene for the parts that matter to identity and correctness (`SyncRenderables`,
+  `BeginTransforms`, `WorldOf`, `Register`), but the cluster gather re-walks entities because
+  `RenderableInputGpu` does not carry the handle slot or the mesh pointer the emissive collection
+  needs. Closing that means widening GpuScene's read surface, which changes what geometry ends up in
+  the BVH -- a pixel-affecting change that should not ride along with a file move. Moving the code
+  and changing what it reads in one step would make any regression unbisectable.
+- **`INeedsHost` is still on nine of the eleven features.** What remains behind it is a small,
+  legible set: `renderTargets`, `gpuScene`, `Scene`, `MarkAccumulatorDirty`/`AccumulatorDirty`, and
+  `gfx`. Those are the next channels to grow, not more feature migrations. The manifest tags each
+  remaining one `NEEDS-HOST`, so the debt reports itself at every boot.
+
+The boot-time registry cross-check needed one change to survive this step: `ReflectedPrograms` used
+to walk only the Renderer's own `PipelineBase` fields, so migrating a pipeline into its core would
+have silently dropped it out of the check. It now walks the host *and* every built feature. The
+proof it still works is that the consumed-parameter count is unchanged across the whole step.
+
 ## What already exists (not starting cold)
 
 - `IGraphModule<In,Out>` modules (`DeferredModule` et al.): the target discipline realized -- typed
   `Inputs`/`Outputs` records, collaborators injected by type, `Func<>` for per-frame params, zero
   `Renderer` reach. The north star; propagate it outward.
-- `DescriptorRegistry` named broker (incl. `RegisterTlas`): the resource channel, built; IBL and
-  SceneAS not yet publishing through it.
+- `DescriptorRegistry` named broker (incl. `RegisterTlas`): the resource channel, built; IBL, the
+  probes and SceneAS all publish through it as of step 8.
 - Cores self-register + list-dispose: the lifecycle model, ready to generalize.
 - `MarkAccumulatorDirty` / `MarkTlasDirty` / `RequestCoreIndex` and `InspectorPanel`: the intent
   style the whole UI should adopt.
@@ -578,22 +642,20 @@ Ordered so early steps shrink later ones. Each step ships green.
    `Renderer.Initialize` names no feature, `Cleanup` is one `_features.Dispose()`, and
    `RegisterCore` / `_renderCores` are gone. Verified by boot: the manifest above is real output.
 
-   **Bridge accessors are deliberately not written yet.** They exist to keep callers of
-   `Renderer.Ibl` / `.reflectionProbeSystem` / `.selection` compiling while the Renderer stops
-   *owning* those subsystems -- but that ownership move IS step 8, so today there is nothing to
-   bridge and an accessor would forward a field to itself. They land with each subsystem as it
-   becomes a feature.
+   Bridge accessors were deliberately left for step 8, since until ownership actually moved an
+   accessor would have forwarded a field to itself. They landed with each subsystem as it became a
+   feature; they are the null-tolerant properties on `Renderer` and in `Renderer_SceneAsBridge.cs`.
 
-   Two pieces of the machinery have no implementer yet and are therefore unexercised at runtime:
-   `INeedsFeature<T>` resolution (nothing declares a collaborator until IBL becomes a provider) and
-   the `Bake` / `PreDraw` / `PostDraw` pumps (the calls are in `DrawFrame`, walking empty lists).
-   Step 8 is what proves them.
-8. **Migrate features onto the lifecycle** (A4, A5, IBL, SceneAS). `SceneAS` as a gated feature
-   consuming GpuScene + `RenderView` + the AS verbs, publishing TLAS via the registry; IBL-as-provider
-   (publish images via registry, `IIblProvider` scalars, delete `Renderer.Ibl.*` in the PBR
-   pipelines), probes via `INeedsFeature<IIblProvider>`; `SelectionSystem` lift (pre/post-draw
-   phases + role interfaces); `DeferredCore` owns its pipelines and feeds `DeferredModule`; shared
-   tonemap owned by the `FeatureHost`; `RegisterSceneBindings` becomes feature-driven.
+   Two pieces of the machinery had no implementer at the end of step 7 and were therefore
+   unexercised: `INeedsFeature<T>` resolution and the `Bake` / `PreDraw` / `PostDraw` pumps (the
+   calls were in `DrawFrame`, walking empty lists). Step 8 filled all four -- two contracts injected
+   across six consumers, three bakes, one pre-draw and one post-draw -- and none of them needed a
+   change to the machinery, which is the result the split was betting on.
+8. **Migrate features onto the lifecycle** (A4, A5, IBL, SceneAS). **Done** -- eleven features now
+   build, in Order: IBL(1), probes(2), SceneAS(3), SharedPipelines(5), the six cores(10-60),
+   Selection(100). `Renderer` owns no pipeline and no subsystem field; `Initialize` names no
+   feature; `DrawFrame` has no per-subsystem call left. See "Step 8 as built" below for what each
+   piece cost and the two carve-outs.
 9. **Settings-panel command/event facade** (A1-finish). Last, highest surface; by now most targets
    are already events/intents.
 10. **(Optional, orthogonal)** G5 consistency pass: `VkCheck` / `VulkanException` in place of raw

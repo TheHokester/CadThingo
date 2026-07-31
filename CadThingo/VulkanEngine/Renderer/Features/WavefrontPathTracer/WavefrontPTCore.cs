@@ -2,6 +2,7 @@
 using System.Runtime.CompilerServices;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
 
@@ -25,7 +26,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// camera-motion restart, per-frame light/material refresh, UpdatePerFrame, then graph.Execute.
 /// </summary>
 internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
-                                        ISelfRegisteringFeature<WavefrontPTCore>, INeedsHost
+                                        ISelfRegisteringFeature<WavefrontPTCore>, INeedsGpu, INeedsHost,
+                                        INeedsFeature<ISharedPipelines>
 {
     public static FeatureDesc Desc =>
         new(Order: 50, Gate: _ => true, Make: () => new WavefrontPTCore());
@@ -33,7 +35,14 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
     [ModuleInitializer]
     internal static void _Reg() => FeatureCatalog.Register<WavefrontPTCore>();
 
-    // Transitional: the wavefront pipeline + PT render targets are still renderer-owned.
+    private GpuContext _gpu;
+    GpuContext INeedsGpu.Gpu { set => _gpu = value; }
+
+    // The tonemap this core's graph ends with - one shared instance, injected not constructed.
+    private ISharedPipelines _shared = null!;
+    ISharedPipelines INeedsFeature<ISharedPipelines>.Dependency { set => _shared = value; }
+
+    // Transitional: the PT render targets are still renderer-owned.
     private Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
 
@@ -49,9 +58,16 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
     public string Name => "PathTrace (Wavefront)";
     public Renderer.RenderMode Mode => Renderer.RenderMode.RayWavefront;
 
+    /// <summary>Exposed only for the settings panel + the stats readback, which read its counters.</summary>
+    internal WavefrontPTPipeline Pipeline => _pipe;
+
     public void Initialize()
     {
-        _pipe = _host.wavefrontPipeline;
+        // Shares the accumulator / out-color images with the megakernel via FeaturePTIO and the
+        // scene buffers via the scene set; the SoA working set is pipeline-owned. Technique-private,
+        // so this core builds it rather than the host.
+        _pipe = new WavefrontPTPipeline(_gpu, _host);
+        _pipe.Initialize();
         BuildGraph();
     }
 
@@ -63,7 +79,7 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
         _graph?.Dispose();
         var fg = new WavefrontGraph(_host.gfx);
 
-        var module = new WavefrontPTModule(_pipe, _host.tonemapPipeline);
+        var module = new WavefrontPTModule(_pipe, _shared.Tonemap);
         module.Build(fg.RootScope().Child("Wavefront"),
             new WavefrontPTModule.Inputs(
                 _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
@@ -157,7 +173,9 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
 
     public void Dispose()
     {
+        // Graph first: its passes hold a reference to the pipeline they record with.
         _graph?.Dispose();
         _graph = null;
+        _pipe?.Dispose();
     }
 }

@@ -30,7 +30,15 @@ internal sealed class PathtraceRTCore : PathTraceCoreBase,
     public override string Name => "PathTrace (RT pipeline)";
     public override Renderer.RenderMode Mode => Renderer.RenderMode.RayTrace;
 
-    protected override void BindPipeline() => _pipeline = _host.rtPipeline!;
+    protected override void CreatePipeline()
+    {
+        // Shares the accumulator / out-color images + scene buffers with the compute path; envCube
+        // rides FeatureEnv. The gate above is what makes the unconditional construction safe.
+        _pipeline = new RTPipeline(_gpu, _host);
+        _pipeline.Initialize();
+    }
+
+    protected override void DestroyPipeline() => _pipeline?.Dispose();
 
     protected override PassType TracePassType => PassType.RayTrace;
     protected override void PipelineMarkAccumulatorDirty() => _pipeline.MarkAccumulatorDirty();

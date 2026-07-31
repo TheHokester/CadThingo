@@ -28,7 +28,18 @@ internal sealed class PathtraceComputeCore : PathTraceCoreBase,
     public override string Name => "PathTrace (Compute)";
     public override Renderer.RenderMode Mode => Renderer.RenderMode.RayCompute;
 
-    protected override void BindPipeline() => _pipeline = _host.ptComputePipeline;
+    /// <summary>Exposed only for the settings / viewport panels, which read its sample counters.</summary>
+    internal PTComputePipeline Pipeline => _pipeline;
+
+    protected override void CreatePipeline()
+    {
+        // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come from the
+        // scene set; the accumulator / out-color pair from the registry-owned FeaturePTIO set.
+        _pipeline = new PTComputePipeline(_gpu, _host);
+        _pipeline.Initialize();
+    }
+
+    protected override void DestroyPipeline() => _pipeline?.Dispose();
 
     protected override PassType TracePassType => PassType.Compute;
     protected override void PipelineMarkAccumulatorDirty() => _pipeline.MarkAccumulatorDirty();

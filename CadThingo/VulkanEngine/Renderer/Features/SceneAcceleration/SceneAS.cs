@@ -1,19 +1,11 @@
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer;
-
-// Per-entity record consumed by the PBR lighting shader's shadow-ray alpha-test
-// path. One slot per TLAS instance, keyed by AccelerationStructureInstanceKHR.
-// InstanceCustomIndex. Layout matches PbrShader.slang::ShadowEntityInfo.
-
-// One world-space emissive triangle, treated as an area light by the
-// pathtracer's NEE + MIS. Layout matches PTUtils.slang::EmissiveTri (80B,
-// std430). Positions/normal are world-space (baked from the entity transform at
-// TLAS-rebuild time); Le is the material emissive factor. IndexOffset/PrimIndex
-// point back into the global index buffer so the shader can refetch the UVs and
-// modulate Le by the emissive texture at the sampled point.
+namespace CadThingo.VulkanEngine.Renderer.Features.SceneAcceleration;
 
 // Vose alias-table entry for O(1) power-proportional triangle selection.
 // Matches PTCompute.slang::AliasEntry (8B).
@@ -24,18 +16,54 @@ public struct AliasEntryGpu
     public uint  Alias;      // fallback triangle index
 }
 
-public unsafe partial class Renderer
+/// <summary>
+/// The scene's ray-tracing acceleration structure: cluster BLASes, the scene TLAS, and the
+/// side tables a hit resolves through (ShadowEntityInfo, the emissive-triangle list and its alias
+/// table). This is the AS <i>policy</i> half - what to cluster, when to rebuild, how the instance
+/// and shadow-info records are packed. The verbs it drives (create / build / compact / destroy an
+/// AS) belong to the device and live behind <c>gfx.As</c>; nothing in this file issues a Vulkan AS
+/// call directly.
+///
+/// Gated: on a device without ray query + acceleration structure it is never constructed, so none
+/// of these buffers are allocated. Consumers cope with absence by gating the same way - the host's
+/// <c>RayInfraReady</c> bridge reports false, and the scene set simply has no <c>sceneTlas</c>.
+///
+/// Rebuilds are a <see cref="IBakeFeature"/>: editor mutations set a dirty flag and the bake pump
+/// services at most one rebuild per frame, at a fixed point before any command buffer is recorded,
+/// however many slider ticks landed in between.
+/// </summary>
+internal sealed unsafe class SceneAS
+    : IBakeFeature, ISelfRegisteringFeature<SceneAS>, INeedsGpu, INeedsHost
 {
-    
+    // Order 3: after IBL / probes, before every core. Nothing here depends on those, but the TLAS
+    // and its side tables have to be registered into the scene set before the boot-time registry
+    // cross-check runs, and building ahead of the cores keeps that true without a second pass.
+    public static FeatureDesc Desc => new(
+        Order: 3,
+        // Exactly the gate the old InitRayQuery applied as an early-out, hoisted to construction:
+        // if we can never build anything, do not allocate the buffers to build it into.
+        Gate: gpu => gpu.Gfx.RayShadowsSupported && gpu.Gfx.As.Available,
+        Make: () => new SceneAS());
+
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<SceneAS>();
+
+    public string Name => "Scene AS (BLAS/TLAS)";
+
+    private GpuContext _gpu;
+    private Renderer   _host = null!;
+    GpuContext INeedsGpu.Gpu   { set => _gpu  = value; }
+    Renderer   INeedsHost.Host { set => _host = value; }
+
+    private GraphicsDevice Gfx => _gpu.Gfx;
+    private AsDevice       As  => _gpu.Gfx.As;
+    private GpuScene       GpuScene => _host.gpuScene;
+    private Scene          Scene    => _host.Scene;
+
     //  State
 
-    // AS verbs (create/destroy/build/compact + the dispatch table and the scratch alignment
-    // behind them) live on the device facet. What is left in this file is the POLICY: what to
-    // cluster, when to rebuild, how the instance / shadow-info / transform records are packed.
-    private AsDevice As => gfx.As;
-
     // Cluster BLASes. One world-space BLAS per spatial cluster of primitives,
-    // rebuilt wholesale every RebuildTlas (the geometry is baked to world space
+    // rebuilt wholesale every Rebuild (the geometry is baked to world space
     // via per-geometry transforms, so a moved transform invalidates the BLAS).
     // Replaces the old per-mesh BLAS cache: merging co-located primitives into a
     // shared BLAS is what kills the instance-AABB overlap that made the TLAS
@@ -82,16 +110,15 @@ public unsafe partial class Renderer
         public Vector3    Centroid;
     }
 
-    // Single scene-wide TLAS. Rebuild on entity-set / transform changes; flag
-    // tlasDirty so DrawFrame can pick it up at the top of a frame.
+    // Single scene-wide TLAS. Rebuilt on entity-set / transform changes.
     private AccelerationStructureKHR tlas;
-
-    // True when the full ray-query stack is usable for this frame: the device
-    // supports it, the extension loaded, and a TLAS has been built. SelectionSystem
-    // (pick + outline) gates on this before touching the acceleration structure.
-    internal bool RayInfraReady => RayShadowsSupported && As.Available && tlas.Handle != 0;
     private Buffer    tlasStorage;
     private SubAlloc  tlasStorageAlloc;
+
+    /// <summary>True when the full ray-query stack is usable for this frame: the feature exists
+    /// (so the device supports it) and a TLAS has been built. Pick + outline gate on this before
+    /// touching the acceleration structure.</summary>
+    public bool Ready => tlas.Handle != 0;
 
     // Instance buffer feeds Cmd*BuildAccelerationStructures with the per-instance
     // AccelerationStructureInstanceKHR records. Host-visible + coherent so we can
@@ -104,12 +131,13 @@ public unsafe partial class Renderer
 
     // Persistent scratch buffer reused across builds. Sized to the largest
     // BuildScratchSize seen so far; reallocated if a bigger build comes along.
+    // State plus a growth policy, which is why it is here rather than on the device facet.
     private Buffer    asScratchBuffer;
     private SubAlloc  asScratchAlloc;
     private ulong     asScratchSize;
 
     // Per-entity shadow-alpha info. One ShadowEntityInfo per TLAS instance,
-    // indexed by InstanceCustomIndex. Host-visible + coherent so RebuildTlas
+    // indexed by InstanceCustomIndex. Host-visible + coherent so the rebuild
     // writes them inline with the instance buffer. Grows alongside the instance
     // buffer; capacity is tracked separately because zero-entity scenes still
     // need a valid binding.
@@ -118,20 +146,13 @@ public unsafe partial class Renderer
     private void*     shadowInfoMapped;
     private uint      shadowInfoCapacity;     // number of slots allocated, not bytes
 
-    /// <summary>Buffer holding ShadowEntityInfo records, indexed by InstanceCustomIndex.
-    /// PbrDeferredPipeline binds this on its shadow-alpha descriptor set. Returns
-    /// a zero handle until InitRayQuery has run.</summary>
-    public Buffer ShadowInfoBuffer => shadowInfoBuffer;
-    public ulong ShadowInfoBufferSize =>
-        (ulong)shadowInfoCapacity * (ulong)sizeof(ShadowEntityInfo);
-
-    /// <summary>Set by RebuildTlas whenever EnsureShadowInfoCapacity reallocates
-    /// the underlying VkBuffer — the renderer reads this after RebuildTlas and
-    /// re-writes the PBR pipeline's shadow-alpha descriptor when true.</summary>
+    // Set when EnsureShadowInfoCapacity reallocates the underlying VkBuffer - the re-register
+    // below consumes it. Sticky until consumed: a later no-resize rebuild must not erase a
+    // pending notice.
     private bool shadowInfoBufferResized;
 
     // Emissive area-light buffers, rebuilt alongside the TLAS (world-space data
-    // depends on entity transforms). Host-visible so RebuildTlas writes them
+    // depends on entity transforms). Host-visible so the rebuild writes them
     // inline. Always allocated with capacity >= 1 so the PT descriptor stays
     // valid even in scenes with no emissive geometry (emissiveTriCount == 0
     // makes the shader skip them).
@@ -146,31 +167,50 @@ public unsafe partial class Renderer
     private float    totalEmissivePower;     // Σ area·luminance(Le) — the alias-table normaliser
     private bool     emissiveBuffersResized; // true when EnsureEmissiveCapacity reallocated
 
-    /// <summary>Emissive-triangle SSBO + its size. PT pipeline binds these on
-    /// set 0 (bindings 6/7). Zero handle until the first RebuildTlas.</summary>
-    public Buffer EmissiveTriBuffer    => emissiveTriBuffer;
-    public ulong  EmissiveTriBufferSize   => (ulong)emissiveCapacity * (ulong)sizeof(EmissiveTriGpu);
-    public Buffer EmissiveAliasBuffer  => emissiveAliasBuffer;
-    public ulong  EmissiveAliasBufferSize => (ulong)emissiveCapacity * (ulong)sizeof(AliasEntryGpu);
-    public uint   EmissiveTriangleCount => emissiveTriCount;
-    public float  TotalEmissivePower    => totalEmissivePower;
+    /// <summary>Emissive-triangle scalars the path tracers need as uniforms. The buffers
+    /// themselves are bindable and reach consumers through the scene set, so only these two
+    /// non-bindable numbers are exposed.</summary>
+    public uint  EmissiveTriangleCount => emissiveTriCount;
+    public float TotalEmissivePower    => totalEmissivePower;
 
-    private bool tlasDirty = true;
+    // Rebuild request. Starts clean because Initialize builds once itself.
+    private bool _dirty;
 
     /// <summary>
-    /// Flags the TLAS as stale. Consumed at the top of DrawFrame which runs a
-    /// single <see cref="OnSceneEntitiesChanged"/> per frame regardless of how
-    /// many edits accumulated the previous frame. Use this from the editor side
-    /// (InspectorPanel transforms, FileBrowserPanel visibility) — direct
-    /// per-mutation RebuildTlas calls would stall the device on every slider tick.
+    /// Flags the AS as stale. Consumed by the bake pump at the top of DrawFrame, which runs a
+    /// single rebuild per frame regardless of how many edits accumulated the previous frame. Use
+    /// this from the editor side (InspectorPanel transforms, FileBrowserPanel visibility) - direct
+    /// per-mutation rebuilds would stall the device on every slider tick.
     /// </summary>
-    public void MarkTlasDirty()
+    public void MarkDirty()
     {
-        tlasDirty = true;
-        // Structural / transform / alpha-mode edits also re-pack the GPU mirror (L2 step 7).
-        gpuScene?.MarkSceneDirty();
+        _dirty = true;
+        // Structural / transform / alpha-mode edits also re-pack the GPU mirror.
+        GpuScene?.MarkSceneDirty();
     }
-    public bool IsTlasDirty => tlasDirty;
+
+    // ---- Bake phase --------------------------------------------------------
+
+    public bool BakePending => _dirty;
+
+    /// <summary>Services one pending rebuild. The pump calls this before the frame's command
+    /// buffer is opened, so the DeviceWaitIdle inside <see cref="Rebuild"/> never straddles a
+    /// half-recorded frame.</summary>
+    public void Bake()
+    {
+        Rebuild();
+        // Cleared unconditionally, not just on a successful build: on hardware where the rebuild
+        // early-outs there would otherwise be nothing to stop the next frame re-entering.
+        _dirty = false;
+    }
+
+    public void Initialize()
+    {
+        // Build once up front so the scene set holds a valid sceneTlas from boot. An empty scene
+        // still produces a real zero-instance TLAS - an RT core has to be selectable before any
+        // geometry is loaded, and rays simply miss.
+        Rebuild();
+    }
 
 
     //  Helpers
@@ -178,8 +218,7 @@ public unsafe partial class Renderer
     // The AS buffers below (scratch / instance / cluster transforms / AS storage) are created
     // through the ordinary CreateBuffer with ShaderDeviceAddressBit in their usage - that bit is
     // the whole contract, since every allocator buffer block already carries the matching
-    // MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. There used to be a separate
-    // CreateBufferWithDeviceAddress helper here; it had become byte-for-byte the same call.
+    // MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT.
 
     /// <summary>
     /// Packs System.Numerics.Matrix4x4 into Vulkan's TransformMatrixKHR (row-major 3×4,
@@ -205,7 +244,7 @@ public unsafe partial class Renderer
 
 
     //
-    //  Allocator helpers (used by both BuildBlas and RebuildTlas)
+    //  Allocator helpers (used by both BuildClusterBlas and Rebuild)
     //
 
     /// <summary>
@@ -219,9 +258,9 @@ public unsafe partial class Renderer
         ulong padded = ((required + align - 1) / align) * align;
         if (asScratchBuffer.Handle != 0 && asScratchSize >= padded) return;
 
-        if (asScratchBuffer.Handle != 0) DestroyBuffer(asScratchBuffer, asScratchAlloc);
+        if (asScratchBuffer.Handle != 0) Gfx.DestroyBuffer(asScratchBuffer, asScratchAlloc);
 
-        CreateBuffer(padded,
+        Gfx.CreateBuffer(padded,
             BufferUsageFlags.StorageBufferBit | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit,
             out asScratchBuffer, out asScratchAlloc);
@@ -239,7 +278,7 @@ public unsafe partial class Renderer
 
         if (tlasInstanceAlloc.IsValid)
         {
-            DestroyBuffer(tlasInstanceBuffer, tlasInstanceAlloc);
+            Gfx.DestroyBuffer(tlasInstanceBuffer, tlasInstanceAlloc);
             tlasInstanceMapped = null;
         }
 
@@ -247,19 +286,19 @@ public unsafe partial class Renderer
         while (capacity < requiredInstances) capacity <<= 1;
 
         ulong sizeBytes = (ulong)capacity * (ulong)sizeof(AccelerationStructureInstanceKHR);
-        CreateBuffer(sizeBytes,
+        Gfx.CreateBuffer(sizeBytes,
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out tlasInstanceBuffer, out tlasInstanceAlloc);
 
-        tlasInstanceMapped = memAllocator.GetMapped(tlasInstanceAlloc);
+        tlasInstanceMapped = Gfx.Allocator.GetMapped(tlasInstanceAlloc);
         tlasInstanceCapacity = capacity;
     }
 
     /// <summary>
     /// Mirror of EnsureInstanceCapacity for the ShadowEntityInfo SSBO. Returns
     /// true iff the underlying VkBuffer was (re-)allocated — the caller must
-    /// re-write the PBR pipeline's shadow-alpha descriptor set in that case.
+    /// re-register the scene-set binding in that case.
     /// </summary>
     private bool EnsureShadowInfoCapacity(uint requiredInstances)
     {
@@ -268,7 +307,7 @@ public unsafe partial class Renderer
 
         if (shadowInfoAlloc.IsValid)
         {
-            DestroyBuffer(shadowInfoBuffer, shadowInfoAlloc);
+            Gfx.DestroyBuffer(shadowInfoBuffer, shadowInfoAlloc);
             shadowInfoMapped = null;
         }
 
@@ -276,11 +315,11 @@ public unsafe partial class Renderer
         while (capacity < requiredInstances) capacity <<= 1;
 
         ulong sizeBytes = (ulong)capacity * (ulong)sizeof(ShadowEntityInfo);
-        CreateBuffer(sizeBytes, BufferUsageFlags.StorageBufferBit,
+        Gfx.CreateBuffer(sizeBytes, BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out shadowInfoBuffer, out shadowInfoAlloc, preferDeviceLocal: true);
 
-        shadowInfoMapped = memAllocator.GetMapped(shadowInfoAlloc);
+        shadowInfoMapped = Gfx.Allocator.GetMapped(shadowInfoAlloc);
         shadowInfoCapacity = capacity;
         return true;
     }
@@ -289,7 +328,7 @@ public unsafe partial class Renderer
     /// Grows the emissive-triangle + alias-table buffers to hold at least
     /// <paramref name="requiredTris"/> entries (floored at 1 so the descriptor
     /// is always valid). Both buffers share one capacity. Returns true iff a
-    /// reallocation happened — caller must re-write the PT descriptor then.
+    /// reallocation happened — caller must re-register then.
     /// </summary>
     private bool EnsureEmissiveCapacity(uint requiredTris)
     {
@@ -297,23 +336,23 @@ public unsafe partial class Renderer
         if (emissiveCapacity >= required && emissiveTriBuffer.Handle != 0)
             return false;
 
-        if (emissiveTriAlloc.IsValid)   { DestroyBuffer(emissiveTriBuffer,   emissiveTriAlloc);   emissiveTriMapped   = null; }
-        if (emissiveAliasAlloc.IsValid) { DestroyBuffer(emissiveAliasBuffer, emissiveAliasAlloc); emissiveAliasMapped = null; }
+        if (emissiveTriAlloc.IsValid)   { Gfx.DestroyBuffer(emissiveTriBuffer,   emissiveTriAlloc);   emissiveTriMapped   = null; }
+        if (emissiveAliasAlloc.IsValid) { Gfx.DestroyBuffer(emissiveAliasBuffer, emissiveAliasAlloc); emissiveAliasMapped = null; }
 
         uint capacity = 8;
         while (capacity < required) capacity <<= 1;
 
-        CreateBuffer((ulong)capacity * (ulong)sizeof(EmissiveTriGpu),
+        Gfx.CreateBuffer((ulong)capacity * (ulong)sizeof(EmissiveTriGpu),
             BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out emissiveTriBuffer, out emissiveTriAlloc, preferDeviceLocal: true);
-        CreateBuffer((ulong)capacity * (ulong)sizeof(AliasEntryGpu),
+        Gfx.CreateBuffer((ulong)capacity * (ulong)sizeof(AliasEntryGpu),
             BufferUsageFlags.StorageBufferBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out emissiveAliasBuffer, out emissiveAliasAlloc, preferDeviceLocal: true);
 
-        emissiveTriMapped   = memAllocator.GetMapped(emissiveTriAlloc);
-        emissiveAliasMapped = memAllocator.GetMapped(emissiveAliasAlloc);
+        emissiveTriMapped   = Gfx.Allocator.GetMapped(emissiveTriAlloc);
+        emissiveAliasMapped = Gfx.Allocator.GetMapped(emissiveAliasAlloc);
         emissiveCapacity    = capacity;
         return true;
     }
@@ -467,7 +506,7 @@ public unsafe partial class Renderer
 
     /// <summary>
     /// Grows the per-geometry transform buffer (one TransformMatrixKHR per
-    /// primitive). Build input + device address; host-visible so RebuildTlas
+    /// primitive). Build input + device address; host-visible so the rebuild
     /// writes it inline before the BLAS builds read it.
     /// </summary>
     private void EnsureClusterTransformCapacity(uint requiredSlots)
@@ -478,31 +517,31 @@ public unsafe partial class Renderer
 
         if (clusterTransformAlloc.IsValid)
         {
-            DestroyBuffer(clusterTransformBuffer, clusterTransformAlloc);
+            Gfx.DestroyBuffer(clusterTransformBuffer, clusterTransformAlloc);
             clusterTransformMapped = null;
         }
 
         uint capacity = 8;
         while (capacity < required) capacity <<= 1;
 
-        CreateBuffer((ulong)capacity * (ulong)sizeof(TransformMatrixKHR),
+        Gfx.CreateBuffer((ulong)capacity * (ulong)sizeof(TransformMatrixKHR),
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out clusterTransformBuffer, out clusterTransformAlloc);
 
-        clusterTransformMapped   = memAllocator.GetMapped(clusterTransformAlloc);
+        clusterTransformMapped   = Gfx.Allocator.GetMapped(clusterTransformAlloc);
         clusterTransformCapacity = capacity;
     }
 
     /// <summary>Destroys all cluster BLAS handles + storage. Caller must have
-    /// drained the device (RebuildTlas runs under the editor's DeviceWaitIdle, or
-    /// at init before any frame).</summary>
+    /// drained the device (Rebuild runs under its own DeviceWaitIdle, or at
+    /// Initialize before any frame).</summary>
     private void DestroyClusterBlases()
     {
         foreach (var b in clusterBlases)
         {
             As.Destroy(b.Handle);
-            DestroyBuffer(b.Storage, b.StorageAlloc);
+            Gfx.DestroyBuffer(b.Storage, b.StorageAlloc);
         }
         clusterBlases.Clear();
     }
@@ -516,9 +555,9 @@ public unsafe partial class Renderer
     {
         int geomCount = hi - lo;
 
-        ulong vbAddr    = gfx.GetBufferDeviceAddress(Engine.ResourceManager.GlobalVertexBuffer);
-        ulong ibBase    = gfx.GetBufferDeviceAddress(Engine.ResourceManager.GlobalIndexBuffer);
-        ulong xfBase    = gfx.GetBufferDeviceAddress(clusterTransformBuffer);
+        ulong vbAddr    = Gfx.GetBufferDeviceAddress(Engine.ResourceManager.GlobalVertexBuffer);
+        ulong ibBase    = Gfx.GetBufferDeviceAddress(Engine.ResourceManager.GlobalIndexBuffer);
+        ulong xfBase    = Gfx.GetBufferDeviceAddress(clusterTransformBuffer);
         uint  maxVertex = (uint)Engine.ResourceManager.VertexHighWater;
         uint  xfStride  = (uint)sizeof(TransformMatrixKHR);   // 48 — a multiple of 16 (transformOffset rule)
 
@@ -579,7 +618,7 @@ public unsafe partial class Renderer
 
             // High priority: BLAS storage is the persistent geometry BVH the path tracer
             // traverses every frame — must stay resident under WDDM budget pressure.
-            CreateBuffer(sizes.AccelerationStructureSize,
+            Gfx.CreateBuffer(sizes.AccelerationStructureSize,
                 BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
                 MemoryPropertyFlags.DeviceLocalBit, out var storage, out var storageAlloc,
                 GpuMemoryAllocator.PriorityHigh);
@@ -589,7 +628,7 @@ public unsafe partial class Renderer
             var handle = As.Create(storage, sizes.AccelerationStructureSize,
                 AccelerationStructureTypeKHR.BottomLevelKhr);
             buildInfo.DstAccelerationStructure  = handle;
-            buildInfo.ScratchData.DeviceAddress = gfx.GetBufferDeviceAddress(asScratchBuffer);
+            buildInfo.ScratchData.DeviceAddress = Gfx.GetBufferDeviceAddress(asScratchBuffer);
 
             fixed (AccelerationStructureBuildRangeInfoKHR* pRanges = ranges)
                 As.Build(ref buildInfo, pRanges);
@@ -620,7 +659,7 @@ public unsafe partial class Renderer
         if (compactedSize == 0 || compactedSize >= originalSize)
             return src;
 
-        CreateBuffer(compactedSize,
+        Gfx.CreateBuffer(compactedSize,
             BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit, out var cStorage, out var cAlloc,
             GpuMemoryAllocator.PriorityHigh);
@@ -630,7 +669,7 @@ public unsafe partial class Renderer
 
         // Free the uncompacted source now that the compacted copy owns the geometry.
         As.Destroy(src.Handle);
-        DestroyBuffer(src.Storage, src.StorageAlloc);
+        Gfx.DestroyBuffer(src.Storage, src.StorageAlloc);
 
         return new BlasEntry
         {
@@ -640,23 +679,22 @@ public unsafe partial class Renderer
             DeviceAddress = As.DeviceAddress(cHandle),
         };
     }
+
     //tlas previous entry count(ensures that if all are removed old tlas isnt used)
     private uint PreviousCount = 0;
+
     private void RebuildTlas()
     {
-        // Reconcile renderable identity (L2 step 2) on the same cadence as the AS:
-        // every renderable gathered below gets a stable RenderableHandle (freed when
-        // its entity leaves the scene), written into ShadowEntityInfo.EntityIndex
-        // below and resolved back by pick / selection (L2 step 6).
-        gpuScene.SyncRenderables(scene);
+        // Reconcile renderable identity on the same cadence as the AS: every renderable gathered
+        // below gets a stable RenderableHandle (freed when its entity leaves the scene), written
+        // into ShadowEntityInfo.EntityIndex below and resolved back by pick / selection.
+        GpuScene.SyncRenderables(Scene);
 
         // Open a fresh world-transform cache window for this rebuild. Unlike the per-frame
-        // extraction, RebuildTlas is edit-driven and reachable from outside DrawFrame (the
-        // asset/visibility paths call OnSceneEntitiesChanged directly), so it cannot assume the
-        // draw loop opened a window for it - without this the gather below would read whatever
-        // cycle ran last. Folds into the draw loop's single window once the AS becomes a
-        // request-driven bake at a fixed pump point.
-        gpuScene.BeginTransforms();
+        // extraction, this is edit-driven and reachable from outside DrawFrame (the asset /
+        // visibility paths rebuild synchronously), so it cannot assume the draw loop opened a
+        // window for it - without this the gather below would read whatever cycle ran last.
+        GpuScene.BeginTransforms();
 
         // World-space cluster BLASes depend on the current transforms, so free
         // last build's set before regathering.
@@ -670,6 +708,7 @@ public unsafe partial class Renderer
         var emWeights = new List<float>();
         float emPower = 0f;
 
+        var scene = Scene;
         for (int i = 0; i < scene.EntityCount; i++)
         {
             Entity* e = scene.GetEntity(i);
@@ -679,7 +718,7 @@ public unsafe partial class Renderer
             var meshComp  = e->GetComponent<MeshComponent>();
             if (transform == null || meshComp == null || meshComp.mesh == null) continue;
 
-            Matrix4x4 world = gpuScene.WorldOf(e); // cached (L2 step 5)
+            Matrix4x4 world = GpuScene.WorldOf(e); // cached
 
             uint  matFlags        = 0u;
             float matTransmission = 0f;
@@ -704,10 +743,10 @@ public unsafe partial class Renderer
             prims.Add(new ClusterPrim
             {
                 // Stable RenderableHandle slot — not the flat list index `i` — so a
-                // later reorder/removal can't alias identity (L2 step 6). Register is
-                // idempotent: SyncRenderables already allocated this entity's slot at
-                // the top of RebuildTlas, so this just reads it back.
-                EntityIndex   = (int)gpuScene.Register(e).Index,
+                // later reorder/removal can't alias identity. Register is idempotent:
+                // SyncRenderables already allocated this entity's slot at the top of
+                // the rebuild, so this just reads it back.
+                EntityIndex   = (int)GpuScene.Register(e).Index,
                 World         = world,
                 IndexOffset   = (uint)meshComp.mesh->offset,
                 TriCount      = (uint)(meshComp.mesh->count / 3),
@@ -795,14 +834,11 @@ public unsafe partial class Renderer
         // core can be selected (rays just miss). Skip only re-building an already
         // existing TLAS with nothing.
         if (instCount == 0 && PreviousCount == 0 && tlas.Handle != 0)
-        {
-            tlasDirty = false;
             return;
-        }
         PreviousCount = instCount;
 
 
-        // 3. Geometry — instance data lives at tlasInstanceBuffer's device address.
+        // 5. Geometry — instance data lives at tlasInstanceBuffer's device address.
         uint instanceCount = instCount;
         var geo = new AccelerationStructureGeometryKHR
         {
@@ -812,9 +848,9 @@ public unsafe partial class Renderer
         };
         geo.Geometry.Instances.SType              = StructureType.AccelerationStructureGeometryInstancesDataKhr;
         geo.Geometry.Instances.ArrayOfPointers    = false;
-        geo.Geometry.Instances.Data.DeviceAddress = gfx.GetBufferDeviceAddress(tlasInstanceBuffer);
+        geo.Geometry.Instances.Data.DeviceAddress = Gfx.GetBufferDeviceAddress(tlasInstanceBuffer);
 
-        // 4. Build info — full rebuild for now. AllowUpdateBitKhr is set so a future
+        // 6. Build info — full rebuild for now. AllowUpdateBitKhr is set so a future
         //    transform-only path can use Mode = UpdateKhr + SrcAccelerationStructure = tlas.
         var buildInfo = new AccelerationStructureBuildGeometryInfoKHR
         {
@@ -827,18 +863,18 @@ public unsafe partial class Renderer
             PGeometries   = &geo,
         };
 
-        // 5. Size query. For TLAS, the "primitive count" is the instance count.
+        // 7. Size query. For TLAS, the "primitive count" is the instance count.
         var sizes = As.GetBuildSizes(ref buildInfo, &instanceCount);
 
-        // 6. (Re)allocate TLAS storage. Free + reallocate on every rebuild until
+        // 8. (Re)allocate TLAS storage. Free + reallocate on every rebuild until
         //    the update-mode path lands.
         if (tlas.Handle != 0)
         {
             As.Destroy(tlas);
-            DestroyBuffer(tlasStorage, tlasStorageAlloc);
+            Gfx.DestroyBuffer(tlasStorage, tlasStorageAlloc);
         }
         // High priority: TLAS storage is the top-level BVH traversed every path-trace frame.
-        CreateBuffer(sizes.AccelerationStructureSize,
+        Gfx.CreateBuffer(sizes.AccelerationStructureSize,
             BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit,
             out tlasStorage, out tlasStorageAlloc,
@@ -847,10 +883,10 @@ public unsafe partial class Renderer
         tlas = As.Create(tlasStorage, sizes.AccelerationStructureSize,
             AccelerationStructureTypeKHR.TopLevelKhr);
 
-        // 7. Wire scratch + dst into buildInfo, record + submit.
+        // 9. Wire scratch + dst into buildInfo, record + submit.
         EnsureScratchCapacity(sizes.BuildScratchSize);
         buildInfo.DstAccelerationStructure  = tlas;
-        buildInfo.ScratchData.DeviceAddress = gfx.GetBufferDeviceAddress(asScratchBuffer);
+        buildInfo.ScratchData.DeviceAddress = Gfx.GetBufferDeviceAddress(asScratchBuffer);
 
         var range = new AccelerationStructureBuildRangeInfoKHR
         {
@@ -860,108 +896,82 @@ public unsafe partial class Renderer
             TransformOffset = 0,
         };
         As.Build(ref buildInfo, &range);
-
-        tlasDirty = false;
     }
 
 
-    //  Orchestrators
+    //  Orchestration
 
-    private void InitRayQuery()
+    /// <summary>
+    /// Reclusters from scratch, rebuilds the world-space cluster BLASes and the TLAS, and
+    /// republishes whatever the rebuild invalidated. Newly-joined meshes are picked up
+    /// automatically because the gather walks the live scene. Performs a DeviceWaitIdle
+    /// internally, so it must not be called with a command buffer open - the bake pump and the
+    /// editor's synchronous asset paths both satisfy that.
+    /// </summary>
+    public void Rebuild()
     {
-        // The dispatch table + scratch alignment are loaded with the device now; this gate is
-        // purely the policy one - do we intend to build anything, and can we.
-        if (!RayShadowsSupported || !As.Available) return;
+        // Changing the scene invalidates any in-progress path-trace integration regardless of
+        // what happens to the AS below.
+        _host.MarkAccumulatorDirty();
 
-        // RebuildTlas now clusters primitives and builds the world-space cluster
-        // BLASes itself — no per-mesh BLAS prepass.
+        Gfx.Vk!.DeviceWaitIdle(Gfx.Device);
+
         RebuildTlas();
+        PublishBindings();
     }
 
     /// <summary>
-    /// Pairs with file destroy in the editor. Cluster BLASes are world-space and
-    /// rebuilt wholesale on the next RebuildTlas, so there is nothing mesh-keyed
-    /// to free here — just mark the AS stale so the freed geometry is dropped on
-    /// the next rebuild (which the editor triggers via OnSceneEntitiesChanged).
+    /// (Re)registers everything the rebuild may have replaced. The TLAS handle changes on every
+    /// rebuild, so it always re-registers; the side-table buffers only change identity when their
+    /// capacity is outgrown, and their contents update in place through the host-coherent mapping,
+    /// so those re-register on the resize flag alone. One registry write per name covers every
+    /// consuming shader - none of them names this feature.
     /// </summary>
-    public void DestroyBlasFor(IEnumerable<nint> meshPtrs)
+    private void PublishBindings()
     {
-        _ = meshPtrs;
-        MarkTlasDirty();
-    }
+        var r = _gpu.Registry;
 
-    /// <summary>
-    /// Rebuilds BLAS for any newly-seen meshes and re-runs RebuildTlas. Re-writes
-    /// the TLAS and (if its underlying VkBuffer reallocated) the ShadowEntityInfo
-    /// descriptor on every consumer pipeline. Safe to call after a scene-edit
-    /// from the editor; performs a DeviceWaitIdle internally so it doesn't race
-    /// in-flight command buffers.
-    /// </summary>
-    public void OnSceneEntitiesChanged()
-    {
-        if (!initialized) return;
-        // Pathtracer always cares because changing the scene invalidates the
-        // accumulator regardless of whether ray shadows are supported.
-        MarkAccumulatorDirty();
-
-        if (!RayShadowsSupported || !As.Available) return;
-
-        vk!.DeviceWaitIdle(device);
-
-        // RebuildTlas reclusters from scratch and rebuilds the world-space cluster
-        // BLASes, so newly-joined meshes are picked up automatically.
-        RebuildTlas();
-
-        // TLAS handle changes on every rebuild - one scene-set re-register covers every
-        // consumer 
         if (tlas.Handle != 0)
-            descriptorRegistry.RegisterTlas("sceneTlas", tlas);
+            r.RegisterTlas("sceneTlas", tlas);
 
         if (shadowInfoBufferResized)
         {
-            descriptorRegistry.RegisterBuffer("sceneEntityInfo", shadowInfoBuffer);
+            r.RegisterBuffer("sceneEntityInfo", shadowInfoBuffer);
             shadowInfoBufferResized = false;
         }
 
-        // Emissive buffers reallocate only when the triangle count outgrows
-        // capacity; content otherwise updates in place (host-coherent), so a
-        // re-write is only needed on resize.
         if (emissiveBuffersResized)
         {
-            descriptorRegistry.RegisterBuffer("sceneEmissiveTris", emissiveTriBuffer);
-            descriptorRegistry.RegisterBuffer("sceneEmissiveAlias", emissiveAliasBuffer);
+            r.RegisterBuffer("sceneEmissiveTris",  emissiveTriBuffer);
+            r.RegisterBuffer("sceneEmissiveAlias", emissiveAliasBuffer);
             emissiveBuffersResized = false;
         }
     }
 
-    private void CleanupRayQuery()
+    public void Dispose()
     {
-        // Nothing was ever built without the verbs. The dispatch table itself is the device's
-        // to dispose, after this has released every structure allocated through it.
-        if (!As.Available) return;
-
         // Host-visible mappings live for the lifetime of the parent block (the
-        // allocator owns the map/unmap). Just null the pointers — Free below
-        // releases the suballocation; the block stays mapped until allocator dispose.
+        // allocator owns the map/unmap). Just null the pointers — the frees below
+        // release the suballocations; the block stays mapped until allocator dispose.
         tlasInstanceMapped     = null;
         shadowInfoMapped       = null;
         emissiveTriMapped      = null;
         emissiveAliasMapped    = null;
         clusterTransformMapped = null;
 
-        if (shadowInfoBuffer.Handle    != 0) DestroyBuffer(shadowInfoBuffer,    shadowInfoAlloc);
-        if (emissiveTriBuffer.Handle   != 0) DestroyBuffer(emissiveTriBuffer,   emissiveTriAlloc);
-        if (emissiveAliasBuffer.Handle != 0) DestroyBuffer(emissiveAliasBuffer, emissiveAliasAlloc);
-        if (clusterTransformBuffer.Handle != 0) DestroyBuffer(clusterTransformBuffer, clusterTransformAlloc);
+        if (shadowInfoBuffer.Handle       != 0) Gfx.DestroyBuffer(shadowInfoBuffer,       shadowInfoAlloc);
+        if (emissiveTriBuffer.Handle      != 0) Gfx.DestroyBuffer(emissiveTriBuffer,      emissiveTriAlloc);
+        if (emissiveAliasBuffer.Handle    != 0) Gfx.DestroyBuffer(emissiveAliasBuffer,    emissiveAliasAlloc);
+        if (clusterTransformBuffer.Handle != 0) Gfx.DestroyBuffer(clusterTransformBuffer, clusterTransformAlloc);
 
         if (tlas.Handle != 0)
         {
             As.Destroy(tlas);
             tlas = default;
         }
-        if (tlasStorage.Handle != 0)        DestroyBuffer(tlasStorage,        tlasStorageAlloc);
-        if (tlasInstanceBuffer.Handle != 0) DestroyBuffer(tlasInstanceBuffer, tlasInstanceAlloc);
-        if (asScratchBuffer.Handle != 0)    DestroyBuffer(asScratchBuffer,    asScratchAlloc);
+        if (tlasStorage.Handle != 0)        Gfx.DestroyBuffer(tlasStorage,        tlasStorageAlloc);
+        if (tlasInstanceBuffer.Handle != 0) Gfx.DestroyBuffer(tlasInstanceBuffer, tlasInstanceAlloc);
+        if (asScratchBuffer.Handle != 0)    Gfx.DestroyBuffer(asScratchBuffer,    asScratchAlloc);
 
         DestroyClusterBlases();
     }

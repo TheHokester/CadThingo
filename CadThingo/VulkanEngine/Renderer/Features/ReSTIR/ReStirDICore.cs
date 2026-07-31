@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
 
@@ -26,7 +27,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 /// graph.Execute. Only constructed when the device exposes the RT pipeline (reStirPipeline != null).
 /// </summary>
 internal sealed class ReStirDICore : IRenderCore, IGraphCore,
-                                     ISelfRegisteringFeature<ReStirDICore>, INeedsHost
+                                     ISelfRegisteringFeature<ReStirDICore>, INeedsGpu, INeedsHost,
+                                     INeedsFeature<ISharedPipelines>
 {
     // Same condition the host used to build reStirPipeline under, now stated once, here.
     public static FeatureDesc Desc =>
@@ -37,7 +39,14 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
     [ModuleInitializer]
     internal static void _Reg() => FeatureCatalog.Register<ReStirDICore>();
 
-    // Transitional: the ReSTIR pipeline + PT render targets are still renderer-owned.
+    private GpuContext _gpu;
+    GpuContext INeedsGpu.Gpu { set => _gpu = value; }
+
+    // The tonemap this core's graph ends with - one shared instance, injected not constructed.
+    private ISharedPipelines _shared = null!;
+    ISharedPipelines INeedsFeature<ISharedPipelines>.Dependency { set => _shared = value; }
+
+    // Transitional: the PT render targets are still renderer-owned.
     private Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
 
@@ -55,7 +64,11 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
 
     public void Initialize()
     {
-        _pipe = _host.reStirPipeline!;
+        // Same RT-pipeline machinery as PathtraceRTCore (it subclasses RTPipeline), forked only at
+        // the shader; shares the accumulator / outColor + scene set. Technique-private, so this
+        // core builds it rather than the host.
+        _pipe = new ReStirDIPipeline(_gpu, _host);
+        _pipe.Initialize();
         BuildGraph();
     }
 
@@ -67,7 +80,7 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
         _graph?.Dispose();
         var fg = new ReStirGraph(_host.gfx);
 
-        var module = new ReStirDIModule(_pipe, _host.tonemapPipeline);
+        var module = new ReStirDIModule(_pipe, _shared.Tonemap);
         module.Build(fg.RootScope().Child("ReStirDI"),
             new ReStirDIModule.Inputs(
                 _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
@@ -152,7 +165,9 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
 
     public void Dispose()
     {
+        // Graph first: its passes hold a reference to the pipeline they record with.
         _graph?.Dispose();
         _graph = null;
+        _pipe?.Dispose();
     }
 }

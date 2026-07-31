@@ -491,7 +491,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
             screenSize               = new Vector2(renderExtent.Width, renderExtent.Height),
             fov                      = fovRad,
             tanHalfFov               = tanHalfFov,
-            prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels,
+            prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels,
             scaleIBLAmbient          = EditorState.IblIntensity,
             focusDistance            = FocusDistance,
             aperture                 = Aperture,

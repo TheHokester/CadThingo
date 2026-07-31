@@ -1,5 +1,8 @@
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -37,9 +40,25 @@ internal struct PcProbePrefilter
 /// Phase-2 status: GPU resources allocated, registry working — but the capture
 /// pass, prefilter dispatch, cluster grid, and shader integration are all
 /// downstream phases.
+///
+/// It is a feature that declares <c>INeedsFeature&lt;IIblProvider&gt;</c>. Probe prefiltering is the
+/// same GGX convolution as the global one, so it drives the IBL feature's kernel and sampler rather
+/// than compiling a second copy. Order 2 - one above IBL - is what makes that legal: descriptor
+/// Order guarantees the provider has finished its own Initialize before this one runs, which is
+/// exactly what the old <c>new ReflectionProbeSystem(gpu, renderer, iblSystem)</c> argument was
+/// standing in for.
 /// </summary>
-public sealed unsafe class ReflectionProbeSystem : IDisposable
+public sealed unsafe class ReflectionProbeSystem
+    : ISelfRegisteringFeature<ReflectionProbeSystem>, INeedsGpu, INeedsHost, INeedsFeature<IIblProvider>
 {
+    public static FeatureDesc Desc =>
+        new(Order: 2, Gate: _ => true, Make: () => new ReflectionProbeSystem());
+
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<ReflectionProbeSystem>();
+
+    public string Name => "Reflection probes";
+
     // Hard caps. Bumping MaxProbes resizes the cubemap array (one-time cost at
     // startup); bumping ProbeFaceSize costs 4× VRAM per size step. 16 × 256² is
     // the working default for typical CAD scenes (~67 MB RGBA16F mipped).
@@ -47,12 +66,16 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     public const uint ProbeFaceSize = 256;
     public static readonly uint ProbeMipLevels =
         (uint)System.Math.Floor(System.Math.Log2(ProbeFaceSize)) + 1;
-    private readonly Renderer _renderer;
-    private readonly GpuContext _gpu;
-    private readonly GraphicsDevice _gfx;
-    private readonly IblSystem _iblSystem;
-    private readonly Vk       _vk;
-    private readonly Device   _device;
+    private Renderer     _renderer = null!;
+    private GpuContext   _gpu;
+    private IIblProvider _ibl = null!;
+    GpuContext   INeedsGpu.Gpu                        { set => _gpu      = value; }
+    Renderer     INeedsHost.Host                      { set => _renderer = value; }
+    IIblProvider INeedsFeature<IIblProvider>.Dependency { set => _ibl     = value; }
+
+    private GraphicsDevice _gfx    => _gpu.Gfx;
+    private Vk             _vk     => _gpu.Gfx.Vk!;
+    private Device         _device => _gpu.Gfx.Device;
 
     // GPU resources
 
@@ -121,15 +144,8 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
     public IReadOnlyList<ReflectionProbeComponent> Probes => _probes;
 
-    public ReflectionProbeSystem(GpuContext gpu, Renderer renderer, IblSystem iblSystem)
+    public void Initialize()
     {
-        _gpu = gpu;
-        _renderer = renderer;
-        _gfx = _gpu.Gfx;
-        _vk = _gpu.Gfx.Vk;
-        _device = _gpu.Gfx.Device;
-        _iblSystem = iblSystem;
-
         CreatePrefilteredArray();
         CreateSampler();
         CreateProbeRecordBuffers();
@@ -139,6 +155,33 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
         clusterGrid = new ProbeClusterGrid(_gfx);
 
         for (int i = (int)MaxProbes - 1; i >= 0; i--) _freeSlots.Push(i);
+
+        RegisterBindings();
+    }
+
+    /// <summary>
+    /// Publishes the probe half of the FeatureIBL set (set 2) by binding name. The cube array is a
+    /// fixed MaxProbes allocation and the cluster SSBOs are max-sized, so every handle here is
+    /// stable for the renderer's lifetime - registering once is enough, and per-frame updates only
+    /// ever rewrite buffer *contents*.
+    /// </summary>
+    private void RegisterBindings()
+    {
+        var r = _gpu.Registry;
+        r.RegisterImage("probeCubeArray", prefilteredArrayView, ImageLayout.ShaderReadOnlyOptimal, prefilteredArraySampler);
+
+        var probes       = new Silk.NET.Vulkan.Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var clusterRange = new Silk.NET.Vulkan.Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var indexList    = new Silk.NET.Vulkan.Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
+        {
+            probes[i]       = probeRecordBuffers[i].buffer;
+            clusterRange[i] = clusterGrid.GetClusterRangeBuffer((uint)i);
+            indexList[i]    = clusterGrid.GetProbeIndexBuffer((uint)i);
+        }
+        r.RegisterBufferPerFrame("probes", probes);
+        r.RegisterBufferPerFrame("probeClusterRange", clusterRange);
+        r.RegisterBufferPerFrame("probeIndexList", indexList);
     }
 
     /// <summary>
@@ -149,9 +192,9 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     /// </summary>
     private void CreatePrefilterDescriptors()
     {
-        var bake = _iblSystem.prefilterEnvPipeline;
+        var bake = _ibl.PrefilterPipeline;
         var inputView = captureCubeSampleView;
-        var inputSampler = _iblSystem.iblCubeSampler;
+        var inputSampler = _ibl.CubeSampler;
 
         _prefilterStorageViews = new ImageView[MaxProbes, ProbeMipLevels];
         _prefilterSets         = new DescriptorSet[MaxProbes, ProbeMipLevels];
@@ -739,7 +782,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             0, 0, null, 0, null, 2, postBarriers);
 
         // Prefilter dispatch: per-mip GGX importance sample into the slot
-        var prefilter = _iblSystem.prefilterEnvPipeline;
+        var prefilter = _ibl.PrefilterPipeline;
         _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilter.Handle);
         uint slot = (uint)probe.CubeArraySlot;
         for (uint m = 0; m < ProbeMipLevels; m++)

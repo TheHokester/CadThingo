@@ -171,9 +171,9 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
         // Used by PBR.slang to scale roughness into the prefiltered mip chain.
-        // Renderer.Ibl.prefilteredCubeMipLevels is set when IblSystem is constructed
-        // and never changes - IBL bakes overwrite content, not metadata.
-        ubo.prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels;
+        // Read from the IBL provider every frame rather than cached: it is fixed today (bakes
+        // overwrite content, not metadata) but a stale copy would be silent if that ever changed.
+        ubo.prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels;
         ubo.scaleIBLAmbient = EditorState.IblIntensity;
         ubo.lightCount = count;
         ubo.tileCountX = tileX;
