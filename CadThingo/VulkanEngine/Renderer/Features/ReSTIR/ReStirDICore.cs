@@ -1,6 +1,8 @@
 using System.Numerics;
+using System.Runtime.CompilerServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
-using CadThingo.VulkanEngine.Renderer.RenderCores;
 using Silk.NET.Vulkan;
 
 // The graph type shares its name with its namespace; alias so bare references never have to
@@ -23,11 +25,24 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 /// the PT skeleton: camera-motion restart, per-frame light/material refresh, UpdatePerFrame, then
 /// graph.Execute. Only constructed when the device exposes the RT pipeline (reStirPipeline != null).
 /// </summary>
-internal sealed class ReStirDICore : IRenderCore, IGraphCore
+internal sealed class ReStirDICore : IRenderCore, IGraphCore,
+                                     ISelfRegisteringFeature<ReStirDICore>, INeedsHost
 {
-    private readonly Renderer         _host;
-    private readonly ReStirDIPipeline _pipe;
-    private ReStirGraph?              _graph;
+    // Same condition the host used to build reStirPipeline under, now stated once, here.
+    public static FeatureDesc Desc =>
+        new(Order: 60,
+            Gate: gpu => gpu.Gfx.RayTracePipelineSupported,
+            Make: () => new ReStirDICore());
+
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<ReStirDICore>();
+
+    // Transitional: the ReSTIR pipeline + PT render targets are still renderer-owned.
+    private Renderer _host = null!;
+    Renderer INeedsHost.Host { set => _host = value; }
+
+    private ReStirDIPipeline _pipe = null!;
+    private ReStirGraph?     _graph;
 
     // Previous-frame camera snapshot -- any change restarts progressive integration (same scheme as
     // WavefrontPTCore). Identity/zero defaults force a restart on first activation.
@@ -38,11 +53,9 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore
     public string Name => "ReSTIR DI (RT pipeline)";
     public Renderer.RenderMode Mode => Renderer.RenderMode.ReStirDI;
 
-    public ReStirDICore(Renderer host)
+    public void Initialize()
     {
-        _host = host;
-        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
-        _pipe = host.reStirPipeline!;
+        _pipe = _host.reStirPipeline!;
         BuildGraph();
     }
 

@@ -1,6 +1,6 @@
 ﻿using System.Numerics;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
-using CadThingo.VulkanEngine.Renderer.RenderCores;
 using Silk.NET.Vulkan;
 
 // The graph type shares its name with its namespace; alias so bare references never have to
@@ -14,12 +14,15 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 /// and the RT-pipeline path. GRAPH-RESIDENT like WavefrontPTCore / ReStirDICore: owns a
 /// <see cref="PTGraph"/> built from <see cref="PathTraceModule"/> (Trace -> Tonemap), so the
 /// barriers and the tonemap HDR-input set are graph-derived / graph-baked instead of hand-rolled.
-/// Subclasses bind the concrete pipeline via the protected hooks and call <see cref="BuildGraph"/>
-/// at the end of their ctor (after their pipeline field is assigned).
+/// Subclasses bind the concrete pipeline via the protected hooks; the base resolves that pipeline
+/// and builds the graph in <see cref="Initialize"/>, once the host is wired.
 /// </summary>
-internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
+internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore, INeedsHost
 {
-    protected readonly Renderer _host;
+    // Transitional: the PT cores compose against renderer-owned pipelines + render targets.
+    protected Renderer _host = null!;
+    Renderer INeedsHost.Host { set => _host = value; }
+
     private PTGraph? _graph;
 
     // Previous-frame camera snapshot. Any change restarts progressive integration. Identity/zero
@@ -29,16 +32,21 @@ internal abstract class PathTraceCoreBase : IRenderCore, IGraphCore
     // FOV doesn't move the view matrix, so it needs its own snapshot.
     private float     _lastCamFov;
 
-    protected PathTraceCoreBase(Renderer host)
-    {
-        _host = host;
-        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
-    }
-
     public abstract string Name { get; }
     public abstract Renderer.RenderMode Mode { get; }
 
+    /// <summary>Resolves the subclass's pipeline off the (now-wired) host, then builds the graph.
+    /// Split this way so the ctor stays empty and the pipeline field is assigned exactly once,
+    /// before the graph that closes over it is compiled.</summary>
+    public void Initialize()
+    {
+        BindPipeline();
+        BuildGraph();
+    }
+
     // ---- Pipeline-specific hooks (forwarded to PTComputePipeline / RTPipeline) ------------------
+    /// <summary>Assigns the concrete pipeline from the host. Runs first in Initialize.</summary>
+    protected abstract void BindPipeline();
     /// <summary>Compute (ray query) vs RayTrace (CmdTraceRays) -- selects the Trace pass type and
     /// the stage the module's derived barriers target.</summary>
     protected abstract PassType TracePassType { get; }

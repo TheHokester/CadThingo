@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // In-proc IShaderCompiler over slang.dll: one lazily created global session, one cached
 // ISession per (defines, capabilities) combination. Slang's global session is not

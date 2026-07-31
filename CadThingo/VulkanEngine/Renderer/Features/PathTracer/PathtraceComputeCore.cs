@@ -1,4 +1,7 @@
-﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using System.Runtime.CompilerServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
@@ -9,18 +12,23 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 /// A thin <see cref="PathTraceCoreBase"/> subclass binding the renderer-owned
 /// <see cref="PTComputePipeline"/>; the Trace pass runs as a graph compute pass.
 /// </summary>
-internal sealed class PathtraceComputeCore : PathTraceCoreBase
+internal sealed class PathtraceComputeCore : PathTraceCoreBase,
+                                             ISelfRegisteringFeature<PathtraceComputeCore>
 {
-    private readonly PTComputePipeline _pipeline;
+    // Ungated: the ray-query compute path is built unconditionally today, matching the pipeline it
+    // binds. If that pipeline ever becomes conditional, this gate is where it says so.
+    public static FeatureDesc Desc =>
+        new(Order: 20, Gate: _ => true, Make: () => new PathtraceComputeCore());
 
-    public PathtraceComputeCore(Renderer host) : base(host)
-    {
-        _pipeline = host.ptComputePipeline;
-        BuildGraph();
-    }
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<PathtraceComputeCore>();
+
+    private PTComputePipeline _pipeline = null!;
 
     public override string Name => "PathTrace (Compute)";
     public override Renderer.RenderMode Mode => Renderer.RenderMode.RayCompute;
+
+    protected override void BindPipeline() => _pipeline = _host.ptComputePipeline;
 
     protected override PassType TracePassType => PassType.Compute;
     protected override void PipelineMarkAccumulatorDirty() => _pipeline.MarkAccumulatorDirty();

@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // Disk cache for compiled shaders (docs/descriptor-system.md section 4): per request, a
 // .refl file (reflection + dependency manifest) plus one .spv per entry point, named

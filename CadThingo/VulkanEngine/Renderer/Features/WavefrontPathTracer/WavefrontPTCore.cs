@@ -1,6 +1,8 @@
 ﻿using System.Numerics;
+using System.Runtime.CompilerServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
-using CadThingo.VulkanEngine.Renderer.RenderCores;
 using Silk.NET.Vulkan;
 
 // The graph type shares its name with its namespace; alias so bare `FrameGraph`
@@ -22,11 +24,21 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// camera-snapshot / accumulator-reset bookkeeping. <see cref="Render"/> mirrors the PT skeleton:
 /// camera-motion restart, per-frame light/material refresh, UpdatePerFrame, then graph.Execute.
 /// </summary>
-internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
+internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
+                                        ISelfRegisteringFeature<WavefrontPTCore>, INeedsHost
 {
-    private readonly Renderer            _host;
-    private readonly WavefrontPTPipeline _pipe;
-    private WavefrontGraph?              _graph;
+    public static FeatureDesc Desc =>
+        new(Order: 50, Gate: _ => true, Make: () => new WavefrontPTCore());
+
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<WavefrontPTCore>();
+
+    // Transitional: the wavefront pipeline + PT render targets are still renderer-owned.
+    private Renderer _host = null!;
+    Renderer INeedsHost.Host { set => _host = value; }
+
+    private WavefrontPTPipeline _pipe = null!;
+    private WavefrontGraph?     _graph;
 
     // Previous-frame camera snapshot -- any change restarts progressive integration (same scheme
     // as PathTraceCoreBase). Identity/zero defaults force a restart on first activation.
@@ -37,11 +49,9 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
     public string Name => "PathTrace (Wavefront)";
     public Renderer.RenderMode Mode => Renderer.RenderMode.RayWavefront;
 
-    public WavefrontPTCore(Renderer host)
+    public void Initialize()
     {
-        _host = host;
-        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
-        _pipe = host.wavefrontPipeline;
+        _pipe = _host.wavefrontPipeline;
         BuildGraph();
     }
 

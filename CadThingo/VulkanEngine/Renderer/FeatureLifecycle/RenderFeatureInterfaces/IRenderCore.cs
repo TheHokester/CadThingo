@@ -1,7 +1,7 @@
 ﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.RenderCores;
+namespace CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 
 /// <summary>
 /// Optional capability for cores that drive a <see cref="FrameGraph.FrameGraph"/> (deferred,
@@ -48,14 +48,16 @@ internal readonly ref struct RenderFrame
 /// path today.
 ///
 /// This replaces the four parallel <c>DrawX</c> methods + the <c>switch(renderMode)</c> in
-/// <c>DrawFrame</c>: a mode change becomes a swap of the active core. Cores are built eagerly (all
-/// technique pipelines are already constructed up front in <c>Renderer.Initialize</c>).
+/// <c>DrawFrame</c>: a mode change becomes a swap of the active core.
+///
+/// A core is a FEATURE with two extra properties: exactly one is active at a time, and the active
+/// one produces the frame. Everything else - registration, gating, ordered construction, wiring,
+/// Initialize, resize, reverse dispose - it inherits from <see cref="IResizeFeature"/> rather than
+/// getting its own parallel machinery. Its descriptor Order doubles as its index in the mode combo,
+/// so the lowest-Order core is the boot default.
 /// </summary>
-internal interface IRenderCore : IDisposable
+internal interface IRenderCore : IResizeFeature
 {
-    /// <summary>Human-readable label (debug / DOT / stats panels).</summary>
-    string Name { get; }
-
     /// <summary>The <see cref="Renderer.RenderMode"/> this core services.</summary>
     Renderer.RenderMode Mode { get; }
 
@@ -71,9 +73,4 @@ internal interface IRenderCore : IDisposable
     /// <summary>Records the full technique into <see cref="RenderFrame.Cmd"/>, leaving FinalColor
     /// in <c>ShaderReadOnlyOptimal</c> for the host post-stack.</summary>
     void Render(in RenderFrame frame);
-
-    /// <summary>Rebuilds / rebinds any size-dependent technique state after a render-target
-    /// resize (fresh extent -> fresh transients / storage images). The host has issued
-    /// DeviceWaitIdle and reallocated the shared targets before calling this.</summary>
-    void Resize(Extent2D extent);
 }

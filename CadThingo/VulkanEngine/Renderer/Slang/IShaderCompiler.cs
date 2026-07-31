@@ -1,4 +1,4 @@
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // Quarantine seam for the Slang interop: everything
 // above this interface must not know whether SPIR-V came from slang.dll or a slangc

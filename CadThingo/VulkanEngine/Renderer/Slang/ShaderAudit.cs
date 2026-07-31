@@ -1,6 +1,6 @@
 using System.Text;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // Headless shader check (`dotnet run --project CadThingo -- --shader-audit`). Compiles every
 // engine kernel through ShaderLibrary and reports, without bringing up a device.

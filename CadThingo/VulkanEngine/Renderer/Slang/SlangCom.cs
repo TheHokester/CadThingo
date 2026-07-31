@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // COM-lite wrappers over slang.dll interface pointers. Slang objects are C++ classes whose
 // vtables start IUnknown-compatible (slot 0 queryInterface, 1 addRef, 2 release). A wrapper

@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // Walks an opaque ProgramLayout* (SlangComponentType.GetLayout) into ShaderReflectionData
 // via the flat spReflection_* exports. The layout is owned by the component it came from -

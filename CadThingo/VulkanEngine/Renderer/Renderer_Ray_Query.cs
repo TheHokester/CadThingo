@@ -1,7 +1,6 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
-using Silk.NET.Vulkan.Extensions.KHR;
 
 namespace CadThingo.VulkanEngine.Renderer;
 
@@ -30,16 +29,10 @@ public unsafe partial class Renderer
     
     //  State
 
-    // Silk.NET dispatch table for VK_KHR_acceleration_structure. Loaded once via
-    // TryGetDeviceExtension after the logical device is created. Null when the
-    // extension wasn't enabled — every method below should early-out on null.
-    private KhrAccelerationStructure? khrAccelStruct;
-    
-    // Pulled from PhysicalDeviceAccelerationStructurePropertiesKHR at startup.
-    // Every scratch buffer offset passed to Cmd*BuildAccelerationStructures must be
-    // a multiple of this value, otherwise validation errors with "scratchData not
-    // properly aligned." Default 1 keeps math safe before LoadRayQueryExtensions runs.
-    private uint asScratchAlignment = 1;
+    // AS verbs (create/destroy/build/compact + the dispatch table and the scratch alignment
+    // behind them) live on the device facet. What is left in this file is the POLICY: what to
+    // cluster, when to rebuild, how the instance / shadow-info / transform records are packed.
+    private AsDevice As => gfx.As;
 
     // Cluster BLASes. One world-space BLAS per spatial cluster of primitives,
     // rebuilt wholesale every RebuildTlas (the geometry is baked to world space
@@ -96,7 +89,7 @@ public unsafe partial class Renderer
     // True when the full ray-query stack is usable for this frame: the device
     // supports it, the extension loaded, and a TLAS has been built. SelectionSystem
     // (pick + outline) gates on this before touching the acceleration structure.
-    internal bool RayInfraReady => RayShadowsSupported && khrAccelStruct != null && tlas.Handle != 0;
+    internal bool RayInfraReady => RayShadowsSupported && As.Available && tlas.Handle != 0;
     private Buffer    tlasStorage;
     private SubAlloc  tlasStorageAlloc;
 
@@ -180,51 +173,13 @@ public unsafe partial class Renderer
     public bool IsTlasDirty => tlasDirty;
 
 
-    //  Helpers — finished
+    //  Helpers
 
-    private ulong GetBufferDeviceAddress(Buffer buffer)
-    {
-        BufferDeviceAddressInfo deviceAddressInfo = new()
-        {
-            SType = StructureType.BufferDeviceAddressInfo,
-            Buffer = buffer,
-        };
-        return vk!.GetBufferDeviceAddress(device, &deviceAddressInfo);
-    }
-
-
-    // 
-    //  Helpers — TODO
-    // 
-
-    /// <summary>
-    /// Same shape as the existing CreateBuffer helper but chains
-    /// MemoryAllocateFlagsInfo { flags = AddressBitKhr } into MemoryAllocateInfo.PNext.
-    /// REQUIRED for any buffer you'll call vkGetBufferDeviceAddress on
-    /// (BLAS storage, TLAS storage, scratch, instance). Without it the address
-    /// returned is undefined and validation will yell on first use.
-    ///
-    /// Caller still passes ShaderDeviceAddressBit in `usage` — both the buffer
-    /// usage bit AND the alloc flag are needed.
-    /// </summary>
-    private void CreateBufferWithDeviceAddress(
-        ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault)
-    {
-        // Allocator buffer blocks unconditionally carry MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
-        // so this is now just a buffer create + bind. Caller still owns the
-        // ShaderDeviceAddressBit usage flag — the buffer needs both halves.
-        BufferCreateInfo bufferInfo = new()
-        {
-            SType = StructureType.BufferCreateInfo,
-            Size = size,
-            Usage = usage,
-            SharingMode = SharingMode.Exclusive,
-        };
-        if (vk!.CreateBuffer(device, &bufferInfo, null, out buffer) != Result.Success)
-            throw new Exception("Failed to create device-address buffer");
-        alloc = memAllocator.AllocateForBuffer(buffer, memProps, priority);
-    }
+    // The AS buffers below (scratch / instance / cluster transforms / AS storage) are created
+    // through the ordinary CreateBuffer with ShaderDeviceAddressBit in their usage - that bit is
+    // the whole contract, since every allocator buffer block already carries the matching
+    // MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. There used to be a separate
+    // CreateBufferWithDeviceAddress helper here; it had become byte-for-byte the same call.
 
     /// <summary>
     /// Packs System.Numerics.Matrix4x4 into Vulkan's TransformMatrixKHR (row-major 3×4,
@@ -255,17 +210,18 @@ public unsafe partial class Renderer
 
     /// <summary>
     /// Grows the persistent scratch buffer if `required` exceeds current size.
-    /// Padded up to asScratchAlignment so any offset into the buffer satisfies
-    /// the scratchData alignment rule.
+    /// Padded up to the device's scratch alignment so any offset into the buffer
+    /// satisfies the scratchData alignment rule.
     /// </summary>
     private void EnsureScratchCapacity(ulong required)
     {
-        ulong padded = ((required + asScratchAlignment - 1) / asScratchAlignment) * asScratchAlignment;
+        uint align = As.ScratchAlignment;
+        ulong padded = ((required + align - 1) / align) * align;
         if (asScratchBuffer.Handle != 0 && asScratchSize >= padded) return;
 
         if (asScratchBuffer.Handle != 0) DestroyBuffer(asScratchBuffer, asScratchAlloc);
 
-        CreateBufferWithDeviceAddress(padded,
+        CreateBuffer(padded,
             BufferUsageFlags.StorageBufferBit | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit,
             out asScratchBuffer, out asScratchAlloc);
@@ -291,7 +247,7 @@ public unsafe partial class Renderer
         while (capacity < requiredInstances) capacity <<= 1;
 
         ulong sizeBytes = (ulong)capacity * (ulong)sizeof(AccelerationStructureInstanceKHR);
-        CreateBufferWithDeviceAddress(sizeBytes,
+        CreateBuffer(sizeBytes,
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out tlasInstanceBuffer, out tlasInstanceAlloc);
@@ -529,7 +485,7 @@ public unsafe partial class Renderer
         uint capacity = 8;
         while (capacity < required) capacity <<= 1;
 
-        CreateBufferWithDeviceAddress((ulong)capacity * (ulong)sizeof(TransformMatrixKHR),
+        CreateBuffer((ulong)capacity * (ulong)sizeof(TransformMatrixKHR),
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out clusterTransformBuffer, out clusterTransformAlloc);
@@ -543,10 +499,9 @@ public unsafe partial class Renderer
     /// at init before any frame).</summary>
     private void DestroyClusterBlases()
     {
-        if (khrAccelStruct == null) return;
         foreach (var b in clusterBlases)
         {
-            khrAccelStruct.DestroyAccelerationStructure(device, b.Handle, null);
+            As.Destroy(b.Handle);
             DestroyBuffer(b.Storage, b.StorageAlloc);
         }
         clusterBlases.Clear();
@@ -561,9 +516,9 @@ public unsafe partial class Renderer
     {
         int geomCount = hi - lo;
 
-        ulong vbAddr    = GetBufferDeviceAddress(Engine.ResourceManager.GlobalVertexBuffer);
-        ulong ibBase    = GetBufferDeviceAddress(Engine.ResourceManager.GlobalIndexBuffer);
-        ulong xfBase    = GetBufferDeviceAddress(clusterTransformBuffer);
+        ulong vbAddr    = gfx.GetBufferDeviceAddress(Engine.ResourceManager.GlobalVertexBuffer);
+        ulong ibBase    = gfx.GetBufferDeviceAddress(Engine.ResourceManager.GlobalIndexBuffer);
+        ulong xfBase    = gfx.GetBufferDeviceAddress(clusterTransformBuffer);
         uint  maxVertex = (uint)Engine.ResourceManager.VertexHighWater;
         uint  xfStride  = (uint)sizeof(TransformMatrixKHR);   // 48 — a multiple of 16 (transformOffset rule)
 
@@ -620,47 +575,32 @@ public unsafe partial class Renderer
                 PGeometries   = pGeos,
             };
 
-            var sizes = new AccelerationStructureBuildSizesInfoKHR { SType = StructureType.AccelerationStructureBuildSizesInfoKhr };
-            khrAccelStruct!.GetAccelerationStructureBuildSizes(
-                device, AccelerationStructureBuildTypeKHR.DeviceKhr,
-                &buildInfo, pMaxPrims, &sizes);
+            var sizes = As.GetBuildSizes(ref buildInfo, pMaxPrims);
 
             // High priority: BLAS storage is the persistent geometry BVH the path tracer
             // traverses every frame — must stay resident under WDDM budget pressure.
-            CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize,
+            CreateBuffer(sizes.AccelerationStructureSize,
                 BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
                 MemoryPropertyFlags.DeviceLocalBit, out var storage, out var storageAlloc,
                 GpuMemoryAllocator.PriorityHigh);
 
             EnsureScratchCapacity(sizes.BuildScratchSize);
 
-            var createInfo = new AccelerationStructureCreateInfoKHR
-            {
-                SType  = StructureType.AccelerationStructureCreateInfoKhr,
-                Buffer = storage,
-                Size   = sizes.AccelerationStructureSize,
-                Type   = AccelerationStructureTypeKHR.BottomLevelKhr,
-            };
-            khrAccelStruct.CreateAccelerationStructure(device, &createInfo, null, out var handle);
+            var handle = As.Create(storage, sizes.AccelerationStructureSize,
+                AccelerationStructureTypeKHR.BottomLevelKhr);
             buildInfo.DstAccelerationStructure  = handle;
-            buildInfo.ScratchData.DeviceAddress = GetBufferDeviceAddress(asScratchBuffer);
+            buildInfo.ScratchData.DeviceAddress = gfx.GetBufferDeviceAddress(asScratchBuffer);
 
             fixed (AccelerationStructureBuildRangeInfoKHR* pRanges = ranges)
-            {
-                var pr  = pRanges;
-                var cmd = BeginSingleTimeCommands();
-                khrAccelStruct.CmdBuildAccelerationStructures(cmd, 1, &buildInfo, &pr);
-                EndSingleTimeCommands(cmd);
-            }
+                As.Build(ref buildInfo, pRanges);
 
-            var addrInfo = new AccelerationStructureDeviceAddressInfoKHR
+            var built = new BlasEntry
             {
-                SType = StructureType.AccelerationStructureDeviceAddressInfoKhr,
-                AccelerationStructure = handle,
+                Handle        = handle,
+                Storage       = storage,
+                StorageAlloc  = storageAlloc,
+                DeviceAddress = As.DeviceAddress(handle),
             };
-            ulong devAddr = khrAccelStruct.GetAccelerationStructureDeviceAddress(device, &addrInfo);
-
-            var built = new BlasEntry { Handle = handle, Storage = storage, StorageAlloc = storageAlloc, DeviceAddress = devAddr };
             return CompactBlas(built, sizes.AccelerationStructureSize);
         }
     }
@@ -674,67 +614,31 @@ public unsafe partial class Renderer
     // fine at edit/load time; batching belongs in the planned static/dynamic AS wrapper.
     private BlasEntry CompactBlas(BlasEntry src, ulong originalSize)
     {
-        var qpInfo = new QueryPoolCreateInfo
-        {
-            SType      = StructureType.QueryPoolCreateInfo,
-            QueryType  = QueryType.AccelerationStructureCompactedSizeKhr,
-            QueryCount = 1,
-        };
-        vk!.CreateQueryPool(device, &qpInfo, null, out var pool);
-
-        var srcHandle = src.Handle;
-        var qcmd = BeginSingleTimeCommands();
-        vk.CmdResetQueryPool(qcmd, pool, 0, 1);
-        khrAccelStruct!.CmdWriteAccelerationStructuresProperties(qcmd, 1, &srcHandle,
-            QueryType.AccelerationStructureCompactedSizeKhr, pool, 0);
-        EndSingleTimeCommands(qcmd);
-
-        ulong compactedSize = 0;
-        vk.GetQueryPoolResults(device, pool, 0, 1, (nuint)sizeof(ulong), &compactedSize,
-            (ulong)sizeof(ulong), QueryResultFlags.Result64Bit | QueryResultFlags.ResultWaitBit);
-        vk.DestroyQueryPool(device, pool, null);
+        ulong compactedSize = As.QueryCompactedSize(src.Handle);
 
         // No useful shrink (or a driver reporting 0) — keep the original.
         if (compactedSize == 0 || compactedSize >= originalSize)
             return src;
 
-        CreateBufferWithDeviceAddress(compactedSize,
+        CreateBuffer(compactedSize,
             BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit, out var cStorage, out var cAlloc,
             GpuMemoryAllocator.PriorityHigh);
 
-        var createInfo = new AccelerationStructureCreateInfoKHR
-        {
-            SType  = StructureType.AccelerationStructureCreateInfoKhr,
-            Buffer = cStorage,
-            Size   = compactedSize,
-            Type   = AccelerationStructureTypeKHR.BottomLevelKhr,
-        };
-        khrAccelStruct.CreateAccelerationStructure(device, &createInfo, null, out var cHandle);
-
-        var copyInfo = new CopyAccelerationStructureInfoKHR
-        {
-            SType = StructureType.CopyAccelerationStructureInfoKhr,
-            Src   = srcHandle,
-            Dst   = cHandle,
-            Mode  = CopyAccelerationStructureModeKHR.CompactKhr,
-        };
-        var ccmd = BeginSingleTimeCommands();
-        khrAccelStruct.CmdCopyAccelerationStructure(ccmd, &copyInfo);
-        EndSingleTimeCommands(ccmd);
+        var cHandle = As.Create(cStorage, compactedSize, AccelerationStructureTypeKHR.BottomLevelKhr);
+        As.CopyCompact(src.Handle, cHandle);
 
         // Free the uncompacted source now that the compacted copy owns the geometry.
-        khrAccelStruct.DestroyAccelerationStructure(device, src.Handle, null);
+        As.Destroy(src.Handle);
         DestroyBuffer(src.Storage, src.StorageAlloc);
 
-        var addrInfo = new AccelerationStructureDeviceAddressInfoKHR
+        return new BlasEntry
         {
-            SType                 = StructureType.AccelerationStructureDeviceAddressInfoKhr,
-            AccelerationStructure = cHandle,
+            Handle        = cHandle,
+            Storage       = cStorage,
+            StorageAlloc  = cAlloc,
+            DeviceAddress = As.DeviceAddress(cHandle),
         };
-        ulong cAddr = khrAccelStruct.GetAccelerationStructureDeviceAddress(device, &addrInfo);
-
-        return new BlasEntry { Handle = cHandle, Storage = cStorage, StorageAlloc = cAlloc, DeviceAddress = cAddr };
     }
     //tlas previous entry count(ensures that if all are removed old tlas isnt used)
     private uint PreviousCount = 0;
@@ -908,7 +812,7 @@ public unsafe partial class Renderer
         };
         geo.Geometry.Instances.SType              = StructureType.AccelerationStructureGeometryInstancesDataKhr;
         geo.Geometry.Instances.ArrayOfPointers    = false;
-        geo.Geometry.Instances.Data.DeviceAddress = GetBufferDeviceAddress(tlasInstanceBuffer);
+        geo.Geometry.Instances.Data.DeviceAddress = gfx.GetBufferDeviceAddress(tlasInstanceBuffer);
 
         // 4. Build info — full rebuild for now. AllowUpdateBitKhr is set so a future
         //    transform-only path can use Mode = UpdateKhr + SrcAccelerationStructure = tlas.
@@ -924,41 +828,29 @@ public unsafe partial class Renderer
         };
 
         // 5. Size query. For TLAS, the "primitive count" is the instance count.
-        var sizes = new AccelerationStructureBuildSizesInfoKHR
-        {
-            SType = StructureType.AccelerationStructureBuildSizesInfoKhr,
-        };
-        khrAccelStruct!.GetAccelerationStructureBuildSizes(
-            device, AccelerationStructureBuildTypeKHR.DeviceKhr,
-            &buildInfo, &instanceCount, &sizes);
+        var sizes = As.GetBuildSizes(ref buildInfo, &instanceCount);
 
         // 6. (Re)allocate TLAS storage. Free + reallocate on every rebuild until
         //    the update-mode path lands.
         if (tlas.Handle != 0)
         {
-            khrAccelStruct.DestroyAccelerationStructure(device, tlas, null);
+            As.Destroy(tlas);
             DestroyBuffer(tlasStorage, tlasStorageAlloc);
         }
         // High priority: TLAS storage is the top-level BVH traversed every path-trace frame.
-        CreateBufferWithDeviceAddress(sizes.AccelerationStructureSize,
+        CreateBuffer(sizes.AccelerationStructureSize,
             BufferUsageFlags.AccelerationStructureStorageBitKhr | BufferUsageFlags.ShaderDeviceAddressBit,
             MemoryPropertyFlags.DeviceLocalBit,
             out tlasStorage, out tlasStorageAlloc,
             GpuMemoryAllocator.PriorityHigh);
 
-        var createInfo = new AccelerationStructureCreateInfoKHR
-        {
-            SType  = StructureType.AccelerationStructureCreateInfoKhr,
-            Buffer = tlasStorage,
-            Size   = sizes.AccelerationStructureSize,
-            Type   = AccelerationStructureTypeKHR.TopLevelKhr,
-        };
-        khrAccelStruct.CreateAccelerationStructure(device, &createInfo, null, out tlas);
+        tlas = As.Create(tlasStorage, sizes.AccelerationStructureSize,
+            AccelerationStructureTypeKHR.TopLevelKhr);
 
         // 7. Wire scratch + dst into buildInfo, record + submit.
         EnsureScratchCapacity(sizes.BuildScratchSize);
         buildInfo.DstAccelerationStructure  = tlas;
-        buildInfo.ScratchData.DeviceAddress = GetBufferDeviceAddress(asScratchBuffer);
+        buildInfo.ScratchData.DeviceAddress = gfx.GetBufferDeviceAddress(asScratchBuffer);
 
         var range = new AccelerationStructureBuildRangeInfoKHR
         {
@@ -967,11 +859,7 @@ public unsafe partial class Renderer
             FirstVertex     = 0,
             TransformOffset = 0,
         };
-        var pRange = &range;
-
-        var cmd = BeginSingleTimeCommands();
-        khrAccelStruct.CmdBuildAccelerationStructures(cmd, 1, &buildInfo, &pRange);
-        EndSingleTimeCommands(cmd);
+        As.Build(ref buildInfo, &range);
 
         tlasDirty = false;
     }
@@ -981,27 +869,9 @@ public unsafe partial class Renderer
 
     private void InitRayQuery()
     {
-        if (!RayShadowsSupported) return;
-
-        if (!vk!.TryGetDeviceExtension(instance, device, out khrAccelStruct))
-        {
-            Console.Error.WriteLine("[RayQuery] KhrAccelerationStructure dispatch table failed to load");
-            khrAccelStruct = null;
-            return;
-        }
-
-        // Pull MinAccelerationStructureScratchOffsetAlignment via the properties2 chain.
-        var asProps = new PhysicalDeviceAccelerationStructurePropertiesKHR
-        {
-            SType = StructureType.PhysicalDeviceAccelerationStructurePropertiesKhr,
-        };
-        var props2 = new PhysicalDeviceProperties2
-        {
-            SType = StructureType.PhysicalDeviceProperties2,
-            PNext = &asProps,
-        };
-        vk!.GetPhysicalDeviceProperties2(physicalDevice, &props2);
-        asScratchAlignment = Math.Max(1, asProps.MinAccelerationStructureScratchOffsetAlignment);
+        // The dispatch table + scratch alignment are loaded with the device now; this gate is
+        // purely the policy one - do we intend to build anything, and can we.
+        if (!RayShadowsSupported || !As.Available) return;
 
         // RebuildTlas now clusters primitives and builds the world-space cluster
         // BLASes itself — no per-mesh BLAS prepass.
@@ -1034,7 +904,7 @@ public unsafe partial class Renderer
         // accumulator regardless of whether ray shadows are supported.
         MarkAccumulatorDirty();
 
-        if (!RayShadowsSupported || khrAccelStruct == null) return;
+        if (!RayShadowsSupported || !As.Available) return;
 
         vk!.DeviceWaitIdle(device);
 
@@ -1066,7 +936,9 @@ public unsafe partial class Renderer
 
     private void CleanupRayQuery()
     {
-        if (khrAccelStruct == null) return;
+        // Nothing was ever built without the verbs. The dispatch table itself is the device's
+        // to dispose, after this has released every structure allocated through it.
+        if (!As.Available) return;
 
         // Host-visible mappings live for the lifetime of the parent block (the
         // allocator owns the map/unmap). Just null the pointers — Free below
@@ -1084,7 +956,7 @@ public unsafe partial class Renderer
 
         if (tlas.Handle != 0)
         {
-            khrAccelStruct.DestroyAccelerationStructure(device, tlas, null);
+            As.Destroy(tlas);
             tlas = default;
         }
         if (tlasStorage.Handle != 0)        DestroyBuffer(tlasStorage,        tlasStorageAlloc);
@@ -1092,8 +964,5 @@ public unsafe partial class Renderer
         if (asScratchBuffer.Handle != 0)    DestroyBuffer(asScratchBuffer,    asScratchAlloc);
 
         DestroyClusterBlases();
-
-        khrAccelStruct.Dispose();
-        khrAccelStruct = null;
     }
 }

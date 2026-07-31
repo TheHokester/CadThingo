@@ -1,4 +1,7 @@
-﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using System.Runtime.CompilerServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 
@@ -7,21 +10,27 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 /// <summary>
 /// Progressive path tracer driven by the RT pipeline / CmdTraceRays (RenderMode.RayTrace). A thin
 /// <see cref="PathTraceCoreBase"/> subclass binding the renderer-owned <see cref="RTPipeline"/>;
-/// the Trace pass runs as a graph RayTrace pass. Only constructed when the device exposes the RT
-/// pipeline (<c>rtPipeline != null</c>); the host falls back to the deferred core otherwise.
+/// the Trace pass runs as a graph RayTrace pass. Gated on the RT pipeline being available - on a
+/// device without it this core is never constructed and never appears in the mode combo.
 /// </summary>
-internal sealed class PathtraceRTCore : PathTraceCoreBase
+internal sealed class PathtraceRTCore : PathTraceCoreBase,
+                                        ISelfRegisteringFeature<PathtraceRTCore>
 {
-    private readonly RTPipeline _pipeline;
+    // Same condition the host used to build rtPipeline under, now stated once, here.
+    public static FeatureDesc Desc =>
+        new(Order: 30,
+            Gate: gpu => gpu.Gfx.RayTracePipelineSupported,
+            Make: () => new PathtraceRTCore());
 
-    public PathtraceRTCore(Renderer host) : base(host)
-    {
-        _pipeline = host.rtPipeline!;
-        BuildGraph();
-    }
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<PathtraceRTCore>();
+
+    private RTPipeline _pipeline = null!;
 
     public override string Name => "PathTrace (RT pipeline)";
     public override Renderer.RenderMode Mode => Renderer.RenderMode.RayTrace;
+
+    protected override void BindPipeline() => _pipeline = _host.rtPipeline!;
 
     protected override PassType TracePassType => PassType.RayTrace;
     protected override void PipelineMarkAccumulatorDirty() => _pipeline.MarkAccumulatorDirty();

@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // Blittable mirrors of slang.h structs and enums (Slang 2026.1,
 // %VULKAN_SDK%\Include\slang\slang.h). Layout rules that make Sequential match MSVC:

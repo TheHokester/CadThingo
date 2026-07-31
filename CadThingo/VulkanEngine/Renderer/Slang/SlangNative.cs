@@ -1,7 +1,7 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // Flat C exports from slang.dll, resolved from %VULKAN_SDK%\Bin (docs/descriptor-system.md
 // section 3). COM-lite vtable wrappers live in SlangCom.cs, struct mirrors in SlangStructs.cs.

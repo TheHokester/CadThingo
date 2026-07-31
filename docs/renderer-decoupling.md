@@ -28,9 +28,13 @@ at the end.
 - **Features receive infrastructure via marker-interface setter injection** (`INeedsGpu`), and
   **collaborators via `INeedsFeature<T>`**; both are filled by the `FeatureHost` in one wiring
   pass. **Pipelines keep a single `GpuContext` ctor arg** (they are constructed explicitly by
-  cores/modules, matching the existing `DeferredModule` style).
+  cores/modules, matching the existing `DeferredModule` style). Corollary settled in step 7: because
+  injection covers everything, feature constructors and `Initialize` take **no** parameters -- there
+  is no `FeatureContext`, and the transitional host reach is itself an injected interface
+  (`INeedsHost`).
 - **Features self-register via a `[ModuleInitializer]` descriptor** (factory + gate + order); the
-  `FeatureHost` sorts, gates, and builds. Adding a feature file *is* the registration.
+  `FeatureHost` sorts, gates, and builds. Adding a feature file *is* the registration, and the
+  descriptor is a `static abstract` interface member so the compiler rejects a feature without one.
 - **Typed feature fields on `Renderer` become bridge accessors first**
   (`internal IblSystem Ibl => _features.Get<IblSystem>()!;`), so existing callers keep working
   while `Renderer` stops constructing/disposing them. Callers migrate off later, per-caller.
@@ -139,15 +143,22 @@ as interfaces and the `FeatureHost` fills them in one wiring pass -- no ctor par
 which interfaces a feature implements:
 
 ```csharp
-interface INeedsGpu        { GpuContext Gpu { private get; set; } }        // infra
-interface INeedsFeature<T> where T : class { T Dependency { set; } }        // a collaborator contract
+interface INeedsGpu        { GpuContext Gpu { set; } }                      // infra
+interface INeedsFeature<in T> where T : class { T Dependency { set; } }     // a collaborator contract
+interface INeedsHost       { Renderer Host { set; } }                       // transitional; deleted at the end
 
 // FeatureHost wiring pass (phase 2 of BuildAll), once, after all features are constructed:
 foreach (var f in _all) {
-    if (f is INeedsGpu g) g.Gpu = _gpu;
+    if (f is INeedsGpu g)  g.Gpu  = _gpu;
+    if (f is INeedsHost h) h.Host = _host;
     WireFeatureDeps(f);   // for each INeedsFeature<T> implemented, resolve T from _all and set it
 }
 ```
+
+Infrastructure is a direct type test; collaborators need reflection, because the contract type is a
+generic argument and is only knowable from the feature's implemented-interface list. That is once
+per feature at boot, not per frame. An unresolvable dependency throws at wiring with both type names
+and the likely cause -- usually a consumer that forgot the gate its provider has.
 
 A feature needing two collaborators implements `INeedsFeature<T>` twice with explicit-interface
 setters:
@@ -176,58 +187,96 @@ value at record time so rebakes never leave a stale copy.
 
 ## Feature lifecycle and the closed base renderer
 
-Cores already prove two thirds of the pattern (self-register via `RegisterCore`, list-disposed).
-Generalize it so `DrawFrame`/`Cleanup`/`Initialize` stop changing per feature.
+*(Machinery done; the cores are on it. Non-core subsystems migrate in step 8.)* Cores already proved
+two thirds of the pattern (self-register via `RegisterCore`, list-disposed). It is now generalized,
+and `DrawFrame`/`Cleanup`/`Initialize` no longer change per feature. Lives in
+`Renderer/FeatureLifecycle/`.
 
 ```csharp
-interface IRenderFeature : IDisposable { string Name { get; } void Initialize(in FeatureContext ctx); }
-interface IBakeFeature     { void Bake(in BakeContext ctx); }       // IBL, probes, SceneAS build
-interface IResizeFeature   { void Resize(Extent2D extent); }
-interface IPreDrawFeature  { void PreDraw(in FrameContext frame); } // selection pick
-interface IPostDrawFeature { void PostDraw(in RenderFrame frame); } // selection outline
+interface IRenderFeature : IDisposable { string Name { get; } void Initialize(); }
+interface IResizeFeature   : IRenderFeature { void Resize(Extent2D extent); }
+interface IBakeFeature     : IRenderFeature { bool BakePending { get; } void Bake(); }
+interface IPreDrawFeature  : IRenderFeature { void PreDraw(in RenderView view); }
+interface IPostDrawFeature : IRenderFeature { void PostDraw(CommandBuffer cmd, in RenderView view); }
+interface IRenderCore      : IResizeFeature { RenderMode Mode { get; } void Activate(); void Render(in RenderFrame f); }
 ```
 
-Registration is a descriptor appended by each feature file's `[ModuleInitializer]`:
+**`Initialize` takes no arguments, and neither does the factory.** The sketch above used to thread a
+`FeatureContext` through both; it was a second dependency channel doing what the wiring pass already
+does. By the time `Initialize` runs, phase 2 has set `Gpu` via `INeedsGpu` and every collaborator via
+`INeedsFeature<T>` -- so a feature already holds everything it needs in fields, and a constructor has
+nothing useful to receive. Construction is `() => new DeferredCore()`. One channel, not two.
+
+The one thing the context was carrying that injection did not cover is the transitional `Renderer`
+reach, and that now rides the same wiring pass as `INeedsHost`. Keeping it an *interface* is the
+point: every feature still coupled to the host declares it in its own type header, so "what is left
+to decouple" is a search for `INeedsHost` and the boot manifest tags those features `NEEDS-HOST`.
+When the last implementer drops it the interface is deleted, and the compiler proves nothing reaches
+the host any more.
+
+**Registration is compiler-enforced.** A feature declares its own descriptor through a
+`static abstract` member, so the build fails if a feature exists without one:
 
 ```csharp
-// In ReStirDICore.cs -- adding this file IS the registration:
-[ModuleInitializer]
-internal static void _Reg() => FeatureCatalog.Add(new FeatureDesc(
-    Order: 40,
-    Gate:  gpu => gpu.Gfx.RtPipelineSupported,
-    Make:  ctx => new ReStirDICore(ctx)));
-```
+internal sealed class ReStirDICore : IRenderCore, ISelfRegisteringFeature<ReStirDICore>, INeedsHost
+{
+    public static FeatureDesc Desc =>
+        new(Order: 60, Gate: gpu => gpu.Gfx.RayTracePipelineSupported, Make: () => new ReStirDICore());
 
-The `FeatureHost` builds in three phases so cross-references are always safe:
-
-```csharp
-public void BuildAll(in GpuContext gpu) {
-    foreach (var d in FeatureCatalog.Descriptors.OrderBy(d => d.Order))
-        if (d.Gate(gpu)) Add(d.Make(_featureCtx));      // 1. construct (gated), fields null
-    foreach (var f in _all) Wire(f);                    // 2. INeedsGpu / INeedsFeature<T> setter injection
-    foreach (var f in _all) (f as IRenderFeature)?.Initialize(_featureCtx); // 3. Initialize in Order -> resolve safe
-    foreach (var b in _bake) b.Bake(...);               //    initial bake pass
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<ReStirDICore>();
 }
 ```
 
-`Renderer.Initialize()` loses every feature name; its feature section becomes:
+It has to be `static abstract` on a self-referencing interface rather than a plain static member on
+`IRenderFeature`: a plain static interface member is *one storage slot shared by every implementer*,
+so six cores would overwrite each other's descriptor. The `_Reg` line stays per-file because
+`[ModuleInitializer]` runs once per **assembly**, not once per type -- there is no per-type startup
+hook in .NET short of an assembly-wide reflection scan. It cannot silently drift, though:
+`Register<T>` only accepts a type satisfying the interface, so it will not compile without a `Desc`.
+
+`BuildAll` runs three passes over the whole set. They are separate because each needs the previous
+to have finished for *every* feature, not just the ones ahead of it in `Order` -- wiring before all
+features exist would resolve a dependency to null purely because its `Order` was higher.
 
 ```csharp
-RegisterSceneBindings();
-_features.BuildAll(gpuCtx);
-_features.ActivateDefaultCore();
-Console.WriteLine(_features.Dump());   // runtime manifest: resolved, gated, ordered feature list
+foreach (var d in FeatureCatalog.Descriptors.OrderBy(d => d.Order))
+    if (d.Gate(_gpu)) Add(d.Make());   // 1. construct (gated) -- fields still null
+foreach (var f in _all) Wire(f);        // 2. INeedsGpu / INeedsHost / INeedsFeature<T> injection
+foreach (var f in _all) f.Initialize(); // 3. build owned state; lower Order is fully built
 ```
 
-`DrawFrame` gets fixed pump points (`PreDraw` -> active core `Render` -> `PostDraw`, plus `Resize`);
-bake is request-driven, serviced like the existing `pendingPbrRebuild` / `tlasDirty` checks at the
-top of `DrawFrame`. `Cleanup` collapses to `_features.Dispose()` (reverse order) + `renderTargets` +
-`gfx` last. `IRenderCore` stays a specialization (exactly-one-active, mode-switched, produces the
-draw) that also implements `IRenderFeature` so it shares the dispose/registration path.
+`Renderer.Initialize` lost every feature name. Its whole feature section is now:
+
+```csharp
+_features = new FeatureHost(Gpu, this);
+_features.BuildAll();
+Console.WriteLine(_features.Dump());
+_activeCore = RenderCores[_desiredCoreIndex];
+_activeCore.Activate();
+```
+
+`DrawFrame` has fixed pump points (`ServiceBakes` at the top with the other pending-work flags, then
+`PreDraw` -> active core `Render` -> `PostDraw`), plus `Resize`. Bake is request-driven, so a feature
+with nothing stale costs one bool test. `Cleanup` collapses to `_features.Dispose()` -- reverse
+`Order`, the exact inverse of the Initialize guarantee -- then `renderTargets`, then `gfx` last.
+`IRenderCore` is a specialization of `IResizeFeature`: exactly-one-active, mode-switched, produces
+the draw, and inherits registration/gating/ordering/wiring/dispose rather than having a parallel set.
+Its `Order` doubles as its mode-combo index, so the lowest-Order core is the boot default.
 
 The tradeoff of descriptor-scattered `Order`: you lose the single readable boot-order list. The
 `_features.Dump()` manifest (the analog of the existing `descriptorRegistry.DumpBindings()` call)
-replaces it with a runtime view that also reflects gating.
+replaces it with a runtime view that also reflects gating and flags remaining host coupling:
+
+```
+[features] 6 built, 0 gated out by device caps
+  Deferred                     core:Deferred NEEDS-HOST
+  PathTrace (Compute)          core:RayCompute NEEDS-HOST
+  PathTrace (RT pipeline)      core:RayTrace NEEDS-HOST
+  Forward+ (stub)              core:ForwardPlus
+  PathTrace (Wavefront)        core:RayWavefront NEEDS-HOST
+  ReSTIR DI (RT pipeline)      core:ReStirDI NEEDS-HOST
+```
 
 Follow-on: `RegisterSceneBindings` becomes feature-driven -- each feature registers its own scene-set
 bindings in `Initialize()`, shrinking the central method to genuinely-core bindings only.
@@ -274,14 +323,14 @@ verified change, not a rider on a plumbing step.
 
 ## Acceleration structure: verb / policy split
 
-The AS in `Renderer_Ray_Query.cs` is two altitudes bundled:
+The AS in `Renderer_Ray_Query.cs` was two altitudes bundled:
 
 - **AS verbs** (create/destroy AS, device address, `CmdBuildAccelerationStructures`, compaction copy,
   the `khrAccelStruct` dispatcher + `PhysicalDeviceAccelerationStructurePropertiesKHR`) are thin,
-  stateless RHI wrappers at the same altitude as `CreateBuffer`/`CreateImage`. **Move them to
-  `GfxDevice`** (recommend a grouped `gfx.As.*` facet to avoid flattening a dozen methods onto the
-  top-level surface). Test: "could a different renderer with a different BLAS strategy reuse this
-  unchanged?" -> if yes, it is a `GfxDevice` verb.
+  stateless RHI wrappers at the same altitude as `CreateBuffer`/`CreateImage`. **Moved to
+  `GraphicsDevice`** as the grouped `gfx.As.*` facet (`AsDevice`), which avoids flattening a dozen
+  methods onto the top-level surface. Test: "could a different renderer with a different BLAS
+  strategy reuse this unchanged?" -> if yes, it is a device verb. *(Done -- see below.)*
 - **AS policy** (BLAS clustering / scene-wide SAH strategy, rebuild-vs-refit, compaction scheduling,
   instance-record packing) is renderer logic. **It becomes a gated `SceneAS` feature.**
 
@@ -297,6 +346,43 @@ becomes GpuScene's, driven by a `SceneMutated` event.
 Verify before implementing: whether the BLAS build needs a geometry layout GpuScene does not expose
 (it currently walks meshes for the cluster SAH build). If so, GpuScene gains a small geometry-view
 accessor rather than `SceneAS` re-walking the scene -- still one source of truth, wider read surface.
+
+### The `gfx.As.*` facet (done)
+
+`AsDevice` holds the dispatch table, the cached scratch alignment, and eight verbs: `Create`,
+`Destroy`, `DeviceAddress`, `GetBuildSizes`, `Build`, `QueryCompactedSize`, `CopyCompact`, plus
+`Available`. Nothing more -- each one is only the Vulkan call plus the struct it needs filled, and
+nothing in it decides *what* to build.
+
+Three judgement calls worth recording:
+
+- **`Build` submits, it does not just record.** Both call sites did
+  `BeginSingleTimeCommands -> CmdBuildAccelerationStructures -> EndSingleTimeCommands` identically,
+  so the submit is part of the verb. A batched or async builder would want a `CmdBuild` recording
+  into a caller-supplied buffer instead; that is a policy change for the AS owner to ask for, and
+  the facet grows the overload when something actually needs it. Same for `QueryCompactedSize`,
+  which owns its query pool and blocks -- compaction *scheduling* stays policy, the size query is a
+  verb.
+- **The scratch buffer stayed behind.** It is state, not a verb, and "one persistent scratch sized
+  to the largest build so far" is the AS owner's growth policy. Only `ScratchAlignment` -- a device
+  property -- moved. It goes to `SceneAS` in step 8 along with the instance / shadow-info /
+  cluster-transform buffers.
+- **The load gate widened, deliberately.** The dispatch table now loads whenever
+  VK_KHR_acceleration_structure is enabled, not only when ray *query* is. Whether the verbs are
+  callable is a device fact; whether anything gets built stays `RayShadowsSupported`, checked
+  unchanged in `InitRayQuery`. This costs nothing today and stops a latent trap where an
+  RT-pipeline-capable device without ray query would have had no dispatch table.
+
+Two duplicates fell out on the way. `Renderer.CreateBufferWithDeviceAddress` had become a
+byte-for-byte copy of `gfx.CreateBuffer` (the allocator started putting the device-address flag on
+every buffer block), and `GetBufferDeviceAddress` existed privately in two places
+(`Renderer_Ray_Query` and `RTPipeline`, for the SBT). Both now resolve to one
+`gfx.GetBufferDeviceAddress`.
+
+`Renderer_Ray_Query.cs` lost ~100 lines and every `khrAccelStruct` / `vk` / `device` reach in its
+build paths. What remains is exactly the policy the doc says belongs to `SceneAS`: clustering, the
+capacity grow-by-doubling helpers, instance and `ShadowEntityInfo` packing, emissive collection, and
+the rebuild cadence.
 
 ## UI via events
 
@@ -481,12 +567,27 @@ Ordered so early steps shrink later ones. Each step ships green.
    not scene data, and its buffer + capacity growth live in the AS path. Moving it now would move it
    twice -- it belongs in step 8 where `SceneAS` is built. What step 5 owed step 8 is delivered
    anyway: the world cache is populated before the AS gather and `RebuildTlas` already reads it.
-6. **AS verbs -> `GfxDevice`.** Move the thin AS wrappers to a `gfx.As.*` facet. Makes the SceneAS
-   feature (next) pure policy.
-7. **Feature lifecycle** (A4-enabling). `IRenderFeature` + phase interfaces + `INeedsGpu` /
-   `INeedsFeature<T>` + `FeatureHost` (3-phase `BuildAll`, phase pump, reverse dispose, `Dump`) +
-   `FeatureCatalog` + `[ModuleInitializer]` descriptors. Close `Renderer.Initialize`/`Cleanup`; add
-   the bridge accessors. Prereq for step 8.
+6. **AS verbs -> `GraphicsDevice`.** *(Done.)* `AsDevice` facet reached as `gfx.As.*`; the dispatch
+   table + scratch alignment load with the device; `Renderer_Ray_Query` keeps only policy. Dropped
+   two duplicated buffer-address helpers on the way. What is left there is now the `SceneAS`
+   feature's body, waiting on step 7's lifecycle.
+7. **Feature lifecycle** (A4-enabling). *(Done, except the bridge accessors -- see below.)*
+   `IRenderFeature` + phase interfaces + `INeedsGpu` / `INeedsFeature<T>` / `INeedsHost` +
+   `FeatureHost` (3-phase `BuildAll`, phase pumps, reverse dispose, `Dump`) + `FeatureCatalog` +
+   compiler-enforced `[ModuleInitializer]` descriptors. All six cores migrated onto it;
+   `Renderer.Initialize` names no feature, `Cleanup` is one `_features.Dispose()`, and
+   `RegisterCore` / `_renderCores` are gone. Verified by boot: the manifest above is real output.
+
+   **Bridge accessors are deliberately not written yet.** They exist to keep callers of
+   `Renderer.Ibl` / `.reflectionProbeSystem` / `.selection` compiling while the Renderer stops
+   *owning* those subsystems -- but that ownership move IS step 8, so today there is nothing to
+   bridge and an accessor would forward a field to itself. They land with each subsystem as it
+   becomes a feature.
+
+   Two pieces of the machinery have no implementer yet and are therefore unexercised at runtime:
+   `INeedsFeature<T>` resolution (nothing declares a collaborator until IBL becomes a provider) and
+   the `Bake` / `PreDraw` / `PostDraw` pumps (the calls are in `DrawFrame`, walking empty lists).
+   Step 8 is what proves them.
 8. **Migrate features onto the lifecycle** (A4, A5, IBL, SceneAS). `SceneAS` as a gated feature
    consuming GpuScene + `RenderView` + the AS verbs, publishing TLAS via the registry; IBL-as-provider
    (publish images via registry, `IIblProvider` scalars, delete `Renderer.Ibl.*` in the PBR

@@ -1,5 +1,5 @@
 using CadThingo.VulkanEngine.Renderer.Descriptors;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 
 namespace CadThingo.VulkanEngine.Renderer;
 

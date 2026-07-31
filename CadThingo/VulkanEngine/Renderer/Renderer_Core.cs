@@ -1,11 +1,12 @@
-using System.Linq;
+﻿using System.Linq;
 using System.Numerics;
 using System.Reflection;
 using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.RenderCores;
 using CadThingo.VulkanEngine.Renderer.Features.Deferred;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Forward;
@@ -14,7 +15,7 @@ using CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Features.Selection;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -89,33 +90,40 @@ public unsafe partial class Renderer
     // a device without the RT pipeline simply never registers those cores, so they can't be picked.
     public RenderMode renderMode => _activeCore?.Mode ?? RenderMode.Deferred;
 
-    // L3 render cores (renderer-refactor.md): one pluggable technique each, built eagerly (all
-    // their pipelines already exist up front). Cores register THEMSELVES into this list from their
-    // ctor (IRenderCore via RegisterCore), so adding a technique is just "construct it" -- no
-    // switch, no per-core field, no ImGui label array to keep in sync. The ImGui mode combo lists
-    // the cores by index and hands an index back (RequestCoreIndex); DrawFrame swaps _activeCore to
-    // the requested core + Activates it (rebinds tonemap's HDR input to the new core's scene-colour
-    // source). See IRenderCore. Index 0 (first registered = Deferred) is the boot default.
-    private readonly List<IRenderCore> _renderCores = new();
-    private IRenderCore                _activeCore  = null!;
-    private int                        _desiredCoreIndex;
+    // Every feature the device can run, owned by the FeatureHost: constructed from the catalog,
+    // wired, initialized, phase-pumped and disposed without this class naming any of them. Adding a
+    // technique or subsystem is a new file with a descriptor -- no switch, no field here, no ImGui
+    // label array to keep in sync.
+    private FeatureHost _features = null!;
 
-    /// <summary>The registered render cores, in construction order. Drives the ImGui mode combo so
-    /// a new core needs no host edit beyond constructing it.</summary>
-    internal IReadOnlyList<IRenderCore> RenderCores => _renderCores;
+    // Exactly one core produces the frame. The ImGui mode combo lists the cores by index and hands
+    // an index back (RequestCoreIndex); DrawFrame swaps _activeCore to the requested core and
+    // Activates it (rebinding tonemap's HDR input to the new core's scene-colour source).
+    private IRenderCore _activeCore = null!;
+    private int         _desiredCoreIndex;
+
+    /// <summary>The built render cores, in descriptor Order. Drives the ImGui mode combo, so a new
+    /// core needs no host edit at all.</summary>
+    internal IReadOnlyList<IRenderCore> RenderCores => _features.Cores;
 
     /// <summary>List index of the currently-active core (for the ImGui combo's current selection).</summary>
-    internal int ActiveCoreIndex => _renderCores.IndexOf(_activeCore);
-
-    /// <summary>Called by an <see cref="IRenderCore"/> ctor to add itself to the registry.</summary>
-    internal void RegisterCore(IRenderCore core) => _renderCores.Add(core);
+    internal int ActiveCoreIndex
+    {
+        get
+        {
+            var cores = _features.Cores;
+            for (int i = 0; i < cores.Count; i++)
+                if (ReferenceEquals(cores[i], _activeCore)) return i;
+            return -1;
+        }
+    }
 
     /// <summary>ImGui mode-combo entry point: request the core at list index <paramref name="i"/>
     /// become active. The swap + Activate happen at the start of the next frame (DrawFrame step 0d),
     /// after DeviceWaitIdle, so it is safe to call mid-frame from the UI.</summary>
     internal void RequestCoreIndex(int i)
     {
-        if (i >= 0 && i < _renderCores.Count) _desiredCoreIndex = i;
+        if (i >= 0 && i < RenderCores.Count) _desiredCoreIndex = i;
     }
     
     
@@ -478,20 +486,17 @@ public unsafe partial class Renderer
         Console.WriteLine($"[layout-cache] set layouts {lc.SetLayoutCount}/{lc.SetLayoutRequests} distinct, " +
                           $"pipeline layouts {lc.PipelineLayoutCount}/{lc.PipelineLayoutRequests} distinct");
 
-        // Stand up the render cores. Each ctor registers the core into _renderCores
-        // (RegisterCore) -- construction order IS the list/combo order, so Deferred (index 0) is
-        // the boot default + fallback. 
-        new DeferredCore(this);
-        new PathtraceComputeCore(this);
-        if (rtPipeline != null)     new PathtraceRTCore(this);
-        new ForwardPlusCore(this);
-        // Wavefront core builds + compiles its own FrameGraph in the ctor (like DeferredCore),
-        // importing the pipeline-owned set-4 buffers + the PT/Final targets.
-        new WavefrontPTCore(this);
-        if (reStirPipeline != null) new ReStirDICore(this);
+        // Stand up every feature the device can run: construct (gated) -> wire -> Initialize, in
+        // descriptor Order. This method names none of them; a new technique is a new file whose
+        // module initializer put a descriptor in the catalog before Main ran. The manifest is the
+        // replacement for the boot-order list that used to live right here, and it shows what the
+        // gates excluded on THIS device, which a source list never could.
+        _features = new FeatureHost(Gpu, this);
+        _features.BuildAll();
+        Console.WriteLine(_features.Dump());
 
-        // Activate the boot core (index 0 = Deferred unless RequestCoreIndex ran before init).
-        _activeCore = _renderCores[_desiredCoreIndex];
+        // Activate the boot core (lowest Order = Deferred, unless RequestCoreIndex ran before init).
+        _activeCore = RenderCores[_desiredCoreIndex];
         _activeCore.Activate();
 
         // Last, so no handler can fire against half-built pipelines.
@@ -628,7 +633,7 @@ public unsafe partial class Renderer
         // Re-wire cross-pipeline + Renderer-owned bindings on the fresh descriptor sets. The
         // g-buffer set (set 1) is graph-owned now, so DeferredCore re-bakes it by rebuilding
         // the deferred graph against PBR's new layout.
-        _renderCores.OfType<DeferredCore>().FirstOrDefault()?.OnPbrPipelineRebuilt();
+        _features.Get<DeferredCore>()?.OnPbrPipelineRebuilt();
         
     }
 
@@ -789,10 +794,10 @@ public unsafe partial class Renderer
         imGuiUtils?.Dispose();
         
         
-        // Render cores: DeferredCore owns the deferred FrameGraph (g-buffer / depth / HDR
-        // transients) — dispose the cores before RenderTargets, which owns FinalColor + the PT /
-        // selection images the graph imports. The PT / forward cores own no GPU resources.
-        foreach (var core in _renderCores) core.Dispose();
+        // Every feature, in reverse Order. DeferredCore owns the deferred FrameGraph (g-buffer /
+        // depth / HDR transients), so features go before RenderTargets, which owns FinalColor + the
+        // PT / selection images those graphs import.
+        _features.Dispose();
         renderTargets.Dispose();
 
         // GpuScene buffers (light SSBO today) — the GPU mirror of Scene's render data.

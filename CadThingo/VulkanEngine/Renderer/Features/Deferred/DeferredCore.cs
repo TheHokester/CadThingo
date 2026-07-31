@@ -1,6 +1,8 @@
+using System.Runtime.CompilerServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
-using CadThingo.VulkanEngine.Renderer.RenderCores;
 using Silk.NET.Vulkan;
 
 // The graph type shares its name with its namespace; alias it so bare `FrameGraph`
@@ -23,9 +25,19 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 /// FinalColor in <c>ShaderReadOnlyOptimal</c> for the host. The pipelines are
 /// renderer-owned. 
 /// </summary>
-internal sealed class DeferredCore : IRenderCore, IGraphCore
+internal sealed class DeferredCore : IRenderCore, IGraphCore,
+                                     ISelfRegisteringFeature<DeferredCore>, INeedsHost
 {
-    private readonly Renderer _host;
+    // Order 10 = first core built, so index 0 in the mode combo: the boot default and fallback.
+    // Ungated - the deferred path is the one technique every device can run.
+    public static FeatureDesc Desc => new(Order: 10, Gate: _ => true, Make: () => new DeferredCore());
+
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<DeferredCore>();
+
+    // Transitional: the deferred chain is composed from pipelines the Renderer still owns.
+    private Renderer _host = null!;
+    Renderer INeedsHost.Host { set => _host = value; }
 
     // The frame graph driving the deferred chain
     private DeferredGraph? _graph;
@@ -39,12 +51,9 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore
     public string Name => "Deferred";
     public Renderer.RenderMode Mode => Renderer.RenderMode.Deferred;
 
-    public DeferredCore(Renderer host)
-    {
-        _host = host;
-        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
-        BuildGraph();
-    }
+    /// <summary>Builds the deferred chain. Runs at Initialize rather than in the constructor
+    /// because the graph closes over pipelines that only exist once every feature is wired.</summary>
+    public void Initialize() => BuildGraph();
 
     /// <summary>
     /// (Re)builds the deferred chain as the <see cref="DeferredGraph"/>. The graph OWNS the

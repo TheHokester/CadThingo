@@ -2,10 +2,12 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;   // GraphStats (deferred-graph debug surface)
-using CadThingo.VulkanEngine.Renderer.RenderCores;  // IRenderCore, RenderFrame
-using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;  // WavefrontPTCore (active-core type test)
+// IRenderCore, RenderFrame
+using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
+// WavefrontPTCore (active-core type test)
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
@@ -113,7 +115,7 @@ public unsafe partial class Renderer
         // re-compile their graphs (fresh transients, re-import FinalColor, re-bind descriptors);
         // the PT/RT cores rebind their storage images (which marks the accumulator dirty so the
         // next dispatch clears fresh memory).
-        foreach (var core in _renderCores) core.Resize(renderExtent);
+        _features.Resize(renderExtent);
 
         // Tonemap's HDR input is graph-baked, re-pointed by each core's graph rebuild above;
         // Activate restarts the active PT core's progressive accumulation on the fresh targets.
@@ -190,11 +192,17 @@ public unsafe partial class Renderer
         //     so it sits here before the per-frame command buffer is recorded.
         selection.ProcessPickRequest();
 
+        // 0c-ter. Service any feature whose baked content went stale (IBL, probes, the scene AS).
+        //     Request-driven and ordered, the same shape as the two rebuild flags above - a
+        //     feature with nothing pending costs one bool test. No implementers until those
+        //     subsystems become features; the pump exists so that migration needs no edit here.
+        _features.ServiceBakes();
+
         // 0d. Render-mode change: swap the active core. Tonemap's HDR input is graph-baked per
         //     core, so Activate() only restarts the PT cores' progressive accumulation.
         //     DeviceWaitIdle ensures no in-flight frame straddles the switch. Mode flips are
         //     user-driven (ImGui combo), so the hitch is acceptable.
-        var desiredCore = _renderCores[_desiredCoreIndex];
+        var desiredCore = RenderCores[_desiredCoreIndex];
         if (!ReferenceEquals(desiredCore, _activeCore))
         {
             vk!.DeviceWaitIdle(device);
@@ -252,11 +260,18 @@ public unsafe partial class Renderer
             TransparentCandidates = gpuScene.TransparentCandidates,
         };
 
+        // 6. Fixed pump points around the technique. A feature slots into the frame by implementing
+        //    the matching interface; this sequence never grows an entry per feature.
+        _features.PreDraw(view);
+
         // Dispatch the active render core. It records its technique into cmd and leaves
         // FinalColor in ShaderReadOnlyOptimal for upcoming commands.
         _activeCore.Render(new RenderFrame { Cmd = cmd, View = view });
 
-        // 6b. Selection outline.
+        _features.PostDraw(cmd, view);
+
+        // 6b. Selection outline. Becomes a PostDraw feature in the next step; until then it is
+        //     recorded here, in the same place in the sequence the pump occupies.
         selection.RecordOutline(cmd);
 
         // 7. Blit FinalColor -> swapchain image

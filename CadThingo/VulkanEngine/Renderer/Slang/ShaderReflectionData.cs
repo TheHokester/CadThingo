@@ -1,6 +1,6 @@
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // Engine-facing reflection summary (docs/descriptor-system.md section 2.2): everything the
 // descriptor registry and pipeline layout construction need, fully managed so it outlives

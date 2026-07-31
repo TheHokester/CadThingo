@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 /// <summary>Specialization-constant values keyed by the Slang constant's NAME. The constant ids
 /// come from reflection, so a pipeline never transcribes a constant_id; renaming or renumbering in

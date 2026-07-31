@@ -1,6 +1,6 @@
 using Silk.NET.Vulkan;
 
-namespace CadThingo.VulkanEngine.Renderer.Shaders;
+namespace CadThingo.VulkanEngine.Renderer.Slang;
 
 // Startup smoke test for the interop : compiles a tiny
 // inline shader and sanity-checks the output before anything trusts the vtable math. Call once

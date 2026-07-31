@@ -1,5 +1,6 @@
 ﻿using System.Numerics;
 using CadThingo.VulkanEngine.Renderer;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 using ImGuiNET;
 using Silk.NET.Core.Native;
@@ -731,7 +732,7 @@ public unsafe class ImGuiVulkanUtils : IDisposable, IEventListener
         // The reflected route emits one SPIR-V blob per entry point, so this is two modules where
         // the old build-time .spv was one shared module holding both stages.
         var program = renderer.Gpu.Shaders.GetProgram(
-            new Renderer.Shaders.ShaderCompileRequest("ImGui", ["VSMain", "PSMain"], [], []));
+            new ShaderCompileRequest("ImGui", ["VSMain", "PSMain"], [], []));
 
         ShaderModule vertShader = renderer.gfx.CreateShaderModule(program.Spirv(0).ToArray());
         ShaderModule fragShader = renderer.gfx.CreateShaderModule(program.Spirv(1).ToArray());
