@@ -230,13 +230,19 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
     /// staged for Record's arena push. Call once per frame from DrawFrame;
     /// tileCount / lightCount come from PbrDeferredPipeline.UpdatePerFrame so
     /// the two pipelines stay coherent.</summary>
-    public void UpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, uint tileCountX, uint tileCountY)
+    public void UpdatePerFrame(RenderView f, uint tileCountX, uint tileCountY)
     {
+        var camera = f.Camera;
+        var renderExtent = f.RenderExtent;
+        var lightCount = f.LightCount;
+        
         TransparentFrameUBO ubo = new();
+        
+        var aspect = (float)renderExtent.Width / renderExtent.Height;
         if (camera != null)
         {
             ubo.proj = camera.GetProjectionMatrix(
-                (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
+                aspect, 0.1f, 100.0f);
             ubo.view = camera.GetViewMatrix();
             ubo.proj.M22 *= -1;
             ubo.camPos = new Vector4(camera.GetPosition(), 1.0f);
@@ -245,25 +251,26 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         {
             ubo.view   = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), Vector3.Zero, new Vector3(0, 0, 1));
             ubo.proj   = Matrix4x4.CreatePerspectiveFieldOfView((float)(45 * Math.PI / 180),
-                (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
+                aspect, 0.1f, 100.0f);
             ubo.proj.M22 *= -1;
             ubo.camPos = new Vector4(2, 2, 2, 1);
         }
         ubo.lightCount = lightCount;
         ubo.tileCountX = tileCountX;
         ubo.tileCountY = tileCountY;
-        ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
+        ubo.screenSize = new Vector2(renderExtent.Width, renderExtent.Height);
         ubo.prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels;
         ubo.scaleIBLAmbient          = EditorState.IblIntensity;
 
-        // Probe cluster dims — built once per frame by ReflectionProbeSystem.
+        // Probe cluster dims - built once per frame by ReflectionProbeSystem.
         // The transparent pass uses the same grid as PbrDeferred so cluster
         // indices stay consistent across opaque and transparent samples.
-        var grid = Renderer.reflectionProbeSystem.clusterGrid;
+        
+        var grid = Renderer.reflectionProbeSystem.ClusterGrid;
         ubo.probeClusterDimsX = grid.DimsX;
         ubo.probeClusterDimsY = grid.DimsY;
         ubo.probeClusterDimsZ = grid.DimsZ;
-        ubo.probeMipLevels    = ReflectionProbeSystem.ProbeMipLevels;
+        ubo.probeMipLevels    = Renderer.reflectionProbeSystem.ProbeMipLevels;
 
         _frameUbo = ubo;
     }

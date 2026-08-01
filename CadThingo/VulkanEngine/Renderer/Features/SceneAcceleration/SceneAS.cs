@@ -44,7 +44,7 @@ internal sealed unsafe class SceneAS
         // if we can never build anything, do not allocate the buffers to build it into.
         Gate: gpu => gpu.Gfx.RayShadowsSupported && gpu.Gfx.As.Available,
         Make: () => new SceneAS());
-
+    
     [ModuleInitializer]
     internal static void _Reg() => FeatureCatalog.Register<SceneAS>();
 

@@ -31,6 +31,9 @@ public sealed unsafe class RenderTargets : IDisposable
 
     public Extent2D RenderExtent => _extent;
 
+    /// <summary>The current extent + FinalColor, as handed to the features on every resize.</summary>
+    public HostTargets Snapshot => new(_extent, FinalColor);
+
     //render targets now only keeys ownership of shared gbuffer sampler 
     public Sampler       GBufferSampler  { get; private set; }
 

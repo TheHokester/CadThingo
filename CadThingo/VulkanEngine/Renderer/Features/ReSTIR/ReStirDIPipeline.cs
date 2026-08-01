@@ -162,10 +162,11 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         return pipeline;
     }
 
+    // Only the extent-independent resources. The per-pixel working set is allocated by
+    // ReallocReStirBuffers, which the core drives from its Resize (primed once at boot).
     protected override void CreateResources()
     {
         base.CreateResources();   // per-frame UBO
-        AllocBuffers(Renderer.RenderExtent);
     }
 
     // ---- ReSTIR working-set buffers (extent-sized, device-local, ping-ponged) -------------------
@@ -191,9 +192,10 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         _resA = default; _resB = default; _gbufA = default; _gbufB = default; _sceneRad = default;
     }
 
-    /// <summary>Resize path: reallocate the per-pixel working set to the new extent. Resets the
-    /// history gate. Called by the core's Resize before the graph rebuild, which re-bakes the
-    /// graph-owned set 2 from the fresh buffer handles (see GraphSharedSpec).</summary>
+    /// <summary>Allocates the per-pixel working set at <paramref name="extent"/>, freeing any
+    /// previous one. Resets the history gate. Called by the core's Resize before the graph rebuild,
+    /// which re-bakes the graph-owned set 2 from the fresh buffer handles (see GraphSharedSpec).
+    /// This is the only construction site - the first call comes from the boot-time resize.</summary>
     public void ReallocReStirBuffers(Extent2D extent)
     {
         FreeBuffers();

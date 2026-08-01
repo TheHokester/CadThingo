@@ -49,7 +49,7 @@ internal struct PcProbePrefilter
 /// standing in for.
 /// </summary>
 public sealed unsafe class ReflectionProbeSystem
-    : ISelfRegisteringFeature<ReflectionProbeSystem>, INeedsGpu, INeedsHost, INeedsFeature<IIblProvider>
+    : IReflectionProbeProvider, ISelfRegisteringFeature<ReflectionProbeSystem>, INeedsGpu, INeedsHost, INeedsFeature<IIblProvider>
 {
     public static FeatureDesc Desc =>
         new(Order: 2, Gate: _ => true, Make: () => new ReflectionProbeSystem());
@@ -58,14 +58,22 @@ public sealed unsafe class ReflectionProbeSystem
     internal static void _Reg() => FeatureCatalog.Register<ReflectionProbeSystem>();
 
     public string Name => "Reflection probes";
-
+    
+    public uint MaxProbes => _maxProbes;
+    public uint ProbeFaceSize => _probeFaceSize;
+    public uint ProbeMipLevels => _probeMipLevels;
+    
+    public uint ProbeCount => (uint)_probes.Count;
+    
+    public ProbeClusterGrid ClusterGrid => _clusterGrid;
+    public ProbeCapturePipeline CapturePipeline => capturePipeline!;
     // Hard caps. Bumping MaxProbes resizes the cubemap array (one-time cost at
     // startup); bumping ProbeFaceSize costs 4× VRAM per size step. 16 × 256² is
     // the working default for typical CAD scenes (~67 MB RGBA16F mipped).
-    public const uint MaxProbes     = 16;
-    public const uint ProbeFaceSize = 256;
-    public static readonly uint ProbeMipLevels =
-        (uint)System.Math.Floor(System.Math.Log2(ProbeFaceSize)) + 1;
+    private const uint _maxProbes     = 16;
+    private const uint _probeFaceSize = 256;
+    private readonly uint _probeMipLevels =
+        (uint)Math.Floor(Math.Log2(_probeFaceSize)) + 1;
     private Renderer     _renderer = null!;
     private GpuContext   _gpu;
     private IIblProvider _ibl = null!;
@@ -117,7 +125,7 @@ public sealed unsafe class ReflectionProbeSystem
 
     // CPU-built per-cluster probe lists + the SSBOs the PBR shader will bind
     // to look up probes intersecting a fragment. Rebuilt each frame in BuildClusters.
-    internal ProbeClusterGrid clusterGrid = null!;
+    private ProbeClusterGrid _clusterGrid = null!;
 
     // Tracks whether the capture image is still in its post-init Undefined
     // layout. First capture transitions Undefined → ColorAttachmentOptimal;
@@ -152,9 +160,9 @@ public sealed unsafe class ReflectionProbeSystem
         CreateCaptureAttachments();
         TryCreateCapturePipeline();
         CreatePrefilterDescriptors();
-        clusterGrid = new ProbeClusterGrid(_gfx);
+        _clusterGrid = new ProbeClusterGrid(_gfx);
 
-        for (int i = (int)MaxProbes - 1; i >= 0; i--) _freeSlots.Push(i);
+        for (int i = (int)_maxProbes - 1; i >= 0; i--) _freeSlots.Push(i);
 
         RegisterBindings();
     }
@@ -170,14 +178,14 @@ public sealed unsafe class ReflectionProbeSystem
         var r = _gpu.Registry;
         r.RegisterImage("probeCubeArray", prefilteredArrayView, ImageLayout.ShaderReadOnlyOptimal, prefilteredArraySampler);
 
-        var probes       = new Silk.NET.Vulkan.Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
-        var clusterRange = new Silk.NET.Vulkan.Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
-        var indexList    = new Silk.NET.Vulkan.Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var probes       = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var clusterRange = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var indexList    = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
         for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             probes[i]       = probeRecordBuffers[i].buffer;
-            clusterRange[i] = clusterGrid.GetClusterRangeBuffer((uint)i);
-            indexList[i]    = clusterGrid.GetProbeIndexBuffer((uint)i);
+            clusterRange[i] = _clusterGrid.GetClusterRangeBuffer((uint)i);
+            indexList[i]    = _clusterGrid.GetProbeIndexBuffer((uint)i);
         }
         r.RegisterBufferPerFrame("probes", probes);
         r.RegisterBufferPerFrame("probeClusterRange", clusterRange);
@@ -196,11 +204,11 @@ public sealed unsafe class ReflectionProbeSystem
         var inputView = captureCubeSampleView;
         var inputSampler = _ibl.CubeSampler;
 
-        _prefilterStorageViews = new ImageView[MaxProbes, ProbeMipLevels];
-        _prefilterSets         = new DescriptorSet[MaxProbes, ProbeMipLevels];
+        _prefilterStorageViews = new ImageView[_maxProbes, _probeMipLevels];
+        _prefilterSets         = new DescriptorSet[_maxProbes, _probeMipLevels];
 
-        for (uint slot = 0; slot < MaxProbes; slot++)
-        for (uint mip  = 0; mip  < ProbeMipLevels; mip++)
+        for (uint slot = 0; slot < _maxProbes; slot++)
+        for (uint mip  = 0; mip  < _probeMipLevels; mip++)
         {
             ImageViewCreateInfo info = new()
             {
@@ -297,9 +305,9 @@ public sealed unsafe class ReflectionProbeSystem
             SType         = StructureType.ImageCreateInfo,
             ImageType     = ImageType.Type2D,
             Format        = Format.R16G16B16A16Sfloat,
-            Extent        = new Extent3D(ProbeFaceSize, ProbeFaceSize, 1),
-            MipLevels     = ProbeMipLevels,
-            ArrayLayers   = 6 * MaxProbes,
+            Extent        = new Extent3D(_probeFaceSize, _probeFaceSize, 1),
+            MipLevels     = _probeMipLevels,
+            ArrayLayers   = 6 * _maxProbes,
             Samples       = SampleCountFlags.Count1Bit,
             Tiling        = ImageTiling.Optimal,
             // Sampled for shader reads; Storage so the prefilter compute pass can
@@ -326,9 +334,9 @@ public sealed unsafe class ReflectionProbeSystem
             {
                 AspectMask     = ImageAspectFlags.ColorBit,
                 BaseMipLevel   = 0,
-                LevelCount     = ProbeMipLevels,
+                LevelCount     = _probeMipLevels,
                 BaseArrayLayer = 0,
-                LayerCount     = 6 * MaxProbes,
+                LayerCount     = 6 * _maxProbes,
             },
         };
         if (_vk.CreateImageView(_device, &viewInfo, null, out prefilteredArrayView) != Result.Success)
@@ -349,7 +357,7 @@ public sealed unsafe class ReflectionProbeSystem
             DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
             SrcAccessMask       = 0,
             DstAccessMask       = AccessFlags.ShaderReadBit,
-            SubresourceRange    = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, ProbeMipLevels, 0, 6 * MaxProbes),
+            SubresourceRange    = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, _probeMipLevels, 0, 6 * _maxProbes),
         };
         _vk.CmdPipelineBarrier(cmd,
             PipelineStageFlags.TopOfPipeBit, PipelineStageFlags.FragmentShaderBit,
@@ -378,7 +386,7 @@ public sealed unsafe class ReflectionProbeSystem
 
     private void CreateProbeRecordBuffers()
     {
-        ulong sizeBytes = MaxProbes * (ulong)sizeof(ProbeGpuRecord);
+        ulong sizeBytes = _maxProbes * (ulong)sizeof(ProbeGpuRecord);
         for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             _gfx.CreateMappedStorageBuffer(sizeBytes, ref probeRecordBuffers[i]);
     }
@@ -391,7 +399,7 @@ public sealed unsafe class ReflectionProbeSystem
             SType         = StructureType.ImageCreateInfo,
             ImageType     = ImageType.Type2D,
             Format        = Format.R16G16B16A16Sfloat,
-            Extent        = new Extent3D(ProbeFaceSize, ProbeFaceSize, 1),
+            Extent        = new Extent3D(_probeFaceSize, _probeFaceSize, 1),
             MipLevels     = 1,
             ArrayLayers   = 6,
             Samples       = SampleCountFlags.Count1Bit,
@@ -440,7 +448,7 @@ public sealed unsafe class ReflectionProbeSystem
             SType         = StructureType.ImageCreateInfo,
             ImageType     = ImageType.Type2D,
             Format        = Format.D32Sfloat,
-            Extent        = new Extent3D(ProbeFaceSize, ProbeFaceSize, 1),
+            Extent        = new Extent3D(_probeFaceSize, _probeFaceSize, 1),
             MipLevels     = 1,
             ArrayLayers   = 6,
             Samples       = SampleCountFlags.Count1Bit,
@@ -583,7 +591,7 @@ public sealed unsafe class ReflectionProbeSystem
         var ptr = (ProbeGpuRecord*)probeRecordBuffers[frameIndex].mapped;
         // Zero everything first — slot indices can be sparse if probes were
         // unregistered, and the cluster grid emits absolute slot indices.
-        for (int i = 0; i < MaxProbes; i++) ptr[i] = default;
+        for (int i = 0; i < _maxProbes; i++) ptr[i] = default;
 
         foreach (var p in _probes)
         {
@@ -601,10 +609,10 @@ public sealed unsafe class ReflectionProbeSystem
     /// DrawFrame after the camera's per-frame matrices are settled and tile
     /// counts known. Tile-only today; pass zSlices &gt; 1 when 3D clustering lands.
     /// </summary>
-    public void BuildClusters(uint frameIndex, Camera camera, float aspect, float nearZ, float farZ,
+    public void BuildClusters(RenderView view, float nearZ, float farZ,
         uint tileCountX, uint tileCountY, uint zSlices = 1)
     {
-        clusterGrid.Build(frameIndex, camera, aspect, nearZ, farZ,
+        _clusterGrid.Build(view, nearZ, farZ,
             tileCountX, tileCountY, zSlices, _probes);
     }
 
@@ -615,7 +623,7 @@ public sealed unsafe class ReflectionProbeSystem
     /// sample <see cref="captureCubeSampleView"/> downstream (currently only
     /// the prefilter compute pass, landing in Phase 5).
     /// </summary>
-    public void RecordCapture(CommandBuffer cmd, uint frameIndex, ulong frameCounter, Scene scene)
+    public void RecordCapture(CommandBuffer cmd, RenderView view, Scene scene)
     {
         if (capturePipeline == null) return;
 
@@ -637,7 +645,7 @@ public sealed unsafe class ReflectionProbeSystem
         // ProbeCapture.slang reads this at (0,0) - the scene set's dynamic constant slot -
         // so it goes through the arena, and the returned byte offset is the dynamic offset
         // the CmdBindDescriptorSets below must supply.
-        uint captureUboOffset = _gpu.Registry.ConstantArena.Push(frameIndex, in ubo);
+        uint captureUboOffset = _gpu.Registry.ConstantArena.Push(view.FrameIndex, in ubo);
 
         // Layout transitions: cube + depth to attachment layouts
         ImageMemoryBarrier* preBarriers = stackalloc ImageMemoryBarrier[2];
@@ -692,7 +700,7 @@ public sealed unsafe class ReflectionProbeSystem
         var renderInfo = new RenderingInfo
         {
             SType                = StructureType.RenderingInfo,
-            RenderArea           = new Rect2D(new Offset2D(0, 0), new Extent2D(ProbeFaceSize, ProbeFaceSize)),
+            RenderArea           = new Rect2D(new Offset2D(0, 0), new Extent2D(_probeFaceSize, _probeFaceSize)),
             LayerCount           = 1,           // multiview supplies the layer fan-out
             ViewMask             = 0x3Fu,       // 6 bits = 6 cube faces
             ColorAttachmentCount = 1,
@@ -703,12 +711,12 @@ public sealed unsafe class ReflectionProbeSystem
 
         _vk.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, capturePipeline.Handle);
 
-        Viewport vp = new() { X = 0, Y = 0, Width = ProbeFaceSize, Height = ProbeFaceSize, MinDepth = 0f, MaxDepth = 1f };
-        Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(ProbeFaceSize, ProbeFaceSize));
+        Viewport vp = new() { X = 0, Y = 0, Width = _probeFaceSize, Height = _probeFaceSize, MinDepth = 0f, MaxDepth = 1f };
+        Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(_probeFaceSize, _probeFaceSize));
         _vk.CmdSetViewport(cmd, 0, 1, &vp);
         _vk.CmdSetScissor (cmd, 0, 1, &scissor);
 
-        var frameSet = _gpu.Registry.SceneSet(frameIndex);
+        var frameSet = _gpu.Registry.SceneSet(view.FrameIndex);
         var sets        = stackalloc DescriptorSet[1] { frameSet };
         // The scene set's binding 0 is the arena's UniformBufferDynamic slot, so exactly one
         // dynamic offset must accompany it - the CaptureUbo slice pushed above.
@@ -774,7 +782,7 @@ public sealed unsafe class ReflectionProbeSystem
             SrcAccessMask       = AccessFlags.ShaderReadBit,
             DstAccessMask       = AccessFlags.ShaderWriteBit,
             SubresourceRange    = new ImageSubresourceRange(
-                ImageAspectFlags.ColorBit, 0, ProbeMipLevels, (uint)probe.CubeArraySlot * 6, 6),
+                ImageAspectFlags.ColorBit, 0, _probeMipLevels, (uint)probe.CubeArraySlot * 6, 6),
         };
         _vk.CmdPipelineBarrier(cmd,
             PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.FragmentShaderBit,
@@ -785,10 +793,10 @@ public sealed unsafe class ReflectionProbeSystem
         var prefilter = _ibl.PrefilterPipeline;
         _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilter.Handle);
         uint slot = (uint)probe.CubeArraySlot;
-        for (uint m = 0; m < ProbeMipLevels; m++)
+        for (uint m = 0; m < _probeMipLevels; m++)
         {
-            uint mipSize = Math.Max(1u, ProbeFaceSize >> (int)m);
-            float roughness = ProbeMipLevels == 1 ? 0f : m / (float)(ProbeMipLevels - 1);
+            uint mipSize = Math.Max(1u, _probeFaceSize >> (int)m);
+            float roughness = _probeMipLevels == 1 ? 0f : m / (float)(_probeMipLevels - 1);
 
             var set = _prefilterSets[slot, m];
             _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, prefilter.Layout,
@@ -798,7 +806,7 @@ public sealed unsafe class ReflectionProbeSystem
             {
                 Roughness   = roughness,
                 MipFaceSize = mipSize,
-                EnvCubeSize = ProbeFaceSize,
+                EnvCubeSize = _probeFaceSize,
             };
             _vk.CmdPushConstants(cmd, prefilter.Layout, ShaderStageFlags.ComputeBit,
                 0, (uint)sizeof(PcProbePrefilter), &prefPc);
@@ -819,7 +827,7 @@ public sealed unsafe class ReflectionProbeSystem
             SrcAccessMask       = AccessFlags.ShaderWriteBit,
             DstAccessMask       = AccessFlags.ShaderReadBit,
             SubresourceRange    = new ImageSubresourceRange(
-                ImageAspectFlags.ColorBit, 0, ProbeMipLevels, slot * 6, 6),
+                ImageAspectFlags.ColorBit, 0, _probeMipLevels, slot * 6, 6),
         };
         _vk.CmdPipelineBarrier(cmd,
             PipelineStageFlags.ComputeShaderBit,
@@ -827,7 +835,7 @@ public sealed unsafe class ReflectionProbeSystem
             0, 0, null, 0, null, 1, &slotReadBarrier);
 
         _captureCubeInitialLayout = false;
-        probe.LastCaptureFrame    = frameCounter;
+        probe.LastCaptureFrame    = view.FrameCounter;
         probe.Dirty               = probe.UpdatePolicy switch
         {
             ProbeUpdatePolicy.Once         => false,
@@ -839,14 +847,14 @@ public sealed unsafe class ReflectionProbeSystem
 
     public void Dispose()
     {
-        clusterGrid?.Dispose();
+        _clusterGrid?.Dispose();
 
         // Prefilter resources first — descriptor sets live in the renderer's
         // pool which is destroyed downstream; views must be torn down explicitly.
         if (_prefilterStorageViews != null)
         {
-            for (int slot = 0; slot < MaxProbes; slot++)
-            for (int mip  = 0; mip  < ProbeMipLevels; mip++)
+            for (int slot = 0; slot < _maxProbes; slot++)
+            for (int mip  = 0; mip  < _probeMipLevels; mip++)
             {
                 var v = _prefilterStorageViews[slot, mip];
                 if (v.Handle != 0) _vk.DestroyImageView(_device, v, null);
@@ -875,4 +883,6 @@ public sealed unsafe class ReflectionProbeSystem
         _probes.Clear();
         _freeSlots.Clear();
     }
+
+    
 }

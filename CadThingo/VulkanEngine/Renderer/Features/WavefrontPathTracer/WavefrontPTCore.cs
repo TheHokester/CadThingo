@@ -46,6 +46,9 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
     private Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
 
+    // Last snapshot the host handed over, re-read on every Resize.
+    private HostTargets _targets;
+
     private WavefrontPTPipeline _pipe = null!;
     private WavefrontGraph?     _graph;
 
@@ -68,12 +71,11 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
         // so this core builds it rather than the host.
         _pipe = new WavefrontPTPipeline(_gpu, _host);
         _pipe.Initialize();
-        BuildGraph();
     }
 
     /// <summary>(Re)build the wavefront chain as the <see cref="WavefrontGraph"/>. Imports the
     /// pipeline-owned set-4 buffers + the host accumulator / out-color / FinalColor (re-read here
-    /// so a resize picks up the fresh handles). Called from the ctor + on every resize.</summary>
+    /// so a resize picks up the fresh handles). Called on every resize.</summary>
     private void BuildGraph()
     {
         _graph?.Dispose();
@@ -83,7 +85,7 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
         module.Build(fg.RootScope().Child("Wavefront"),
             new WavefrontPTModule.Inputs(
                 _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
-                _host.renderTargets.FinalColor),
+                _targets.FinalColor),
             out var o);
 
         fg.MarkOutput(o.Final);
@@ -109,9 +111,10 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
     /// <summary>Resize: reallocate the SoA working set to the new extent (which rewrites set 4 +
     /// marks the accumulator dirty), then rebuild the graph so it imports the fresh buffers + the
     /// freshly-reallocated PT/Final targets.</summary>
-    public void Resize(Extent2D extent)
+    public void Resize(in HostTargets targets)
     {
-        _pipe.ReallocSet4(extent);
+        _targets = targets;
+        _pipe.ReallocSet4(targets.Extent);
         BuildGraph();
     }
 

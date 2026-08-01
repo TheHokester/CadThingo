@@ -163,10 +163,14 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     // (tileX, tileY) so the caller can drive the light-cull dispatch without recomputing.
 
     public (uint tileCountX, uint tileCountY) UpdatePerFrame(
-        uint frameIndex, Camera camera, uint count)
+        RenderView f)
     {
-        uint tileX = (Renderer.renderExtent.Width  + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
-        uint tileY = (Renderer.renderExtent.Height + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
+        var camera = f.Camera;
+        var renderExtent = f.RenderExtent;
+        var lightCount = f.LightCount;
+        
+        uint tileX = (renderExtent.Width  + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
+        uint tileY = (renderExtent.Height + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
 
         LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
@@ -175,18 +179,18 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         // overwrite content, not metadata) but a stale copy would be silent if that ever changed.
         ubo.prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels;
         ubo.scaleIBLAmbient = EditorState.IblIntensity;
-        ubo.lightCount = count;
+        ubo.lightCount = lightCount;
         ubo.tileCountX = tileX;
         ubo.tileCountY = tileY;
-        ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
+        ubo.screenSize = new Vector2(renderExtent.Width, renderExtent.Height);
 
         // Probe cluster dims — the cluster grid is rebuilt earlier in DrawFrame
         // with the same tile counts so its dims always match the lighting tile grid.
-        var grid = Renderer.reflectionProbeSystem.clusterGrid;
+        var grid = Renderer.reflectionProbeSystem.ClusterGrid;
         ubo.probeClusterDimsX = grid.DimsX;
         ubo.probeClusterDimsY = grid.DimsY;
         ubo.probeClusterDimsZ = grid.DimsZ;
-        ubo.probeMipLevels    = ReflectionProbeSystem.ProbeMipLevels;
+        ubo.probeMipLevels    = Renderer.reflectionProbeSystem.ProbeMipLevels;
 
         _frameUbo = ubo;
 

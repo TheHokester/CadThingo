@@ -97,7 +97,7 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
         };
         DescriptorSet set;
         if (Vk.AllocateDescriptorSets(Device, &info, &set) != Result.Success)
-            throw new System.Exception("Failed to allocate IBL bake descriptor set");
+            throw new Exception("Failed to allocate IBL bake descriptor set");
         return set;
     }
 

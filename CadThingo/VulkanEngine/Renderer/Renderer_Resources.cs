@@ -46,34 +46,18 @@ namespace CadThingo.VulkanEngine.Renderer;
  */
 public unsafe partial class Renderer
 {
-    // Device-service helpers moved to GraphicsDevice (L1). Forwarders keep the
-    // former Renderer.* / Engine.renderer.* call sites (pipelines, ImageResource,
-    // Texture, ResourceManager) compiling unchanged.
-    public CommandBuffer BeginSingleTimeCommands() => gfx.BeginSingleTimeCommands();
-
-    public void EndSingleTimeCommands(CommandBuffer cmd) => gfx.EndSingleTimeCommands(cmd);
+    
 
     public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
         out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault,
         bool preferDeviceLocal = false)
         => gfx.CreateBuffer(size, usage, memProps, out buffer, out alloc, priority, preferDeviceLocal);
 
-    public void CopyBuffer(Buffer src, Buffer dst, ulong size) => gfx.CopyBuffer(src, dst, size);
-
-    public void UploadBufferData(Buffer dst, long dstOffset, void* srcData, ulong size)
-        => gfx.UploadBufferData(dst, dstOffset, srcData, size);
+    
 
     public void DestroyBuffer(Buffer buffer, SubAlloc alloc) => gfx.DestroyBuffer(buffer, alloc);
 
-    internal void CreateMappedUniformBuffer(int sizeBytes, ref UboBuffer ubo)
-        => gfx.CreateMappedUniformBuffer(sizeBytes, ref ubo);
-
-    public void TransitionImageLayout(CommandBuffer cmd, Image image, Format format, ImageLayout oldLayout,
-        ImageLayout newLayout, uint mipLevels = 1)
-        => gfx.TransitionImageLayout(cmd, image, format, oldLayout, newLayout, mipLevels);
-
-    internal void GenerateMipMaps(CommandBuffer cmds, Image image, Format format, uint width, uint height, uint mipLevels)
-        => gfx.GenerateMipMaps(cmds, image, format, width, height, mipLevels);
+    
     
 
     private void CreateDescriptorPool()
@@ -118,63 +102,7 @@ public unsafe partial class Renderer
         gfx.CreateDescriptorPool(poolSizes, maxSets: 48 + 200 + 16,
             DescriptorPoolCreateFlags.UpdateAfterBindBit | DescriptorPoolCreateFlags.FreeDescriptorSetBit);
     }
-   
-
     
-
-    // Allocates a host-visible, coherent, persistently-mapped SSBO. Optional extra
-    // usage bits let callers turn the same buffer into an indirect-cmd / indirect-
-    // count source on top of plain storage usage.
-    internal void CreateMappedStorageBuffer(ulong sizeBytes, ref UboBuffer ubo,
-        BufferUsageFlags extraUsage = 0, bool preferDeviceLocal = false)
-        => gfx.CreateMappedStorageBuffer(sizeBytes, ref ubo, extraUsage, preferDeviceLocal);
-
-    // Scene -> GPU packing lives on GpuScene and is driven once per frame by DrawFrame's
-    // extraction phase; the results reach consumers through the frame's RenderView. There is
-    // deliberately no Renderer.UpdateLights/UpdateMaterials forwarder any more - a core or
-    // pipeline that re-triggered a pack mid-frame is exactly what that phase exists to prevent.
-
-
-    /// <summary>
-    /// Writes a bindless texture to the given descriptor set at the given binding.
-    /// All descriptor sets must use the same layout.
-    /// </summary>
-    /// <param name="index"></param>
-    /// <param name="texture"></param>
-    /// <param name="sets"></param>
-    /// <param name="binding"></param>
-    /// <exception cref="ArgumentOutOfRangeException"></exception>
-    public void WriteBindlessTexture(int index, Texture texture, DescriptorSet[] sets, uint binding)
-    {
-        if (index < 0 || index >= RenderConfig.MAX_BINDLESS_TEXTURES)
-            throw new ArgumentOutOfRangeException(nameof(index), $"bindless texture index {index} out of [0, {RenderConfig.MAX_BINDLESS_TEXTURES}).");
-
-        // Mirror into the unified scene set's texture table at the same slot index, so
-        // material rows resolve identically once shaders migrate to SceneBindings.
-        descriptorRegistry?.SetBindlessSlot(index, texture.View);
-
-        DescriptorImageInfo imgInfo = new()
-        {
-            ImageView = texture.View,
-            ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
-        };
-
-        var writes = stackalloc WriteDescriptorSet[sets.Length];
-        for (var f = 0; f < sets.Length; f++)
-        {
-            writes[f] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = sets[f],
-                DstBinding = binding,
-                DstArrayElement = (uint)index,
-                DescriptorType = DescriptorType.SampledImage,
-                DescriptorCount = 1,
-                PImageInfo = &imgInfo,
-            };
-        }
-        vk!.UpdateDescriptorSets(device, (uint)sets.Length, writes, 0, null);
-    }
 }
 
 // Mirrors PbrUtils.slang::PbrLight under std430 (16B alignment, no padding needed —

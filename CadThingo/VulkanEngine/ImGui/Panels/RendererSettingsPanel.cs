@@ -288,7 +288,7 @@ public static class RendererSettingsPanel
         // user knows whether ProbeCapture compiled at startup — without it,
         // probes register but never capture.
         int used = probeSys.Probes.Count;
-        int total = (int)ReflectionProbeSystem.MaxProbes;
+        int total = (int)probeSys.MaxProbes;
         ImGuiNET.ImGui.Text($"Slots: {used} / {total}");
         if (probeSys.capturePipeline == null)
         {
@@ -312,7 +312,7 @@ public static class RendererSettingsPanel
         // on the next frame (first-time probes go to the front of the queue),
         // so the user sees the probe contribute within a frame or two.
         var probeSys = renderer.reflectionProbeSystem;
-        if (probeSys.Probes.Count >= ReflectionProbeSystem.MaxProbes)
+        if (probeSys.Probes.Count >= probeSys.MaxProbes)
         {
             Console.WriteLine("[Probe] Cannot spawn — slot pool full.");
             return;

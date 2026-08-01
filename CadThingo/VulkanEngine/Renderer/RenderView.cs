@@ -19,6 +19,8 @@ public readonly ref struct RenderView
 {
     /// <summary>Frame-in-flight slot index. Indexes every per-frame buffer / descriptor set.</summary>
     public uint FrameIndex { get; init; }
+    
+    public ulong FrameCounter { get; init; }
 
     /// <summary>Camera the frame is being recorded for. Null only in headless / pre-camera paths.</summary>
     public Camera Camera { get; init; }

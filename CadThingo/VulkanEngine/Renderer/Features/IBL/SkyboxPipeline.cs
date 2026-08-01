@@ -195,18 +195,18 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
 
     // Per-frame upload
 
-    public void UpdatePerFrame(uint frameIndex, Camera camera, float intensity)
+    public void UpdatePerFrame(RenderView f, float intensity)
     {
         SkyboxUBO ubo = new();
-        if (camera != null)
+        if (f.Camera != null)
         {
-            var proj = camera.GetProjectionMatrix(
-                (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
+            var proj = f.Camera.GetProjectionMatrix(
+                (float)f.RenderExtent.Width / f.RenderExtent.Height, 0.1f, 100.0f);
             proj.M22 *= -1;
-            var view = camera.GetViewMatrix();
+            var view = f.Camera.GetViewMatrix();
             var vp   = view * proj;
             Matrix4x4.Invert(vp, out ubo.invViewProj);
-            ubo.camPos = new Vector4(camera.GetPosition(), 1.0f);
+            ubo.camPos = new Vector4(f.Camera.GetPosition(), 1.0f);
         }
         else
         {
@@ -215,7 +215,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
         }
         ubo.intensity = intensity;
 
-        void* data = FrameUniformBuffers[frameIndex].mapped;
+        void* data = FrameUniformBuffers[f.FrameIndex].mapped;
         new System.Span<SkyboxUBO>(data, 1).Fill(ubo);
     }
 }

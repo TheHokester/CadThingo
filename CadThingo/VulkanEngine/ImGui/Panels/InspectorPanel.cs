@@ -422,7 +422,7 @@ public static unsafe class InspectorPanel
         // Slot assignment & status. Slot < 0 = system didn't register the probe
         // (out-of-slots) — the entity exists but never contributes to lighting.
         if (probe.CubeArraySlot >= 0)
-            ImGuiNET.ImGui.Text($"Slot {probe.CubeArraySlot} / {ReflectionProbeSystem.MaxProbes - 1}");
+            ImGuiNET.ImGui.Text($"Slot {probe.CubeArraySlot}");
         else
             ImGuiNET.ImGui.TextColored(new Vector4(1f, 0.5f, 0.3f, 1f),
                 "Unregistered — slot pool full at probe creation.");

@@ -77,10 +77,11 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
     /// is read snapshot-style — each probe's <c>WorldPosition</c> and
     /// <c>InfluenceRadius</c> are sampled once.
     /// </summary>
-    public void Build(uint frameIndex, Camera camera, float aspect, float nearZ, float farZ,
+    public void Build(RenderView view, float nearZ, float farZ,
         uint dimsX, uint dimsY, uint dimsZ,
         IReadOnlyList<ReflectionProbeComponent> probes)
     {
+        var aspect = view.RenderExtent.Width / (float)view.RenderExtent.Height;
         DimsX = dimsX; DimsY = dimsY; DimsZ = dimsZ;
         uint clusterCount = dimsX * dimsY * dimsZ;
         if (clusterCount > MaxClusters)
@@ -94,7 +95,7 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
 
         if (probes.Count > 0 && clusterCount > 0)
         {
-            BuildClusterBounds(camera, aspect, nearZ, farZ, dimsX, dimsY, dimsZ);
+            BuildClusterBounds(view.Camera, aspect, nearZ, farZ, dimsX, dimsY, dimsZ);
             for (int pi = 0; pi < probes.Count; pi++)
             {
                 var p = probes[pi];
@@ -103,7 +104,7 @@ public unsafe sealed class ProbeClusterGrid : IDisposable
             }
         }
 
-        Pack(frameIndex, clusterCount);
+        Pack(view.FrameIndex, clusterCount);
     }
 
     // World-space cluster bounds

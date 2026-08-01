@@ -39,6 +39,9 @@ public unsafe sealed class SelectionSystem
     GpuContext INeedsGpu.Gpu   { set => _gpu  = value; }
     Renderer   INeedsHost.Host { set => _host = value; }
 
+    // Last snapshot the host handed over, re-read on every Resize.
+    private HostTargets _targets;
+
     private GraphicsDevice Gfx => _gpu.Gfx;
 
     internal PickPipeline          pickPipeline          = null!;
@@ -58,24 +61,24 @@ public unsafe sealed class SelectionSystem
         pickPipeline = new PickPipeline(_gpu, _host);
         pickPipeline.Initialize();
 
-        // Mask pipeline writes the coverage image; outline reads it back.
+        // Mask pipeline writes the coverage image; outline reads it back. Both mask descriptors
+        // point at an extent-sized view, so they are written in Resize (primed once at boot).
         selectionMaskPipeline = new SelectionMaskPipeline(_gpu, _host);
         selectionMaskPipeline.Initialize();
-        selectionMaskPipeline.WriteMaskImageDescriptor(Mask.ImageView);
 
         outlinePipeline = new OutlinePipeline(_gpu, _host);
         outlinePipeline.Initialize();
-        outlinePipeline.WriteMaskDescriptor(Mask.ImageView);
     }
 
     // The coverage mask is a RenderTargets-owned, size-dependent image.
     private ImageResource Mask => _host.renderTargets.SelectionMask;
 
-    /// Re-points the mask descriptors after a resize rebuilt the view (storage side on the compute
-    /// pipeline, sampled side on the outline pass). The extent is unused - both sides bind a view,
-    /// and the new view already carries the new size.
-    public void Resize(Extent2D extent)
+    /// Points the mask descriptors at the current view (storage side on the compute pipeline,
+    /// sampled side on the outline pass). Nothing here reads the extent - both sides bind a view,
+    /// which already carries its own size.
+    public void Resize(in HostTargets targets)
     {
+        _targets = targets;
         selectionMaskPipeline.WriteMaskImageDescriptor(Mask.ImageView);
         outlinePipeline.WriteMaskDescriptor(Mask.ImageView);
     }
@@ -115,7 +118,7 @@ public unsafe sealed class SelectionSystem
 
         var cmd = Gfx.BeginSingleTimeCommands();
         pickPipeline.Record(cmd, invVP, camera.GetPosition(),
-            new Vector2(extent.Width, extent.Height), px, py);
+            view, px, py);
         Gfx.EndSingleTimeCommands(cmd);   // QueueWaitIdle - result buffer is now valid
 
         uint idx = pickPipeline.ReadResult();
@@ -174,13 +177,13 @@ public unsafe sealed class SelectionSystem
         Gfx.TransitionImageLayout(cmd, mask.Image, mask._format,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.General);
 
-        selectionMaskPipeline.Record(cmd, invVP, camera.GetPosition(), extent, idx);
+        selectionMaskPipeline.Record(cmd, invVP, view, idx);
 
         // compute write -> outline fragment read
         Gfx.TransitionImageLayout(cmd, mask.Image, mask._format,
             ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
 
-        var finalColor = _host.renderTargets.FinalColor;
+        var finalColor = _targets.FinalColor;
         Gfx.TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.ColorAttachmentOptimal);
 

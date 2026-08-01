@@ -134,7 +134,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
             (CommandBuffer cmd, PassResources res, in RenderView f) =>
             {
                 var (lightCount, tileCountX, tileCountY) = _lightCullParams();
-                _lightCull.Record(cmd, f.FrameIndex, f.Camera, lightCount, tileCountX, tileCountY, res.PassSet);
+                _lightCull.Record(cmd, f, lightCount, tileCountX, tileCountY, res.PassSet);
             });
 
         // Geometry -> g-buffers + depth. Reads the post-cull indirect buffers (IndirectArg) +

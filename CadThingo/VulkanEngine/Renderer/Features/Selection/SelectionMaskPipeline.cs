@@ -105,16 +105,16 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
     /// [numthreads(8,8,1)]). The mask image must be in GENERAL before this call. Runs in
     /// the per-frame command buffer after BeginFrame, so the current frame's scene set is
     /// fresh.</summary>
-    public void Record(CommandBuffer cmd, in Matrix4x4 invViewProj, Vector3 camPos,
-                       Extent2D extent, uint selectedIndex)
+    public void Record(CommandBuffer cmd, in Matrix4x4 invViewProj, RenderView view, uint selectedIndex)
     {
+        var extent = view.RenderExtent;
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, PipelineHandle);
 
         // Scene set (zero dynamic offset: mask params stay push constants) + owned mask set.
         uint zeroOffset = 0;
         var sets = stackalloc DescriptorSet[2]
         {
-            Registry.SceneSet(Renderer.currentFrame),
+            Registry.SceneSet(view.FrameIndex),
             DescriptorSets[SetMask][0],
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);
@@ -122,7 +122,7 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
         var push = new MaskPushConstants
         {
             InvViewProj   = invViewProj,
-            CamPos        = new Vector4(camPos, 1f),
+            CamPos        = new Vector4(view.Camera.GetPosition(), 1f),
             ScreenSize    = new Vector2(extent.Width, extent.Height),
             SelectedIndex = selectedIndex,
         };

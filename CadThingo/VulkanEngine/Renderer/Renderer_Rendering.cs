@@ -16,55 +16,12 @@ namespace CadThingo.VulkanEngine.Renderer;
 
 public unsafe partial class Renderer
 {
-    private void SetupDynamicRendering()
-    {
-        //create color attachment
-        ClearValue backgroundValue = new()
-        {
-            Color = new ClearColorValue() { Float32_0 = 0.0f, Float32_1 = 0.0f, Float32_2 = 0.0f, Float32_3 = 1.0f }
-        };
-        colorAttachments = new()
-        {
-            new RenderingAttachmentInfo()
-            {
-                ImageLayout = ImageLayout.ColorAttachmentOptimal,
-                LoadOp = AttachmentLoadOp.Clear,
-                StoreOp = AttachmentStoreOp.Store,
-                ClearValue = backgroundValue,
-            }
-        };
-        //create depth attachment
-        ClearValue depthValue = new()
-        {
-            DepthStencil = new ClearDepthStencilValue(1.0f, 0)
-        };
-        depthAttachment = new()
-        {
-            ImageLayout = ImageLayout.DepthStencilAttachmentOptimal,
-            LoadOp = AttachmentLoadOp.Clear,
-            StoreOp = AttachmentStoreOp.Store,
-            ClearValue = depthValue,
-        };
-        //Create rendering info
-        fixed (RenderingAttachmentInfo* pColorAttachment = &colorAttachments.ToArray()[0])
-        fixed(RenderingAttachmentInfo* pDepthAttachment = &depthAttachment)
-        {
-            renderingInfo = new()
-            {
-                RenderArea = new Rect2D(new Offset2D(0, 0), swapChainExtent),
-                LayerCount = 1,
-                ColorAttachmentCount = (uint)colorAttachments.Count,
-                PColorAttachments = pColorAttachment,
-                PDepthAttachment = pDepthAttachment
-            };
-            
-        }
-    }
+    
     
     // Rebuilds everything tied to the surface extent: swap chain, attachment
     // images, render graph (which captures width/height in its pass closures),
     // and the lighting pass's g-buffer descriptor writes.
-    // Public so Engine can call it from window.Resize — otherwise the only
+    // Public so Engine can call it from window.Resize - otherwise the only
     // trigger is AcquireNextImage returning ErrorOutOfDateKhr, which leaves
     // one frame at the wrong dimensions on some platforms.
     public void RecreateSwapChain()
@@ -115,7 +72,7 @@ public unsafe partial class Renderer
         // re-compile their graphs (fresh transients, re-import FinalColor, re-bind descriptors);
         // the PT/RT cores rebind their storage images (which marks the accumulator dirty so the
         // next dispatch clears fresh memory).
-        _features.Resize(renderExtent);
+        _features.Resize(renderTargets.Snapshot);
 
         // Tonemap's HDR input is graph-baked, re-pointed by each core's graph rebuild above;
         // Activate restarts the active PT core's progressive accumulation on the fresh targets.
@@ -147,6 +104,11 @@ public unsafe partial class Renderer
     /// </summary>
     public void DrawFrame()
     {
+        var currentFrame = frameRing.CurrentFrame;
+        var imageAvailableSemaphore = frameRing.ImageAvailableSemaphores[currentFrame];
+        var renderFinishedSemaphore = frameRing.RenderFinishedSemaphores[currentFrame];
+        var graphicsCmds = frameRing.CommandBuffers[currentFrame];
+        var inFlightFence = frameRing.InFlightFences[currentFrame];
         
         
         
@@ -182,46 +144,40 @@ public unsafe partial class Renderer
         }
 
         // 1. CPU/GPU sync for this slot
-        vk!.WaitForFences(device, 1, ref inFlightFences[currentFrame], true, ulong.MaxValue);
-
-        // This frame's scene set is provably idle now: apply queued registry rewrites and
-        // reset its constant-arena slice.
+        vk!.WaitForFences(device, 1, ref inFlightFence, true, ulong.MaxValue);
+        
+        //apply queued registry rewrites
         descriptorRegistry.BeginFrame(currentFrame);
 
         // 2. Acquire swapchain image
-        var acquireResult = swapchain.AcquireNextImage(imageAvailableSemaphores[currentFrame], out uint imageIndex);
+        var acquireResult = swapchain.AcquireNextImage(imageAvailableSemaphore, out var imageIndex);
         if (acquireResult == Result.ErrorOutOfDateKhr) { RecreateSwapChain(); return; }
 
         // 3. Reset fence - about to submit work that will signal it
-        vk!.ResetFences(device, 1, ref inFlightFences[currentFrame]);
+        vk!.ResetFences(device, 1, ref inFlightFence);
 
         // 4. Reset + begin command buffer
-        var cmd = commandBuffers[currentFrame];
-        vk!.ResetCommandBuffer(cmd, 0);
+        
+        vk!.ResetCommandBuffer(graphicsCmds, 0);
         var beginInfo = new CommandBufferBeginInfo
         {
             SType = StructureType.CommandBufferBeginInfo,
             Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
         };
-        if (vk!.BeginCommandBuffer(cmd, &beginInfo) != Result.Success)
+        if (vk!.BeginCommandBuffer(graphicsCmds, &beginInfo) != Result.Success)
             throw new Exception("Failed to begin command buffer");
 
-        // 5. Scene extraction. Technique-independent, so it runs here exactly once instead of
-        //    inside whichever core happens to be active - a core consumes the result and never
-        //    re-triggers it. Order is load-bearing: BeginTransforms opens the world-matrix cache
-        //    window that the light and renderable walks below read through, so every entity's
-        //    parent chain is composed at most once this frame.
-        //    (RebuildTlas runs out-of-band above and opens its own window.)
+        // 5. Scene extraction. 
         gpuScene.BeginTransforms();
         uint materialCount   = gpuScene.UpdateMaterials(currentFrame, scene);
         uint lightCount      = gpuScene.UpdateLights(currentFrame, scene);
         uint renderableCount = gpuScene.ExtractRenderables(currentFrame, scene);
 
-        // The per-frame snapshot every consumer downstream reads. Built after extraction so the
-        // counts in it are this frame's, not last frame's.
+        // The per-frame data read by all consumers 
         var view = new RenderView
         {
             FrameIndex            = currentFrame,
+            FrameCounter          = frameRing.FrameCounter,
             Camera                = camera,
             Scene                 = scene,
             RenderExtent          = renderExtent,
@@ -237,9 +193,9 @@ public unsafe partial class Renderer
 
         // Dispatch the active render core. It records its technique into cmd and leaves
         // FinalColor in ShaderReadOnlyOptimal for upcoming commands.
-        _activeCore.Render(new RenderFrame { Cmd = cmd, View = view });
+        _activeCore.Render(new RenderFrame { Cmd = graphicsCmds, View = view });
 
-        _features.PostDraw(cmd, view);
+        _features.PostDraw(graphicsCmds, view);
 
         // 7. Blit FinalColor -> swapchain image
         var swapImage = swapChainImages[imageIndex];
@@ -257,7 +213,7 @@ public unsafe partial class Renderer
             DstAccessMask = AccessFlags.TransferWriteBit,
             SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1),
         };
-        vk!.CmdPipelineBarrier(cmd,
+        vk!.CmdPipelineBarrier(graphicsCmds,
             PipelineStageFlags.TopOfPipeBit,
             PipelineStageFlags.TransferBit,
             0, 0, null, 0, null, 1, &toTransferDst);
@@ -268,7 +224,7 @@ public unsafe partial class Renderer
         // here and back to ShaderReadOnlyOptimal after the blit. The graph's layout
         // tracker stays consistent because we end where the graph thinks it ends.
         var finalColor = renderTargets.FinalColor;
-        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+        gfx.TransitionImageLayout(graphicsCmds, finalColor.Image, finalColor._format,
             ImageLayout.ShaderReadOnlyOptimal, ImageLayout.TransferSrcOptimal);
         var blit = new ImageBlit
         {
@@ -294,19 +250,19 @@ public unsafe partial class Renderer
         blit.DstOffsets[0] = new Offset3D(0, 0, 0);
         blit.DstOffsets[1] = new Offset3D((int)swapChainExtent.Width, (int)swapChainExtent.Height, 1);
 
-        vk!.CmdBlitImage(cmd,
+        vk!.CmdBlitImage(graphicsCmds,
             finalColor.Image, ImageLayout.TransferSrcOptimal,
             swapImage, ImageLayout.TransferDstOptimal,
             1, &blit, Filter.Linear);
 
         // 7b-post. Return FinalColor to ShaderReadOnlyOptimal so the viewport ImGui
         //     panel (and the render graph's layout tracker) can rely on it.
-        TransitionImageLayout(cmd, finalColor.Image, finalColor._format,
+        gfx.TransitionImageLayout(graphicsCmds, finalColor.Image, finalColor._format,
             ImageLayout.TransferSrcOptimal, ImageLayout.ShaderReadOnlyOptimal);
 
         // 7c. Swapchain TransferDstOptimal → ColorAttachmentOptimal so the UI overlay
         //     can render on top of the blitted scene.
-        TransitionImageLayout(cmd, swapImage, swapChainImageFormat,
+        gfx.TransitionImageLayout(graphicsCmds, swapImage, swapChainImageFormat,
             ImageLayout.TransferDstOptimal, ImageLayout.ColorAttachmentOptimal);
 
         // 7d. UI overlay (no-op when imGuiUtils is unwired).
@@ -315,14 +271,14 @@ public unsafe partial class Renderer
             imGuiUtils.newFrame();
             imGuiUtils.updateBuffers(currentFrame);
         }
-        imGuiUtils?.DrawFrame(cmd, swapChainImageViews[imageIndex], currentFrame);
+        imGuiUtils?.DrawFrame(graphicsCmds, swapChainImageViews[imageIndex], currentFrame);
 
-        // 7e. Swapchain ColorAttachmentOptimal → PresentSrcKhr.
-        TransitionImageLayout(cmd, swapImage, swapChainImageFormat,
+        // 7e. Swapchain ColorAttachmentOptimal -> PresentSrcKhr.
+        gfx.TransitionImageLayout(graphicsCmds, swapImage, swapChainImageFormat,
             ImageLayout.ColorAttachmentOptimal, ImageLayout.PresentSrcKhr);
 
         // 8. End command buffer
-        if (vk!.EndCommandBuffer(cmd) != Result.Success)
+        if (vk!.EndCommandBuffer(graphicsCmds) != Result.Success)
             throw new Exception("Failed to end command buffer");
 
         // 9. Submit: wait imageAvailable @ Transfer, signal renderFinished, fence inFlight.
@@ -332,29 +288,29 @@ public unsafe partial class Renderer
         var imgAvailWait = new SemaphoreSubmitInfo
         {
             SType     = StructureType.SemaphoreSubmitInfo,
-            Semaphore = imageAvailableSemaphores[currentFrame],
+            Semaphore = imageAvailableSemaphore,
             Value     = 0,
             StageMask = PipelineStageFlags2.TransferBit,
         };
         var renderDoneSignal = new SemaphoreSubmitInfo
         {
             SType     = StructureType.SemaphoreSubmitInfo,
-            Semaphore = renderFinishedSemaphores[currentFrame],
+            Semaphore = renderFinishedSemaphore,
             Value     = 0,
             StageMask = PipelineStageFlags2.AllCommandsBit,
         };
 
         if (ActiveGraphCore is { HasPendingGfxChunks: true } graphCore)
         {
-            graphCore.SubmitGfxChunks(graphicsQueue, imgAvailWait, renderDoneSignal,
-                cmd, inFlightFences[currentFrame]);
+            graphCore.SubmitGfxChunks(gfx.GraphicsQueue, imgAvailWait, renderDoneSignal,
+                graphicsCmds, inFlightFence);
         }
         else
         {
             var hostCmdInfo = new CommandBufferSubmitInfo
             {
                 SType = StructureType.CommandBufferSubmitInfo,
-                CommandBuffer = cmd,
+                CommandBuffer = graphicsCmds,
             };
             var submitInfo2 = new SubmitInfo2
             {
@@ -366,14 +322,13 @@ public unsafe partial class Renderer
                 SignalSemaphoreInfoCount = 1,
                 PSignalSemaphoreInfos    = &renderDoneSignal,
             };
-            if (vk!.QueueSubmit2(graphicsQueue, 1, &submitInfo2, inFlightFences[currentFrame]) != Result.Success)
+            if (vk!.QueueSubmit2(gfx.GraphicsQueue, 1, &submitInfo2, inFlightFence) != Result.Success)
                 throw new Exception("Queue submit failed");
         }
 
-        // 10. Present — wait on renderFinished
-        swapchain.Present(presentQueue, renderFinishedSemaphores[currentFrame], imageIndex);
-
-        // Advance to the next frame-in-flight slot + bump the monotonic counter.
+        // 10. Present finalized image 
+        swapchain.Present(gfx.PresentQueue, renderFinishedSemaphore, imageIndex);
+        
         frameRing.Advance();
     }
 

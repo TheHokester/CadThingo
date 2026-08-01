@@ -30,9 +30,12 @@ internal abstract class PathTraceCoreBase
     protected ISharedPipelines _shared = null!;
     ISharedPipelines INeedsFeature<ISharedPipelines>.Dependency { set => _shared = value; }
 
-    // Transitional: the PT cores still compose against renderer-owned render targets.
+    // Transitional: the accumulator / out-color pair is still renderer-owned.
     protected Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
+
+    // Last snapshot the host handed over, re-read on every Resize.
+    protected HostTargets _targets;
 
     private PTGraph? _graph;
 
@@ -46,13 +49,12 @@ internal abstract class PathTraceCoreBase
     public abstract string Name { get; }
     public abstract Renderer.RenderMode Mode { get; }
 
-    /// <summary>Builds the subclass's tracer pipeline, then the graph that closes over it. Split
-    /// this way so the ctor stays empty and the pipeline field is assigned exactly once, before the
-    /// graph is compiled.</summary>
+    /// <summary>Builds the subclass's tracer pipeline. Split off the ctor so the pipeline field is
+    /// assigned exactly once, after wiring. The graph imports the extent-sized targets, so it is
+    /// built in <see cref="Resize"/>, which the host primes once at boot.</summary>
     public void Initialize()
     {
         CreatePipeline();
-        BuildGraph();
     }
 
     // ---- Pipeline-specific hooks (forwarded to PTComputePipeline / RTPipeline) ------------------
@@ -73,7 +75,7 @@ internal abstract class PathTraceCoreBase
     /// <summary>(Re)build the Trace -> Tonemap graph. Imports the host accumulator / out-color /
     /// FinalColor (re-read here so a resize picks up the fresh handles), then rebinds the
     /// pipeline's storage-image descriptors to the SAME handles the graph just imported (which
-    /// also marks the accumulator dirty). Called from the subclass ctor + on every resize.</summary>
+    /// also marks the accumulator dirty). Called on every resize.</summary>
     protected void BuildGraph()
     {
         _graph?.Dispose();
@@ -84,7 +86,7 @@ internal abstract class PathTraceCoreBase
         module.Build(fg.RootScope().Child("PathTrace"),
             new PathTraceModule.Inputs(
                 _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
-                _host.renderTargets.FinalColor),
+                _targets.FinalColor),
             out var o);
 
         fg.MarkOutput(o.Final);
@@ -107,7 +109,11 @@ internal abstract class PathTraceCoreBase
     /// <summary>Resize: rebuild the graph so it imports the freshly-reallocated PT/Final targets
     /// (BuildGraph also rebinds the pipeline's storage-image descriptors + marks the accumulator
     /// dirty).</summary>
-    public void Resize(Extent2D extent) => BuildGraph();
+    public void Resize(in HostTargets targets)
+    {
+        _targets = targets;
+        BuildGraph();
+    }
 
     public void Render(in RenderFrame frame)
     {

@@ -55,8 +55,11 @@ internal sealed class FeatureHost : IDisposable
     /// exist, or a dependency would resolve to null purely because its Order was higher; Initialize
     /// cannot start until all wiring is done, or a feature would build against a half-wired
     /// collaborator. Doing it in one pass is exactly the ordering trap this shape removes.
+    ///
+    /// A fourth pass primes the resize path at the boot extent, so a feature's extent-sized state
+    /// has exactly one construction site instead of an Initialize copy beside a Resize copy.
     /// </summary>
-    public void BuildAll()
+    public void BuildAll(in HostTargets targets)
     {
         if (_built) throw new InvalidOperationException("FeatureHost.BuildAll ran twice");
         _built = true;
@@ -74,6 +77,9 @@ internal sealed class FeatureHost : IDisposable
         // 3. Initialize, in Order, so a feature can rely on any lower-Order collaborator being
         //    fully built by the time it runs.
         foreach (var f in _all) f.Initialize();
+
+        // 4. Build the extent-sized state through the same path a viewport resize takes.
+        Resize(targets);
     }
 
     /// <summary>Resolves a built feature by contract or concrete type. Null when the device gated
@@ -94,11 +100,12 @@ internal sealed class FeatureHost : IDisposable
         foreach (var f in _postDraw) f.PostDraw(cmd, view);
     }
 
-    /// <summary>Rebuilds size-dependent state. The caller has already idled the device and
-    /// reallocated the shared render targets.</summary>
-    public void Resize(Extent2D extent)
+    /// <summary>Builds or rebuilds size-dependent state at the snapshotted targets. The caller has
+    /// already idled the device and reallocated them. Must follow that realloc immediately - until
+    /// this returns, every feature still holds a snapshot of the images the realloc disposed.</summary>
+    public void Resize(in HostTargets targets)
     {
-        foreach (var f in _resize) f.Resize(extent);
+        foreach (var f in _resize) f.Resize(targets);
     }
 
     /// <summary>Services pending bakes, in Order. Request-driven: a feature with nothing stale

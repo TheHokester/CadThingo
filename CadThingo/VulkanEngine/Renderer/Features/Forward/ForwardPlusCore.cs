@@ -34,7 +34,7 @@ internal sealed class ForwardPlusCore : IRenderCore, ISelfRegisteringFeature<For
     // No-op frame (matches the former empty DrawRayQueried). FinalColor is untouched.
     public void Render(in RenderFrame frame) { }
 
-    public void Resize(Extent2D extent) { }
+    public void Resize(in HostTargets targets) { }
 
     public void Dispose() { }
 }

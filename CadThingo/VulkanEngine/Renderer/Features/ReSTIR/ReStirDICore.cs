@@ -50,6 +50,9 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
     private Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
 
+    // Last snapshot the host handed over, re-read on every Resize.
+    private HostTargets _targets;
+
     private ReStirDIPipeline _pipe = null!;
     private ReStirGraph?     _graph;
 
@@ -69,12 +72,11 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
         // core builds it rather than the host.
         _pipe = new ReStirDIPipeline(_gpu, _host);
         _pipe.Initialize();
-        BuildGraph();
     }
 
     /// <summary>(Re)build the ReSTIR chain as the <see cref="ReStirGraph"/>. Imports the host
     /// accumulator / out-color / FinalColor (re-read here so a resize picks up the fresh handles).
-    /// Called from the ctor + on every resize.</summary>
+    /// Called on every resize.</summary>
     private void BuildGraph()
     {
         _graph?.Dispose();
@@ -84,7 +86,7 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
         module.Build(fg.RootScope().Child("ReStirDI"),
             new ReStirDIModule.Inputs(
                 _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
-                _host.renderTargets.FinalColor),
+                _targets.FinalColor),
             out var o);
 
         fg.MarkOutput(o.Final);
@@ -107,9 +109,10 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
     /// <summary>Resize: reallocate the per-pixel reservoir + G-buffer to the new extent, then
     /// rebuild the graph so it imports the freshly-reallocated PT/Final targets (BuildGraph also
     /// rebinds the pipeline's storage-image descriptors + marks the accumulator dirty).</summary>
-    public void Resize(Extent2D extent)
+    public void Resize(in HostTargets targets)
     {
-        _pipe.ReallocReStirBuffers(extent);
+        _targets = targets;
+        _pipe.ReallocReStirBuffers(targets.Extent);
         BuildGraph();
     }
 

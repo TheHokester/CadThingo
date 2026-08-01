@@ -359,7 +359,8 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
                 $"WavefrontPathTracer/Shade must reflect exactly one {sizeof(WavefrontPush)}-byte push " +
                 $"range for WavefrontPush; got [{string.Join(", ", PushConstantRanges.Select(p => p.Size))}]");
 
-        AllocSet4(PathCount(Renderer.RenderExtent));
+        // The SoA working set is extent-sized, so it is allocated by ReallocSet4, which the core
+        // drives from its Resize (primed once at boot).
 
         // TEMP/debug compaction readback staging (host-visible, mapped). See _argsReadback.
         Gfx.CreateMappedStorageBuffer(DispatchArgsBytes, ref _argsReadback, BufferUsageFlags.TransferDstBit);
@@ -444,8 +445,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         }
     }
 
-    /// <summary>Resize path: reallocate the SoA working set to the new extent + rewrite set 4.
-    /// Marks the accumulator dirty (the freshly-allocated memory holds garbage).</summary>
+    /// <summary>Allocates the SoA working set at <paramref name="extent"/> + rewrites set 4, freeing
+    /// any previous one. Marks the accumulator dirty (the fresh memory holds garbage). The only
+    /// construction site - the first call comes from the boot-time resize.</summary>
     public void ReallocSet4(Extent2D extent)
     {
         FreeSet4();

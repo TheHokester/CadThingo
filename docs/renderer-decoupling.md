@@ -195,7 +195,7 @@ and `DrawFrame`/`Cleanup`/`Initialize` no longer change per feature. Lives in
 
 ```csharp
 interface IRenderFeature : IDisposable { string Name { get; } void Initialize(); }
-interface IResizeFeature   : IRenderFeature { void Resize(Extent2D extent); }
+interface IResizeFeature   : IRenderFeature { void Resize(in HostTargets targets); }
 interface IBakeFeature     : IRenderFeature { bool BakePending { get; } void Bake(); }
 interface IPreDrawFeature  : IRenderFeature { void PreDraw(in RenderView view); }
 interface IPostDrawFeature : IRenderFeature { void PostDraw(CommandBuffer cmd, in RenderView view); }

@@ -35,16 +35,8 @@ public unsafe partial class Renderer
         this.window = window;
         camera = new Camera();
     }
-    /// <summary>
-    /// Renderer fields
-    /// </summary>
-    // The Vulkan RHI context — instance, device, queues, allocator, descriptor /
-    // command pools, capability flags, and the device-service helpers. Owned for the
-    // app's lifetime; constructed first in Initialize() and disposed strictly last in
-    // Cleanup(). Renderer exposes the same-named delegating accessors below so the rest
-    // of the Renderer partials and every pipeline / ImageResource / ResourceManager
-    // call site keep reaching device services unchanged while the deeper L1/L2/L3
-    // repoints land (L1 of the renderer refactor).a
+    
+    //RHI object
     internal GraphicsDevice gfx = null!;
 
     private bool initialized = false;
@@ -59,24 +51,11 @@ public unsafe partial class Renderer
     internal Device            device         => gfx.Device;
     internal PhysicalDevice    physicalDevice => gfx.PhysicalDevice;
     internal GpuMemoryAllocator memAllocator  => gfx.Allocator;
-    internal DescriptorPool    descriptorPool => gfx.DescriptorPool;
-    internal CommandPool       commandPool    => gfx.CommandPool;
+    
     internal Queue             graphicsQueue  => gfx.GraphicsQueue;
     internal Queue             presentQueue   => gfx.PresentQueue;
-    internal Queue             computeQueue   => gfx.ComputeQueue;
-    internal Queue             transferQueue  => gfx.TransferQueue;
-    private  Instance          instance       => gfx.Instance;
-    private  SurfaceKHR        surface        => gfx.Surface;
-    private  QueueFamilyIndices queueFamilyIndices => gfx.QueueFamilyIndices;
-
-    internal bool descriptorIndexEnabled => gfx.DescriptorIndexingEnabled;
-    internal bool multiviewEnabled       => gfx.MultiviewEnabled;
-
-    // Read-only handle accessor - pipelines that load their own device-extension
-    // dispatch tables (e.g. RtPipeline -> KhrRayTracingPipeline) need the instance
-    // for vk.TryGetDeviceExtension. Generic, not tied to any one extension.
-    internal Instance GetVkInstance() => gfx.GetVkInstance();
-
+    
+    
     public enum RenderMode : uint
     {
         Deferred = 0,
@@ -204,10 +183,6 @@ public unsafe partial class Renderer
     // Lifetime/instantiation owned externally; null when UI is disabled.
     public ImGuiVulkanUtils? imGuiUtils;
     
-    //dynamic rendering fields
-    RenderingInfo renderingInfo;
-    List<RenderingAttachmentInfo> colorAttachments;
-    RenderingAttachmentInfo depthAttachment;
     
     
     // No pipelines here any more. Each one is owned by the feature that records with it: private
@@ -241,12 +216,7 @@ public unsafe partial class Renderer
     // delegating accessors so the frame body reads them unchanged. currentFrame /
     // frameCounter advance via frameRing.Advance() at end-of-frame.
     internal FrameRing frameRing = null!;
-    internal CommandBuffer[] commandBuffers           => frameRing.CommandBuffers;
-    internal Semaphore[]     imageAvailableSemaphores => frameRing.ImageAvailableSemaphores;
-    internal Semaphore[]     renderFinishedSemaphores => frameRing.RenderFinishedSemaphores;
-    internal Fence[]         inFlightFences           => frameRing.InFlightFences;
-    internal uint            currentFrame             => frameRing.CurrentFrame;
-    internal ulong           frameCounter             => frameRing.FrameCounter;
+    
 
     //Camera
     Camera camera;
@@ -255,8 +225,7 @@ public unsafe partial class Renderer
     //Sampler for gbuffers and pathtracing ImageResources (the selection mask is
     //owned by RenderTargets and reached through SelectionSystem)
     internal Sampler       gBufferSampler     => renderTargets.GBufferSampler;
-    private  ImageResource ptAccumulator      => renderTargets.PtAccumulator;
-    private  ImageResource ptOutColor         => renderTargets.PtOutColor;
+    
 
     //Path-tracing accumulation state (the images live on RenderTargets; this is the
     //CPU-side dirty/restart bookkeeping that drives progressive integration).
@@ -326,7 +295,6 @@ public unsafe partial class Renderer
         renderTargets = new RenderTargets(gfx);
         renderTargets.SetExtent(swapChainExtent);
         swapchain.CreateImageViews();
-        SetupDynamicRendering();
 
         CreateDescriptorPool();
 
@@ -354,7 +322,7 @@ public unsafe partial class Renderer
 
         scene = new Scene(vk, device, physicalDevice);//initialise scene
 
-        imGuiUtils = new ImGuiVulkanUtils(this, (uint)queueFamilyIndices.graphicsFamily! );
+        imGuiUtils = new ImGuiVulkanUtils(this, (uint)gfx.QueueFamilyIndices.graphicsFamily! );
         imGuiUtils?.init(swapChainExtent.Width, swapChainExtent.Height);
 
         // Bind FinalColor into the ImGui viewport descriptor so the Viewport panel
@@ -377,7 +345,7 @@ public unsafe partial class Renderer
         // providers: IBL and the probes publish their own bindings during Initialize, and the probe
         // registry has to exist before an entity carrying a probe component is spawned.
         _features = new FeatureHost(Gpu, this);
-        _features.BuildAll();
+        _features.BuildAll(renderTargets.Snapshot);
         Console.WriteLine(_features.Dump());
         Ibl                   = _features.Get<IblSystem>()!;
         reflectionProbeSystem = _features.Get<ReflectionProbeSystem>()!;
@@ -560,23 +528,14 @@ public unsafe partial class Renderer
             .Where(f => typeof(PipelineBase).IsAssignableFrom(f.FieldType))
             .Select(f => f.GetValue(owner) as PipelineBase);
 
-    // The progressive-accumulation IO pair (FeaturePTIO, set 5), shared by all four tracers -- they
-    // all write the SAME two renderer-owned images, so this is one registry set rather than the
-    // identical pass set each pipeline used to build and write for itself. Called after every
-    // (re)allocation of the size-dependent targets, since resize replaces both views; the registry
-    // queue applies the rewrite when each frame slot is provably idle.
+    // The progressive-accumulation IO pair (FeaturePTIO, set 5), shared by all tracers 
     internal void RegisterPathTraceIoBindings()
     {
         descriptorRegistry.RegisterImage("accumulator", renderTargets.PtAccumulator.ImageView, ImageLayout.General);
         descriptorRegistry.RegisterImage("outColor",    renderTargets.PtOutColor.ImageView,    ImageLayout.General);
     }
 
-    // Centralized teardown. Each lifetime-scoped owner (FrameRing, RenderTargets,
-    // Swapchain, GraphicsDevice) frees only what it owns; the orchestrator owns the
-    // *order*. The one hard rule: GraphicsDevice.Dispose() runs strictly last - it frees
-    // every VkDeviceMemory block + the device itself, so everything that allocated
-    // through it must already be gone. Globals.vk is a process-wide singleton - never
-    // disposed here. The window is owned by Engine and disposed by Engine.Shutdown.
+    /// Centralized teardown. scoped renderer elements destroy respect vk handles and other unmanaged resources 
     public void Cleanup()
     {
         if (!initialized) return;
@@ -604,26 +563,19 @@ public unsafe partial class Renderer
         //  Mesh pool (global VB/IB)
         Engine.ResourceManager.Dispose();
         
-        // ImGUI dispose
+        // Dear ImGUI dispose
         imGuiUtils?.Dispose();
-        
-        
-        // Every feature, in reverse Order. DeferredCore owns the deferred FrameGraph (g-buffer /
-        // depth / HDR transients), so features go before RenderTargets, which owns FinalColor + the
-        // PT / selection images those graphs import.
+        // Every feature, in reverse Order. 
         _features.Dispose();
         renderTargets.Dispose();
 
-        // GpuScene buffers (light SSBO today) — the GPU mirror of Scene's render data.
+        // GpuScene buffers (light SSBO today) - the GPU mirror of Scene's render data.
         gpuScene.Dispose();
 
         // Swap chain + image views
         swapchain.Dispose();
 
-        // RHI context - strictly last. GraphicsDevice.Dispose() destroys the
-        // descriptor pool, command pool, frees every VkDeviceMemory block, then
-        // tears down device → debug → surface → instance in order. Every resource
-        // freed above allocated through it, so it has to outlive them all.
+        // RHI context - strictly last. 
         gfx.Dispose();
 
         initialized = false;
