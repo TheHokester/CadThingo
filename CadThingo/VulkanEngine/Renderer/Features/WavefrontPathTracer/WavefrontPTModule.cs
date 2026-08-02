@@ -27,7 +27,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// (declared RW on each); Connect is DECOUPLED from it -- Connect(b) is declared between
 /// Extend(b+1) and Shade(b+1) with an empty barrier batch so it overlaps the trace (see
 /// AddConnectPass + the Extend pass's phantom declarations). Tonemap is the composed
-/// TonemapModule (HDR format parameterized to PtOutColor's R32F): its HDR-input set is
+/// TonemapModule (HDR format parameterized to OutColor's R32F): its HDR-input set is
 /// graph-baked from the imported out-color, so no host-side rebind happens on core switch.
 /// </summary>
 public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, WavefrontPTModule.Outputs>
@@ -338,8 +338,8 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
             },
             (CommandBuffer cmd, PassResources res, in RenderView f) => _pipe.RecordFinalize(cmd, f));
 
-        // ---- Tonemap: the shared TonemapModule (HDR format parameterized to PtOutColor's
-        // R32F). Its HDR-input set is GRAPH-BAKED 
+        // ---- Tonemap: the shared TonemapModule, HDR format parameterized to OutColor's R32F. Its
+        // HDR-input set is graph-baked from the imported out-color.
         var tonemapModule = new TonemapModule(_tonemap, inp.OutColor._format);
         tonemapModule.Build(scope, new TonemapModule.Input(outColor, inp.FinalColor), out var tm);
 

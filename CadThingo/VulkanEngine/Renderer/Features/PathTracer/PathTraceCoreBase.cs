@@ -19,18 +19,23 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 /// and builds the graph in <see cref="Initialize"/>, once the host is wired.
 /// </summary>
 internal abstract class PathTraceCoreBase
-    : IRenderCore, IGraphCore, INeedsGpu, INeedsHost, INeedsFeature<ISharedPipelines>
+    : IRenderCore, IGraphCore, INeedsGpu, INeedsHost,
+      INeedsFeature<ISharedPipelines>, INeedsFeature<IPathTracingProvider>
 {
     // Each PT core builds and owns its own tracer pipeline through this.
     protected GpuContext _gpu;
     GpuContext INeedsGpu.Gpu { set => _gpu = value; }
 
-    // The tonemap this core's graph ends with. One instance, shared with every other core - which
-    // is exactly why it arrives as a collaborator rather than being constructed here.
+    // The tonemap this core's graph ends with. One instance, shared with every other core, so it
+    // arrives as a collaborator.
     protected ISharedPipelines _shared = null!;
     ISharedPipelines INeedsFeature<ISharedPipelines>.Dependency { set => _shared = value; }
 
-    // Transitional: the accumulator / out-color pair is still renderer-owned.
+    // The accumulator / out-color pair and the restart flag every tracer shares.
+    protected IPathTracingProvider _pt = null!;
+    IPathTracingProvider INeedsFeature<IPathTracingProvider>.Dependency { set => _pt = value; }
+
+    // Transitional: the pipelines still take a host handle at construction.
     protected Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
 
@@ -72,10 +77,9 @@ internal abstract class PathTraceCoreBase
     protected abstract bool PipelineUpdatePerFrame(uint frameIndex, Camera camera, uint lightCount, Extent2D renderExtent);
     protected abstract void PipelineRecord(CommandBuffer cmd, in RenderView ctx);
 
-    /// <summary>(Re)build the Trace -> Tonemap graph. Imports the host accumulator / out-color /
-    /// FinalColor (re-read here so a resize picks up the fresh handles), then rebinds the
-    /// pipeline's storage-image descriptors to the SAME handles the graph just imported (which
-    /// also marks the accumulator dirty). Called on every resize.</summary>
+    /// <summary>(Re)build the Trace -> Tonemap graph. Imports the shared accumulator / out-color and
+    /// the host FinalColor, all re-read here so a resize picks up the fresh handles, and drops the
+    /// sample count. Called on every resize.</summary>
     protected void BuildGraph()
     {
         _graph?.Dispose();
@@ -85,30 +89,28 @@ internal abstract class PathTraceCoreBase
             (CommandBuffer cmd, PassResources res, in RenderView f) => PipelineRecord(cmd, f));
         module.Build(fg.RootScope().Child("PathTrace"),
             new PathTraceModule.Inputs(
-                _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
-                _targets.FinalColor),
+                _pt.Accumulator, _pt.OutColor, _targets.FinalColor),
             out var o);
 
         fg.MarkOutput(o.Final);
         fg.Compile();
         _graph = fg;
 
-        // The storage-image descriptors themselves are registry-owned (FeaturePTIO) and re-registered
-        // by the host on resize; all that is left here is dropping the sample count, since fresh
-        // images make any in-progress accumulation invalid by construction.
+        // The storage-image descriptors are registry-owned (FeaturePTIO) and re-registered by
+        // PathTracingSystem earlier in the same resize pump, so only the sample count needs
+        // dropping - fresh images invalidate any accumulation in progress.
         PipelineMarkAccumulatorDirty();
     }
 
     /// <summary>Restart progressive integration on activation. Tonemap's HDR input is graph-baked
-    /// by this core's composed TonemapModule from the imported PtOutColor, so no descriptor rebind
-    /// is needed. The accumulator is SHARED with the other PT cores, so resetting here --
-    /// deterministically, after the host's DeviceWaitIdle -- guarantees a fresh start instead of
-    /// `+=`-ing onto a stale image.</summary>
+    /// by this core's composed TonemapModule from the imported OutColor, so no descriptor rebind is
+    /// needed. The accumulator is shared with the other PT cores, so resetting here, after the
+    /// host's DeviceWaitIdle, guarantees a fresh start instead of `+=`-ing onto a stale
+    /// image.</summary>
     public void Activate() => PipelineMarkAccumulatorDirty();
 
-    /// <summary>Resize: rebuild the graph so it imports the freshly-reallocated PT/Final targets
-    /// (BuildGraph also rebinds the pipeline's storage-image descriptors + marks the accumulator
-    /// dirty).</summary>
+    /// <summary>Rebuilds the graph so it imports the freshly reallocated PT and Final targets, and
+    /// marks the accumulator dirty.</summary>
     public void Resize(in HostTargets targets)
     {
         _targets = targets;
@@ -131,7 +133,7 @@ internal abstract class PathTraceCoreBase
             var fov  = camera.Fov;
             if (camView != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
             {
-                _host.MarkAccumulatorDirty();
+                _pt.MarkAccumulatorDirty();
                 _lastCamView = camView; _lastCamPos = pos; _lastCamFov = fov;
             }
         }
@@ -140,11 +142,11 @@ internal abstract class PathTraceCoreBase
         // inspector edits land in PT mode); the count only feeds the pipeline's frame UBO.
         uint lightCount = view.LightCount;
 
-        // Bridge the host's dirty signal into the pipeline's accumulator reset.
-        if (_host.AccumulatorDirty)
+        // Bridge the shared dirty signal into this pipeline's accumulator reset.
+        if (_pt.AccumulatorDirty)
         {
             PipelineMarkAccumulatorDirty();
-            _host.ClearAccumulatorDirty();
+            _pt.ClearAccumulatorDirty();
         }
 
         PipelineUpdatePerFrame(currentFrame, camera!, lightCount, view.RenderExtent);

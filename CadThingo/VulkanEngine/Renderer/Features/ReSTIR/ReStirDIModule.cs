@@ -22,7 +22,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 /// "Import for barriers, bind for access" (as in WavefrontPTModule): the tracer touches the
 /// accumulator / out-color through the pipeline-owned descriptor sets; the graph imports the SAME
 /// handles only so it can sequence Trace -> Tonemap from the declared usages. Tonemap is the
-/// composed TonemapModule (HDR format parameterized to PtOutColor's R32F): its HDR-input set is
+/// composed TonemapModule (HDR format parameterized to OutColor's R32F): its HDR-input set is
 /// graph-baked from the imported out-color, so no host-side rebind happens on core switch.
 /// </summary>
 internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReStirDIModule.Outputs>

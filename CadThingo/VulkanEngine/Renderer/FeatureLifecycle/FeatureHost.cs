@@ -156,7 +156,9 @@ internal sealed class FeatureHost : IDisposable
 
     /// <summary>Fills a feature's declared dependencies. Infrastructure is a direct type test;
     /// collaborators need reflection because the contract type is a generic argument, which is only
-    /// knowable from the feature's implemented interface list.</summary>
+    /// knowable from the feature's implemented interface list. An unresolved
+    /// <see cref="INeedsFeature{T}"/> throws; an unresolved <see cref="INeedsOptionalFeature{T}"/>
+    /// sets null.</summary>
     private void Wire(IRenderFeature feature)
     {
         if (feature is INeedsGpu g)  g.Gpu  = _gpu;
@@ -164,15 +166,21 @@ internal sealed class FeatureHost : IDisposable
 
         foreach (var iface in feature.GetType().GetInterfaces())
         {
-            if (!iface.IsGenericType || iface.GetGenericTypeDefinition() != typeof(INeedsFeature<>))
-                continue;
+            if (!iface.IsGenericType) continue;
+            var kind = iface.GetGenericTypeDefinition();
+
+            bool optional = kind == typeof(INeedsOptionalFeature<>);
+            if (!optional && kind != typeof(INeedsFeature<>)) continue;
 
             var contract = iface.GetGenericArguments()[0];
-            var provider = _all.FirstOrDefault(contract.IsInstanceOfType)
-                ?? throw new InvalidOperationException(
+            var provider = _all.FirstOrDefault(contract.IsInstanceOfType);
+
+            if (provider is null && !optional)
+                throw new InvalidOperationException(
                     $"{feature.Name} needs {contract.Name}, but no built feature provides it. " +
                     "Either its provider is gated out on this device (gate the consumer the same " +
-                    "way) or the provider is not registered in the catalog.");
+                    "way, or take INeedsOptionalFeature if absence is survivable) or the provider " +
+                    "is not registered in the catalog.");
 
             iface.GetProperty("Dependency")!.SetValue(feature, provider);
         }

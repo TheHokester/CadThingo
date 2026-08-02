@@ -32,7 +32,7 @@ public sealed class TonemapModule : IGraphModule<TonemapModule.Input, TonemapMod
 
     private readonly TonemapPipeline _tonemap;
     // The expected upstream HDR format for the wire-time port check. Defaults to the deferred
-    // chain's R16F scene-colour transient; the PT graph cores pass PtOutColor's R32F. The shader
+    // chain's R16F scene-colour transient; the PT graph cores pass OutColor's R32F. The shader
     // just samples a float4, so any float colour format tonemaps correctly.
     private readonly Format _hdrFormat;
 

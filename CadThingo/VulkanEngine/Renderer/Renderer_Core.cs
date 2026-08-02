@@ -1,7 +1,6 @@
 ﻿using System.Linq;
 using System.Numerics;
 using System.Reflection;
-using CadThingo.Graphics.Rendering;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
@@ -9,20 +8,13 @@ using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Features.Deferred;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
-using CadThingo.VulkanEngine.Renderer.Features.Forward;
 using CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
-using CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using CadThingo.VulkanEngine.Renderer.Features.IBL;
-using CadThingo.VulkanEngine.Renderer.Features.Selection;
 using CadThingo.VulkanEngine.Renderer.Features.SceneAcceleration;
 using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.Slang;
-using Silk.NET.Core;
-using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
-using Silk.NET.Vulkan.Extensions.EXT;
-using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Windowing;
 // ReSharper disable InconsistentNaming
 
@@ -43,8 +35,8 @@ public unsafe partial class Renderer
 
     // Config input for the GraphicsDevice (instance validation layers). Lives here so
     // the toggle stays next to the renderer; passed to the GraphicsDevice constructor.
-    private readonly bool enableValidationLayers = false;
-    private IWindow? window;
+    private const bool enableValidationLayers = false;
+    private readonly IWindow? window;
 
     // ---- Delegating accessors onto GraphicsDevice (transitional) -----------
     internal Vk?               vk             => gfx?.Vk;
@@ -116,6 +108,8 @@ public unsafe partial class Renderer
     // deletes itself when its last caller stops naming the feature.
     internal IblSystem             Ibl                   = null!;
     internal ReflectionProbeSystem reflectionProbeSystem = null!;
+    // Null until BuildAll. The AS bridges below can be read during it, so every use stays guarded.
+    private  IPathTracingProvider? _ptResources;
 
     /// <summary>The one non-bindable IBL scalar the lighting and tracing shaders need as a uniform
     /// (roughness -> mip mapping). Read through <see cref="IIblProvider"/> at record time, so a
@@ -222,28 +216,21 @@ public unsafe partial class Renderer
     Camera camera;
     public Camera Camera => camera;
     
-    //Sampler for gbuffers and pathtracing ImageResources (the selection mask is
-    //owned by RenderTargets and reached through SelectionSystem)
+    //Sampler for gbuffers and pathtracing ImageResources
     internal Sampler       gBufferSampler     => renderTargets.GBufferSampler;
-    
 
-    //Path-tracing accumulation state (the images live on RenderTargets; this is the
-    //CPU-side dirty/restart bookkeeping that drives progressive integration).
-    bool accumulatorDirty = false;
+
+    // Bridge onto PathTracingSystem, which owns the accumulator and therefore its restart flag. The
+    // editor panels call this from thirty-odd places and hold a Renderer, so the entry point stays
+    // here and forwards. Null-guarded because the panels can fire before BuildAll resolves it.
     public void MarkAccumulatorDirty()
     {
-        accumulatorDirty = true;
-        // Dirty-driven scene extract (L2 step 7) piggybacks on this near-universal
-        // "scene visually changed" signal — every material/light/transform edit calls
-        // it, so the GPU mirror re-packs. Over-triggering (e.g. a PT camera move, which
-        // doesn't change scene data) is harmless: it only costs a re-pack.
+        _ptResources?.MarkAccumulatorDirty();
+        // The dirty-driven scene extract piggybacks on this "scene visually changed" signal: every
+        // material/light/transform edit calls it, so the GPU mirror re-packs. Over-triggering (a PT
+        // camera move, say, which changes no scene data) costs one re-pack and nothing else.
         gpuScene?.MarkSceneDirty();
     }
-    // Read/clear hooks for the path-trace cores (L3): the dirty flag lives here because
-    // MarkAccumulatorDirty is called from all over the editor, but the per-frame
-    // consume-and-clear is the PT core's job (bridged into its pipeline's accumulator reset).
-    internal bool AccumulatorDirty => accumulatorDirty;
-    internal void ClearAccumulatorDirty() => accumulatorDirty = false;
 
     /// <summary>
     /// Subscribes the renderer to the editor's intents. Everything here is Renderer-category, so
@@ -337,18 +324,18 @@ public unsafe partial class Renderer
 
         // Stand up every feature the device can run: construct (gated) -> wire -> Initialize, in
         // descriptor Order. This method names none of them; a new technique is a new file whose
-        // module initializer put a descriptor in the catalog before Main ran. The manifest is the
-        // replacement for the boot-order list that used to live right here, and it shows what the
-        // gates excluded on THIS device, which a source list never could.
+        // module initializer put a descriptor in the catalog before Main ran. The dump below reports
+        // what the gates excluded on this device, which no source-order list can.
         //
-        // Ahead of the scene setup and the registry cross-check below, because features are now
-        // providers: IBL and the probes publish their own bindings during Initialize, and the probe
-        // registry has to exist before an entity carrying a probe component is spawned.
+        // Ahead of the scene setup and the registry cross-check: IBL and the probes publish their
+        // own bindings during Initialize, and the probe registry has to exist before an entity
+        // carrying a probe component is spawned.
         _features = new FeatureHost(Gpu, this);
         _features.BuildAll(renderTargets.Snapshot);
         Console.WriteLine(_features.Dump());
         Ibl                   = _features.Get<IblSystem>()!;
         reflectionProbeSystem = _features.Get<ReflectionProbeSystem>()!;
+        _ptResources          = _features.Get<IPathTracingProvider>();
         _sceneAs              = _features.Get<SceneAS>();   // null when the device gated it out
 
         CreateTestEntity();
@@ -359,7 +346,6 @@ public unsafe partial class Renderer
         // (The FeatureIBL / FeatureEnv sets and the AS side tables are absent here on purpose -
         // IBL, the probes and SceneAS register their own during BuildAll above.)
         RegisterSceneBindings();
-        RegisterPathTraceIoBindings();
         Console.WriteLine(descriptorRegistry.DumpBindings());
 
         // Cross-check every migrated pipeline's reflected bindings against what the registry owns
@@ -527,13 +513,6 @@ public unsafe partial class Renderer
             .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
             .Where(f => typeof(PipelineBase).IsAssignableFrom(f.FieldType))
             .Select(f => f.GetValue(owner) as PipelineBase);
-
-    // The progressive-accumulation IO pair (FeaturePTIO, set 5), shared by all tracers 
-    internal void RegisterPathTraceIoBindings()
-    {
-        descriptorRegistry.RegisterImage("accumulator", renderTargets.PtAccumulator.ImageView, ImageLayout.General);
-        descriptorRegistry.RegisterImage("outColor",    renderTargets.PtOutColor.ImageView,    ImageLayout.General);
-    }
 
     /// Centralized teardown. scoped renderer elements destroy respect vk handles and other unmanaged resources 
     public void Cleanup()

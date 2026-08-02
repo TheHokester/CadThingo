@@ -47,10 +47,9 @@ public unsafe partial class Renderer
     }
 
     /// <summary>
-    /// Reallocates depth + g-buffers + render graph at (<paramref name="width"/>,
-    /// <paramref name="height"/>) and re-binds every descriptor whose ImageView
-    /// changed. Caller must have invoked vkDeviceWaitIdle beforehand — none of
-    /// the disposed resources can be in flight.
+    /// Reallocates FinalColor at (<paramref name="width"/>, <paramref name="height"/>), then pumps
+    /// every resize feature so each rebuilds its own size-dependent state. Caller must have invoked
+    /// vkDeviceWaitIdle beforehand: none of the disposed resources can be in flight.
     /// </summary>
     private void RebuildRenderTargets(uint width, uint height)
     {
@@ -59,19 +58,13 @@ public unsafe partial class Renderer
         // retained-block investigation).
         _renderTargetRebuilds++;
 
-        // The cores own their size-dependent technique state. Reallocate the shared host targets
-        // first (FinalColor + PT accumulator/out + selection), then rebuild each core: DeferredCore
-        // re-compiles its graph (fresh g-buffer/depth/HDR transients, re-imports FinalColor,
-        // re-binds its lighting + tonemap descriptors); the PT cores rebind their storage images
-        // (which marks the accumulator dirty so the next dispatch clears fresh memory).
+        // FinalColor first, since every core imports the fresh handle from the snapshot below.
         renderTargets.ReallocateSizeDependent(new Extent2D(width, height));
-        // Fresh accumulator / out-color views: re-register before the cores rebuild, so the
-        // FeaturePTIO set points at the new images.
-        RegisterPathTraceIoBindings();
-        // Every registered core rebuilds its size-dependent state: DeferredCore/WavefrontPTCore
-        // re-compile their graphs (fresh transients, re-import FinalColor, re-bind descriptors);
-        // the PT/RT cores rebind their storage images (which marks the accumulator dirty so the
-        // next dispatch clears fresh memory).
+
+        // Every resize feature rebuilds its size-dependent state, in Order: PathTracingSystem
+        // reallocates the accumulator / out-color pair and re-registers the FeaturePTIO bindings
+        // first, then each core re-compiles its graph against the fresh handles, then Selection
+        // reallocates its coverage mask.
         _features.Resize(renderTargets.Snapshot);
 
         // Tonemap's HDR input is graph-baked, re-pointed by each core's graph rebuild above;
@@ -391,68 +384,8 @@ public unsafe partial class Renderer
         _activeCore is WavefrontPTCore && wavefrontPipeline != null
             ? wavefrontPipeline.ReadDispatchArgs() : null;
 
-
-
-
-
-
-
-    
-    
-    
-    /// <summary>
-    /// 
-    /// </summary>
    
 }
-
-unsafe class CullingSystem(Camera camera)
-{
-    private Camera camera;
-    private List<Entity> visibleEntities;
-
-    void SetCamera(Camera camera) => this.camera = camera;
-
-
-    public void CullScene(List<Entity> allEntities)
-    {
-        visibleEntities.Clear();
-
-        if (camera == null) return;
-
-        //Get camera frustum
-        //TODO: Make culling system use the new camera 
-        Frustum frustum = camera.GetFrustum();
-
-        //check each entity against frustum
-        foreach (var entity in allEntities)
-        {
-            if (!entity.IsActive) continue;
-
-            var meshComponent = entity.GetComponent<MeshComponent>();
-            if (meshComponent == null) continue;
-
-            var transformComponent = entity.GetComponent<TransformComponent>();
-            if (transformComponent == null) continue;
-
-            //Get bouding box of the mesh
-            BoundingBox boundingBox = meshComponent.GetBoundingBox();
-            //transform the bounding box by entity transform
-            boundingBox.Transform(transformComponent.GetModelMatrix());
-
-            //check if bounding box is visible
-            if (frustum.Intersects(boundingBox))
-            {
-                visibleEntities.Add(entity);
-            }
-        }
-    }
-
-    public List<Entity> GetVisibleEntities() => visibleEntities;
-}
-
-
-
 
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct Plane

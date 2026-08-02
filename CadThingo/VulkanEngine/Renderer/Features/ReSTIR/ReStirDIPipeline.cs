@@ -166,7 +166,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     // ReallocReStirBuffers, which the core drives from its Resize (primed once at boot).
     protected override void CreateResources()
     {
-        base.CreateResources();   // per-frame UBO
+        base.CreateResources();
     }
 
     // ---- ReSTIR working-set buffers (extent-sized, device-local, ping-ponged) -------------------

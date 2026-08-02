@@ -90,7 +90,7 @@ internal sealed class SharedPipelines
     public void Bake()
     {
         _rebuildPending = false;
-        _host.gfx.Vk!.DeviceWaitIdle(_host.gfx.Device);
+        _gpu.Gfx.Vk!.DeviceWaitIdle(_gpu.Gfx.Device);
 
         // In-place rebuild (stable object identity, fresh GPU handles) so each core module's
         // tonemap reference stays valid. Operator is a spec constant, read by Rebuild's Initialize.

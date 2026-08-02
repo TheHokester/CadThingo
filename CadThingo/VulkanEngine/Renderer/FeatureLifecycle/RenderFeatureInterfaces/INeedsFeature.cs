@@ -25,3 +25,16 @@ public interface INeedsFeature<in T> where T : class
 {
     T Dependency { set; }
 }
+
+/// <summary>
+/// The same wiring for a collaborator that may be gated out: it arrives as null and the build
+/// carries on. Take it where the consumer has a defined answer for absence - a device with no
+/// acceleration structure traces nothing, which is a valid frame.
+///
+/// A consumer that cannot cope with absence takes <see cref="INeedsFeature{T}"/> and fails at
+/// wiring, or gates itself the same way its collaborator does.
+/// </summary>
+public interface INeedsOptionalFeature<in T> where T : class
+{
+    T? Dependency { set; }
+}

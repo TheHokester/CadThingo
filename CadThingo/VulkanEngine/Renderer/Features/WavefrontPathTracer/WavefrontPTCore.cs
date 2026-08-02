@@ -2,6 +2,7 @@
 using System.Runtime.CompilerServices;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
@@ -27,7 +28,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// </summary>
 internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
                                         ISelfRegisteringFeature<WavefrontPTCore>, INeedsGpu, INeedsHost,
-                                        INeedsFeature<ISharedPipelines>
+                                        INeedsFeature<ISharedPipelines>, INeedsFeature<IPathTracingProvider>
 {
     public static FeatureDesc Desc =>
         new(Order: 50, Gate: _ => true, Make: () => new WavefrontPTCore());
@@ -42,7 +43,11 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
     private ISharedPipelines _shared = null!;
     ISharedPipelines INeedsFeature<ISharedPipelines>.Dependency { set => _shared = value; }
 
-    // Transitional: the PT render targets are still renderer-owned.
+    // The accumulator / out-color pair and the restart flag every tracer shares.
+    private IPathTracingProvider _pt = null!;
+    IPathTracingProvider INeedsFeature<IPathTracingProvider>.Dependency { set => _pt = value; }
+
+    // Transitional: the pipeline still takes a host handle at construction.
     private Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
 
@@ -74,8 +79,8 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
     }
 
     /// <summary>(Re)build the wavefront chain as the <see cref="WavefrontGraph"/>. Imports the
-    /// pipeline-owned set-4 buffers + the host accumulator / out-color / FinalColor (re-read here
-    /// so a resize picks up the fresh handles). Called on every resize.</summary>
+    /// pipeline-owned set-4 buffers + the shared accumulator / out-color + the host FinalColor
+    /// (re-read here so a resize picks up the fresh handles). Called on every resize.</summary>
     private void BuildGraph()
     {
         _graph?.Dispose();
@@ -84,8 +89,7 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
         var module = new WavefrontPTModule(_pipe, _shared.Tonemap);
         module.Build(fg.RootScope().Child("Wavefront"),
             new WavefrontPTModule.Inputs(
-                _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
-                _targets.FinalColor),
+                _pt.Accumulator, _pt.OutColor, _targets.FinalColor),
             out var o);
 
         fg.MarkOutput(o.Final);
@@ -96,11 +100,11 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
         // buffer handles) back to the pipeline for its record-time binds.
         _pipe.SetGraphSharedSet(fg.GraphSharedSet);
 
-        // accumulator + out-color are registry-owned (FeaturePTIO), re-registered by the host as soon
-        // as RebuildRenderTargets reallocates them - which is what keeps the bound descriptor and the
-        // handle the graph imported in lockstep. Getting that wrong previously caused the bars /
-        // background / firefly corruption after a render-extent change. All that is left here is
-        // dropping the sample count, since the fresh images invalidate any accumulation.
+        // accumulator + out-color are registry-owned (FeaturePTIO). PathTracingSystem reallocates and
+        // re-registers them earlier in the same resize pump, which keeps the bound descriptor and the
+        // handle the graph imported in lockstep. Break that and a render-extent change shows up as
+        // bars / background / firefly corruption. Only the sample count needs dropping here, since
+        // the fresh images invalidate any accumulation.
         _pipe.MarkAccumulatorDirty();
     }
 
@@ -133,7 +137,7 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
             var fov  = camera.Fov;
             if (camView != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
             {
-                _host.MarkAccumulatorDirty();
+                _pt.MarkAccumulatorDirty();
                 _lastCamView = camView; _lastCamPos = pos; _lastCamFov = fov;
             }
         }
@@ -143,11 +147,11 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
         // the pipeline's frame UBO.
         uint lightCount = view.LightCount;
 
-        // Bridge the host's dirty signal into the pipeline's accumulator reset.
-        if (_host.AccumulatorDirty)
+        // Bridge the shared dirty signal into this pipeline's accumulator reset.
+        if (_pt.AccumulatorDirty)
         {
             _pipe.MarkAccumulatorDirty();
-            _host.ClearAccumulatorDirty();
+            _pt.ClearAccumulatorDirty();
         }
 
         _pipe.UpdatePerFrame(currentFrame, camera!, lightCount, view.RenderExtent);

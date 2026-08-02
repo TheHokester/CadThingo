@@ -11,16 +11,14 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
 ///   PickPipeline          one-ray-per-click compute pick (returns an entity)
 ///   SelectionMaskPipeline ray-query coverage mask of the selected entity
 ///   OutlinePipeline       composites an outer ring around that mask into FinalColor
-/// The coverage mask image itself lives on <see cref="RenderTargets"/> (resized with the
-/// swapchain); this system only binds it. The pick + mask pipelines read the TLAS +
-/// ShadowEntityInfo table from the registry-owned scene set (sceneTlas / sceneEntityInfo), so no
-/// per-pipeline TLAS/entity-info fan-out is needed.
+/// The coverage mask is this system's own image - nothing outside these three pipelines reads it.
+/// The pick + mask pipelines read the TLAS + ShadowEntityInfo table from the registry-owned scene
+/// set (sceneTlas / sceneEntityInfo), so no per-pipeline TLAS/entity-info fan-out is needed.
 ///
-/// Three phases, which between them are the whole of what the host used to call by name:
-/// <see cref="PreDraw"/> resolves a pending click out-of-band, <see cref="PostDraw"/> composites
-/// the outline once the active core has produced FinalColor, and <see cref="Resize"/> re-points the
-/// mask descriptors. Order 100 puts it after every core, which is what makes "after the frame's
-/// image exists" true for PostDraw without the host sequencing it.
+/// Three phases: <see cref="PreDraw"/> resolves a pending click out-of-band, <see cref="PostDraw"/>
+/// composites the outline once the active core has produced FinalColor, and <see cref="Resize"/>
+/// reallocates the mask and re-points its descriptors. Order 100 puts it after every core, which is
+/// what makes "after the frame's image exists" true for PostDraw without the host sequencing it.
 /// </summary>
 public unsafe sealed class SelectionSystem
     : IPreDrawFeature, IPostDrawFeature, IResizeFeature,
@@ -70,17 +68,36 @@ public unsafe sealed class SelectionSystem
         outlinePipeline.Initialize();
     }
 
-    // The coverage mask is a RenderTargets-owned, size-dependent image.
-    private ImageResource Mask => _host.renderTargets.SelectionMask;
+    // R32F coverage mask, sized to the render extent. The mask compute pass writes it, the outline
+    // pass samples it, and nothing else reads it, so this system owns it.
+    private ImageResource _mask = null!;
+    private ImageResource Mask => _mask;
 
-    /// Points the mask descriptors at the current view (storage side on the compute pipeline,
-    /// sampled side on the outline pass). Nothing here reads the extent - both sides bind a view,
-    /// which already carries its own size.
+    /// <summary>Reallocates the coverage mask at the new extent and points both mask descriptors at
+    /// the fresh view: storage side on the compute pipeline, sampled side on the outline
+    /// pass.</summary>
     public void Resize(in HostTargets targets)
     {
         _targets = targets;
-        selectionMaskPipeline.WriteMaskImageDescriptor(Mask.ImageView);
-        outlinePipeline.WriteMaskDescriptor(Mask.ImageView);
+
+        _mask?.Dispose();
+        _mask = new ImageResource(Gfx.Vk, Gfx.Device, "selectionMask", Format.R32Sfloat,
+            targets.Extent,
+            ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
+            ImageLayout.Undefined, ImageLayout.General);
+        _mask.Allocate(Gfx.PhysicalDevice);
+
+        // Settles in ShaderReadOnly so PostDraw's opening ShaderReadOnly->General transition has a
+        // valid source layout on the first frame.
+        var cmd = Gfx.BeginSingleTimeCommands();
+        Gfx.TransitionImageLayout(cmd, _mask.Image, _mask._format,
+            ImageLayout.Undefined, ImageLayout.General);
+        Gfx.TransitionImageLayout(cmd, _mask.Image, _mask._format,
+            ImageLayout.General, ImageLayout.ShaderReadOnlyOptimal);
+        Gfx.EndSingleTimeCommands(cmd);
+
+        selectionMaskPipeline.WriteMaskImageDescriptor(_mask.ImageView);
+        outlinePipeline.WriteMaskDescriptor(_mask.ImageView);
     }
 
     /// <summary>
@@ -201,5 +218,6 @@ public unsafe sealed class SelectionSystem
         outlinePipeline?.Dispose();
         selectionMaskPipeline?.Dispose();
         pickPipeline?.Dispose();
+        _mask?.Dispose();
     }
 }

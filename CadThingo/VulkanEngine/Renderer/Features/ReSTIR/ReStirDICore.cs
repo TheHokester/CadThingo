@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
@@ -20,17 +21,16 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 /// post-stack. This is what render-graph RT-pass support buys ReSTIR: the reuse phases each drop in
 /// as additional graph nodes.
 ///
-/// The graph is rebuilt in the ctor + on resize. The pipeline owns the descriptor sets (storage
-/// images rebound here so the graph imports the fresh handles after a resize); this core owns only
-/// the graph + the camera-snapshot / accumulator-reset bookkeeping. <see cref="Render"/> mirrors
-/// the PT skeleton: camera-motion restart, per-frame light/material refresh, UpdatePerFrame, then
-/// graph.Execute. Only constructed when the device exposes the RT pipeline (reStirPipeline != null).
+/// The graph is rebuilt on every resize. The pipeline owns its descriptor sets; this core owns the
+/// graph plus the camera-snapshot / accumulator-reset bookkeeping. <see cref="Render"/> mirrors the
+/// PT skeleton: camera-motion restart, per-frame light/material refresh, UpdatePerFrame, then
+/// graph.Execute.
 /// </summary>
 internal sealed class ReStirDICore : IRenderCore, IGraphCore,
                                      ISelfRegisteringFeature<ReStirDICore>, INeedsGpu, INeedsHost,
-                                     INeedsFeature<ISharedPipelines>
+                                     INeedsFeature<ISharedPipelines>, INeedsFeature<IPathTracingProvider>
 {
-    // Same condition the host used to build reStirPipeline under, now stated once, here.
+    // Gated on RT-pipeline support: without it there is no tracer to record with.
     public static FeatureDesc Desc =>
         new(Order: 60,
             Gate: gpu => gpu.Gfx.RayTracePipelineSupported,
@@ -46,7 +46,11 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
     private ISharedPipelines _shared = null!;
     ISharedPipelines INeedsFeature<ISharedPipelines>.Dependency { set => _shared = value; }
 
-    // Transitional: the PT render targets are still renderer-owned.
+    // The accumulator / out-color pair and the restart flag every tracer shares.
+    private IPathTracingProvider _pt = null!;
+    IPathTracingProvider INeedsFeature<IPathTracingProvider>.Dependency { set => _pt = value; }
+
+    // Transitional: the pipeline still takes a host handle at construction.
     private Renderer _host = null!;
     Renderer INeedsHost.Host { set => _host = value; }
 
@@ -80,13 +84,12 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
     private void BuildGraph()
     {
         _graph?.Dispose();
-        var fg = new ReStirGraph(_host.gfx);
+        var fg = new ReStirGraph(_gpu.Gfx);
 
         var module = new ReStirDIModule(_pipe, _shared.Tonemap);
         module.Build(fg.RootScope().Child("ReStirDI"),
             new ReStirDIModule.Inputs(
-                _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
-                _targets.FinalColor),
+                _pt.Accumulator, _pt.OutColor, _targets.FinalColor),
             out var o);
 
         fg.MarkOutput(o.Final);
@@ -96,9 +99,10 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
         // Hand the graph-owned working set (set 2, baked in Compile) to the pipeline for its binds.
         _pipe.SetGraphSharedSet(fg.GraphSharedSet);
 
-        // accumulator + out-color are registry-owned (FeaturePTIO); the host re-registers them right
-        // after reallocating the render targets, so they already point at the same handles the graph
-        // just imported. Only the sample count needs dropping - fresh images invalidate accumulation.
+        // accumulator + out-color are registry-owned (FeaturePTIO). PathTracingSystem reallocates and
+        // re-registers them earlier in the same resize pump, so they already point at the handles the
+        // graph just imported. Only the sample count needs dropping - fresh images invalidate
+        // accumulation.
         _pipe.MarkAccumulatorDirty();
     }
 
@@ -131,7 +135,7 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
             var fov     = camera.Fov;
             if (camView != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
             {
-                _host.MarkAccumulatorDirty();
+                _pt.MarkAccumulatorDirty();
                 _lastCamView = camView; _lastCamPos = pos; _lastCamFov = fov;
             }
         }
@@ -140,11 +144,11 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
         // inspector edits land); the count feeds the pipeline's frame UBO and NEE.
         uint lightCount = view.LightCount;
 
-        // Bridge the host's dirty signal into the pipeline's accumulator reset.
-        if (_host.AccumulatorDirty)
+        // Bridge the shared dirty signal into this pipeline's accumulator reset.
+        if (_pt.AccumulatorDirty)
         {
             _pipe.MarkAccumulatorDirty();
-            _host.ClearAccumulatorDirty();
+            _pt.ClearAccumulatorDirty();
         }
 
         _pipe.UpdatePerFrame(currentFrame, camera!, lightCount, view.RenderExtent);

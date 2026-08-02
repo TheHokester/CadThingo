@@ -2,16 +2,14 @@ using CadThingo.VulkanEngine.Renderer.Features.SceneAcceleration;
 
 namespace CadThingo.VulkanEngine.Renderer;
 
-// What is left of the old Renderer_Ray_Query partial. The acceleration structure - clustering,
-// rebuild cadence, instance / shadow-info / emissive packing, and the buffers behind them - now
-// belongs to the gated SceneAS feature, and the Vulkan verbs it drives belong to gfx.As. This file
-// is only the bridge: the editor panels and the path-trace pipelines still name the Renderer, so
-// their calls land here and forward.
+// Bridge onto the gated SceneAS feature, which owns clustering, rebuild cadence, instance /
+// shadow-info / emissive packing and the buffers behind them; the Vulkan verbs it drives live on
+// gfx.As. The editor panels and the path-trace pipelines still name the Renderer, so their calls
+// land here and forward.
 //
-// Every member is null-tolerant on purpose. SceneAS is gated out on a device without ray query, and
-// that is not an error condition - it is a scene with no ray infrastructure, where a pick finds
-// nothing and a path tracer sees no emissive triangles. Each of these deletes itself when its last
-// caller stops naming the Renderer.
+// Every member is null-tolerant on purpose. A device without ray query gates SceneAS out, which
+// leaves a scene with no ray infrastructure: a pick finds nothing and a path tracer sees no
+// emissive triangles. Each of these deletes itself when its last caller stops naming the Renderer.
 public unsafe partial class Renderer
 {
     // Assigned right after FeatureHost.BuildAll. Null when the device gated the feature out.
@@ -43,8 +41,8 @@ public unsafe partial class Renderer
 
     /// <summary>
     /// Pairs with file destroy in the editor. Cluster BLASes are world-space and rebuilt wholesale
-    /// on the next rebuild, so there is nothing mesh-keyed to free here — just mark the AS stale so
-    /// the freed geometry is dropped on the next rebuild.
+    /// on the next rebuild, so there is nothing mesh-keyed to free here. Marking the AS stale drops
+    /// the freed geometry on the next rebuild.
     /// </summary>
     public void DestroyBlasFor(IEnumerable<nint> meshPtrs)
     {
@@ -52,12 +50,15 @@ public unsafe partial class Renderer
         MarkTlasDirty();
     }
 
+    // The three AS reads below go through PathTracingSystem, which already resolves the gated AS for
+    // the tracers. One path to the scalars, so the two readers cannot disagree.
+
     /// <summary>True when the full ray-query stack is usable this frame: the feature exists on this
     /// device and has a built TLAS. Selection gates on it before picking or outlining.</summary>
-    internal bool RayInfraReady => _sceneAs?.Ready ?? false;
+    internal bool RayInfraReady => _ptResources?.RayInfraReady ?? false;
 
     /// <summary>Emissive area-light scalars the path tracers push as uniforms. Zero when there is
-    /// no AS, which is exactly what makes the shaders skip their NEE loop.</summary>
-    public uint  EmissiveTriangleCount => _sceneAs?.EmissiveTriangleCount ?? 0u;
-    public float TotalEmissivePower    => _sceneAs?.TotalEmissivePower    ?? 0f;
+    /// no AS, which is what makes the shaders skip their NEE loop.</summary>
+    public uint  EmissiveTriangleCount => _ptResources?.EmissiveTriangleCount ?? 0u;
+    public float TotalEmissivePower    => _ptResources?.TotalEmissivePower    ?? 0f;
 }
