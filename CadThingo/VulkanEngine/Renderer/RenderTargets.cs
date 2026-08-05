@@ -4,18 +4,16 @@ using Silk.NET.Vulkan;
 namespace CadThingo.VulkanEngine.Renderer;
 
 /// <summary>
-/// What the host owns of the render targets: FinalColor and the shared g-buffer sampler. Each
-/// technique-private target sits on the feature that uses it. The g-buffers / depth / HDR are graph
-/// transients, the accumulator / out-color pair belongs to
-/// <see cref="Features.PathTracer.PathTracingSystem"/>, and the coverage mask to
-/// <see cref="Features.Selection.SelectionSystem"/>.
+/// What the host owns of the render targets: FinalColor. Each technique-private target sits on the
+/// feature that uses it. The g-buffers / depth / HDR are graph transients, the accumulator /
+/// out-color pair belongs to <see cref="Features.PathTracer.PathTracingSystem"/>, and the coverage
+/// mask to <see cref="Features.Selection.SelectionSystem"/>.
 ///
 /// FinalColor stays here because it is consumed outside every feature: the swapchain blit and the
 /// ImGui viewport panel both sample it. Depends only on <see cref="GraphicsDevice"/>.
 ///
 /// The orchestrator (Renderer) keeps RebuildRenderTargets / ResizeRenderTargets, which pump the
-/// feature resize, and delegates the realloc here via <see cref="ReallocateSizeDependent"/>. The
-/// g-buffer sampler survives a resize.
+/// feature resize, and delegates the realloc here via <see cref="ReallocateSizeDependent"/>.
 /// </summary>
 public sealed unsafe class RenderTargets : IDisposable
 {
@@ -34,23 +32,19 @@ public sealed unsafe class RenderTargets : IDisposable
     /// <summary>The current extent + FinalColor, as handed to the features on every resize.</summary>
     public HostTargets Snapshot => new(_extent, FinalColor);
 
-    // Extent-independent, so a resize leaves it alone. Every deferred g-buffer read binds it.
-    public Sampler       GBufferSampler  { get; private set; }
-
     public ImageResource FinalColor    { get; private set; } = null!;
 
     public void SetExtent(Extent2D extent) => _extent = extent;
 
-    /// <summary>First-time allocation at the current extent: g-buffer sampler + FinalColor.</summary>
+    /// <summary>First-time allocation at the current extent.</summary>
     public void AllocateAll()
     {
-        CreateGBufferSampler();
         CreateFinalColorResources();
     }
 
-    /// <summary>Resize path: disposes + recreates FinalColor at the new extent. Keeps the g-buffer
-    /// sampler (extent-independent). The caller pumps the feature resize after this, which is where
-    /// every technique-private target is reallocated and the fresh FinalColor re-imported.</summary>
+    /// <summary>Resize path: disposes + recreates FinalColor at the new extent. The caller pumps the
+    /// feature resize after this, which is where every technique-private target is reallocated and
+    /// the fresh FinalColor re-imported.</summary>
     public void ReallocateSizeDependent(Extent2D extent)
     {
         DisposeSizeDependent();
@@ -66,7 +60,6 @@ public sealed unsafe class RenderTargets : IDisposable
     public void Dispose()
     {
         DisposeSizeDependent();
-        if (GBufferSampler.Handle != 0) vk.DestroySampler(_gfx.Device, GBufferSampler, null);
     }
 
     /// <summary>
@@ -85,34 +78,6 @@ public sealed unsafe class RenderTargets : IDisposable
             ImageLayout.Undefined, ImageLayout.ShaderReadOnlyOptimal);
         // High priority: FinalColor is regenerated and sampled every frame (the viewport source).
         FinalColor.Allocate(_gfx.PhysicalDevice, GpuMemoryAllocator.PriorityHigh);
-    }
-
-    private void CreateGBufferSampler()
-    {
-        SamplerCreateInfo samplerInfo = new()
-        {
-            SType = StructureType.SamplerCreateInfo,
-            MagFilter = Filter.Nearest,
-            MinFilter = Filter.Nearest,
-            AddressModeU = SamplerAddressMode.ClampToEdge,
-            AddressModeV = SamplerAddressMode.ClampToEdge,
-            AddressModeW = SamplerAddressMode.ClampToEdge,
-            AnisotropyEnable = true,
-            MaxAnisotropy = 16,
-            BorderColor = BorderColor.FloatOpaqueBlack,
-            UnnormalizedCoordinates = false,
-            CompareEnable = false,
-            CompareOp = CompareOp.Always,
-            MipmapMode = SamplerMipmapMode.Nearest,
-            MinLod = 0.0f,
-            MaxLod = 1.0f,
-            MipLodBias = 0.0f,
-        };
-        if (vk.CreateSampler(_gfx.Device, &samplerInfo, null, out var sampler) != Result.Success)
-        {
-            throw new Exception("Failed to create gBuffer sampler");
-        }
-        GBufferSampler = sampler;
     }
 
 }

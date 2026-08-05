@@ -21,8 +21,8 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
     readonly bool   _hasInputSampler;
     readonly uint   _pushSize;
 
-    public IblBakePipeline(GpuContext gpu, Renderer renderer, string module, bool hasInputSampler, uint pushSize)
-        : base(gpu, renderer)
+    public IblBakePipeline(GpuContext gpu, string module, bool hasInputSampler, uint pushSize)
+        : base(gpu)
     {
         _module          = module;
         _hasInputSampler = hasInputSampler;

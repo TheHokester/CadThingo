@@ -2,6 +2,7 @@
 using System.Runtime.CompilerServices;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
@@ -27,8 +28,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// camera-motion restart, per-frame light/material refresh, UpdatePerFrame, then graph.Execute.
 /// </summary>
 internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
-                                        ISelfRegisteringFeature<WavefrontPTCore>, INeedsGpu, INeedsHost,
-                                        INeedsFeature<ISharedPipelines>, INeedsFeature<IPathTracingProvider>
+                                        ISelfRegisteringFeature<WavefrontPTCore>, INeedsGpu,
+                                        INeedsFeature<ISharedPipelines>, INeedsFeature<IIblProvider>,INeedsFeature<IPathTracingProvider>
 {
     public static FeatureDesc Desc =>
         new(Order: 50, Gate: _ => true, Make: () => new WavefrontPTCore());
@@ -46,10 +47,9 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
     // The accumulator / out-color pair and the restart flag every tracer shares.
     private IPathTracingProvider _pt = null!;
     IPathTracingProvider INeedsFeature<IPathTracingProvider>.Dependency { set => _pt = value; }
-
-    // Transitional: the pipeline still takes a host handle at construction.
-    private Renderer _host = null!;
-    Renderer INeedsHost.Host { set => _host = value; }
+    //ibl feature import needed by a pipeline
+    private IIblProvider _ibl = null;
+    IIblProvider INeedsFeature<IIblProvider>.Dependency { set => _ibl = value; }
 
     // Last snapshot the host handed over, re-read on every Resize.
     private HostTargets _targets;
@@ -74,7 +74,7 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
         // Shares the accumulator / out-color images with the megakernel via FeaturePTIO and the
         // scene buffers via the scene set; the SoA working set is pipeline-owned. Technique-private,
         // so this core builds it rather than the host.
-        _pipe = new WavefrontPTPipeline(_gpu, _host);
+        _pipe = new WavefrontPTPipeline(_gpu, _ibl, _pt);
         _pipe.Initialize();
     }
 
@@ -84,7 +84,7 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
     private void BuildGraph()
     {
         _graph?.Dispose();
-        var fg = new WavefrontGraph(_host.gfx);
+        var fg = new WavefrontGraph(_gpu.Gfx);
 
         var module = new WavefrontPTModule(_pipe, _shared.Tonemap);
         module.Build(fg.RootScope().Child("Wavefront"),

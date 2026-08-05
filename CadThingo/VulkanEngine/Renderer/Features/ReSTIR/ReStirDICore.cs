@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
@@ -27,8 +28,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 /// graph.Execute.
 /// </summary>
 internal sealed class ReStirDICore : IRenderCore, IGraphCore,
-                                     ISelfRegisteringFeature<ReStirDICore>, INeedsGpu, INeedsHost,
-                                     INeedsFeature<ISharedPipelines>, INeedsFeature<IPathTracingProvider>
+                                     ISelfRegisteringFeature<ReStirDICore>, INeedsGpu,
+                                     INeedsFeature<ISharedPipelines>, INeedsFeature<IIblProvider>, INeedsFeature<IPathTracingProvider>
 {
     // Gated on RT-pipeline support: without it there is no tracer to record with.
     public static FeatureDesc Desc =>
@@ -50,9 +51,10 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
     private IPathTracingProvider _pt = null!;
     IPathTracingProvider INeedsFeature<IPathTracingProvider>.Dependency { set => _pt = value; }
 
-    // Transitional: the pipeline still takes a host handle at construction.
-    private Renderer _host = null!;
-    Renderer INeedsHost.Host { set => _host = value; }
+    private IIblProvider _ibl = null;
+    IIblProvider INeedsFeature<IIblProvider>.Dependency { set => _ibl = value; }
+
+    
 
     // Last snapshot the host handed over, re-read on every Resize.
     private HostTargets _targets;
@@ -74,7 +76,7 @@ internal sealed class ReStirDICore : IRenderCore, IGraphCore,
         // Same RT-pipeline machinery as PathtraceRTCore (it subclasses RTPipeline), forked only at
         // the shader; shares the accumulator / outColor + scene set. Technique-private, so this
         // core builds it rather than the host.
-        _pipe = new ReStirDIPipeline(_gpu, _host);
+        _pipe = new ReStirDIPipeline(_gpu, _ibl, _pt);
         _pipe.Initialize();
     }
 

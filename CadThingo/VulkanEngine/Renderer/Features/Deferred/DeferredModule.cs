@@ -24,7 +24,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, DeferredModule.Outputs>
 {
     
-    public readonly record struct Inputs(ImageResource FinalColor, Extent2D Extent);
+    public readonly record struct Inputs(Buffer[] renderablesBuffers, ImageResource FinalColor, Extent2D Extent);
 
     public readonly record struct Outputs(
         GraphImage Position, GraphImage Normal, GraphImage Albedo, GraphImage Material,
@@ -91,7 +91,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         var tileIndicesF   = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
         for (uint i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
-            renderablesF[i]   = _cull.GetRenderablesBuffer(i);
+            renderablesF[i]   = inputs.renderablesBuffers[i];
             indirectCmdF[i]   = _cull.GetIndirectCmdBuffer(i);
             indirectCountF[i] = _cull.GetIndirectCountBuffer(i);
             instanceF[i]      = Engine.ResourceManager.GetInstanceBuffer(i);

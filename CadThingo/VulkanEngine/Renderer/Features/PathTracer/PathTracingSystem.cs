@@ -53,9 +53,20 @@ internal sealed class PathTracingSystem
     public uint  EmissiveTriangleCount => _as?.EmissiveTriangleCount ?? 0u;
     public float TotalEmissivePower    => _as?.TotalEmissivePower    ?? 0f;
 
-    /// <summary>Nothing extent-independent to build - the pair is sized to the render target, so
-    /// <see cref="Resize"/> allocates it (primed once at boot).</summary>
-    public void Initialize() { }
+    // All three scene-invalidation signals restart integration: this is the one subscriber that
+    // cares about every one of them, since any of the three changes the image being converged on.
+    private readonly List<IDisposable> _subs = [];
+
+    /// <summary>Subscribes the accumulator to the invalidation signals. Nothing extent-independent
+    /// to build - the image pair is sized to the render target, so <see cref="Resize"/> allocates it
+    /// (primed once at boot).</summary>
+    public void Initialize()
+    {
+        var bus = Engine.EventBus;
+        _subs.Add(bus.Subscribe<SceneDirtyEvent>(_ => MarkAccumulatorDirty()));
+        _subs.Add(bus.Subscribe<SceneDataDirtyEvent>(_ => MarkAccumulatorDirty()));
+        _subs.Add(bus.Subscribe<PathTracingAccumulatorInvalidatedEvent>(_ => MarkAccumulatorDirty()));
+    }
 
     /// <summary>Reallocates the pair at the new extent, lays both out in General, and re-registers
     /// the FeaturePTIO bindings. The cores rebuild their graphs off the same pump straight after, so
@@ -106,5 +117,10 @@ internal sealed class PathTracingSystem
         _outColor?.Dispose();
     }
 
-    public void Dispose() => DisposeImages();
+    public void Dispose()
+    {
+        foreach (var s in _subs) s.Dispose();
+        _subs.Clear();
+        DisposeImages();
+    }
 }

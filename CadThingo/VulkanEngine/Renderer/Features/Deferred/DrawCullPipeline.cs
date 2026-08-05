@@ -36,7 +36,6 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
 
     public Buffer GetIndirectCmdBuffer  (uint frame) => IndirectCmdBuffers[frame].buffer;
     public Buffer GetIndirectCountBuffer(uint frame) => IndirectCountBuffers[frame].buffer;
-    public Buffer GetRenderablesBuffer  (uint frame) => Renderer.gpuScene.GetRenderablesBuffer(frame);
 
     // Pass-set contract for the deferred FrameGraph. The four
     // storage buffers this compute shader binds are all graph resources -- the input renderable
@@ -65,7 +64,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
 
     // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
     // still matches the reflected size.
-    public DrawCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public DrawCullPipeline(GpuContext gpu) : base(gpu) { }
 
     public override void Dispose()
     {

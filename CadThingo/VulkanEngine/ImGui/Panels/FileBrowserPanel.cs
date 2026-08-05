@@ -40,9 +40,8 @@ internal sealed unsafe class LoadedSceneFile
 }
 
 /// <summary>
-/// File browser / scene loader. Replaces the hardcoded <c>GltfLoader.Load</c>
-/// calls that used to live in <c>Renderer_Core.CreateTestEntity</c>. Listens
-/// for File → Open in the main menu (or the Browse button on the panel).
+/// File browser and scene loader, and the only path that calls <c>GltfLoader.Load</c>. Listens for
+/// File / Open in the main menu, and for the Browse button on the panel.
 /// </summary>
 public static unsafe class FileBrowserPanel
 {

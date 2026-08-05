@@ -15,6 +15,7 @@ namespace CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
 internal sealed class FeatureHost : IDisposable
 {
     private readonly GpuContext _gpu;
+    private readonly GpuScene   _scene;
     private readonly Renderer   _host;
 
     // Every built feature, in Order. Dispose walks this backwards; the phase lists below are
@@ -40,10 +41,11 @@ internal sealed class FeatureHost : IDisposable
     /// feature with <see cref="Get{T}"/>, not by scanning this.</summary>
     public IReadOnlyList<IRenderFeature> All => _all;
 
-    public FeatureHost(GpuContext gpu, Renderer host)
+    public FeatureHost(GpuContext gpu, GpuScene scene, Renderer host)
     {
-        _gpu  = gpu;
-        _host = host;
+        _gpu   = gpu;
+        _scene = scene;
+        _host  = host;
     }
 
     /// <summary>
@@ -136,6 +138,7 @@ internal sealed class FeatureHost : IDisposable
             if (f is IPostDrawFeature)   roles.Add("postDraw");
             if (f is IResizeFeature and not IRenderCore) roles.Add("resize");
             if (f is INeedsHost)         roles.Add("NEEDS-HOST");
+            if (f is INeedsScene)        roles.Add("scene");
             sb.AppendLine($"  {f.Name,-36} {string.Join(' ', roles)}");
         }
         return sb.ToString().TrimEnd();
@@ -161,8 +164,9 @@ internal sealed class FeatureHost : IDisposable
     /// sets null.</summary>
     private void Wire(IRenderFeature feature)
     {
-        if (feature is INeedsGpu g)  g.Gpu  = _gpu;
-        if (feature is INeedsHost h) h.Host = _host;   // transitional; see INeedsHost
+        if (feature is INeedsGpu g)   g.Gpu   = _gpu;
+        if (feature is INeedsScene s) s.Scene = _scene;
+        if (feature is INeedsHost h)  h.Host  = _host;   // transitional; see INeedsHost
 
         foreach (var iface in feature.GetType().GetInterfaces())
         {

@@ -33,7 +33,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
     // tone-mapped with everything else.
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 
-    public SkyboxPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
+    public SkyboxPipeline(GpuContext gpu) : base(gpu)
     {
         DepthAttachmentFormat = Gfx.FindDepthFormat();
     }

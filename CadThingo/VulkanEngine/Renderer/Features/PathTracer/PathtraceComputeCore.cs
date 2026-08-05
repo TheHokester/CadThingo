@@ -35,7 +35,7 @@ internal sealed class PathtraceComputeCore : PathTraceCoreBase,
     {
         // Scene buffers (TLAS / lights / shadow info / vb+ib / emissive / bindless) come from the
         // scene set; the accumulator / out-color pair from the registry-owned FeaturePTIO set.
-        _pipeline = new PTComputePipeline(_gpu, _host);
+        _pipeline = new PTComputePipeline(_gpu, _ibl, _pt);
         _pipeline.Initialize();
     }
 

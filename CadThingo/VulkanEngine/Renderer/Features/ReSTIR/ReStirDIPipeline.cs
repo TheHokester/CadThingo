@@ -2,6 +2,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
@@ -64,7 +65,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     private Pipeline _buildTemporalPipeline;   // BuildTemporal compute (reservoir build + temporal)
     private Pipeline _spatialPipeline;         // SpatialShade compute (spatial reuse + shade)
 
-    public ReStirDIPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public ReStirDIPipeline(GpuContext gpu, IIblProvider ibl, IPathTracingProvider pt) : base(gpu, ibl, pt) { }
 
     // Public handles for the graph module to import (barrier ordering across passes + frames).
     public Buffer ReservoirA    => _resA;

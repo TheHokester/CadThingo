@@ -22,7 +22,7 @@ public abstract unsafe class RtPipeline : PipelineBase
     protected uint ShaderGroupHandleAlignment;   // per-handle stride alignment within a region
     protected uint MaxRayRecursionDepth;         // device cap; the path tracer targets depth 1
 
-    protected RtPipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer)
+    protected RtPipeline(in GpuContext gpu) : base(gpu)
     {
         LoadDispatchAndProperties();
     }

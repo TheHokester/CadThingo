@@ -1,5 +1,6 @@
 ﻿using System.Numerics;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
@@ -19,8 +20,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 /// and builds the graph in <see cref="Initialize"/>, once the host is wired.
 /// </summary>
 internal abstract class PathTraceCoreBase
-    : IRenderCore, IGraphCore, INeedsGpu, INeedsHost,
-      INeedsFeature<ISharedPipelines>, INeedsFeature<IPathTracingProvider>
+    : IRenderCore, IGraphCore, INeedsGpu,
+      INeedsFeature<ISharedPipelines>, INeedsFeature<IIblProvider> ,INeedsFeature<IPathTracingProvider>
 {
     // Each PT core builds and owns its own tracer pipeline through this.
     protected GpuContext _gpu;
@@ -35,9 +36,11 @@ internal abstract class PathTraceCoreBase
     protected IPathTracingProvider _pt = null!;
     IPathTracingProvider INeedsFeature<IPathTracingProvider>.Dependency { set => _pt = value; }
 
+    protected IIblProvider _ibl = null!;
+    IIblProvider INeedsFeature<IIblProvider>.Dependency { set => _ibl = value; }
+
     // Transitional: the pipelines still take a host handle at construction.
-    protected Renderer _host = null!;
-    Renderer INeedsHost.Host { set => _host = value; }
+    
 
     // Last snapshot the host handed over, re-read on every Resize.
     protected HostTargets _targets;
@@ -83,7 +86,7 @@ internal abstract class PathTraceCoreBase
     protected void BuildGraph()
     {
         _graph?.Dispose();
-        var fg = new PTGraph(_host.gfx);
+        var fg = new PTGraph(_gpu.Gfx);
 
         var module = new PathTraceModule(_shared.Tonemap, TracePassType,
             (CommandBuffer cmd, PassResources res, in RenderView f) => PipelineRecord(cmd, f));

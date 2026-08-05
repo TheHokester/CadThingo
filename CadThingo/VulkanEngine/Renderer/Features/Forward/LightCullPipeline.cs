@@ -53,7 +53,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
     // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
     // still matches the reflected size.
-    public LightCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public LightCullPipeline(GpuContext gpu) : base(gpu) { }
 
     public override void Dispose()
     {

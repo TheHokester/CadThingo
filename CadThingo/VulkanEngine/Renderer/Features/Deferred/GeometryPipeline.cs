@@ -30,8 +30,8 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     ];
 
 
-    public GeometryPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
-    {
+    public GeometryPipeline(GpuContext gpu) : base(gpu)
+    { 
         DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
 

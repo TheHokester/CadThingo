@@ -34,7 +34,7 @@ public sealed unsafe class SelectionMaskPipeline : ComputePipeline
 
     // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
     // still matches the reflected size.
-    public SelectionMaskPipeline(GpuContext gpu,Renderer renderer) : base(gpu, renderer) { }
+    public SelectionMaskPipeline(GpuContext gpu) : base(gpu) { }
 
     // Set 0 borrowed from the registry (sceneTlas + sceneEntityInfo); set 1 owns the mask image.
     private const int SetMask = (int)ShaderSets.Pass;

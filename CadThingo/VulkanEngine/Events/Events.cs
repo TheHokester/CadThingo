@@ -166,10 +166,20 @@ sealed class MouseScrollEvent : Event
 // Drain runs in Engine's Update handler, ahead of DrawFrame, so an intent raised while drawing
 // frame N is applied at the top of frame N+1 - the same timing the pending-flag fields had.
 
+// Three scene-invalidation signals, ordered heaviest to lightest. Each names what CHANGED, and
+// every subscriber decides for itself what that costs it - no publisher calls a Mark* method.
+// Picking the wrong one is a silent bug in both directions: too light and the GPU mirror or the
+// TLAS keeps stale data, too heavy and every slider tick rebuilds the acceleration structure.
+//
+//   SceneDirtyEvent      geometry set / transforms / opacity  -> mirror + TLAS + accumulator
+//   SceneDataDirtyEvent  material + light VALUES               -> mirror + accumulator
+//   PathTracing...       camera or render settings             -> accumulator
+
 /// <summary>
-/// The scene's contents or transforms changed: the TLAS is stale and any progressive
-/// integration has to restart. Publish this instead of reaching for MarkTlasDirty +
-/// MarkAccumulatorDirty from code that has no business holding a Renderer.
+/// The scene's contents, transforms, or per-instance opacity changed, so the TLAS no longer
+/// describes it. Covers add / remove, IsActive, any transform edit, and the material flags that
+/// feed an instance's ForceNoOpaque (MASK, BLEND, transmission, emissive). Use
+/// <see cref="SceneDataDirtyEvent"/> for edits that only change how a surface shades.
 /// </summary>
 sealed class SceneDirtyEvent : Event
 {
@@ -177,8 +187,20 @@ sealed class SceneDirtyEvent : Event
 }
 
 /// <summary>
-/// Something changed what the camera sees without changing the scene, so accumulation restarts
-/// but the TLAS stands. Lighter than <see cref="SceneDirtyEvent"/> - use that one for edits.
+/// A material or light value changed: the GPU mirror has to re-pack and any progressive
+/// integration restarts, but the acceleration structure still describes the scene. Publish this
+/// for the edits that change shading alone - base colour, metallic / roughness, light colour,
+/// intensity, cone angles.
+/// </summary>
+sealed class SceneDataDirtyEvent : Event
+{
+    public override EventCategory Category => EventCategory.Renderer;
+}
+
+/// <summary>
+/// Something changed what the camera sees without changing the scene at all, so accumulation
+/// restarts and nothing else does. Camera moves and render-setting toggles - the lightest of the
+/// three.
 /// </summary>
 sealed class PathTracingAccumulatorInvalidatedEvent : Event
 {

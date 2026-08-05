@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
@@ -30,6 +31,10 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 //  machinery unchanged. Later ReSTIR phases extend it with reservoir buffers + reuse passes.
 public unsafe class RTPipeline : RtPipeline
 {
+    
+    private IIblProvider _ibl;
+    private IPathTracingProvider _pt;
+    
     // Matches PathTraceRT.slang / PTComputePipeline PathFrameUBO byte-for-byte.
     [StructLayout(LayoutKind.Sequential)]
     private struct PathFrameUBO
@@ -100,7 +105,11 @@ public unsafe class RTPipeline : RtPipeline
     private uint _accumSamples;
     private bool _accumDirty = true;
 
-    public RTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public RTPipeline(GpuContext gpu, IIblProvider ibl, IPathTracingProvider pt) : base(gpu)
+    {
+        _ibl = ibl;
+        _pt  = pt;
+    }
 
     public void MarkAccumulatorDirty() => _accumDirty = true;
     public uint CurrentSampleCount => _accumSamples;
@@ -292,14 +301,14 @@ public unsafe class RTPipeline : RtPipeline
             screenSize               = new Vector2(renderExtent.Width, renderExtent.Height),
             fov                      = fovRad,
             tanHalfFov               = tanHalfFov,
-            prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels,
+            prefilteredCubeMipLevels = _ibl.PrefilteredCubeMipLevels,
             scaleIBLAmbient          = EditorState.IblIntensity,
             focusDistance            = FocusDistance,
             aperture                 = Aperture,
             paniniDistance           = 1.0f,
             verticalCompression      = 0.0f,
-            emissiveTriCount         = Renderer.EmissiveTriangleCount,
-            totalEmissivePower       = Renderer.TotalEmissivePower,
+            emissiveTriCount         = _pt.EmissiveTriangleCount,
+            totalEmissivePower       = _pt.TotalEmissivePower,
         };
         return reset;
     }

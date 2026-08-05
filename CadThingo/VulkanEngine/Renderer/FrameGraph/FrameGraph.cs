@@ -40,7 +40,7 @@ public unsafe class FrameGraph : IDisposable
     private bool _chunked;                         // true iff any live pass landed on the async queue
     private int _gfxSignalCount, _cmpSignalCount;  // relative timeline values consumed per frame
     private int _lastGfxChunk = -1;                // closing image barriers are appended here
-    private Silk.NET.Vulkan.Semaphore _gfxTimeline, _cmpTimeline;
+    private Semaphore _gfxTimeline, _cmpTimeline;
     private ulong _gfxCursor, _cmpCursor;          // monotonic absolute timeline bases across frames
     private CommandPool _gfxChunkPool, _cmpChunkPool;
     private CommandBuffer[][] _chunkCmds = [];     // [frameInFlight][chunkIndex], parallel to _chunks

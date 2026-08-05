@@ -47,7 +47,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
 
     // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
     // still matches the reflected size.
-    public PickPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public PickPipeline(GpuContext gpu) : base(gpu) { }
 
     public override void Dispose()
     {

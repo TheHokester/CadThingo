@@ -34,7 +34,7 @@ public interface ISharedPipelines
 /// point where no command buffer is open.
 /// </summary>
 internal sealed class SharedPipelines
-    : ISharedPipelines, IBakeFeature, ISelfRegisteringFeature<SharedPipelines>, INeedsGpu, INeedsHost
+    : ISharedPipelines, IBakeFeature, ISelfRegisteringFeature<SharedPipelines>, INeedsGpu
 {
     public static FeatureDesc Desc =>
         new(Order: 5, Gate: _ => true, Make: () => new SharedPipelines());
@@ -45,9 +45,7 @@ internal sealed class SharedPipelines
     public string Name => "Shared pipelines (tonemap + skybox)";
 
     private GpuContext _gpu;
-    private Renderer   _host = null!;
     GpuContext INeedsGpu.Gpu   { set => _gpu  = value; }
-    Renderer   INeedsHost.Host { set => _host = value; }
 
     private TonemapPipeline _tonemap = null!;
     private SkyboxPipeline  _skybox  = null!;
@@ -75,18 +73,18 @@ internal sealed class SharedPipelines
         // Tone-map / post pass - reads whichever HDR image the active core's graph produced, writes
         // the LDR FinalColor the swapchain blit sources. Its HDR-input descriptor is graph-baked
         // when each core compiles, so there is no descriptor write here.
-        _tonemap = new TonemapPipeline(_gpu, _host) { Operator = _operator };
+        _tonemap = new TonemapPipeline(_gpu)  { Operator = _operator };
         _tonemap.Initialize();
 
         // EditorState.SkyboxEnabled gates the draw without re-recording the graph.
-        _skybox = new SkyboxPipeline(_gpu, _host);
+        _skybox = new SkyboxPipeline(_gpu);
         _skybox.Initialize();
     }
 
     // ---- Bake phase: tone-map spec-constant rebuild -------------------------
 
     public bool BakePending => _rebuildPending;
-
+ 
     public void Bake()
     {
         _rebuildPending = false;
@@ -96,12 +94,6 @@ internal sealed class SharedPipelines
         // tonemap reference stays valid. Operator is a spec constant, read by Rebuild's Initialize.
         _tonemap.Operator = _operator;
         _tonemap.Rebuild();
-
-        // Every core's graph-baked HDR set survives the in-place rebuild - a set outlives its
-        // source layout and binds by pipeline-layout compatibility (identical definition), and the
-        // HDR view is unchanged - so no graph rebuild is needed. Re-activating the core is only to
-        // restart the PT cores' progressive accumulation against the new curve.
-        _host.ReactivateCore();
     }
 
     public void Dispose()

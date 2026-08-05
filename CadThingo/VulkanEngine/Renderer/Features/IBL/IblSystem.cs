@@ -23,8 +23,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 // It publishes its four images into the registry itself rather than having the host do it: the
 // handles are stable for the renderer's lifetime (a rebake overwrites content, not handles), so one
 // registration in Initialize is the whole story, and no other file has to know these bindings exist.
-public unsafe sealed class IblSystem
-    : IIblProvider, ISelfRegisteringFeature<IblSystem>, INeedsGpu, INeedsHost
+public unsafe sealed class IblSystem : IIblProvider, ISelfRegisteringFeature<IblSystem>, INeedsGpu
 {
     public static FeatureDesc Desc =>
         new(Order: 1, Gate: _ => true, Make: () => new IblSystem());
@@ -47,10 +46,10 @@ public unsafe sealed class IblSystem
     internal const uint PrefilteredCubeFaceSize = 128;
     internal const uint BrdfLutSize            = 512;
 
-    private Renderer   _renderer = null!;
+    
     private GpuContext _gpu;
     GpuContext INeedsGpu.Gpu   { set => _gpu      = value; }
-    Renderer   INeedsHost.Host { set => _renderer = value; }
+    
 
     // Shorthands over the injected context. Properties rather than fields copied in Initialize so
     // there is no window where a partially-wired instance holds a default Vk/Device.
@@ -394,13 +393,13 @@ public unsafe sealed class IblSystem
 
     void CreateIblBakePipelines()
     {
-        equirectToCubePipeline = new IblBakePipeline(_gpu, _renderer,
+        equirectToCubePipeline = new IblBakePipeline(_gpu,
             "IBL/EquirectToCube",     hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
-        irradianceConvolvePipeline = new IblBakePipeline(_gpu, _renderer,
+        irradianceConvolvePipeline = new IblBakePipeline(_gpu,
             "IBL/IrradianceConvolve", hasInputSampler: true,  pushSize: (uint)sizeof(PcFaceSize));
-        prefilterEnvPipeline = new IblBakePipeline(_gpu, _renderer,
+        prefilterEnvPipeline = new IblBakePipeline(_gpu,
             "IBL/PrefilterEnv",       hasInputSampler: true,  pushSize: (uint)sizeof(PcPrefilter));
-        brdfLutGenPipeline = new IblBakePipeline(_gpu, _renderer,
+        brdfLutGenPipeline = new IblBakePipeline(_gpu,
             "IBL/BrdfLutGen",         hasInputSampler: false, pushSize: (uint)sizeof(PcLutSize));
 
         equirectToCubePipeline    .Initialize();

@@ -49,7 +49,7 @@ internal struct PcProbePrefilter
 /// standing in for.
 /// </summary>
 public sealed unsafe class ReflectionProbeSystem
-    : IReflectionProbeProvider, ISelfRegisteringFeature<ReflectionProbeSystem>, INeedsGpu, INeedsHost, INeedsFeature<IIblProvider>
+    : IReflectionProbeProvider, ISelfRegisteringFeature<ReflectionProbeSystem>, INeedsGpu, INeedsFeature<IIblProvider>
 {
     public static FeatureDesc Desc =>
         new(Order: 2, Gate: _ => true, Make: () => new ReflectionProbeSystem());
@@ -74,11 +74,11 @@ public sealed unsafe class ReflectionProbeSystem
     private const uint _probeFaceSize = 256;
     private readonly uint _probeMipLevels =
         (uint)Math.Floor(Math.Log2(_probeFaceSize)) + 1;
-    private Renderer     _renderer = null!;
+    
     private GpuContext   _gpu;
     private IIblProvider _ibl = null!;
     GpuContext   INeedsGpu.Gpu                        { set => _gpu      = value; }
-    Renderer     INeedsHost.Host                      { set => _renderer = value; }
+    
     IIblProvider INeedsFeature<IIblProvider>.Dependency { set => _ibl     = value; }
 
     private GraphicsDevice _gfx    => _gpu.Gfx;
@@ -243,7 +243,7 @@ public sealed unsafe class ReflectionProbeSystem
         // shader iteration on the capture kernel does not take the whole editor down with it.
         try
         {
-            capturePipeline = new ProbeCapturePipeline(_gpu, _renderer);
+            capturePipeline = new ProbeCapturePipeline(_gpu);
             capturePipeline.Initialize();
         }
         catch (Exception e)

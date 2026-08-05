@@ -47,7 +47,7 @@ public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
         public uint Pad2;
     }
 
-    public ProbeCapturePipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
+    public ProbeCapturePipeline(GpuContext gpu) : base(gpu)
     {
         // Matches the capture depth attachment created by ReflectionProbeSystem.
         DepthAttachmentFormat = Format.D32Sfloat;
@@ -105,6 +105,4 @@ public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
                 $"reflects {reflected}");
         }
     }
-
-    
 }

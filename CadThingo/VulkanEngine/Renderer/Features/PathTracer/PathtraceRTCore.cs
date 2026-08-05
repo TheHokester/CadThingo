@@ -34,7 +34,7 @@ internal sealed class PathtraceRTCore : PathTraceCoreBase,
     {
         // Shares the accumulator / out-color images + scene buffers with the compute path; envCube
         // rides FeatureEnv. The gate above is what makes the unconditional construction safe.
-        _pipeline = new RTPipeline(_gpu, _host);
+        _pipeline = new RTPipeline(_gpu, _ibl, _pt);
         _pipeline.Initialize();
     }
 

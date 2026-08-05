@@ -33,7 +33,7 @@ public struct AliasEntryGpu
 /// however many slider ticks landed in between.
 /// </summary>
 internal sealed unsafe class SceneAS
-    : IBakeFeature, ISelfRegisteringFeature<SceneAS>, INeedsGpu, INeedsHost
+    : IBakeFeature, ISelfRegisteringFeature<SceneAS>, INeedsGpu, INeedsScene, INeedsHost
 {
     // Order 3: after IBL / probes, before every core. Nothing here depends on those, but the TLAS
     // and its side tables have to be registered into the scene set before the boot-time registry
@@ -51,13 +51,14 @@ internal sealed unsafe class SceneAS
     public string Name => "Scene AS (BLAS/TLAS)";
 
     private GpuContext _gpu;
+    private GpuScene   GpuScene = null!;
     private Renderer   _host = null!;
-    GpuContext INeedsGpu.Gpu   { set => _gpu  = value; }
-    Renderer   INeedsHost.Host { set => _host = value; }
+    GpuContext INeedsGpu.Gpu     { set => _gpu      = value; }
+    GpuScene   INeedsScene.Scene { set => GpuScene  = value; }
+    Renderer   INeedsHost.Host   { set => _host     = value; }
 
     private GraphicsDevice Gfx => _gpu.Gfx;
     private AsDevice       As  => _gpu.Gfx.As;
-    private GpuScene       GpuScene => _host.gpuScene;
     private Scene          Scene    => _host.Scene;
 
     //  State
@@ -182,12 +183,7 @@ internal sealed unsafe class SceneAS
     /// this from the editor side (InspectorPanel transforms, FileBrowserPanel visibility) - direct
     /// per-mutation rebuilds would stall the device on every slider tick.
     /// </summary>
-    public void MarkDirty()
-    {
-        _dirty = true;
-        // Structural / transform / alpha-mode edits also re-pack the GPU mirror.
-        GpuScene?.MarkSceneDirty();
-    }
+    public void MarkDirty() => _dirty = true;
 
     // ---- Bake phase --------------------------------------------------------
 
@@ -206,11 +202,18 @@ internal sealed unsafe class SceneAS
 
     public void Initialize()
     {
+        // Only the heavy signal reaches the AS. A material or light VALUE edit leaves every
+        // instance transform and opacity flag exactly as the TLAS already describes them, so
+        // SceneDataDirtyEvent deliberately goes unsubscribed here.
+        _dirtySub = Engine.EventBus.Subscribe<SceneDirtyEvent>(_ => MarkDirty());
+
         // Build once up front so the scene set holds a valid sceneTlas from boot. An empty scene
         // still produces a real zero-instance TLAS - an RT core has to be selectable before any
         // geometry is loaded, and rays simply miss.
         Rebuild();
     }
+
+    private IDisposable? _dirtySub;
 
 
     //  Helpers
@@ -688,7 +691,7 @@ internal sealed unsafe class SceneAS
         // Reconcile renderable identity on the same cadence as the AS: every renderable gathered
         // below gets a stable RenderableHandle (freed when its entity leaves the scene), written
         // into ShadowEntityInfo.EntityIndex below and resolved back by pick / selection.
-        GpuScene.SyncRenderables(Scene);
+        GpuScene.SyncRenderables();
 
         // Open a fresh world-transform cache window for this rebuild. Unlike the per-frame
         // extraction, this is edit-driven and reachable from outside DrawFrame (the asset /
@@ -910,10 +913,6 @@ internal sealed unsafe class SceneAS
     /// </summary>
     public void Rebuild()
     {
-        // Changing the scene invalidates any in-progress path-trace integration regardless of
-        // what happens to the AS below.
-        _host.MarkAccumulatorDirty();
-
         Gfx.Vk!.DeviceWaitIdle(Gfx.Device);
 
         RebuildTlas();
@@ -950,6 +949,8 @@ internal sealed unsafe class SceneAS
 
     public void Dispose()
     {
+        _dirtySub?.Dispose();
+
         // Host-visible mappings live for the lifetime of the parent block (the
         // allocator owns the map/unmap). Just null the pointers — the frees below
         // release the suballocations; the block stays mapped until allocator dispose.

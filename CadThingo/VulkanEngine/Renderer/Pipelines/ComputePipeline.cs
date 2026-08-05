@@ -7,7 +7,7 @@ public abstract unsafe class ComputePipeline : PipelineBase
 {
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
 
-    protected ComputePipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    protected ComputePipeline(in GpuContext gpu) : base(gpu) { }
 
     protected sealed override void CreatePipeline()
     {

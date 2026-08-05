@@ -77,9 +77,9 @@ public static unsafe class InspectorPanel
         if (ImGuiNET.ImGui.Checkbox("Active", ref active))
         {
             entity->IsActive = active;
-            // Active gates the light set (Scene.EnumerateLights) — restart PT
-            // integration + re-pack the GPU mirror (L2 step 7 dirty signal).
-            Engine.renderer.MarkAccumulatorDirty();
+            // Active gates both the light set (Scene.EnumerateLights) and the TLAS gather,
+            // which skips !IsActive entities - so a toggle changes what rays can hit.
+            Engine.EventBus.PublishEvent(new SceneDirtyEvent());
         }
 
         ImGuiNET.ImGui.Separator();
@@ -94,8 +94,7 @@ public static unsafe class InspectorPanel
         if (ImGuiNET.ImGui.DragFloat3("Position", ref pos, 0.05f))
         {
             t.SetPosition(pos);
-            Engine.renderer.MarkAccumulatorDirty();
-            Engine.renderer.MarkTlasDirty();
+            Engine.EventBus.PublishEvent(new SceneDirtyEvent());
         }
 
         var quat = t.GetRotation();
@@ -103,15 +102,13 @@ public static unsafe class InspectorPanel
         if (ImGuiNET.ImGui.DragFloat3("Rotation", ref euler, 0.5f, 0f, 0f, "%.2f°"))
         {
             SetEulerDeg(entity, euler, t);
-            Engine.renderer.MarkAccumulatorDirty();
-            Engine.renderer.MarkTlasDirty();
+            Engine.EventBus.PublishEvent(new SceneDirtyEvent());
         }
 
         var scale = t.GetScale();
         if (ImGuiNET.ImGui.DragFloat3("Scale", ref scale, 0.01f, 0.0001f, float.MaxValue))
         {
-            Engine.renderer.MarkAccumulatorDirty();
-            Engine.renderer.MarkTlasDirty();
+            Engine.EventBus.PublishEvent(new SceneDirtyEvent());
             t.SetScale(scale);
         }
 
@@ -145,7 +142,9 @@ public static unsafe class InspectorPanel
         int matMin = -1;
         if (ImGuiNET.ImGui.DragInt("Material", ref matIdx, 0.1f, matMin, matMax))
         {
-            Engine.renderer.MarkAccumulatorDirty();
+            // A different material can carry different MASK / BLEND / transmission flags, which
+            // feed the instance's ForceNoOpaque in RebuildTlas.
+            Engine.EventBus.PublishEvent(new SceneDirtyEvent());
             m.materialIndex = matIdx;
         }
         ImGuiNET.ImGui.SameLine();
@@ -170,7 +169,7 @@ public static unsafe class InspectorPanel
         if (ImGuiNET.ImGui.ColorEdit4("Base color", ref mat.BaseColorFactor,
                 ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreview | ImGuiColorEditFlags.Float))
         {
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
         }
 
         // Emissive is one HDR vector (color × strength). Editing the raw HDR
@@ -189,23 +188,22 @@ public static unsafe class InspectorPanel
                 emColor    = Vector3.Clamp(emColor, Vector3.Zero, Vector3.One);
                 _emissiveCache[idx] = (emColor, emStrength);
                 mat.EmissiveFactor  = emColor * emStrength;
-                Engine.renderer.MarkAccumulatorDirty();
                 // PT area lights (emissiveTriBuffer + alias table + totalEmissivePower)
-                // are baked in RebuildTlas, NOT the per-frame material SSBO — force a
-                // rebuild so the new Le actually drives NEE, and so a triangle that
-                // crosses the zero/non-zero boundary joins or leaves the emitter set.
-                Engine.renderer.MarkTlasDirty();
+                // are baked in RebuildTlas, NOT the per-frame material SSBO - the full
+                // signal is what makes the new Le drive NEE, and what moves a triangle
+                // into or out of the emitter set as it crosses zero.
+                Engine.EventBus.PublishEvent(new SceneDirtyEvent());
             }
         }
 
         if (ImGuiNET.ImGui.SliderFloat("Metallic", ref mat.MetallicFactor, 0f, 1f))
         {
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
         }
 
         if (ImGuiNET.ImGui.SliderFloat("Roughness", ref mat.RoughnessFactor, 0f, 1f))
         {
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
         }
 
         // Alpha flags — Mask and Blend are conceptually mutually exclusive
@@ -218,30 +216,28 @@ public static unsafe class InspectorPanel
         if (ImGuiNET.ImGui.Checkbox("Alpha mask", ref alphaMask))
         {
             mat.Flags = SetBit(mat.Flags, 0x1u, alphaMask);
-            Engine.renderer.MarkAccumulatorDirty();
             // MASK feeds the TLAS instance's ForceNoOpaque flag (RebuildTlas:
-            // matFlags & 5) — rebuild so ray queries alpha-test this instance.
-            Engine.renderer.MarkTlasDirty();
+            // matFlags & 5), so ray queries only alpha-test this instance after a rebuild.
+            Engine.EventBus.PublishEvent(new SceneDirtyEvent());
         }
         ImGuiNET.ImGui.SameLine();
         if (ImGuiNET.ImGui.Checkbox("Double sided", ref doubleSided))
         {
             mat.Flags = SetBit(mat.Flags, 0x2u, doubleSided);
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
         }
         ImGuiNET.ImGui.SameLine();
         if (ImGuiNET.ImGui.Checkbox("Alpha blend", ref alphaBlend))
         {
             mat.Flags = SetBit(mat.Flags, 0x4u, alphaBlend);
-            Engine.renderer.MarkAccumulatorDirty();
             // BLEND also feeds ForceNoOpaque (RebuildTlas: matFlags & 5).
-            Engine.renderer.MarkTlasDirty();
+            Engine.EventBus.PublishEvent(new SceneDirtyEvent());
         }
 
         if (alphaMask)
             if (ImGuiNET.ImGui.SliderFloat("Alpha cutoff", ref mat.AlphaCutoff, 0f, 1f))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             }
 
         // KHR_materials_transmission + KHR_materials_ior
@@ -253,16 +249,15 @@ public static unsafe class InspectorPanel
         {
             if (ImGuiNET.ImGui.SliderFloat("Transmission", ref mat.TransmissionFactor, 0f, 1f))
             {
-                Engine.renderer.MarkAccumulatorDirty();
                 // transmission > 0 flips the instance to ForceNoOpaque (RebuildTlas)
-                // so the ray query can refract / pass through — rebuild on change.
-                Engine.renderer.MarkTlasDirty();
+                // so the ray query can refract / pass through.
+                Engine.EventBus.PublishEvent(new SceneDirtyEvent());
             }
             // 1.0 = vacuum / no refraction, 2.4 covers everything up to diamond.
             // Glass sits at 1.5, water 1.33, plastic 1.46–1.55.
             if (ImGuiNET.ImGui.SliderFloat("IOR", ref mat.Ior, 1.0f, 2.5f))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             }
 
             // KHR_materials_volume (Beer-Lambert absorption). Tint = color light
@@ -271,14 +266,14 @@ public static unsafe class InspectorPanel
             // interior, so push Distance to max (no absorption) for those.
             if (ImGuiNET.ImGui.ColorEdit3("Attenuation tint", ref mat.AttenuationColor))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             }
             // Log slider: short distance = strong absorption (small gem),
             // huge distance ≈ no absorption (clear / thin glass).
             if (ImGuiNET.ImGui.SliderFloat("Attenuation distance", ref mat.AttenuationDistance,
                                            0.01f, 100f, "%.3f", ImGuiNET.ImGuiSliderFlags.Logarithmic))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             }
             ImGuiNET.ImGui.TreePop();
         }
@@ -291,11 +286,11 @@ public static unsafe class InspectorPanel
         {
             if (ImGuiNET.ImGui.SliderFloat("Clearcoat", ref mat.ClearcoatFactor, 0f, 1f))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             };
             if (ImGuiNET.ImGui.SliderFloat("Clearcoat roughness", ref mat.ClearcoatRoughnessFactor, 0f, 1f))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             }
             ImGuiNET.ImGui.TreePop();
         }
@@ -344,28 +339,28 @@ public static unsafe class InspectorPanel
         // CastShadows flag), so a toggle must restart PT integration + re-pack the
         // GPU mirror (L2 step 7) — these were the gaps where neither dirty signal fired.
         if (ImGuiNET.ImGui.Checkbox("Enabled", ref l.Enabled))
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
         ImGuiNET.ImGui.SameLine();
         if (ImGuiNET.ImGui.Checkbox("Cast shadows", ref l.CastShadows))
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
 
         int type = (int)l.Type;
         if (ImGuiNET.ImGui.Combo("Type", ref type, "Directional\0Point\0Spot\0\0"))
         {
             l.Type = (LightType)type;
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
         }
 
         var color = l.Color;
         if (ImGuiNET.ImGui.ColorEdit3("Color", ref color, ImGuiColorEditFlags.Float))
         {
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             l.Color = color;
         }
 
         if (ImGuiNET.ImGui.DragFloat("Intensity", ref l.Intensity, 0.05f, 0f, float.MaxValue))
         {
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
         }
 
         // Range is meaningless for directional lights — the shader encodes
@@ -373,7 +368,7 @@ public static unsafe class InspectorPanel
         if (l.Type != LightType.Directional)
             if (ImGuiNET.ImGui.DragFloat("Range", ref l.Range, 0.1f, 0f, float.MaxValue))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             }
 
         // Direction is consumed by directional + spot only. Renormalise on edit
@@ -384,7 +379,7 @@ public static unsafe class InspectorPanel
             if (ImGuiNET.ImGui.DragFloat3("Direction", ref dir, 0.01f))
             {
                 l.Direction = dir.LengthSquared() > 1e-6f ? Vector3.Normalize(dir) : Vector3.UnitY * -1f;
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
             }
         }
 
@@ -396,12 +391,12 @@ public static unsafe class InspectorPanel
             float outerDeg = MathF.Acos(Math.Clamp(l.OuterConeCos, -1f, 1f)) * (180f / MathF.PI);
             if (ImGuiNET.ImGui.DragFloat("Inner cone", ref innerDeg, 0.25f, 0f, 89f, "%.2f°"))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
                 l.InnerConeCos = MathF.Cos(innerDeg * (MathF.PI / 180f));
             }
             if (ImGuiNET.ImGui.DragFloat("Outer cone", ref outerDeg, 0.25f, 0f, 89f, "%.2f°"))
             {
-                Engine.renderer.MarkAccumulatorDirty();
+                Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
                 l.OuterConeCos = MathF.Cos(outerDeg * (MathF.PI / 180f));
             }
         }
@@ -410,7 +405,7 @@ public static unsafe class InspectorPanel
         // point/spot; tan(angularRadius) for directional (sun ≈ 0.005).
         if (ImGuiNET.ImGui.DragFloat("Radius", ref l.Radius, 0.005f, 0f, float.MaxValue))
         {
-            Engine.renderer.MarkAccumulatorDirty();
+            Engine.EventBus.PublishEvent(new SceneDataDirtyEvent());
         };
     }
 

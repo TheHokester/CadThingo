@@ -35,6 +35,29 @@ public readonly struct MemoryBudgetInfo
     public float Fraction => Budget > 0 ? (float)Usage / Budget : 0f;
 }
 
+
+
+public struct QueueFamilyIndices
+{
+    public QueueFamilyIndices()
+    {
+    }
+    public uint? graphicsFamily { get; set; }
+    public uint? presentFamily { get; set; }
+    public uint? computeFamily { get; set; }
+    public uint? transferFamily { get; set; }//optional
+    public bool IsComplete()
+    {
+        return graphicsFamily.HasValue && presentFamily.HasValue && computeFamily.HasValue;
+    }
+}
+public struct SwapChainSupportDetails
+{
+    public SurfaceCapabilitiesKHR Capabilities;
+    public SurfaceFormatKHR[] Formats;
+    public PresentModeKHR[] PresentModes;
+}
+
 /// <summary>
 /// The Vulkan RHI context - instance, debug messenger, surface, physical/logical
 /// device, queues, the suballocating memory allocator, descriptor pool, and command
@@ -96,6 +119,7 @@ public sealed unsafe class GraphicsDevice : IDisposable
     private DescriptorPool descriptorPool;
     private CommandPool commandPool;
     private PipelineLayoutCache layoutCache = null!;
+    private SamplerCache        samplerCache = null!;
 
     private bool descriptorIndexEnabled = false;
     private bool robustness2Enabled = false;
@@ -131,6 +155,10 @@ public sealed unsafe class GraphicsDevice : IDisposable
     /// Shared descriptor-set / pipeline layout dedupe plus the one device-level VkPipelineCache.
     /// Created with the logical device; every pipeline builds its layouts through it.
     public PipelineLayoutCache LayoutCache => layoutCache;
+
+    /// Shared samplers, including the engine's two defaults (PointClamp / LinearRepeat). Created
+    /// with the logical device and destroyed with it, so callers never own what they take.
+    public SamplerCache        Samplers       => samplerCache;
     public PhysicalDevice     PhysicalDevice => physicalDevice;
     public GpuMemoryAllocator Allocator      => memAllocator;
 
@@ -232,6 +260,8 @@ public sealed unsafe class GraphicsDevice : IDisposable
         // driver + device, so a rebuilt/relocated output legitimately starts cold.
         layoutCache = new PipelineLayoutCache(vk, device, physicalDevice,
             Path.Combine(AppContext.BaseDirectory, "PipelineCache.bin"));
+
+        samplerCache = new SamplerCache(vk, device, physicalDevice);
     }
 
     // Full teardown in reverse-creation order. The orchestrator (Renderer) calls
@@ -242,6 +272,10 @@ public sealed unsafe class GraphicsDevice : IDisposable
         // Shared layouts + the pipeline cache (writes the warm blob back to disk). Runs after the
         // pipelines that borrowed these handles have been disposed, before the device goes away.
         layoutCache?.Dispose();
+
+        // Shared samplers. Must outlive every layout that pinned one as an immutable sampler and
+        // every descriptor set that wrote one, both of which are gone by here.
+        samplerCache?.Dispose();
 
         // AS dispatch table. Owns no Vulkan objects, so ordering only needs it to outlive the AS
         // owner's teardown (which destroys its structures through these verbs).

@@ -51,11 +51,11 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
     public PassSetSpec PassSet =>
         new(PassSetIndex, DescriptorSetLayouts[PassSetIndex], ReflectedBindings(PassSetIndex));
 
-    public TonemapPipeline(GpuContext gpu, Renderer renderer) : base( gpu, renderer) { }
+    public TonemapPipeline(GpuContext gpu) : base( gpu) { }
 
     // The graph writes only the view into the pass set, so the sampler is pinned here.
-    protected override Sampler? ImmutableSamplerFor(in BindingDesc binding) 
-        => binding.Name == "hdrInput" ? Renderer.gBufferSampler : null;
+    protected override Sampler? ImmutableSamplerFor(in BindingDesc binding)
+        => binding.Name == "hdrInput" ? Gfx.Samplers.PointClamp : null;
 
     protected override SpecValues? Specialization =>
         new SpecValues().Set("TONEMAP_OPERATOR", (uint)Operator);

@@ -186,7 +186,6 @@ public unsafe class ResourceManager
     internal const uint MAX_BINDLESS_TEXTURES = RenderConfig.MAX_MATERIALS * 9;
     
     
-    private Sampler defaultBindlessSampler;
     private UboBuffer[] MaterialStorageBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
     private UboBuffer[] InstanceStorageBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
@@ -226,12 +225,10 @@ public unsafe class ResourceManager
             _gfx.CreateMappedStorageBuffer(RenderConfig.MAX_MATERIALS * (uint)sizeof(PbrMaterial),     ref MaterialStorageBuffers[i], preferDeviceLocal: true);
             _gfx.CreateMappedStorageBuffer(RenderConfig.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU), ref InstanceStorageBuffers[i], preferDeviceLocal: true);
         }
-        CreateDefaultBindlessSampler();
-        
         //register resourcemanager owned resourced into sceneset.
         _registry.RegisterBufferPerFrame("sceneMaterials",  MaterialStorageBuffers.Select(b => b.buffer).ToArray(), RenderConfig.MAX_MATERIALS * (uint)sizeof(PbrMaterial));                                                                        
         _registry.RegisterBufferPerFrame("sceneInstances",  InstanceStorageBuffers.Select(b => b.buffer).ToArray(), RenderConfig.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU));                                                                    
-        _registry.RegisterSampler("sceneSamplers", defaultBindlessSampler, 0);    
+        _registry.RegisterSampler("sceneSamplers", DefaultSampler, 0);
     }
 
     public Mesh UploadMesh(Vertex[] vertices, uint[] indices)
@@ -382,7 +379,6 @@ public unsafe class ResourceManager
             _gfx.DestroyBuffer(globalVertexBuffer, globalVertexBufferAlloc);
             _gfx.DestroyBuffer(globalIndexBuffer,  globalIndexBufferAlloc);
 
-            vk!.DestroySampler(device, defaultBindlessSampler, null);
             for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             {
                 _gfx.DestroyBuffer(MaterialStorageBuffers[i].buffer, MaterialStorageBuffers[i].alloc);
@@ -391,7 +387,8 @@ public unsafe class ResourceManager
 
         }
     }
-    internal Sampler DefaultSampler => defaultBindlessSampler;
+    /// <summary>Sampler every bindless material texture is read through. Device-owned.</summary>
+    internal Sampler DefaultSampler => _gfx.Samplers.LinearRepeat;
     public Buffer GetMaterialBuffer(int frameIndex) => MaterialStorageBuffers[frameIndex].buffer;
     public Buffer GetInstanceBuffer(uint frameIndex) => InstanceStorageBuffers[frameIndex].buffer;
     public void* GetMaterialMapped(uint frameIndex) => MaterialStorageBuffers[frameIndex].mapped;
@@ -449,32 +446,6 @@ public unsafe class ResourceManager
         public ManifestScope(ResourceManager rm) => _rm = rm;
         public void Dispose() => _rm._activeManifest = null;
     }
-    
-    
-    private void CreateDefaultBindlessSampler()
-    {
-        SamplerCreateInfo samplerInfo = new()
-        {
-            SType = StructureType.SamplerCreateInfo,
-            MagFilter = Filter.Linear,
-            MinFilter = Filter.Linear,
-            AddressModeU = SamplerAddressMode.Repeat,
-            AddressModeV = SamplerAddressMode.Repeat,
-            AddressModeW = SamplerAddressMode.Repeat,
-            MipmapMode = SamplerMipmapMode.Linear,
-            AnisotropyEnable = true,
-            MaxAnisotropy = 16,
-            BorderColor = BorderColor.FloatOpaqueBlack,
-            UnnormalizedCoordinates = false,
-            CompareEnable = false,
-            CompareOp = CompareOp.Always,
-            MinLod = 0.0f, 
-            MaxLod = Vk.LodClampNone,
-        };
-        if (vk!.CreateSampler(device, &samplerInfo, null, out defaultBindlessSampler) != Result.Success)
-            throw new Exception("Failed to create default bindless sampler");
-    }
-    
     
     
     ///<summary>load a resource of type T with the given ID</summary>

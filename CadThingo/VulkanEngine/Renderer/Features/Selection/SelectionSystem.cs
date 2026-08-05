@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
 using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
@@ -22,7 +23,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
 /// </summary>
 public unsafe sealed class SelectionSystem
     : IPreDrawFeature, IPostDrawFeature, IResizeFeature,
-      ISelfRegisteringFeature<SelectionSystem>, INeedsGpu, INeedsHost
+      ISelfRegisteringFeature<SelectionSystem>, INeedsGpu, INeedsScene,
+      INeedsFeature<IPathTracingProvider>
 {
     public static FeatureDesc Desc =>
         new(Order: 100, Gate: _ => true, Make: () => new SelectionSystem());
@@ -33,9 +35,13 @@ public unsafe sealed class SelectionSystem
     public string Name => "Selection (pick + outline)";
 
     private GpuContext _gpu;
-    private Renderer   _host = null!;
-    GpuContext INeedsGpu.Gpu   { set => _gpu  = value; }
-    Renderer   INeedsHost.Host { set => _host = value; }
+    private GpuScene   _scene = null!;
+    GpuContext INeedsGpu.Gpu     { set => _gpu   = value; }
+    GpuScene   INeedsScene.Scene { set => _scene = value; }
+    
+
+    private IPathTracingProvider _pt;
+    IPathTracingProvider INeedsFeature<IPathTracingProvider>.Dependency { set => _pt = value; }
 
     // Last snapshot the host handed over, re-read on every Resize.
     private HostTargets _targets;
@@ -56,15 +62,15 @@ public unsafe sealed class SelectionSystem
         _selectionSub = Engine.EventBus.Subscribe<SceneEntitySelectedEvent>(OnEntitySelected);
 
         // Object picking owns only a tiny result SSBO; the TLAS is bound later.
-        pickPipeline = new PickPipeline(_gpu, _host);
+        pickPipeline = new PickPipeline(_gpu);
         pickPipeline.Initialize();
 
         // Mask pipeline writes the coverage image; outline reads it back. Both mask descriptors
         // point at an extent-sized view, so they are written in Resize (primed once at boot).
-        selectionMaskPipeline = new SelectionMaskPipeline(_gpu, _host);
+        selectionMaskPipeline = new SelectionMaskPipeline(_gpu);
         selectionMaskPipeline.Initialize();
 
-        outlinePipeline = new OutlinePipeline(_gpu, _host);
+        outlinePipeline = new OutlinePipeline(_gpu);
         outlinePipeline.Initialize();
     }
 
@@ -115,7 +121,7 @@ public unsafe sealed class SelectionSystem
         if (!req.HasValue) return;
         ImGui.EditorState.RequestedPick = null;
 
-        if (!_host.RayInfraReady) return;
+        if (!_pt.RayInfraReady) return;
 
         var extent = view.RenderExtent;
         var camera = view.Camera;
@@ -140,7 +146,7 @@ public unsafe sealed class SelectionSystem
 
         uint idx = pickPipeline.ReadResult();
         Engine.EventBus.PublishEvent(new SceneEntitySelectedEvent(
-            idx == PickPipeline.PickNone ? null : _host.gpuScene.ResolveSlot(idx)));
+            idx == PickPipeline.PickNone ? null : _scene.ResolveSlot(idx)));
     }
 
     /// <summary>
@@ -154,7 +160,6 @@ public unsafe sealed class SelectionSystem
         if (ImGui.EditorState.SelectedEntity == e.GetEntity) return;
 
         ImGui.EditorState.SelectedEntity = e.GetEntity;
-        _host.MarkAccumulatorDirty();
     }
 
     /// <summary>
@@ -168,13 +173,13 @@ public unsafe sealed class SelectionSystem
     public void PostDraw(CommandBuffer cmd, in RenderView view)
     {
         if (ImGui.EditorState.SelectedEntity == null) return;
-        if (!_host.RayInfraReady) return;
+        if (!_pt.RayInfraReady) return;
 
         // Resolve the selection to its RenderableHandle slot - the same token the
         // mask shader compares against ShadowEntityInfo.EntityIndex. No handle
         // => not a renderable (e.g. a light picked in the outliner) => no
         // outline, which is correct.
-        if (!_host.gpuScene.TryGetHandle(ImGui.EditorState.SelectedEntity, out var selHandle)) return;
+        if (!_scene.TryGetHandle(ImGui.EditorState.SelectedEntity, out var selHandle)) return;
         uint idx = selHandle.Index;
 
         var extent = view.RenderExtent;

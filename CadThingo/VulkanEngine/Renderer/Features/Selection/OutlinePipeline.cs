@@ -32,7 +32,7 @@ public sealed unsafe class OutlinePipeline : GraphicsPipeline
     public Vector3 Color     { get; set; } = new(1.0f, 0.55f, 0.1f);   // editor orange
     public int     Thickness { get; set; } = 3;
 
-    public OutlinePipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public OutlinePipeline(GpuContext gpu) : base(gpu) { }
 
     // Fullscreen triangle — no vertex inputs, no depth, no cull, no blend.
     protected override PipelineDepthStencilStateCreateInfo BuildDepthStencil() => new()

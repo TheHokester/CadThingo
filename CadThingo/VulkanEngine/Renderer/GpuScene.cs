@@ -123,6 +123,7 @@ public readonly struct RenderableHandle
 public sealed unsafe class GpuScene : IDisposable
 {
     private readonly GraphicsDevice _gfx;
+    private readonly Scene _scene;
 
     // Per-frame-in-flight light SSBO. Holds packed PbrLightGpu records; bound by
     // every pipeline that needs scene lighting (deferred, light-cull, transparent,
@@ -170,11 +171,24 @@ public sealed unsafe class GpuScene : IDisposable
         mask &= ~bit;
         return was;
     }
-
-    public GpuScene(GraphicsDevice gfx)
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <param name="gfx"></param>
+    /// <param name="scene">Holds a reference to the scene to ensure all renderer scene reads are through GpuScene</param>
+    public GpuScene(GraphicsDevice gfx, Scene scene)
     {
         _gfx = gfx;
+        _scene = scene;
+
+        // Both scene-invalidation signals re-pack the mirror; only their effect on the AS differs,
+        // which is SceneAS's business and not this class's.
+        var bus = Engine.EventBus;
+        _subs.Add(bus.Subscribe<SceneDirtyEvent>(_ => MarkSceneDirty()));
+        _subs.Add(bus.Subscribe<SceneDataDirtyEvent>(_ => MarkSceneDirty()));
     }
+
+    private readonly List<IDisposable> _subs = [];
 
     // Renderable identity 
     // Generational slot allocator. Generalizes Scene's material free-list idea to
@@ -262,13 +276,13 @@ public sealed unsafe class GpuScene : IDisposable
     /// doesn't churn generations. Called on the TLAS-rebuild cadence (dirty-driven),
     /// not per frame.
     /// </summary>
-    public void SyncRenderables(Scene scene)
+    public void SyncRenderables()
     {
         // 1. Register current renderables (entities with a live mesh).
         _present.Clear();
-        for (int i = 0; i < scene.EntityCount; i++)
+        for (int i = 0; i < _scene.EntityCount; i++)
         {
-            Entity* e = scene.GetEntity(i);
+            Entity* e = _scene.GetEntity(i);
             if (e == null) continue;
             var mesh = e->GetComponent<MeshComponent>();
             if (mesh == null || mesh.mesh == null) continue;
@@ -328,7 +342,7 @@ public sealed unsafe class GpuScene : IDisposable
 
     /// <summary>Cull-input SSBO for the given frame slot — bound by the cull pass
     /// at binding 0. Stable for the renderer's lifetime.</summary>
-    public Buffer GetRenderablesBuffer(uint frame) => _renderableBuffers[frame].buffer;
+    public Buffer[] GetRenderablesBuffers() => _renderableBuffers.Select(b => b.buffer).ToArray();
 
     /// <summary>BLEND-mode renderables extracted this frame, unsorted. The cull pass
     /// applies the view-dependent back-to-front sort and hands the result to the
@@ -355,7 +369,7 @@ public sealed unsafe class GpuScene : IDisposable
     /// <see cref="ExtractedRenderableCount"/>. This is the extraction half of the
     /// former DrawCullPipeline.Record walk; GPU frustum cull reads this buffer.
     /// </summary>
-    public uint ExtractRenderables(uint frameIndex, Scene scene)
+    public uint ExtractRenderables(uint frameIndex)
     {
         // Dirty-driven: skip the walk if this slot is already current.
         // The cull pass still re-sorts transparents by camera every frame - only the
@@ -365,14 +379,14 @@ public sealed unsafe class GpuScene : IDisposable
 
         RenderableInputGpu* inputPtr = (RenderableInputGpu*)_renderableBuffers[frameIndex].mapped;
         uint count = 0;
-        int matCount = scene.MaterialCount;
+        int matCount = _scene.MaterialCount;
         int fallbackMatIdx = matCount; // matches the fallback slot UpdateMaterials writes
 
         _transparentCandidates.Clear();
 
-        for (int i = 0; i < scene.EntityCount; i++)
+        for (int i = 0; i < _scene.EntityCount; i++)
         {
-            Entity* e = scene.GetEntity(i);
+            Entity* e = _scene.GetEntity(i);
             if (e == null) continue;
             var meshComp = e->GetComponent<MeshComponent>();
             if (meshComp == null || meshComp.mesh == null) continue;
@@ -387,7 +401,7 @@ public sealed unsafe class GpuScene : IDisposable
             // mode in the Flags bitfield.
             AlphaMode mode = AlphaMode.Opaque;
             if (matIdx >= 0 && matIdx < matCount)
-                mode = scene.Materials[matIdx].GetAlphaMode();
+                mode = _scene.Materials[matIdx].GetAlphaMode();
 
             if (mode == AlphaMode.Blend)
             {
@@ -430,18 +444,18 @@ public sealed unsafe class GpuScene : IDisposable
     /// active. Returns the material count actually written (excluding the
     /// fallback).
     /// </summary>
-    public uint UpdateMaterials(uint frameIndex, Scene scene)
+    public uint UpdateMaterials(uint frameIndex)
     {
         // Dirty-driven (L2 step 7): this slot's material SSBO is already current.
         if (!TakeSlot(ref _materialDirty, frameIndex)) return _lastMaterialCount;
 
-        int matCount = scene.MaterialCount;
+        int matCount = _scene.MaterialCount;
         if (matCount + 1 > (int)RenderConfig.MAX_MATERIALS)
             throw new InvalidOperationException(
                 $"Scene material count ({matCount}) exceeds MAX_MATERIALS ({RenderConfig.MAX_MATERIALS}).");
 
         PbrMaterial* matPtr = (PbrMaterial*)Engine.ResourceManager.GetMaterialMapped(frameIndex);
-        for (int mi = 0; mi < matCount; mi++) matPtr[mi] = scene.Materials[mi];
+        for (int mi = 0; mi < matCount; mi++) matPtr[mi] = _scene.Materials[mi];
 
         matPtr[matCount] = new PbrMaterial
         {
@@ -476,12 +490,12 @@ public sealed unsafe class GpuScene : IDisposable
     /// packed light count, also cached in <see cref="LightCount"/>. Every
     /// rendering path (deferred, forward+, pathtracer) calls this once per frame
     /// before recording its draws.</summary>
-    public uint UpdateLights(uint frameIndex, Scene scene)
+    public uint UpdateLights(uint frameIndex)
     {
         // Dirty-driven (L2 step 7): this slot's light SSBO is already current.
         if (!TakeSlot(ref _lightDirty, frameIndex)) return LightCount;
 
-        scene.EnumerateLights(_lightScratch);
+        _scene.EnumerateLights(_lightScratch);
 
         PbrLightGpu* lightPtr = (PbrLightGpu*)_lightBuffers[frameIndex].mapped;
         uint count = 0;
@@ -525,6 +539,9 @@ public sealed unsafe class GpuScene : IDisposable
 
     public void Dispose()
     {
+        foreach (var s in _subs) s.Dispose();
+        _subs.Clear();
+
         for (int i = 0; i < _lightBuffers.Length; i++)
         {
             if (_lightBuffers[i].buffer.Handle != 0)

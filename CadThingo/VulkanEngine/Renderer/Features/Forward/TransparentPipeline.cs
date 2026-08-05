@@ -18,6 +18,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
 //
 public sealed unsafe class TransparentPipeline : GraphicsPipeline
 {
+    private IIblProvider _ibl;
+    private IReflectionProbeProvider _reflProbes;
     // Matches Transparent.slang::FrameUBO — pushed into the scene set's (0,0)
     // constant arena slot each frame. View+proj feed the VS; camPos + tile
     // state feed the FS.
@@ -82,9 +84,11 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
     // by Record (which runs later the same frame inside the graph).
     private TransparentFrameUBO _frameUbo;
 
-    public TransparentPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
+    public TransparentPipeline(GpuContext gpu, IIblProvider ibl, IReflectionProbeProvider reflProbes) : base(gpu)
     {
         DepthAttachmentFormat = Gfx.FindDepthFormat();
+        _ibl = ibl;
+        _reflProbes = reflProbes;
     }
 
     // No owned buffers — frame constants ride the scene set's arena and per-draw state is pushed.
@@ -259,18 +263,18 @@ public sealed unsafe class TransparentPipeline : GraphicsPipeline
         ubo.tileCountX = tileCountX;
         ubo.tileCountY = tileCountY;
         ubo.screenSize = new Vector2(renderExtent.Width, renderExtent.Height);
-        ubo.prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels;
+        ubo.prefilteredCubeMipLevels = _ibl.PrefilteredCubeMipLevels;
         ubo.scaleIBLAmbient          = EditorState.IblIntensity;
 
         // Probe cluster dims - built once per frame by ReflectionProbeSystem.
         // The transparent pass uses the same grid as PbrDeferred so cluster
         // indices stay consistent across opaque and transparent samples.
         
-        var grid = Renderer.reflectionProbeSystem.ClusterGrid;
+        var grid = _reflProbes.ClusterGrid;
         ubo.probeClusterDimsX = grid.DimsX;
         ubo.probeClusterDimsY = grid.DimsY;
         ubo.probeClusterDimsZ = grid.DimsZ;
-        ubo.probeMipLevels    = Renderer.reflectionProbeSystem.ProbeMipLevels;
+        ubo.probeMipLevels    = _reflProbes.ProbeMipLevels;
 
         _frameUbo = ubo;
     }

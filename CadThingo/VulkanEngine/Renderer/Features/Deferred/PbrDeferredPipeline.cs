@@ -15,6 +15,9 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 //  per-tile light list, optional ray-queried shadows.
 public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 {
+    
+    IIblProvider? _ibl;
+    IReflectionProbeProvider? _reflProbes;
     // Matches PBR.slang's LightingFrameUBO - pushed into the scene set's (0,0)
     // constant arena slot each frame.
     [StructLayout(LayoutKind.Sequential)]
@@ -72,7 +75,11 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     /// <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
     public bool SoftShadowsEnabled { get; set; } = true;
 
-    public PbrDeferredPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public PbrDeferredPipeline(GpuContext gpu, IIblProvider ibl, IReflectionProbeProvider reflProbes) : base(gpu)
+    {
+        _ibl = ibl;
+        _reflProbes = reflProbes;
+    }
 
     internal void Record(CommandBuffer cmd, in RenderView ctx, ImageView HdrTarget, DescriptorSet gBufferSet)
     {
@@ -138,11 +145,11 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         DepthBiasEnable         = false,
     };
 
-    // The g-buffer sampler is baked into every set-1 image binding as an IMMUTABLE sampler, so the
+    // The point sampler is baked into every set-1 image binding as an IMMUTABLE sampler, so the
     // graph writes only the views - no sampler plumbing, no update-after-bind. The tile buffers
     // are storage buffers and take none.
     protected override Sampler? ImmutableSamplerFor(in BindingDesc binding)
-        => binding.Type == DescriptorType.CombinedImageSampler ? Renderer.gBufferSampler : null;
+        => binding.Type == DescriptorType.CombinedImageSampler ? Gfx.Samplers.PointClamp : null;
 
     protected override SpecValues? Specialization =>
         new SpecValues().Set("SOFT_SHADOWS", SoftShadowsEnabled);
@@ -177,7 +184,7 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         // Used by PBR.slang to scale roughness into the prefiltered mip chain.
         // Read from the IBL provider every frame rather than cached: it is fixed today (bakes
         // overwrite content, not metadata) but a stale copy would be silent if that ever changed.
-        ubo.prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels;
+        ubo.prefilteredCubeMipLevels = _ibl.PrefilteredCubeMipLevels;
         ubo.scaleIBLAmbient = EditorState.IblIntensity;
         ubo.lightCount = lightCount;
         ubo.tileCountX = tileX;
@@ -186,11 +193,11 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 
         // Probe cluster dims — the cluster grid is rebuilt earlier in DrawFrame
         // with the same tile counts so its dims always match the lighting tile grid.
-        var grid = Renderer.reflectionProbeSystem.ClusterGrid;
+        var grid = _reflProbes.ClusterGrid;
         ubo.probeClusterDimsX = grid.DimsX;
         ubo.probeClusterDimsY = grid.DimsY;
         ubo.probeClusterDimsZ = grid.DimsZ;
-        ubo.probeMipLevels    = Renderer.reflectionProbeSystem.ProbeMipLevels;
+        ubo.probeMipLevels    = _reflProbes.ProbeMipLevels;
 
         _frameUbo = ubo;
 

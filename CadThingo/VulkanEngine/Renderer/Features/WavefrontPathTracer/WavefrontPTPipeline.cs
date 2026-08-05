@@ -2,6 +2,7 @@
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
@@ -28,6 +29,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 //  single reflected 16-byte ComputeBit push range for WavefrontPush).
 public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 {
+    private IIblProvider _ibl;
+    IPathTracingProvider _pt;
     // Matches WavefrontBindings / PTUtils PathFrameUBO byte-for-byte (same as
     // PTComputePipeline's private copy).
     [StructLayout(LayoutKind.Sequential)]
@@ -234,7 +237,11 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 
     // The single 16-byte ComputeBit range for WavefrontPush is reflected from Program by
     // Initialize; CreateResources asserts the C# mirror still matches it.
-    public WavefrontPTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public WavefrontPTPipeline(GpuContext gpu, IIblProvider ibl, IPathTracingProvider pt) : base(gpu)
+    {
+        _ibl = ibl;
+        _pt  = pt;
+    }
 
 
     // ---- Descriptor-set layouts. Scene (set 0) + FeatureEnv (4) + FeaturePTIO (5) come from the
@@ -493,14 +500,14 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
             screenSize               = new Vector2(renderExtent.Width, renderExtent.Height),
             fov                      = fovRad,
             tanHalfFov               = tanHalfFov,
-            prefilteredCubeMipLevels = Renderer.PrefilteredCubeMipLevels,
+            prefilteredCubeMipLevels = _ibl.PrefilteredCubeMipLevels,
             scaleIBLAmbient          = EditorState.IblIntensity,
             focusDistance            = FocusDistance,
             aperture                 = Aperture,
             paniniDistance           = PaniniDistance,
             verticalCompression      = VerticalCompression,
-            emissiveTriCount         = Renderer.EmissiveTriangleCount,
-            totalEmissivePower       = Renderer.TotalEmissivePower,
+            emissiveTriCount         = _pt.EmissiveTriangleCount,
+            totalEmissivePower       = _pt.TotalEmissivePower,
         };
         // Push once per frame; every BindSets this frame reuses the returned dynamic offset.
         // Safe here: the registry reset this frame's arena slice in BeginFrame, before Render.

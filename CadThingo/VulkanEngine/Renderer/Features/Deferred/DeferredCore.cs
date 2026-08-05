@@ -22,7 +22,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 /// chain is built from; tonemap and skybox are shared, so they come in from the feature host.
 /// </summary>
 internal sealed class DeferredCore : IRenderCore, IGraphCore, IBakeFeature,
-                                     ISelfRegisteringFeature<DeferredCore>, INeedsGpu, INeedsHost,
+                                     ISelfRegisteringFeature<DeferredCore>, INeedsGpu, INeedsScene,
                                      INeedsFeature<ISharedPipelines>, INeedsFeature<IIblProvider>, INeedsFeature<IReflectionProbeProvider>
 {
     // Order 10 = first core built, so index 0 in the mode combo: the boot default and fallback.
@@ -46,9 +46,10 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore, IBakeFeature,
     IReflectionProbeProvider INeedsFeature<IReflectionProbeProvider>.Dependency { set => _reflProbeProvider = value; }
     
 
-    // Host handle the technique pipelines still take at construction.
-    private Renderer _host = null!;
-    Renderer INeedsHost.Host { set => _host = value; }
+    // The GPU mirror. Read at graph-build time for the cull pass's input buffers, which the graph
+    // imports per frame-in-flight - not at record time, so it cannot come off the RenderView.
+    private GpuScene _scene = null!;
+    GpuScene INeedsScene.Scene { set => _scene = value; }
 
     // Last snapshot the host handed over. Bake rebuilds the graph out of band, with no resize to
     // supply an extent, so it reads FinalColor and the extent from here.
@@ -93,21 +94,21 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore, IBakeFeature,
 
         // The g-buffers / depth / HDR are graph transients and PBR's g-buffer set is baked when the
         // graph compiles, so the order these initialize in does not matter.
-        _geometry = new GeometryPipeline(_gpu, _host);
+        _geometry = new GeometryPipeline(_gpu);
         _geometry.Initialize();
 
-        _drawCull = new DrawCullPipeline(_gpu, _host);
+        _drawCull = new DrawCullPipeline(_gpu);
         _drawCull.Initialize();
 
-        _pbr = new PbrDeferredPipeline(_gpu, _host) { SoftShadowsEnabled = _softShadows };
+        _pbr = new PbrDeferredPipeline(_gpu, _ibl, _reflProbeProvider) { SoftShadowsEnabled = _softShadows };
         _pbr.Initialize();
 
-        _lightCull = new LightCullPipeline(_gpu, _host);
+        _lightCull = new LightCullPipeline(_gpu);
         _lightCull.Initialize();
 
         // Forward+ BLEND pass between lighting and tonemap. Lights / TLAS / bindless come from the
         // scene set; the tile cull buffers are wired from LightCullPipeline inside the graph.
-        _transparent = new TransparentPipeline(_gpu, _host) { SoftShadowsEnabled = _softShadows };
+        _transparent = new TransparentPipeline(_gpu, _ibl, _reflProbeProvider) { SoftShadowsEnabled = _softShadows };
         _transparent.Initialize();
     }
 
@@ -156,7 +157,7 @@ internal sealed class DeferredCore : IRenderCore, IGraphCore, IBakeFeature,
             () => (_frameLightCount, _frameTileCountX, _frameTileCountY));
 
         module.Build(fg.RootScope().Child("Deferred"),
-            new DeferredModule.Inputs(_targets.FinalColor, _targets.Extent), out var o);
+            new DeferredModule.Inputs(_scene.GetRenderablesBuffers(), _targets.FinalColor, _targets.Extent), out var o);
 
         fg.MarkOutput(o.Final);
         fg.Compile();

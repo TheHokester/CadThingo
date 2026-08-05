@@ -1,201 +1,11 @@
-using System.Numerics;
-using System.Runtime.InteropServices;
-using ImGuiNET;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer;
-/* How the shadows with ray query work 
- * Three parts. The flow is: deferred shading hands the lighting pass a world-space position per pixel → ray query asks "is anything between that position and the light?" → AS makes that question fast.                       
-                                                                                                                                                                                                                             
-  1. How "this pixel" becomes "this point in the world"                                                                                                                                                                        
-   
-  Your geometry pass doesn't draw colors — it draws a g-buffer. For every pixel the screen covers, the geometry shader writes the world-space position of whatever surface is there into GBuffer_Position, plus the            
-  normal/albedo/material into the others. That image is just a 2D grid of world coordinates indexed by screen pixel.
 
-  The lighting pass then runs a fullscreen triangle. There's one fragment shader invocation per pixel of the framebuffer. Inside that shader, gBufferPositionSampler.Sample(input.UV) reads back the world position that the
-  geometry pass wrote for that exact pixel. So WorldPos in PSMain literally means "the 3D point that this screen pixel is showing."
-
-  That's the bridge. Once you have WorldPos per pixel, "shadow ray from this pixel to the light" makes sense — you cast from WorldPos toward lightPos, and if anything is in the way, the pixel's lit by something other than
-  that light. No connection to triangles or meshes anymore — just two world points and a yes/no question.
-
-  2. What an acceleration structure actually is
-
-  Naive shadow trace: for each pixel, walk every triangle in the scene and test ray-triangle intersection. Viking room is ~3800 triangles, screen is ~1M pixels, one light → ~3.8 billion intersection tests per frame. Dead.
-
-  An acceleration structure is a spatial index. It's a tree built over your geometry where each interior node holds a bounding box and each leaf holds a triangle. To check if a ray hits anything, you start at the root: does
-   the ray intersect this node's box? If no, skip the entire subtree. If yes, recurse. You touch O(log N) triangles instead of O(N).
-
-  The hardware on your 4070 Ti has dedicated silicon for this traversal — that's what RT cores are. RayQuery.TraceRayInline doesn't loop in software; it dispatches to those cores. That's why ~1M shadow rays per frame is
-  cheap.
-
-  Tree shape, build algorithm, node packing — all driver/hardware specifics behind vkCmdBuildAccelerationStructures. You hand it triangles + a flag like PreferFastTrace, and it picks the structure for you.
-
-  3. Why two levels (BLAS + TLAS)
-
-  Imagine 100 instances of the viking room scattered around. If everything were one big AS, you'd:
-  - Pay to retesselate the same mesh into the structure 100 times (huge build cost),
-  - Have to rebuild the entire thing every time any instance moves.
-
-  Two levels split that:
-
-  BLAS (Bottom-Level) — built per unique mesh, in mesh-local space. Holds the actual triangles. Expensive to build (it's the spatial tree over real geometry), but you only build it once per mesh and cache it. Your blasCache
-   is keyed by Mesh* for exactly this reason.
-
-  TLAS (Top-Level) — built per scene. Doesn't hold triangles at all. Each entry is a tiny record: a 3×4 transform + a pointer to a BLAS. So 100 viking rooms = one BLAS + 100 small TLAS records. When a viking room moves, you
-   only rebuild the TLAS (cheap - it's effectively a scene graph in spatial form). The BLAS is untouched.
- */
-public unsafe partial class Renderer
-{
-    
-
-    public void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags memProps,
-        out Buffer buffer, out SubAlloc alloc, float priority = GpuMemoryAllocator.PriorityDefault,
-        bool preferDeviceLocal = false)
-        => gfx.CreateBuffer(size, usage, memProps, out buffer, out alloc, priority, preferDeviceLocal);
-
-    
-
-    public void DestroyBuffer(Buffer buffer, SubAlloc alloc) => gfx.DestroyBuffer(buffer, alloc);
-
-    
-    
-
-    private void CreateDescriptorPool()
-    {
-        // Sizing budget per frame-in-flight where relevant:
-        //   - UniformBuffer:   GeometryFrameUBO + LightingUBO  →  2 × MAX_FRAMES + headroom
-        //   - StorageBuffer:   PbrMaterial[]   + InstanceData[] →  2 × MAX_FRAMES + headroom
-        //   - SampledImage:    bindless texture array          →  MAX_BINDLESS_TEXTURES × MAX_FRAMES
-        //   - Sampler:         bindless samplers (default 0)   →  8 × MAX_FRAMES
-        //   - CombinedImageSampler: g-buffer samplers (shared) →  5 + headroom
-        //   - AccelerationStructure: TLAS                       →  MAX_FRAMES + headroom
-        var poolSizes = new DescriptorPoolSize[]
-        {
-            new() { Type = DescriptorType.UniformBuffer,            DescriptorCount = 24 },
-            // Storage buffer budget: bindless mat+instance (2 × MAX_FRAMES), light SSBO
-            // (MAX_FRAMES), cull pass (renderables + cmds + instancesOut + count =
-            // 4 × MAX_FRAMES), PBR shadow-alpha set (ShadowEntityInfo + global vb + ib),
-            // plus the wavefront tracer (set 0 lights/shadow/emissive × MAX_FRAMES, set 1
-            // vb/ib, and the 25-binding set-4 SoA working set: ping-ponged shadow records
-            // + connectArgs + shadowRadiance on top of the original 18). Round up generously.
-            new() { Type = DescriptorType.StorageBuffer,            DescriptorCount = 128 },
-            new() { Type = DescriptorType.SampledImage,             DescriptorCount = RenderConfig.MAX_BINDLESS_TEXTURES * RenderConfig.MAX_CONCURRENT_FRAMES },
-            new() { Type = DescriptorType.Sampler,                  DescriptorCount = 8 * RenderConfig.MAX_CONCURRENT_FRAMES + 4 },
-            // 5 g-buffer samplers (set 1) + 3 IBL samplers × MAX_FRAMES on set 0
-            // for both PBR + Transparent pipelines + ImGui viewport + headroom.
-            // Probe prefilter sets reuse iblCubeSampler — one CombinedImageSampler
-            // each. MaxProbes (16) × MipLevels (9) = 144. Cheap to oversize.
-            new() { Type = DescriptorType.CombinedImageSampler,     DescriptorCount = 32 + 200 },
-            // PBR (1) + Transparent (1) + PT (MAX_FRAMES) + Wavefront (MAX_FRAMES) +
-            // Pick (1) + SelectionMask (1) + headroom.
-            new() { Type = DescriptorType.AccelerationStructureKhr, DescriptorCount = 16 },
-            // IBL bake passes need StorageImage descriptors — one per dispatch.
-            // Worst case is the prefilter chain (1 set × prefilteredCubeMipLevels
-            // mips) + equirect→cube + irradiance + BRDF LUT ≈ 11 sets. Reflection
-            // probes pre-allocate one set per (slot, mip): MaxProbes (16) × MipLevels
-            // (9) = 144. Round up.
-            new() { Type = DescriptorType.StorageImage,             DescriptorCount = 24 + 200 },
-        };
-        // Sizing is an app-level budget (above); GraphicsDevice owns the pool handle.
-        // +16 over the historical 48+200 for the wavefront tracer's 5 sets (set 0 ×MAX_FRAMES,
-        // sets 1/3/4) with headroom.
-        gfx.CreateDescriptorPool(poolSizes, maxSets: 48 + 200 + 16,
-            DescriptorPoolCreateFlags.UpdateAfterBindBit | DescriptorPoolCreateFlags.FreeDescriptorSetBit);
-    }
-    
-}
-
-// Mirrors PbrUtils.slang::PbrLight under std430 (16B alignment, no padding needed —
-// the struct is exactly 4 × float4 = 64B).
-
-// Per-instance row in the geometry pipeline's instance SSBO. Shader sees this as
-// PbrUtils.slang::InstanceData (std430 layout, stride 80B). Padding keeps the C#
-// struct aligned to the shader struct so a Span<InstanceDataGPU> blits cleanly.
-[StructLayout(LayoutKind.Sequential)]
-public struct InstanceDataGPU
-{
-    public Matrix4x4 model;
-    public uint materialIndex;
-    public uint _pad0, _pad1, _pad2;
-}
-
-// Cull-pass input record. GpuScene.ExtractRenderables packs one per OPAQUE/MASK
-// renderable into its cull-input SSBO each frame; the compute shader reads it and
-// emits an indirect draw + InstanceData when the bounding sphere passes the frustum
-// test. Std430 alignment, total 96B.
-
-// CPU-side transparent draw record. Forward+ transparent pass walks a sorted
-// list of these (back-to-front by view-space Z) and issues one push-constant +
-// vkCmdDrawIndexed per entity. Not a GPU SSBO type — the per-draw model + matidx
-// ride in push constants since the count is typically small.
-public struct TransparentDraw
-{
-    public Matrix4x4 Model;
-    public uint      MaterialIndex;
-    public uint      IndexCount;
-    public uint      FirstIndex;     // into Engine.ResourceManager.GlobalIndexBuffer
-    public float     ViewDepth;      // view-space Z of the entity's origin; sort key
-}
-
-// Mirrors VkDrawIndexedIndirectCommand exactly. Compute writes this struct into the
-// indirect-cmd buffer per surviving renderable; vkCmdDrawIndexedIndirectCount
-// consumes them.
-[StructLayout(LayoutKind.Sequential)]
-public struct DrawIndexedIndirectCommandGpu
-{
-    public uint indexCount;
-    public uint instanceCount;
-    public uint firstIndex;
-    public int  vertexOffset;
-    public uint firstInstance;
-}
-
-
-// Per-frame mapped UBO/SSBO bundle. Storage is owned by the renderer's
-// GpuMemoryAllocator; Dispose is intentionally absent — callers free through
-// Renderer.DestroyBuffer(b.buffer, b.alloc) so both the VkBuffer handle AND
-// the suballocation are released together.
-unsafe struct UboBuffer
-{
-    public Buffer    buffer;
-    public SubAlloc  alloc;
-    public void*     mapped;
-}
-
-// Mirrors PbrUtils.slang::PbrMaterial under std430. First 64B holds the core
-// glTF metallic-roughness block (laid out so the vec3 emissive factor's
-// trailing 4B slack absorbs AlphaCutoff). The next 32B carries KHR extension
-// data — transmission, IOR, clearcoat. All scalar / 4B-aligned so std430
-// packs them with zero padding. Fields the shaders don't yet consume sit
-// here as data only; uploaded every frame regardless. Total: 96B.
-
-public static class PbrMaterialVolume
-{
-    // Sentinel for "no participating volume" — matches the shader guard
-    // (mediumSigmaA treats >= 1e6 as no absorption). glTF's real default is
-    // +infinity; a large finite value uploads cleanly and reads identically.
-    public const float NoAbsorptionDistance = 1e30f;
-}
-
-public enum AlphaMode : uint
-{
-    Opaque = 0,
-    Mask   = 1,
-    Blend  = 2,
-}
-
-public static class PbrMaterialAlphaExtensions
-{
-    // BLEND takes precedence over MASK if both bits are accidentally set
-    // (shouldn't happen from glTF — they're mutually exclusive there).
-    public static AlphaMode GetAlphaMode(this in PbrMaterial mat)
-    {
-        if ((mat.Flags & 0x4u) != 0u) return AlphaMode.Blend;
-        if ((mat.Flags & 0x1u) != 0u) return AlphaMode.Mask;
-        return AlphaMode.Opaque;
-    }
-}
-
+/// <summary>
+/// A device image plus its view and suballocation, destroyed together on Dispose. Reserved for
+/// render-graph attachments; use <see cref="Texture"/> when a sampler belongs with the image.
+/// </summary>
 public unsafe class ImageResource : IDisposable
 {
     private readonly Vk     _vk;
@@ -211,12 +21,11 @@ public unsafe class ImageResource : IDisposable
     public ImageLayout _initialLayout;
     public ImageLayout _finalLayout;
 
-
     public VkImage Image;
     public SubAlloc ImageAlloc;
     public ImageView ImageView;
 
-
+    /// <summary>Describes an image the caller will later <see cref="Allocate"/>.</summary>
     public ImageResource(
         Vk vk, Device device,
         string name, Format format, Extent2D extent,
@@ -235,12 +44,9 @@ public unsafe class ImageResource : IDisposable
         _finalLayout = finalLayout;
     }
 
-    /// <summary>
-    /// Adopts already-allocated image handles. Used for resources whose creation
-    /// flow doesn't fit the graph's <see cref="Allocate"/> path (e.g. textures
-    /// uploaded from disk via a staging buffer). Dispose semantics match the
-    /// allocate path — handles are destroyed on Dispose().
-    /// </summary>
+    /// <summary>Adopts already-allocated handles, for resources whose creation does not fit the
+    /// graph's <see cref="Allocate"/> path, such as a texture staged in from disk. Dispose destroys
+    /// them exactly as it does on the allocate path.</summary>
     public ImageResource(
         Vk vk, Device device,
         string name, Format format, Extent2D extent,
@@ -261,9 +67,11 @@ public unsafe class ImageResource : IDisposable
         ImageView = view;
         IsAllocated = true;
     }
+
+    /// <summary>Creates the image, binds device-local memory and builds a single-mip view.</summary>
+    /// <param name="priority">Eviction priority handed to the block suballocator.</param>
     public void Allocate(PhysicalDevice physicalDevice, float priority = GpuMemoryAllocator.PriorityDefault)
     {
-        //configure image creation info based on resource properties
         ImageCreateInfo imageInfo = new()
         {
             SType = StructureType.ImageCreateInfo,
@@ -313,13 +121,11 @@ public unsafe class ImageResource : IDisposable
 
     }
 
-
-
     public void Dispose()
     {
         if (_disposed) return;
 
-        // Destroy in reverse-creation order — mirrors C++ RAII destruction
+        // Reverse creation order: the view references the image.
         if (ImageView.Handle   != 0) _vk.DestroyImageView(_device, ImageView,   null);
         if (Image.Handle  != 0)      _vk.DestroyImage    (_device, Image,  null);
         _allocator.Free(ImageAlloc);
@@ -330,10 +136,8 @@ public unsafe class ImageResource : IDisposable
 }
 
 /// <summary>
-/// Composes an <see cref="ImageResource"/> + <see cref="Sampler"/> as a single
-/// shader-readable texture object. Use for sampled textures (loaded from disk,
-/// dummy fallbacks, baked LUTs); <see cref="ImageResource"/> alone is reserved
-/// for render-graph attachments.
+/// Composes an <see cref="ImageResource"/> and a <see cref="Sampler"/> as one shader-readable
+/// texture. Use for sampled textures: loaded from disk, dummy fallbacks, baked LUTs.
 /// </summary>
 public unsafe class Texture : IDisposable
 {
@@ -355,9 +159,8 @@ public unsafe class Texture : IDisposable
         Sampler = sampler;
     }
 
-    /// <summary>
-    /// Loads a 2D RGBA texture from disk into a device-local image + linear sampler.
-    /// </summary>
+    /// <summary>Loads a 2D RGBA texture from disk into a device-local image plus linear
+    /// sampler.</summary>
     public static Texture CreateTextureFromPath(GraphicsDevice gfx, string path, Format format)
     {
         using var img = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgba32>(path);
@@ -371,11 +174,9 @@ public unsafe class Texture : IDisposable
         }
     }
 
-    /// <summary>
-    /// Uploads raw RGBA pixel data into a device-local image + linear sampler.
-    /// <paramref name="width"/>/<paramref name="height"/> size the staging copy;
-    /// <paramref name="extent"/> sizes the destination image.
-    /// </summary>
+    /// <summary>Uploads raw RGBA pixels into a device-local image plus linear sampler.</summary>
+    /// <param name="width">Sizes the staging copy, alongside <paramref name="height"/>.</param>
+    /// <param name="extent">Sizes the destination image.</param>
     public static Texture CreateTextureFromMemory(GraphicsDevice gfx, byte* pixels,
         uint width, uint height, Format format, Extent3D extent)
     {
@@ -386,7 +187,7 @@ public unsafe class Texture : IDisposable
         ulong imageSize = (ulong)width * (ulong)height * 4UL;
         uint mipLevels = (uint)Math.Floor(Math.Log2(Math.Max(width, height))) + 1;
 
-        // Stage pixels in a host-visible buffer.
+        // Stage the pixels in a host-visible buffer.
         gfx.CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out var staging, out var stagingAlloc);
@@ -397,7 +198,6 @@ public unsafe class Texture : IDisposable
         const ImageUsageFlags usage = ImageUsageFlags.TransferDstBit |ImageUsageFlags.TransferSrcBit | ImageUsageFlags.SampledBit;
         var extent2D = new Extent2D(extent.Width, extent.Height);
 
-        // Device-local image.
         ImageCreateInfo imageInfo = new()
         {
             SType = StructureType.ImageCreateInfo,
@@ -417,7 +217,7 @@ public unsafe class Texture : IDisposable
 
         var imageAlloc = gfx.Allocator.AllocateForImage(image, MemoryPropertyFlags.DeviceLocalBit);
 
-        // Transition → copy → transition (single-time command).
+        // Transition, copy, generate mips, all in one single-time command.
         var cmd = gfx.BeginSingleTimeCommands();
         gfx.TransitionImageLayout(cmd, image, format, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels: mipLevels);
         BufferImageCopy region = new()
@@ -480,9 +280,10 @@ public unsafe class Texture : IDisposable
 
         var resource = new ImageResource(vk, device, "FontTexture", format, extent2D, usage, image, imageAlloc, view);
         return new Texture(vk, device, resource, sampler);
-    } 
+    }
 
-    /// <summary>True for the BC1/BC3/BC4/BC5 block formats the loader compresses material textures to.</summary>
+    /// <summary>True for the BC1/BC3/BC4/BC5 block formats the loader compresses material textures
+    /// to.</summary>
     public static bool IsBcFormat(Format f) => f switch
     {
         Format.BC1RgbUnormBlock or Format.BC1RgbSrgbBlock or Format.BC1RgbaUnormBlock or Format.BC1RgbaSrgbBlock
@@ -499,8 +300,8 @@ public unsafe class Texture : IDisposable
         _                                           => Features.TextureCompression.BcMode.Bc1,
     };
 
-    /// <summary>Uncompressed RGBA8 fallback for a BC format, used when textureCompressionBC is absent.
-    /// Preserves the sRGB-ness so colour textures still decode correctly.</summary>
+    /// <summary>Uncompressed RGBA8 fallback for a BC format, used when textureCompressionBC is
+    /// absent. Preserves the sRGB-ness so colour textures still decode correctly.</summary>
     public static Format BcFallbackFormat(Format f) => f switch
     {
         Format.BC1RgbSrgbBlock or Format.BC1RgbaSrgbBlock or Format.BC3SrgbBlock => Format.R8G8B8A8Srgb,
@@ -508,12 +309,12 @@ public unsafe class Texture : IDisposable
     };
 
     /// <summary>
-    /// Uploads raw RGBA pixel data, then GPU-compresses it to <paramref name="bcFormat"/> (Bc1/3/4/5)
-    /// via <see cref="Features.TextureCompression.BcEncoder"/>. Flow: stage RGBA8 -> blit-generate the
-    /// mip chain (uncompressed, as for any texture) -> compute-encode each mip into a packed buffer ->
-    /// copy the blocks into the BC image. The source is read raw-UNORM so the BC image carries the
-    /// sRGB-ness for the final sample (no double decode). Two single-time submits: the queue-idle
-    /// between them makes the mip chain visible to the encoder without a cross-stage barrier.
+    /// Uploads raw RGBA pixels, then GPU-compresses them to <paramref name="bcFormat"/> through
+    /// <see cref="Features.TextureCompression.BcEncoder"/>. Stages RGBA8, blit-generates the mip
+    /// chain uncompressed, compute-encodes each mip into a packed buffer, then copies the blocks
+    /// into the BC image. The source is read raw-UNORM so the BC image carries the sRGB-ness for
+    /// the final sample and nothing decodes twice. Two single-time submits: the queue idle between
+    /// them makes the mip chain visible to the encoder without a cross-stage barrier.
     /// </summary>
     public static Texture CreateCompressedTexture(GraphicsDevice gfx,
         Features.TextureCompression.BcEncoder encoder, byte* pixels,
