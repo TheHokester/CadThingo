@@ -255,6 +255,7 @@ public unsafe class FrameGraph : IDisposable
 
         // readers[(res, ver)] = every pass that READS exactly that version. Drives WAR:
         // a write that bumps to v must wait for all readers of v-1.
+        //maps to the pass index the edge is formed with
         var readers = new Dictionary<(int res, int ver), List<int>>();
         for (int p = 0; p < n; p++)
             foreach (var rd in _passes[p].Reads)
@@ -345,7 +346,7 @@ public unsafe class FrameGraph : IDisposable
         for (int p = 0; p < n; p++) if (live[p]) liveCount++;
         if (_executionOrder.Count != liveCount)
             throw new InvalidOperationException(
-                "FrameGraph: cycle detected among live passes — the version ledger produced a back-edge.");
+                "FrameGraph: cycle detected among live passes - the version ledger produced a back-edge.");
 
         _live = live;                  // kept for ToDot
         _culledCount = n - liveCount;
