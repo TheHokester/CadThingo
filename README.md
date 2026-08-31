@@ -1,5 +1,8 @@
 # CadThingo
 
+[![CI](https://github.com/TheHokester/CadThingo/actions/workflows/ci.yml/badge.svg)](https://github.com/TheHokester/CadThingo/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A Vulkan renderer and engine written from scratch in C# (.NET 10) on top of
 [Silk.NET](https://github.com/dotnet/Silk.NET). It runs six rendering techniques over one scene
 representation: a deferred PBR pipeline, forward+, and four ray-traced modes ranging from a
@@ -120,7 +123,7 @@ Shaders are authored in [Slang](https://github.com/shader-slang/slang). Shared m
 spec-constant ids all come back from reflection.
 
 Compilation happens at runtime through `slang.dll`, with SPIR-V and reflection disk-cached under
-`Assets/ShaderCache/` keyed on source hashes. The first run on a clean clone compiles all 39 kernels
+`Assets/ShaderCache/` keyed on source hashes. The first run on a clean clone compiles every kernel
 in a few seconds; later runs load from cache. Edit a shader and run.
 
 Because the build never sees a shader, a syntax error would otherwise surface as a runtime crash.
@@ -130,8 +133,11 @@ Because the build never sees a shader, a syntax error would otherwise surface as
 dotnet run --project CadThingo -- --shader-audit
 ```
 
-It compiles and reflects every kernel headlessly with no device, and reports failures, cross-kernel
-binding drift, and a matrix-layout regression guard. `0 col-major` is the expected result.
+It brings up no device, compiles and reflects all 30 kernel configurations in the manifest, and
+reports failures, cross-kernel binding drift, and a matrix-layout regression guard. `0 col-major` is
+the expected result. A compile failure or a col-major regression exits non-zero, which is what CI
+gates on; drift is printed without failing, because one parameter name at different bindings in
+different pipelines is legal.
 
 ---
 
@@ -181,7 +187,8 @@ dotnet run --project CadThingo -- --slang-smoke    # exercise the Slang interop 
 ```
 
 Unsafe blocks are enabled across both projects for Vulkan interop and ECS pointer arithmetic. There
-are no automated tests; `--shader-audit` is the closest thing to one.
+are no automated tests; `--shader-audit` is the closest thing to one, and CI runs it on every push
+and pull request against a pinned standalone Slang build.
 
 ---
 
@@ -220,3 +227,10 @@ Under active development. Current direction:
 - Implement scene ray casting for object picking through a dedicated compute dispatch.
 
 Lighting is tiled rather than clustered, a deliberate choice for the scene sizes in use.
+
+---
+
+## License
+
+[MIT](LICENSE). Sample models and HDR environments under `Assets/` carry their own licenses and are
+not covered by it.

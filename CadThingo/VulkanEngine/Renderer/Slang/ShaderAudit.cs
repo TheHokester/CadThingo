@@ -12,7 +12,8 @@ namespace CadThingo.VulkanEngine.Renderer.Slang;
 //      and no longer catchable by diffing against a build-time .spv;
 //   3. a cross-kernel drift table - parameter names declared at DIFFERENT (set, binding) or
 //      with different types across kernels, i.e. the inconsistency catalog SceneBindings unifies.
-// Log-only by design: nothing throws.
+// Nothing throws; a broken kernel or a matrix-layout regression comes back as exit code 1 so CI
+// can gate on it.
 //
 // The manifest is hand-kept: a new kernel needs an entry here (with its entry points,
 // capabilities and any -D variants) or the audit will not cover it.
@@ -81,7 +82,10 @@ public static class ShaderAudit
         new("WavefrontPathTracer/TailMegakernel", Compute, None, RayQuery),
     ];
 
-    public static void Run()
+    /// <summary>Runs the audit and returns a process exit code: 0 when every kernel compiled with
+    /// row-major matrices, 1 otherwise. Drift is reported but does not fail, because the same name
+    /// at different bindings across pipelines is legal.</summary>
+    public static int Run()
     {
         using var library = ShaderLibrary.CreateDefault();
         var log = new StringBuilder();
@@ -145,5 +149,7 @@ public static class ShaderAudit
                           $"({cached} from cache), {failed} failed, {drifting} drifting parameter names, " +
                           $"{colMajorKernels} col-major (matrix-layout regression if >0)");
         Console.Write(log.ToString());
+
+        return failed > 0 || colMajorKernels > 0 ? 1 : 0;
     }
 }
