@@ -581,27 +581,20 @@ public unsafe sealed class IblSystem : IIblProvider, ISelfRegisteringFeature<Ibl
     /// </summary>
     internal void TryAutoLoadEnvironment()
     {
-        string[] candidates =
-        {
-            System.IO.Path.Combine(System.AppContext.BaseDirectory, "Assets", "Textures"),
-            @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Textures",
-        };
+        string dir = System.IO.Path.Combine(ProjectPaths.Assets, "Textures");
+        if (!System.IO.Directory.Exists(dir)) return;
 
-        foreach (var dir in candidates)
+        var files = System.IO.Directory.GetFiles(dir, "*.hdr", System.IO.SearchOption.TopDirectoryOnly);
+        if (files.Length == 0) return;
+
+        try
         {
-            if (!System.IO.Directory.Exists(dir)) continue;
-            var files = System.IO.Directory.GetFiles(dir, "*.hdr", System.IO.SearchOption.TopDirectoryOnly);
-            if (files.Length == 0) continue;
-            try
-            {
-                LoadEnvironmentHdr(files[0]);
-                System.Console.WriteLine($"Auto-loaded IBL environment: {System.IO.Path.GetFileName(files[0])}");
-                return;
-            }
-            catch (System.Exception e)
-            {
-                System.Console.WriteLine($"Auto-load failed for {files[0]}: {e.Message}");
-            }
+            LoadEnvironmentHdr(files[0]);
+            System.Console.WriteLine($"Auto-loaded IBL environment: {System.IO.Path.GetFileName(files[0])}");
+        }
+        catch (System.Exception e)
+        {
+            System.Console.WriteLine($"Auto-load failed for {files[0]}: {e.Message}");
         }
     }
 

@@ -376,14 +376,7 @@ public static class RendererSettingsPanel
 
     static void RefreshHdrList(Renderer.Renderer renderer)
     {
-        // Assets path is relative to the project layout — same convention the
-        // renderer uses for the rest of its asset lookups.
-        string dir = Path.Combine(AppContext.BaseDirectory, "Assets", "Textures");
-        if (!Directory.Exists(dir))
-        {
-            // Fall back to the source-tree location when running uninstalled.
-            dir = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Textures";
-        }
+        string dir = Path.Combine(ProjectPaths.Assets, "Textures");
         if (Directory.Exists(dir))
         {
             _hdrFiles  = Directory.GetFiles(dir, "*.hdr", SearchOption.TopDirectoryOnly);

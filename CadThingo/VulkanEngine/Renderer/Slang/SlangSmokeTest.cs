@@ -147,9 +147,7 @@ public static unsafe class SlangSmokeTest
         // step 10: SceneBindings foundations (Phase B). Sandbox library: the real
         // SceneBindings module copied to the temp lib dir; its imports (CommonTypes,
         // PTUtils) resolve via the real shader dir as an extra include path.
-        string engineShaders = Path.Combine(AppContext.BaseDirectory, "VulkanEngine", "Shaders");
-        if (!Directory.Exists(engineShaders))
-            engineShaders = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\VulkanEngine\Shaders";
+        string engineShaders = Path.Combine(ProjectPaths.Engine, "Shaders");
         File.Copy(Path.Combine(engineShaders, "SceneBindings.slang"),
                   Path.Combine(tempRoot, "SceneBindings.slang"), overwrite: true);
         File.WriteAllText(Path.Combine(tempRoot, "DeadStripProbe.slang"), """

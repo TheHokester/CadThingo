@@ -51,16 +51,8 @@ public static unsafe class FileBrowserPanel
     /// <summary>Returns the default directory the file picker opens to.</summary>
     static string InitialDirectory()
     {
-        // App-relative Assets folder first (Debug/net*/Assets/Models when running
-        // out of bin/), falling back to the source tree the rest of the codebase
-        // already hardcodes for the HDR picker.
-        string app = Path.Combine(AppContext.BaseDirectory, "Assets", "Models");
-        if (Directory.Exists(app)) return app;
-
-        string src = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models";
-        if (Directory.Exists(src)) return src;
-
-        return AppContext.BaseDirectory;
+        string models = Path.Combine(ProjectPaths.Assets, "Models");
+        return Directory.Exists(models) ? models : AppContext.BaseDirectory;
     }
 
     /// <summary>Opens the native file picker and loads the chosen file as a new entry.</summary>

@@ -21,23 +21,10 @@ public sealed class ShaderLibrary : IDisposable
         _cache = new ShaderCache(cacheDir);
     }
 
-    // Two-step resolution: content next to the executable first, source tree fallback so
-    // running from bin without a copy step works.
-    public static ShaderLibrary CreateDefault()
-    {
-        string engine = Path.Combine(AppContext.BaseDirectory, "VulkanEngine");
-        if (!Directory.Exists(engine))
-            engine = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\VulkanEngine";
-
-        string assets = Path.Combine(AppContext.BaseDirectory, "Assets");
-        if (!Directory.Exists(assets))
-            assets = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets";
-
-        return new ShaderLibrary(
-            Path.Combine(engine, "Shaders"),
-            Path.Combine(engine, "Renderer", "Features"),
-            Path.Combine(assets, "ShaderCache"));
-    }
+    public static ShaderLibrary CreateDefault() =>
+        new(Path.Combine(ProjectPaths.Engine, "Shaders"),
+            Path.Combine(ProjectPaths.Engine, "Renderer", "Features"),
+            Path.Combine(ProjectPaths.Assets, "ShaderCache"));
 
     public ShaderProgram GetProgram(in ShaderCompileRequest request)
     {
