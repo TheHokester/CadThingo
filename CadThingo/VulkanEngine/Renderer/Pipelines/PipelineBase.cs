@@ -1,5 +1,5 @@
 using CadThingo.VulkanEngine.Renderer.Descriptors;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Pipelines;
@@ -22,14 +22,11 @@ namespace CadThingo.VulkanEngine.Renderer.Pipelines;
 
 public abstract unsafe class PipelineBase : IDisposable
 {
-    // Reference back to the renderer — concrete pipelines still reach renderer-owned
-    // technique/scene data through it (IBL views, light SSBOs, g-buffers, the probe
-    // system, per-frame scene packing). That residual coupling is what L2/L3 remove.
-    protected readonly Renderer Renderer;
+    
 
     // The injected device-services channel. Anything RHI, descriptor, or shader related goes
-    // through these three handles rather than the Renderer god object; Renderer above stays
-    // only for the technique/scene reaches that have no other home yet.
+    // through these three handles. Technique and scene data arrive from the owning feature, either
+    // at construction or at record time.
     protected readonly GpuContext Gpu;
 
     protected GraphicsDevice     Gfx      => Gpu.Gfx;
@@ -65,6 +62,12 @@ public abstract unsafe class PipelineBase : IDisposable
 
     public Pipeline                  Handle    => PipelineHandle;
     public PipelineLayout            Layout    => PipelineLayoutHandle;
+    
+    
+    protected PipelineBase(in GpuContext gpu)
+    {
+        Gpu = gpu;
+    }
 
     public DescriptorSet GetDescriptorSet(int layoutNum, uint frame) => DescriptorSets[layoutNum][frame];
     public abstract PipelineBindPoint BindPoint { get; }
@@ -202,11 +205,7 @@ public abstract unsafe class PipelineBase : IDisposable
         return 0;
     }
 
-    protected PipelineBase(in GpuContext gpu, Renderer renderer)
-    {
-        Gpu = gpu;
-        Renderer = renderer;
-    }
+    
 
     // Called once by the owner (Renderer) after construction. Each step is a
     // virtual hook so concrete pipelines slot in their own logic without

@@ -7,7 +7,7 @@ public abstract unsafe class GraphicsPipeline : PipelineBase
 {
     public override PipelineBindPoint BindPoint => PipelineBindPoint.Graphics;
 
-    protected GraphicsPipeline(in GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    protected GraphicsPipeline(in GpuContext gpu) : base(gpu) { }
 
     protected abstract Format[] ColorAttachmentFormats  { get; }
 

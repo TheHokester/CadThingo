@@ -19,7 +19,7 @@ public class Engine
 
 
     //Renderer, Singleton?
-    public static Renderer.Renderer renderer;
+    public static Renderer.Renderer renderer {get; private set;}
     //singleton event bus that all systems can subscribe to
     public static EventBus EventBus = new();
 
@@ -47,6 +47,11 @@ public class Engine
     }
     public void Start()
     {
+        // Claim event delivery for this thread before anything can subscribe. Everything the bus
+        // dispatches to touches Vulkan, ImGui or the scene, so a publish from the resource
+        // worker has to be queued and drained here rather than run where it was raised.
+        EventBus.BindToCurrentThread();
+
         var options = WindowOptions.Default;
 
         options.API = GraphicsAPI.DefaultVulkan;

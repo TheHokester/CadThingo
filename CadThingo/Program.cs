@@ -1,4 +1,5 @@
 ﻿using CadThingo.VulkanEngine;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 
@@ -13,14 +14,15 @@ using Silk.NET.Windowing;
 public class Program
 {
     private static IWindow? window;
-    private static void Main(string[] args)
+    private static int Main(string[] args)
     {
         // Headless developer tools: compile + reflect every kernel, or exercise the Slang
-        // interop, without bringing up a device.
-        if (args.Contains("--shader-audit")) { VulkanEngine.Renderer.Shaders.ShaderAudit.Run(); return; }
-        if (args.Contains("--slang-smoke")) { VulkanEngine.Renderer.Shaders.SlangSmokeTest.Run(); return; }
+        // interop, without bringing up a device. The audit's exit code is what CI gates on.
+        if (args.Contains("--shader-audit")) return ShaderAudit.Run();
+        if (args.Contains("--slang-smoke")) { SlangSmokeTest.Run(); return 0; }
 
         var app = new Engine();
         app.Run();
+        return 0;
     }
 }

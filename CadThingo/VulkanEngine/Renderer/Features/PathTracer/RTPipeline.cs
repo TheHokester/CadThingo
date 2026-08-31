@@ -1,9 +1,10 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -30,6 +31,10 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 //  machinery unchanged. Later ReSTIR phases extend it with reservoir buffers + reuse passes.
 public unsafe class RTPipeline : RtPipeline
 {
+    
+    private IIblProvider _ibl;
+    private IPathTracingProvider _pt;
+    
     // Matches PathTraceRT.slang / PTComputePipeline PathFrameUBO byte-for-byte.
     [StructLayout(LayoutKind.Sequential)]
     private struct PathFrameUBO
@@ -100,7 +105,11 @@ public unsafe class RTPipeline : RtPipeline
     private uint _accumSamples;
     private bool _accumDirty = true;
 
-    public RTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public RTPipeline(GpuContext gpu, IIblProvider ibl, IPathTracingProvider pt) : base(gpu)
+    {
+        _ibl = ibl;
+        _pt  = pt;
+    }
 
     public void MarkAccumulatorDirty() => _accumDirty = true;
     public uint CurrentSampleCount => _accumSamples;
@@ -211,12 +220,6 @@ public unsafe class RTPipeline : RtPipeline
 
     private static uint AlignUp(uint v, uint a) => (v + a - 1) & ~(a - 1);
 
-    private ulong BufferDeviceAddress(Buffer buf)
-    {
-        var info = new BufferDeviceAddressInfo { SType = StructureType.BufferDeviceAddressInfo, Buffer = buf };
-        return Vk.GetBufferDeviceAddress(Device, &info);
-    }
-
     // Packs the 3 group handles into [raygen][miss][hit] regions per the SBT
     // alignment rules (each region base-aligned, handles handle-aligned; raygen
     // size must equal its stride).
@@ -257,7 +260,7 @@ public unsafe class RTPipeline : RtPipeline
             System.Buffer.MemoryCopy(pHandles + 2u * handleSize, sbt + _raygenRegion.Size + _missRegion.Size,              handleSize, handleSize);
         }
 
-        ulong baseAddr = BufferDeviceAddress(_sbtBuffer);
+        ulong baseAddr = Gfx.GetBufferDeviceAddress(_sbtBuffer);
         _raygenRegion.DeviceAddress = baseAddr;
         _missRegion.DeviceAddress   = baseAddr + _raygenRegion.Size;
         _hitRegion.DeviceAddress    = baseAddr + _raygenRegion.Size + _missRegion.Size;
@@ -298,14 +301,14 @@ public unsafe class RTPipeline : RtPipeline
             screenSize               = new Vector2(renderExtent.Width, renderExtent.Height),
             fov                      = fovRad,
             tanHalfFov               = tanHalfFov,
-            prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels,
+            prefilteredCubeMipLevels = _ibl.PrefilteredCubeMipLevels,
             scaleIBLAmbient          = EditorState.IblIntensity,
             focusDistance            = FocusDistance,
             aperture                 = Aperture,
             paniniDistance           = 1.0f,
             verticalCompression      = 0.0f,
-            emissiveTriCount         = Renderer.EmissiveTriangleCount,
-            totalEmissivePower       = Renderer.TotalEmissivePower,
+            emissiveTriCount         = _pt.EmissiveTriangleCount,
+            totalEmissivePower       = _pt.TotalEmissivePower,
         };
         return reset;
     }
@@ -326,7 +329,7 @@ public unsafe class RTPipeline : RtPipeline
     // CreateDescriptorSetLayouts (PushConstantRanges) so the pipeline layout includes it.
     protected virtual void RecordPushConstants(CommandBuffer cmd) { }
 
-    public void Record(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void Record(CommandBuffer cmd, in RenderView ctx)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.RayTracingKhr, PipelineHandle);
 

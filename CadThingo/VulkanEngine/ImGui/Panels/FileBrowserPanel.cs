@@ -40,9 +40,8 @@ internal sealed unsafe class LoadedSceneFile
 }
 
 /// <summary>
-/// File browser / scene loader. Replaces the hardcoded <c>GltfLoader.Load</c>
-/// calls that used to live in <c>Renderer_Core.CreateTestEntity</c>. Listens
-/// for File → Open in the main menu (or the Browse button on the panel).
+/// File browser and scene loader, and the only path that calls <c>GltfLoader.Load</c>. Listens for
+/// File / Open in the main menu, and for the Browse button on the panel.
 /// </summary>
 public static unsafe class FileBrowserPanel
 {
@@ -52,16 +51,8 @@ public static unsafe class FileBrowserPanel
     /// <summary>Returns the default directory the file picker opens to.</summary>
     static string InitialDirectory()
     {
-        // App-relative Assets folder first (Debug/net*/Assets/Models when running
-        // out of bin/), falling back to the source tree the rest of the codebase
-        // already hardcodes for the HDR picker.
-        string app = Path.Combine(AppContext.BaseDirectory, "Assets", "Models");
-        if (Directory.Exists(app)) return app;
-
-        string src = @"C:\Users\jamie\RiderProjects\CadThingo\CadThingo\Assets\Models";
-        if (Directory.Exists(src)) return src;
-
-        return AppContext.BaseDirectory;
+        string models = Path.Combine(ProjectPaths.Assets, "Models");
+        return Directory.Exists(models) ? models : AppContext.BaseDirectory;
     }
 
     /// <summary>Opens the native file picker and loads the chosen file as a new entry.</summary>
@@ -252,8 +243,9 @@ public static unsafe class FileBrowserPanel
         // RebuildTlas now skips !IsActive entities, so a visibility toggle
         // genuinely removes them from the ray-traced shadow set after the next
         // TLAS flush. PT accumulator restarts because the lit scene changed.
-        Engine.renderer?.MarkAccumulatorDirty();
-        Engine.renderer?.MarkTlasDirty();
+        // Both of those are what SceneDirtyEvent means, so the panel states the
+        // fact and leaves the renderer to decide what it invalidates.
+        Engine.EventBus.PublishEvent(new SceneDirtyEvent());
     }
 
     static void Detach(LoadedSceneFile f)

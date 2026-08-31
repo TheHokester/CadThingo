@@ -1,12 +1,12 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.Forward;
-using CadThingo.VulkanEngine.Renderer.Features.IBL;   // ReflectionProbeSystem, ProbeGpuRecord
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
+using CadThingo.VulkanEngine.Renderer.Slang; // ReflectionProbeSystem, ProbeGpuRecord
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
@@ -15,6 +15,9 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 //  per-tile light list, optional ray-queried shadows.
 public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
 {
+    
+    IIblProvider? _ibl;
+    IReflectionProbeProvider? _reflProbes;
     // Matches PBR.slang's LightingFrameUBO - pushed into the scene set's (0,0)
     // constant arena slot each frame.
     [StructLayout(LayoutKind.Sequential)]
@@ -72,9 +75,13 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     /// <see cref="PipelineBase.Rebuild"/> to apply a change.</summary>
     public bool SoftShadowsEnabled { get; set; } = true;
 
-    public PbrDeferredPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public PbrDeferredPipeline(GpuContext gpu, IIblProvider ibl, IReflectionProbeProvider reflProbes) : base(gpu)
+    {
+        _ibl = ibl;
+        _reflProbes = reflProbes;
+    }
 
-    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, ImageView HdrTarget, DescriptorSet gBufferSet)
+    internal void Record(CommandBuffer cmd, in RenderView ctx, ImageView HdrTarget, DescriptorSet gBufferSet)
     {
         //configure single color output for final lighting result
 
@@ -138,11 +145,11 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
         DepthBiasEnable         = false,
     };
 
-    // The g-buffer sampler is baked into every set-1 image binding as an IMMUTABLE sampler, so the
+    // The point sampler is baked into every set-1 image binding as an IMMUTABLE sampler, so the
     // graph writes only the views - no sampler plumbing, no update-after-bind. The tile buffers
     // are storage buffers and take none.
     protected override Sampler? ImmutableSamplerFor(in BindingDesc binding)
-        => binding.Type == DescriptorType.CombinedImageSampler ? Renderer.gBufferSampler : null;
+        => binding.Type == DescriptorType.CombinedImageSampler ? Gfx.Samplers.PointClamp : null;
 
     protected override SpecValues? Specialization =>
         new SpecValues().Set("SOFT_SHADOWS", SoftShadowsEnabled);
@@ -158,42 +165,42 @@ public sealed unsafe class PbrDeferredPipeline : GraphicsPipeline
     }
 
     // Per-frame upload
-    // Walks scene lights into the per-frame Light SSBO and stages the frame
-    // constants for Record's arena push. Returns (lightCount, tileX, tileY) so
-    // the renderer can drive the light-cull dispatch without recomputing.
+    // Stages the frame constants for Record's arena push. Takes the light count the draw loop's
+    // extraction already produced - packing the light SSBO is not this pipeline's job. Returns
+    // (tileX, tileY) so the caller can drive the light-cull dispatch without recomputing.
 
-    public (uint lightCount, uint tileCountX, uint tileCountY) UpdatePerFrame(
-        uint frameIndex, Camera camera, Scene scene)
+    public (uint tileCountX, uint tileCountY) UpdatePerFrame(
+        RenderView f)
     {
-        // Lights SSBO is renderer-owned; this just refreshes its contents from
-        // the current scene. Other rendering paths call the same method.
-        uint count = Renderer.UpdateLights(frameIndex, scene);
-
-        uint tileX = (Renderer.renderExtent.Width  + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
-        uint tileY = (Renderer.renderExtent.Height + Renderer.TILE_SIZE - 1) / Renderer.TILE_SIZE;
+        var camera = f.Camera;
+        var renderExtent = f.RenderExtent;
+        var lightCount = f.LightCount;
+        
+        uint tileX = (renderExtent.Width  + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
+        uint tileY = (renderExtent.Height + RenderConfig.TILE_SIZE - 1) / RenderConfig.TILE_SIZE;
 
         LightingFrameUBO ubo = new();
         ubo.camPos = camera != null ? new Vector4(camera.GetPosition(), 1.0f) : new Vector4(2, 2, 2, 1);
         // Used by PBR.slang to scale roughness into the prefiltered mip chain.
-        // Renderer.Ibl.prefilteredCubeMipLevels is set when IblSystem is constructed
-        // and never changes - IBL bakes overwrite content, not metadata.
-        ubo.prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels;
+        // Read from the IBL provider every frame rather than cached: it is fixed today (bakes
+        // overwrite content, not metadata) but a stale copy would be silent if that ever changed.
+        ubo.prefilteredCubeMipLevels = _ibl.PrefilteredCubeMipLevels;
         ubo.scaleIBLAmbient = EditorState.IblIntensity;
-        ubo.lightCount = count;
+        ubo.lightCount = lightCount;
         ubo.tileCountX = tileX;
         ubo.tileCountY = tileY;
-        ubo.screenSize = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height);
+        ubo.screenSize = new Vector2(renderExtent.Width, renderExtent.Height);
 
         // Probe cluster dims — the cluster grid is rebuilt earlier in DrawFrame
         // with the same tile counts so its dims always match the lighting tile grid.
-        var grid = Renderer.reflectionProbeSystem.clusterGrid;
+        var grid = _reflProbes.ClusterGrid;
         ubo.probeClusterDimsX = grid.DimsX;
         ubo.probeClusterDimsY = grid.DimsY;
         ubo.probeClusterDimsZ = grid.DimsZ;
-        ubo.probeMipLevels    = ReflectionProbeSystem.ProbeMipLevels;
+        ubo.probeMipLevels    = _reflProbes.ProbeMipLevels;
 
         _frameUbo = ubo;
 
-        return (count, tileX, tileY);
+        return (tileX, tileY);
     }
 }

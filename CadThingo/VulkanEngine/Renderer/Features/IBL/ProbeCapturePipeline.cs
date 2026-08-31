@@ -1,7 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -12,10 +12,11 @@ namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
 /// attached cube image via <c>viewMask = 0x3F</c>; the vertex shader picks the
 /// matching per-face VP matrix using <c>SV_ViewID</c>.
 ///
-/// Reuses the bindless materials/instances/textures/samplers layout owned by
-/// <see cref="ResourceManager"/> so the per-frame descriptor bind is identical
-/// to the geometry pass. Set 0 is a private per-frame UBO carrying the 6 view
-/// matrices + projection.
+/// Consumes the registry's scene set for materials/instances/textures/samplers, so
+/// the per-frame descriptor bind is identical to the geometry pass and this pipeline
+/// owns no descriptor sets of its own. The 6 view matrices + projection ride the scene
+/// set's (0,0) dynamic constant slot: ReflectionProbeSystem pushes a <see cref="CaptureUbo"/>
+/// into the PassConstantArena per capture and binds with the returned dynamic offset.
 /// </summary>
 public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
 {
@@ -46,9 +47,7 @@ public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
         public uint Pad2;
     }
 
-    private UboBuffer[] _ubos = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
-
-    public ProbeCapturePipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
+    public ProbeCapturePipeline(GpuContext gpu) : base(gpu)
     {
         // Matches the capture depth attachment created by ReflectionProbeSystem.
         DepthAttachmentFormat = Format.D32Sfloat;
@@ -90,104 +89,20 @@ public sealed unsafe class ProbeCapturePipeline : GraphicsPipeline
 
     protected override void CreateDescriptorSetLayouts()
     {
-        // Set 0 — private per-frame UBO.
-        DescriptorSetLayoutBinding uboBinding = new()
-        {
-            Binding         = 0,
-            DescriptorType  = DescriptorType.UniformBuffer,
-            DescriptorCount = 1,
-            StageFlags      = ShaderStageFlags.VertexBit,
-        };
-        DescriptorSetLayoutCreateInfo set0Info = new()
-        {
-            SType        = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 1,
-            PBindings    = &uboBinding,
-        };
-        if (Vk.CreateDescriptorSetLayout(Device, &set0Info, null, out var set0) != Result.Success)
-            throw new Exception("Failed to create probe capture descriptor set layout 0");
 
-        DescriptorSetLayouts = new[] { set0, Engine.ResourceManager.GetBindlessLayout() };
-        OwnedDescriptorSetLayoutIndices = new[] { 0 };
-
-        PushConstantRanges = new[]
-        {
-            new PushConstantRange
-            {
-                StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
-                Offset     = 0,
-                Size       = (uint)sizeof(CapturePushConst),
-            },
-        };
+        DescriptorSetLayouts = Registry.BuildPipelineSetLayouts(passSet: null);
+        OwnedDescriptorSetLayoutIndices = [];
+    
     }
 
     protected override void CreateResources()
     {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Gfx.CreateMappedUniformBuffer(sizeof(CaptureUbo), ref _ubos[i]);
-    }
-
-    protected override void CreateDescriptorSets()
-    {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
-
-        DescriptorSetAllocateInfo alloc = new()
+        var reflected = PushConstantRanges[0].Size;
+        if (reflected != (uint)sizeof(CapturePushConst))
         {
-            SType              = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts        = layouts,
-        };
-        DescriptorSets = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
-        fixed (DescriptorSet* p = DescriptorSets[0])
-        {
-            if (Vk.AllocateDescriptorSets(Device, &alloc, p) != Result.Success)
-                throw new Exception("Failed to allocate probe capture descriptor sets");
+            throw new Exception(
+                $"CapturePushConst is {sizeof(CapturePushConst)} bytes but ProbeCapture.slang " +
+                $"reflects {reflected}");
         }
     }
-
-    protected override void WriteDescriptors()
-    {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo bufInfo = new()
-            {
-                Buffer = _ubos[i].buffer,
-                Offset = 0,
-                Range  = (ulong)sizeof(CaptureUbo),
-            };
-            WriteDescriptorSet write = new()
-            {
-                SType           = StructureType.WriteDescriptorSet,
-                DstSet          = DescriptorSets[0][i],
-                DstBinding      = 0,
-                DstArrayElement = 0,
-                DescriptorType  = DescriptorType.UniformBuffer,
-                DescriptorCount = 1,
-                PBufferInfo     = &bufInfo,
-            };
-            Vk.UpdateDescriptorSets(Device, 1, &write, 0, null);
-        }
-    }
-
-    public override void Dispose()
-    {
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
-            Gfx.DestroyBuffer(_ubos[i].buffer, _ubos[i].alloc);
-        base.Dispose();
-    }
-
-
-    /// <summary>
-    /// Uploads <paramref name="ubo"/> into the frame slot's mapped UBO. Cheap
-    /// (~448B host write, host-coherent so no flush needed).
-    /// </summary>
-    public void WriteUbo(uint frameIndex, in CaptureUbo ubo)
-    {
-        *(CaptureUbo*)_ubos[frameIndex].mapped = ubo;
-    }
-
-    public DescriptorSet GetFrameSet(uint frameIndex) => DescriptorSets[0][frameIndex];
 }

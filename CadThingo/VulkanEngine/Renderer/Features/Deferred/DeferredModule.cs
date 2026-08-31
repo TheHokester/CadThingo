@@ -1,11 +1,10 @@
-using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using CadThingo.VulkanEngine.Renderer.Features.Forward;
 using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using Silk.NET.Vulkan;
 using HostRenderer = CadThingo.VulkanEngine.Renderer.Renderer;
-using FrameContext = CadThingo.VulkanEngine.Renderer.Renderer.FrameContext;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 
@@ -25,7 +24,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
 public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, DeferredModule.Outputs>
 {
     
-    public readonly record struct Inputs(ImageResource FinalColor, Extent2D Extent);
+    public readonly record struct Inputs(Buffer[] renderablesBuffers, ImageResource FinalColor, Extent2D Extent);
 
     public readonly record struct Outputs(
         GraphImage Position, GraphImage Normal, GraphImage Albedo, GraphImage Material,
@@ -84,15 +83,15 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
         // Per-frame compute-output buffers, imported so the graph derives the cull->geometry
         // and light-cull->lighting barriers + ordering. Renderables is the cull INPUT, imported
         // too so it can fill the cull pass set's binding 0 (matched by name below).
-        var renderablesF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var indirectCmdF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var indirectCountF = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var instanceF      = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var tileCountF     = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        var tileIndicesF   = new Buffer[HostRenderer.MAX_CONCURRENT_FRAMES];
-        for (uint i = 0; i < HostRenderer.MAX_CONCURRENT_FRAMES; i++)
+        var renderablesF   = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var indirectCmdF   = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var indirectCountF = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var instanceF      = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var tileCountF     = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var tileIndicesF   = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (uint i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
-            renderablesF[i]   = _cull.GetRenderablesBuffer(i);
+            renderablesF[i]   = inputs.renderablesBuffers[i];
             indirectCmdF[i]   = _cull.GetIndirectCmdBuffer(i);
             indirectCountF[i] = _cull.GetIndirectCountBuffer(i);
             instanceF[i]      = Engine.ResourceManager.GetInstanceBuffer(i);
@@ -119,8 +118,8 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 instance      = b.Write(instance,      ResourceUsage.StorageWriteCompute, "instanceData");
                 indirectCount = b.Write(indirectCount, ResourceUsage.StorageWriteCompute, "indirectCount");
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
-                _cull.Record(cmd, f.FrameIndex, f.Camera, res.PassSet));
+            (CommandBuffer cmd, PassResources res, in RenderView f) =>
+                _cull.Record(cmd, f, res.PassSet));
 
         // Light-cull (compute): bins lights into the per-tile lists the lighting FS reads.
         // Tile/light counts are computed in DeferredCore.Render and read back via _lightCullParams.
@@ -132,10 +131,10 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 tileCount   = b.Write(tileCount,   ResourceUsage.StorageWriteCompute, "tileLightCount");
                 tileIndices = b.Write(tileIndices, ResourceUsage.StorageWriteCompute, "tileLightIndices");
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+            (CommandBuffer cmd, PassResources res, in RenderView f) =>
             {
                 var (lightCount, tileCountX, tileCountY) = _lightCullParams();
-                _lightCull.Record(cmd, f.FrameIndex, f.Camera, lightCount, tileCountX, tileCountY, res.PassSet);
+                _lightCull.Record(cmd, f, lightCount, tileCountX, tileCountY, res.PassSet);
             });
 
         // Geometry -> g-buffers + depth. Reads the post-cull indirect buffers (IndirectArg) +
@@ -153,7 +152,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 emissive = b.Write(emissive, ResourceUsage.ColorAttachment);
                 depth    = b.Write(depth,    ResourceUsage.DepthAttachment);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+            (CommandBuffer cmd, PassResources res, in RenderView f) =>
             {
                 var indirectCmdBuf   = _cull.GetIndirectCmdBuffer(f.FrameIndex);
                 var indirectCountBuf = _cull.GetIndirectCountBuffer(f.FrameIndex);
@@ -184,7 +183,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 b.Read(tileIndices, ResourceUsage.StorageReadFragment, "tileLightIndices");
                 hdr = b.Write(hdr, ResourceUsage.ColorAttachment);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+            (CommandBuffer cmd, PassResources res, in RenderView f) =>
                 _pbrDeferred.Record(cmd, f, res.View(hdr), res.PassSet));
 
         // Skybox / Transparent both LOAD HDRColor and depth-test (DepthWriteEnable=false)
@@ -198,7 +197,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 hdr   = b.Write(hdr,   ResourceUsage.ColorAttachment);
                 depth = b.Write(depth, ResourceUsage.DepthAttachment);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+            (CommandBuffer cmd, PassResources res, in RenderView f) =>
                 _skybox.Record(cmd, f, new SkyboxPipeline.Attachments(res.View(hdr), res.View(depth))));
 
         scope.AddPass("TransparentPass", PassType.Graphics, QueueClass.Graphics,
@@ -212,7 +211,7 @@ public sealed class DeferredModule : IGraphModule<DeferredModule.Inputs, Deferre
                 hdr   = b.Write(hdr,   ResourceUsage.ColorAttachment);
                 depth = b.Write(depth, ResourceUsage.DepthAttachment);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+            (CommandBuffer cmd, PassResources res, in RenderView f) =>
                 _transparent.Record(cmd, f, _cull.LastTransparentDraws,
                     new TransparentPipeline.Attachments(res.View(hdr), res.View(depth)), res.PassSet));
 

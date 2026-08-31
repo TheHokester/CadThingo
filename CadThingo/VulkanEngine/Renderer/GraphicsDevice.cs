@@ -35,6 +35,29 @@ public readonly struct MemoryBudgetInfo
     public float Fraction => Budget > 0 ? (float)Usage / Budget : 0f;
 }
 
+
+
+public struct QueueFamilyIndices
+{
+    public QueueFamilyIndices()
+    {
+    }
+    public uint? graphicsFamily { get; set; }
+    public uint? presentFamily { get; set; }
+    public uint? computeFamily { get; set; }
+    public uint? transferFamily { get; set; }//optional
+    public bool IsComplete()
+    {
+        return graphicsFamily.HasValue && presentFamily.HasValue && computeFamily.HasValue;
+    }
+}
+public struct SwapChainSupportDetails
+{
+    public SurfaceCapabilitiesKHR Capabilities;
+    public SurfaceFormatKHR[] Formats;
+    public PresentModeKHR[] PresentModes;
+}
+
 /// <summary>
 /// The Vulkan RHI context - instance, debug messenger, surface, physical/logical
 /// device, queues, the suballocating memory allocator, descriptor pool, and command
@@ -92,9 +115,11 @@ public sealed unsafe class GraphicsDevice : IDisposable
     // maxMemoryAllocationCount per resource. Owned for the lifetime of the device;
     // disposed in Dispose() before vkDestroyDevice so every block frees cleanly.
     private GpuMemoryAllocator memAllocator = null!;
+    private AsDevice          asDevice     = null!;
     private DescriptorPool descriptorPool;
     private CommandPool commandPool;
     private PipelineLayoutCache layoutCache = null!;
+    private SamplerCache        samplerCache = null!;
 
     private bool descriptorIndexEnabled = false;
     private bool robustness2Enabled = false;
@@ -130,8 +155,17 @@ public sealed unsafe class GraphicsDevice : IDisposable
     /// Shared descriptor-set / pipeline layout dedupe plus the one device-level VkPipelineCache.
     /// Created with the logical device; every pipeline builds its layouts through it.
     public PipelineLayoutCache LayoutCache => layoutCache;
+
+    /// Shared samplers, including the engine's two defaults (PointClamp / LinearRepeat). Created
+    /// with the logical device and destroyed with it, so callers never own what they take.
+    public SamplerCache        Samplers       => samplerCache;
     public PhysicalDevice     PhysicalDevice => physicalDevice;
     public GpuMemoryAllocator Allocator      => memAllocator;
+
+    /// Acceleration-structure verbs (create/destroy/build/compact). Grouped as a facet so the
+    /// dozen AS entry points don't flatten onto this surface. Check <c>As.Available</c> before
+    /// use - it is false on a device without VK_KHR_acceleration_structure.
+    public AsDevice            As             => asDevice;
     public DescriptorPool     DescriptorPool => descriptorPool;
     public CommandPool        CommandPool    => commandPool;
     
@@ -216,10 +250,18 @@ public sealed unsafe class GraphicsDevice : IDisposable
         memAllocator = new GpuMemoryAllocator(vk, device, physicalDevice, memoryPriorityEnabled);
         CreateCommandPool();
 
+        // AS verb facet. Loaded whenever the extension itself is enabled - narrower gates (ray
+        // query vs RT pipeline) belong to the subsystems that decide whether to BUILD anything,
+        // not to whether the verbs are callable. Left unloaded (As.Available == false) otherwise.
+        asDevice = new AsDevice(this, vk);
+        if (accelerationStructureEnabled) asDevice.Load(instance, device, physicalDevice);
+
         // Lives next to the build output rather than in Assets: the blob is only valid for this
         // driver + device, so a rebuilt/relocated output legitimately starts cold.
         layoutCache = new PipelineLayoutCache(vk, device, physicalDevice,
             Path.Combine(AppContext.BaseDirectory, "PipelineCache.bin"));
+
+        samplerCache = new SamplerCache(vk, device, physicalDevice);
     }
 
     // Full teardown in reverse-creation order. The orchestrator (Renderer) calls
@@ -230,6 +272,14 @@ public sealed unsafe class GraphicsDevice : IDisposable
         // Shared layouts + the pipeline cache (writes the warm blob back to disk). Runs after the
         // pipelines that borrowed these handles have been disposed, before the device goes away.
         layoutCache?.Dispose();
+
+        // Shared samplers. Must outlive every layout that pinned one as an immutable sampler and
+        // every descriptor set that wrote one, both of which are gone by here.
+        samplerCache?.Dispose();
+
+        // AS dispatch table. Owns no Vulkan objects, so ordering only needs it to outlive the AS
+        // owner's teardown (which destroys its structures through these verbs).
+        asDevice?.Dispose();
 
         // Descriptor pool (frees the descriptor sets owned by the pipelines)
         if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(device, descriptorPool, null);
@@ -1325,6 +1375,20 @@ public sealed unsafe class GraphicsDevice : IDisposable
         EndSingleTimeCommands(cmd);
 
         DestroyBuffer(staging, stagingAlloc);
+    }
+
+    /// <summary>GPU address of a buffer, for the shader-side pointer plumbing that takes addresses
+    /// rather than descriptors (AS build inputs, scratch, SBT). The buffer must have been created
+    /// with ShaderDeviceAddressBit; the allocator already puts the matching allocate flag on every
+    /// buffer block, so the usage bit is the whole contract.</summary>
+    public ulong GetBufferDeviceAddress(Buffer buffer)
+    {
+        var info = new BufferDeviceAddressInfo
+        {
+            SType  = StructureType.BufferDeviceAddressInfo,
+            Buffer = buffer,
+        };
+        return vk.GetBufferDeviceAddress(device, &info);
     }
 
     public void DestroyBuffer(Buffer buffer, SubAlloc alloc)

@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
@@ -38,8 +38,8 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
     //         TileLightIndices[tileIdx*MAX + slot] is the flat index into the
     //         lights SSBO. The lighting passes read both, keyed by
     //         tileIdx = (gl_FragCoord / TILE_SIZE).
-    private UboBuffer[] TileLightCountBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
-    private UboBuffer[] TileLightIndicesBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] TileLightCountBuffers   = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] TileLightIndicesBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     public Buffer GetTileLightCountBuffer  (uint frame) => TileLightCountBuffers[frame].buffer;
     public Buffer GetTileLightIndicesBuffer(uint frame) => TileLightIndicesBuffers[frame].buffer;
@@ -53,7 +53,7 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
     // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
     // still matches the reflected size.
-    public LightCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public LightCullPipeline(GpuContext gpu) : base(gpu) { }
 
     public override void Dispose()
     {
@@ -83,13 +83,13 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
 
         // Tile-cull buffers sized for worst-case tile count (MAX_TILE_COUNT).
         // Per frame: TileLightCount = MAX × 4B, TileLightIndices = MAX × MAX_LIGHTS_PER_TILE × 4B.
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             Gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_TILE_COUNT * sizeof(uint)),
+                (ulong)(RenderConfig.MAX_TILE_COUNT * sizeof(uint)),
                 ref TileLightCountBuffers[i]);
             Gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_TILE_COUNT * Renderer.MAX_LIGHTS_PER_TILE * sizeof(uint)),
+                (ulong)(RenderConfig.MAX_TILE_COUNT * RenderConfig.MAX_LIGHTS_PER_TILE * sizeof(uint)),
                 ref TileLightIndicesBuffers[i]);
         }
     }
@@ -102,11 +102,12 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
     // camera/swapchain extent, pushes them, and dispatches one group per tile.
     // (The compute-write -> fragment-read barrier on the tile buffers is derived
     // by the graph from the LightCullPass Write + the lighting-pass Read.)
-    public void Record(CommandBuffer cmd, uint frameIndex, Camera cam,
+    public void Record(CommandBuffer cmd, RenderView view,
                        uint lightCount, uint tileCountX, uint tileCountY, DescriptorSet tileSet)
     {
         if (tileCountX == 0 || tileCountY == 0) return;
-
+        
+        
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, PipelineHandle);
 
         // The scene-set layout carries the (0,0) dynamic constant slot even
@@ -116,29 +117,29 @@ public sealed unsafe class LightCullPipeline : ComputePipeline
         uint zeroOffset = 0;
         var sets = stackalloc DescriptorSet[2]
         {
-            Registry.SceneSet(frameIndex),
+            Registry.SceneSet(view.FrameIndex),
             tileSet,
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute,
             PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);
 
-        Matrix4x4 view = cam.GetViewMatrix();
-        Matrix4x4 proj = cam.GetProjectionMatrix(
-            (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
+        Matrix4x4 viewMat = view.Camera.GetViewMatrix();
+        Matrix4x4 projMat = view.Camera.GetProjectionMatrix(
+            (float)view.RenderExtent.Width / view.RenderExtent.Height, 0.1f, 100.0f);
         // The lighting fragment shader sees a Y-flipped projection (the geometry
         // pipeline flips proj.M22 in its frame constants). Build invViewProj from
         // the SAME flipped matrix so the cull frustum lines up with where pixels
         // actually sample world positions from the g-buffer.
-        proj.M22 *= -1f;
-        Matrix4x4 vp = view * proj;
+        projMat.M22 *= -1f;
+        Matrix4x4 vp = viewMat * projMat;
         if (!Matrix4x4.Invert(vp, out Matrix4x4 invVP))
             invVP = Matrix4x4.Identity;
 
         var push = new LightCullPushConstants
         {
             InvViewProj = invVP,
-            CamPos      = new Vector4(cam.GetPosition(), 1f),
-            ScreenSize  = new Vector2(Renderer.renderExtent.Width, Renderer.renderExtent.Height),
+            CamPos      = new Vector4(view.Camera.GetPosition(), 1f),
+            ScreenSize  = new Vector2(view.RenderExtent.Width, view.RenderExtent.Height),
             TileCountX  = tileCountX,
             TileCountY  = tileCountY,
             LightCount  = lightCount,

@@ -1,5 +1,8 @@
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -37,22 +40,50 @@ internal struct PcProbePrefilter
 /// Phase-2 status: GPU resources allocated, registry working — but the capture
 /// pass, prefilter dispatch, cluster grid, and shader integration are all
 /// downstream phases.
+///
+/// It is a feature that declares <c>INeedsFeature&lt;IIblProvider&gt;</c>. Probe prefiltering is the
+/// same GGX convolution as the global one, so it drives the IBL feature's kernel and sampler rather
+/// than compiling a second copy. Order 2 - one above IBL - is what makes that legal: descriptor
+/// Order guarantees the provider has finished its own Initialize before this one runs, which is
+/// exactly what the old <c>new ReflectionProbeSystem(gpu, renderer, iblSystem)</c> argument was
+/// standing in for.
 /// </summary>
-public sealed unsafe class ReflectionProbeSystem : IDisposable
+public sealed unsafe class ReflectionProbeSystem
+    : IReflectionProbeProvider, ISelfRegisteringFeature<ReflectionProbeSystem>, INeedsGpu, INeedsFeature<IIblProvider>
 {
+    public static FeatureDesc Desc =>
+        new(Order: 2, Gate: _ => true, Make: () => new ReflectionProbeSystem());
+
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<ReflectionProbeSystem>();
+
+    public string Name => "Reflection probes";
+    
+    public uint MaxProbes => _maxProbes;
+    public uint ProbeFaceSize => _probeFaceSize;
+    public uint ProbeMipLevels => _probeMipLevels;
+    
+    public uint ProbeCount => (uint)_probes.Count;
+    
+    public ProbeClusterGrid ClusterGrid => _clusterGrid;
+    public ProbeCapturePipeline CapturePipeline => capturePipeline!;
     // Hard caps. Bumping MaxProbes resizes the cubemap array (one-time cost at
     // startup); bumping ProbeFaceSize costs 4× VRAM per size step. 16 × 256² is
     // the working default for typical CAD scenes (~67 MB RGBA16F mipped).
-    public const uint MaxProbes     = 16;
-    public const uint ProbeFaceSize = 256;
-    public static readonly uint ProbeMipLevels =
-        (uint)System.Math.Floor(System.Math.Log2(ProbeFaceSize)) + 1;
-    private readonly Renderer _renderer;
-    private readonly GpuContext _gpu;
-    private readonly GraphicsDevice _gfx;
-    private readonly IblSystem _iblSystem;
-    private readonly Vk       _vk;
-    private readonly Device   _device;
+    private const uint _maxProbes     = 16;
+    private const uint _probeFaceSize = 256;
+    private readonly uint _probeMipLevels =
+        (uint)Math.Floor(Math.Log2(_probeFaceSize)) + 1;
+    
+    private GpuContext   _gpu;
+    private IIblProvider _ibl = null!;
+    GpuContext   INeedsGpu.Gpu                        { set => _gpu      = value; }
+    
+    IIblProvider INeedsFeature<IIblProvider>.Dependency { set => _ibl     = value; }
+
+    private GraphicsDevice _gfx    => _gpu.Gfx;
+    private Vk             _vk     => _gpu.Gfx.Vk!;
+    private Device         _device => _gpu.Gfx.Device;
 
     // GPU resources
 
@@ -67,7 +98,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     // Per-probe SSBO. Host-visible mapped so the system can write fresh records
     // each frame (cheap: MaxProbes×32B = 512B). One ring per frame-in-flight
     // because the shader reads it during draw and we'd race a writer otherwise.
-    internal UboBuffer[] probeRecordBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    internal UboBuffer[] probeRecordBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     // Transient capture cube. The scene is rendered into this image with multiview
     // (one draw → 6 layers), then the prefilter pass samples it via captureCubeSampleView
@@ -94,7 +125,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
     // CPU-built per-cluster probe lists + the SSBOs the PBR shader will bind
     // to look up probes intersecting a fragment. Rebuilt each frame in BuildClusters.
-    internal ProbeClusterGrid clusterGrid = null!;
+    private ProbeClusterGrid _clusterGrid = null!;
 
     // Tracks whether the capture image is still in its post-init Undefined
     // layout. First capture transitions Undefined → ColorAttachmentOptimal;
@@ -121,24 +152,44 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
     public IReadOnlyList<ReflectionProbeComponent> Probes => _probes;
 
-    public ReflectionProbeSystem(GpuContext gpu, Renderer renderer, IblSystem iblSystem)
+    public void Initialize()
     {
-        _gpu = gpu;
-        _renderer = renderer;
-        _gfx = _gpu.Gfx;
-        _vk = _gpu.Gfx.Vk;
-        _device = _gpu.Gfx.Device;
-        _iblSystem = iblSystem;
-
         CreatePrefilteredArray();
         CreateSampler();
         CreateProbeRecordBuffers();
         CreateCaptureAttachments();
         TryCreateCapturePipeline();
         CreatePrefilterDescriptors();
-        clusterGrid = new ProbeClusterGrid(_gfx);
+        _clusterGrid = new ProbeClusterGrid(_gfx);
 
-        for (int i = (int)MaxProbes - 1; i >= 0; i--) _freeSlots.Push(i);
+        for (int i = (int)_maxProbes - 1; i >= 0; i--) _freeSlots.Push(i);
+
+        RegisterBindings();
+    }
+
+    /// <summary>
+    /// Publishes the probe half of the FeatureIBL set (set 2) by binding name. The cube array is a
+    /// fixed MaxProbes allocation and the cluster SSBOs are max-sized, so every handle here is
+    /// stable for the renderer's lifetime - registering once is enough, and per-frame updates only
+    /// ever rewrite buffer *contents*.
+    /// </summary>
+    private void RegisterBindings()
+    {
+        var r = _gpu.Registry;
+        r.RegisterImage("probeCubeArray", prefilteredArrayView, ImageLayout.ShaderReadOnlyOptimal, prefilteredArraySampler);
+
+        var probes       = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var clusterRange = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        var indexList    = new Buffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
+        {
+            probes[i]       = probeRecordBuffers[i].buffer;
+            clusterRange[i] = _clusterGrid.GetClusterRangeBuffer((uint)i);
+            indexList[i]    = _clusterGrid.GetProbeIndexBuffer((uint)i);
+        }
+        r.RegisterBufferPerFrame("probes", probes);
+        r.RegisterBufferPerFrame("probeClusterRange", clusterRange);
+        r.RegisterBufferPerFrame("probeIndexList", indexList);
     }
 
     /// <summary>
@@ -149,15 +200,15 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     /// </summary>
     private void CreatePrefilterDescriptors()
     {
-        var bake = _iblSystem.prefilterEnvPipeline;
+        var bake = _ibl.PrefilterPipeline;
         var inputView = captureCubeSampleView;
-        var inputSampler = _iblSystem.iblCubeSampler;
+        var inputSampler = _ibl.CubeSampler;
 
-        _prefilterStorageViews = new ImageView[MaxProbes, ProbeMipLevels];
-        _prefilterSets         = new DescriptorSet[MaxProbes, ProbeMipLevels];
+        _prefilterStorageViews = new ImageView[_maxProbes, _probeMipLevels];
+        _prefilterSets         = new DescriptorSet[_maxProbes, _probeMipLevels];
 
-        for (uint slot = 0; slot < MaxProbes; slot++)
-        for (uint mip  = 0; mip  < ProbeMipLevels; mip++)
+        for (uint slot = 0; slot < _maxProbes; slot++)
+        for (uint mip  = 0; mip  < _probeMipLevels; mip++)
         {
             ImageViewCreateInfo info = new()
             {
@@ -192,7 +243,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
         // shader iteration on the capture kernel does not take the whole editor down with it.
         try
         {
-            capturePipeline = new ProbeCapturePipeline(_gpu, _renderer);
+            capturePipeline = new ProbeCapturePipeline(_gpu);
             capturePipeline.Initialize();
         }
         catch (Exception e)
@@ -254,9 +305,9 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             SType         = StructureType.ImageCreateInfo,
             ImageType     = ImageType.Type2D,
             Format        = Format.R16G16B16A16Sfloat,
-            Extent        = new Extent3D(ProbeFaceSize, ProbeFaceSize, 1),
-            MipLevels     = ProbeMipLevels,
-            ArrayLayers   = 6 * MaxProbes,
+            Extent        = new Extent3D(_probeFaceSize, _probeFaceSize, 1),
+            MipLevels     = _probeMipLevels,
+            ArrayLayers   = 6 * _maxProbes,
             Samples       = SampleCountFlags.Count1Bit,
             Tiling        = ImageTiling.Optimal,
             // Sampled for shader reads; Storage so the prefilter compute pass can
@@ -283,9 +334,9 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             {
                 AspectMask     = ImageAspectFlags.ColorBit,
                 BaseMipLevel   = 0,
-                LevelCount     = ProbeMipLevels,
+                LevelCount     = _probeMipLevels,
                 BaseArrayLayer = 0,
-                LayerCount     = 6 * MaxProbes,
+                LayerCount     = 6 * _maxProbes,
             },
         };
         if (_vk.CreateImageView(_device, &viewInfo, null, out prefilteredArrayView) != Result.Success)
@@ -306,7 +357,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
             SrcAccessMask       = 0,
             DstAccessMask       = AccessFlags.ShaderReadBit,
-            SubresourceRange    = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, ProbeMipLevels, 0, 6 * MaxProbes),
+            SubresourceRange    = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, _probeMipLevels, 0, 6 * _maxProbes),
         };
         _vk.CmdPipelineBarrier(cmd,
             PipelineStageFlags.TopOfPipeBit, PipelineStageFlags.FragmentShaderBit,
@@ -335,8 +386,8 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
     private void CreateProbeRecordBuffers()
     {
-        ulong sizeBytes = MaxProbes * (ulong)sizeof(ProbeGpuRecord);
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        ulong sizeBytes = _maxProbes * (ulong)sizeof(ProbeGpuRecord);
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             _gfx.CreateMappedStorageBuffer(sizeBytes, ref probeRecordBuffers[i]);
     }
 
@@ -348,7 +399,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             SType         = StructureType.ImageCreateInfo,
             ImageType     = ImageType.Type2D,
             Format        = Format.R16G16B16A16Sfloat,
-            Extent        = new Extent3D(ProbeFaceSize, ProbeFaceSize, 1),
+            Extent        = new Extent3D(_probeFaceSize, _probeFaceSize, 1),
             MipLevels     = 1,
             ArrayLayers   = 6,
             Samples       = SampleCountFlags.Count1Bit,
@@ -397,7 +448,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             SType         = StructureType.ImageCreateInfo,
             ImageType     = ImageType.Type2D,
             Format        = Format.D32Sfloat,
-            Extent        = new Extent3D(ProbeFaceSize, ProbeFaceSize, 1),
+            Extent        = new Extent3D(_probeFaceSize, _probeFaceSize, 1),
             MipLevels     = 1,
             ArrayLayers   = 6,
             Samples       = SampleCountFlags.Count1Bit,
@@ -540,7 +591,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
         var ptr = (ProbeGpuRecord*)probeRecordBuffers[frameIndex].mapped;
         // Zero everything first — slot indices can be sparse if probes were
         // unregistered, and the cluster grid emits absolute slot indices.
-        for (int i = 0; i < MaxProbes; i++) ptr[i] = default;
+        for (int i = 0; i < _maxProbes; i++) ptr[i] = default;
 
         foreach (var p in _probes)
         {
@@ -558,10 +609,10 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     /// DrawFrame after the camera's per-frame matrices are settled and tile
     /// counts known. Tile-only today; pass zSlices &gt; 1 when 3D clustering lands.
     /// </summary>
-    public void BuildClusters(uint frameIndex, Camera camera, float aspect, float nearZ, float farZ,
+    public void BuildClusters(RenderView view, float nearZ, float farZ,
         uint tileCountX, uint tileCountY, uint zSlices = 1)
     {
-        clusterGrid.Build(frameIndex, camera, aspect, nearZ, farZ,
+        _clusterGrid.Build(view, nearZ, farZ,
             tileCountX, tileCountY, zSlices, _probes);
     }
 
@@ -572,7 +623,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
     /// sample <see cref="captureCubeSampleView"/> downstream (currently only
     /// the prefilter compute pass, landing in Phase 5).
     /// </summary>
-    public void RecordCapture(CommandBuffer cmd, uint frameIndex, ulong frameCounter, Scene scene)
+    public void RecordCapture(CommandBuffer cmd, RenderView view, Scene scene)
     {
         if (capturePipeline == null) return;
 
@@ -591,7 +642,10 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             View3 = views[3], View4 = views[4], View5 = views[5],
             Proj  = proj,
         };
-        capturePipeline.WriteUbo(frameIndex, in ubo);
+        // ProbeCapture.slang reads this at (0,0) - the scene set's dynamic constant slot -
+        // so it goes through the arena, and the returned byte offset is the dynamic offset
+        // the CmdBindDescriptorSets below must supply.
+        uint captureUboOffset = _gpu.Registry.ConstantArena.Push(view.FrameIndex, in ubo);
 
         // Layout transitions: cube + depth to attachment layouts
         ImageMemoryBarrier* preBarriers = stackalloc ImageMemoryBarrier[2];
@@ -646,7 +700,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
         var renderInfo = new RenderingInfo
         {
             SType                = StructureType.RenderingInfo,
-            RenderArea           = new Rect2D(new Offset2D(0, 0), new Extent2D(ProbeFaceSize, ProbeFaceSize)),
+            RenderArea           = new Rect2D(new Offset2D(0, 0), new Extent2D(_probeFaceSize, _probeFaceSize)),
             LayerCount           = 1,           // multiview supplies the layer fan-out
             ViewMask             = 0x3Fu,       // 6 bits = 6 cube faces
             ColorAttachmentCount = 1,
@@ -657,16 +711,17 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
         _vk.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, capturePipeline.Handle);
 
-        Viewport vp = new() { X = 0, Y = 0, Width = ProbeFaceSize, Height = ProbeFaceSize, MinDepth = 0f, MaxDepth = 1f };
-        Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(ProbeFaceSize, ProbeFaceSize));
+        Viewport vp = new() { X = 0, Y = 0, Width = _probeFaceSize, Height = _probeFaceSize, MinDepth = 0f, MaxDepth = 1f };
+        Rect2D scissor = new(new Offset2D(0, 0), new Extent2D(_probeFaceSize, _probeFaceSize));
         _vk.CmdSetViewport(cmd, 0, 1, &vp);
         _vk.CmdSetScissor (cmd, 0, 1, &scissor);
 
-        var frameSet    = capturePipeline.GetFrameSet(frameIndex);
-        var bindlessSet = Engine.ResourceManager.GetBindlessSet(frameIndex);
-        var sets        = stackalloc DescriptorSet[2] { frameSet, bindlessSet };
+        var frameSet = _gpu.Registry.SceneSet(view.FrameIndex);
+        var sets        = stackalloc DescriptorSet[1] { frameSet };
+        // The scene set's binding 0 is the arena's UniformBufferDynamic slot, so exactly one
+        // dynamic offset must accompany it - the CaptureUbo slice pushed above.
         _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
-            capturePipeline.Layout, 0, 2, sets, 0, null);
+            capturePipeline.Layout, 0, 1, sets, 1, &captureUboOffset);
 
         var vb = Engine.ResourceManager.GlobalVertexBuffer;
         var ib = Engine.ResourceManager.GlobalIndexBuffer;
@@ -699,9 +754,9 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
         _vk.CmdEndRendering(cmd);
 
-        // Transition cube → ShaderReadOnly so prefilter compute can sample it 
+        // Transition cube -> ShaderReadOnly so prefilter compute can sample it 
         // Also transition the destination probe slot's layers in the prefiltered
-        // array from ShaderReadOnly → General for storage writes. Combined into
+        // array from ShaderReadOnly -> General for storage writes. Combined into
         // one CmdPipelineBarrier so we pay the sync cost once.
         ImageMemoryBarrier* postBarriers = stackalloc ImageMemoryBarrier[2];
         postBarriers[0] = new()
@@ -727,7 +782,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             SrcAccessMask       = AccessFlags.ShaderReadBit,
             DstAccessMask       = AccessFlags.ShaderWriteBit,
             SubresourceRange    = new ImageSubresourceRange(
-                ImageAspectFlags.ColorBit, 0, ProbeMipLevels, (uint)probe.CubeArraySlot * 6, 6),
+                ImageAspectFlags.ColorBit, 0, _probeMipLevels, (uint)probe.CubeArraySlot * 6, 6),
         };
         _vk.CmdPipelineBarrier(cmd,
             PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.FragmentShaderBit,
@@ -735,13 +790,13 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             0, 0, null, 0, null, 2, postBarriers);
 
         // Prefilter dispatch: per-mip GGX importance sample into the slot
-        var prefilter = _iblSystem.prefilterEnvPipeline;
+        var prefilter = _ibl.PrefilterPipeline;
         _vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, prefilter.Handle);
         uint slot = (uint)probe.CubeArraySlot;
-        for (uint m = 0; m < ProbeMipLevels; m++)
+        for (uint m = 0; m < _probeMipLevels; m++)
         {
-            uint mipSize = Math.Max(1u, ProbeFaceSize >> (int)m);
-            float roughness = ProbeMipLevels == 1 ? 0f : m / (float)(ProbeMipLevels - 1);
+            uint mipSize = Math.Max(1u, _probeFaceSize >> (int)m);
+            float roughness = _probeMipLevels == 1 ? 0f : m / (float)(_probeMipLevels - 1);
 
             var set = _prefilterSets[slot, m];
             _vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, prefilter.Layout,
@@ -751,7 +806,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             {
                 Roughness   = roughness,
                 MipFaceSize = mipSize,
-                EnvCubeSize = ProbeFaceSize,
+                EnvCubeSize = _probeFaceSize,
             };
             _vk.CmdPushConstants(cmd, prefilter.Layout, ShaderStageFlags.ComputeBit,
                 0, (uint)sizeof(PcProbePrefilter), &prefPc);
@@ -772,7 +827,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             SrcAccessMask       = AccessFlags.ShaderWriteBit,
             DstAccessMask       = AccessFlags.ShaderReadBit,
             SubresourceRange    = new ImageSubresourceRange(
-                ImageAspectFlags.ColorBit, 0, ProbeMipLevels, slot * 6, 6),
+                ImageAspectFlags.ColorBit, 0, _probeMipLevels, slot * 6, 6),
         };
         _vk.CmdPipelineBarrier(cmd,
             PipelineStageFlags.ComputeShaderBit,
@@ -780,7 +835,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
             0, 0, null, 0, null, 1, &slotReadBarrier);
 
         _captureCubeInitialLayout = false;
-        probe.LastCaptureFrame    = frameCounter;
+        probe.LastCaptureFrame    = view.FrameCounter;
         probe.Dirty               = probe.UpdatePolicy switch
         {
             ProbeUpdatePolicy.Once         => false,
@@ -792,14 +847,14 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
     public void Dispose()
     {
-        clusterGrid?.Dispose();
+        _clusterGrid?.Dispose();
 
         // Prefilter resources first — descriptor sets live in the renderer's
         // pool which is destroyed downstream; views must be torn down explicitly.
         if (_prefilterStorageViews != null)
         {
-            for (int slot = 0; slot < MaxProbes; slot++)
-            for (int mip  = 0; mip  < ProbeMipLevels; mip++)
+            for (int slot = 0; slot < _maxProbes; slot++)
+            for (int mip  = 0; mip  < _probeMipLevels; mip++)
             {
                 var v = _prefilterStorageViews[slot, mip];
                 if (v.Handle != 0) _vk.DestroyImageView(_device, v, null);
@@ -808,7 +863,7 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
 
         capturePipeline?.Dispose();
 
-        for (int i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             _gfx.DestroyBuffer(probeRecordBuffers[i].buffer, probeRecordBuffers[i].alloc);
 
         if (captureDepthAttachmentView.Handle != 0) _vk.DestroyImageView(_device, captureDepthAttachmentView, null);
@@ -828,4 +883,6 @@ public sealed unsafe class ReflectionProbeSystem : IDisposable
         _probes.Clear();
         _freeSlots.Clear();
     }
+
+    
 }

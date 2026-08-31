@@ -28,7 +28,7 @@ public unsafe struct Mesh
 
 public class Scene
 {
-    private static Camera Cam;
+    private Camera Cam;
 
     // Entity* stored as nint so the managed List doesn't need pinning.
     private readonly List<nint> _entityList = new();
@@ -81,7 +81,7 @@ public class Scene
 
     // vk/device/physicalDevice are retained on the signature for call-site stability; the
     // deferred chain now lives on the renderer's FrameGraph, not a Scene-owned RenderGraph.
-    public Scene(Vk vk, Device device, PhysicalDevice physicalDevice)
+    public Scene()
     {
         Cam = new Camera();
     }

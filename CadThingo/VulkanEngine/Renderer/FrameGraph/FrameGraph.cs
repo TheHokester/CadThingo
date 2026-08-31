@@ -1,5 +1,5 @@
-using System.Diagnostics;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+﻿using System.Diagnostics;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 
@@ -40,7 +40,7 @@ public unsafe class FrameGraph : IDisposable
     private bool _chunked;                         // true iff any live pass landed on the async queue
     private int _gfxSignalCount, _cmpSignalCount;  // relative timeline values consumed per frame
     private int _lastGfxChunk = -1;                // closing image barriers are appended here
-    private Silk.NET.Vulkan.Semaphore _gfxTimeline, _cmpTimeline;
+    private Semaphore _gfxTimeline, _cmpTimeline;
     private ulong _gfxCursor, _cmpCursor;          // monotonic absolute timeline bases across frames
     private CommandPool _gfxChunkPool, _cmpChunkPool;
     private CommandBuffer[][] _chunkCmds = [];     // [frameInFlight][chunkIndex], parallel to _chunks
@@ -164,7 +164,7 @@ public unsafe class FrameGraph : IDisposable
 
     /// <summary>Imports a double-buffered buffer (one handle per frame-in-flight). The
     /// graph derives barriers as usual; at Execute it resolves the right per-frame handle.
-    /// <paramref name="perFrame"/> must be indexable by <c>FrameContext.FrameIndex</c>.</summary>
+    /// <paramref name="perFrame"/> must be indexable by <c>RenderView.FrameIndex</c>.</summary>
     public GraphBuffer ImportBufferPerFrame(Buffer[] perFrame, in BufferDesc desc, string name)
     {
         int id = _nextResourceId++;
@@ -255,6 +255,7 @@ public unsafe class FrameGraph : IDisposable
 
         // readers[(res, ver)] = every pass that READS exactly that version. Drives WAR:
         // a write that bumps to v must wait for all readers of v-1.
+        //maps to the pass index the edge is formed with
         var readers = new Dictionary<(int res, int ver), List<int>>();
         for (int p = 0; p < n; p++)
             foreach (var rd in _passes[p].Reads)
@@ -345,7 +346,7 @@ public unsafe class FrameGraph : IDisposable
         for (int p = 0; p < n; p++) if (live[p]) liveCount++;
         if (_executionOrder.Count != liveCount)
             throw new InvalidOperationException(
-                "FrameGraph: cycle detected among live passes — the version ledger produced a back-edge.");
+                "FrameGraph: cycle detected among live passes - the version ledger produced a back-edge.");
 
         _live = live;                  // kept for ToDot
         _culledCount = n - liveCount;
@@ -573,8 +574,8 @@ public unsafe class FrameGraph : IDisposable
         _gfxChunkPool = MakePool(_plan.Graphics.Family);
         _cmpChunkPool = MakePool(_plan.AsyncCompute!.Value.Family);
 
-        _chunkCmds = new CommandBuffer[Renderer.MAX_CONCURRENT_FRAMES][];
-        for (int f = 0; f < Renderer.MAX_CONCURRENT_FRAMES; f++)
+        _chunkCmds = new CommandBuffer[RenderConfig.MAX_CONCURRENT_FRAMES][];
+        for (int f = 0; f < RenderConfig.MAX_CONCURRENT_FRAMES; f++)
         {
             _chunkCmds[f] = new CommandBuffer[_chunks.Count];
             for (int c = 0; c < _chunks.Count; c++)
@@ -875,7 +876,7 @@ public unsafe class FrameGraph : IDisposable
 
     private void BakePassSets()
     {
-        uint frames = Renderer.MAX_CONCURRENT_FRAMES;
+        uint frames = RenderConfig.MAX_CONCURRENT_FRAMES;
 
         var opting = new List<GraphPass>();
         foreach (var idx in _executionOrder)
@@ -1060,7 +1061,7 @@ public unsafe class FrameGraph : IDisposable
     /// <paramref name="cmd"/> and submitted later on the graphics queue executes after the
     /// chunks by submission order, exactly as it did when the passes lived inside it.
     /// </summary>
-    public void Execute(CommandBuffer cmd, in Renderer.FrameContext frame)
+    public void Execute(CommandBuffer cmd, in RenderView frame)
     {
         if (!Compiled) throw new InvalidOperationException("FrameGraph: call Compile() before Execute().");
 
@@ -1090,7 +1091,7 @@ public unsafe class FrameGraph : IDisposable
     /// with <see cref="SubmitGfxChunks"/> to merge them with its own host command buffer into
     /// one vkQueueSubmit2, giving profilers (Nsight, RenderDoc) a single unified gfx submission
     /// to show all graphics passes alongside the blit and UI work.</summary>
-    private void ExecuteChunked(in Renderer.FrameContext frame)
+    private void ExecuteChunked(in RenderView frame)
     {
         uint fr = frame.FrameIndex;
         var vk = gfx.Vk;
@@ -1378,7 +1379,7 @@ public unsafe class FrameGraph : IDisposable
             _barrierCount += _passes[idx].ImageBarriers.Length + _passes[idx].BufferBarriers.Length;
 
         _debug = new GraphDebug(gfx);
-        _debug.Initialize(names, queues, types, eligible, Renderer.MAX_CONCURRENT_FRAMES);
+        _debug.Initialize(names, queues, types, eligible, RenderConfig.MAX_CONCURRENT_FRAMES);
 
         // Name physical resources so captures read "GBuffer_Position" instead of a raw handle.
         foreach (var res in _resources.Values)

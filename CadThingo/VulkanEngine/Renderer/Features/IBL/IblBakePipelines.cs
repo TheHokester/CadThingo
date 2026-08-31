@@ -1,5 +1,5 @@
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -21,8 +21,8 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
     readonly bool   _hasInputSampler;
     readonly uint   _pushSize;
 
-    public IblBakePipeline(GpuContext gpu, Renderer renderer, string module, bool hasInputSampler, uint pushSize)
-        : base(gpu, renderer)
+    public IblBakePipeline(GpuContext gpu, string module, bool hasInputSampler, uint pushSize)
+        : base(gpu)
     {
         _module          = module;
         _hasInputSampler = hasInputSampler;
@@ -97,7 +97,7 @@ public sealed unsafe class IblBakePipeline : ComputePipeline
         };
         DescriptorSet set;
         if (Vk.AllocateDescriptorSets(Device, &info, &set) != Result.Success)
-            throw new System.Exception("Failed to allocate IBL bake descriptor set");
+            throw new Exception("Failed to allocate IBL bake descriptor set");
         return set;
     }
 

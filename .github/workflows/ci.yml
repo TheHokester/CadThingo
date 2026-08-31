@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  # Standalone Slang, used in place of the full Vulkan SDK. Bump alongside the SDK you build
+  # against: a different compiler build changes the shader-cache key and can change codegen.
+  SLANG_VERSION: "2026.1"
+
+jobs:
+  build:
+    name: Build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false # sample models are hundreds of MB and nothing here loads them
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore
+        run: dotnet restore CadThingo.sln
+
+      - name: Build
+        run: dotnet build CadThingo.sln --configuration Release --no-restore
+
+  shader-audit:
+    name: Shader audit
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # The engine resolves slang.dll from %VULKAN_SDK%\Bin, so a directory shaped like that is
+      # enough. Downloading Slang on its own keeps this job off the ~1 GB SDK installer.
+      - name: Install Slang
+        shell: pwsh
+        run: |
+          $ver = ${env:SLANG_VERSION}
+          $url = "https://github.com/shader-slang/slang/releases/download/v$ver/slang-$ver-windows-x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile slang.zip
+          Expand-Archive -Path slang.zip -DestinationPath slang-dist
+          $dll = Get-ChildItem -Path slang-dist -Filter slang.dll -Recurse | Select-Object -First 1
+          if (-not $dll) { throw "slang.dll not found in $url" }
+          $bin = Join-Path ${env:RUNNER_TEMP} "vulkan-sdk\Bin"
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          # Copies the whole directory: slang.dll loads sibling DLLs from beside itself.
+          Copy-Item -Path (Join-Path $dll.Directory.FullName "*") -Destination $bin -Recurse -Force
+          "VULKAN_SDK=$(Split-Path $bin -Parent)" | Out-File -FilePath ${env:GITHUB_ENV} -Append
+
+      # Compiles and reflects every kernel with no device. Exits 1 on a compile failure or a
+      # col-major matrix regression; drift is printed but does not fail the job.
+      - name: Audit shaders
+        run: dotnet run --project CadThingo --configuration Release -- --shader-audit

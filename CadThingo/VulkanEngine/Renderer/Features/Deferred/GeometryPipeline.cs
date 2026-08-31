@@ -1,8 +1,8 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.GLTF;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
@@ -30,8 +30,8 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     ];
 
 
-    public GeometryPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
-    {
+    public GeometryPipeline(GpuContext gpu) : base(gpu)
+    { 
         DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
 
@@ -54,7 +54,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
     /// <param name="indirectCount"></param>
     /// <param name="drawCount"></param>
     /// <param name="attachments"></param>
-    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx, Buffer indirectCmd,
+    internal void Record(CommandBuffer cmd, in RenderView ctx, Buffer indirectCmd,
         Buffer indirectCount, uint drawCount, Attachments attachments)
     {
         BeginRendering(cmd,
@@ -86,7 +86,7 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
         // First SceneBindings consumer: the unified scene set carries the bindless
         // materials/instances/textures/samplers, and the per-pass view+proj rides the
         // (0,0) dynamic slot as an arena push. One set, one bind, zero per-draw rebinds.
-        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, BuildFrameUbo(ctx.Camera));
+        uint frameConstants = Registry.ConstantArena.Push(ctx.FrameIndex, BuildFrameUbo(ctx.Camera, ctx.RenderExtent));
         var sceneSet = Registry.SceneSet(ctx.FrameIndex);
         Vk!.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
             Layout, 0, 1, &sceneSet, 1, &frameConstants);
@@ -139,22 +139,22 @@ public sealed unsafe class GeometryPipeline : GraphicsPipeline
 
     // Per-pass view+proj for the (0,0) arena slot; pushed by Record each frame.
     // Per-draw model matrix lives in the instance SSBO.
-    private GeometryUBO BuildFrameUbo(Camera? camera)
+    private GeometryUBO BuildFrameUbo(Camera? camera, Extent2D renderExtent)
     {
         GeometryUBO ubo = new();
+        var aspect = (float)renderExtent.Width / renderExtent.Height;
         if (camera != null)
         {
-            ubo.proj = camera.GetProjectionMatrix((float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
+            ubo.proj = camera.GetProjectionMatrix(aspect, 0.1f, 100.0f);
             ubo.view = camera.GetViewMatrix();
-            ubo.proj.M22 *= -1; // Vulkan clip space has Y down
         }
         else
         {
             ubo.view = Matrix4x4.CreateLookAt(new Vector3(2, 2, 2), new Vector3(0, 0, 0), new Vector3(0, 0, 1));
-            ubo.proj = Matrix4x4.CreatePerspectiveFieldOfView((float)(45 * Math.PI / 180),
-                (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
-            ubo.proj.M22 *= -1; // flip Y for Vulkan clip space
+            ubo.proj = Matrix4x4.CreatePerspectiveFieldOfView((float)(45 * Math.PI / 180), aspect, 0.1f, 100.0f);
         }
+
+        ubo.proj.M22 *= -1; // Vulkan clip space has Y down
         return ubo;
     }
 }

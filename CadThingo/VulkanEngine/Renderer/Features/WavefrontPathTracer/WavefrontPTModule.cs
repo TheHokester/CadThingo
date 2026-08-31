@@ -1,8 +1,7 @@
-using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using Silk.NET.Vulkan;
-using FrameContext = CadThingo.VulkanEngine.Renderer.Renderer.FrameContext;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 
@@ -28,7 +27,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// (declared RW on each); Connect is DECOUPLED from it -- Connect(b) is declared between
 /// Extend(b+1) and Shade(b+1) with an empty barrier batch so it overlaps the trace (see
 /// AddConnectPass + the Extend pass's phantom declarations). Tonemap is the composed
-/// TonemapModule (HDR format parameterized to PtOutColor's R32F): its HDR-input set is
+/// TonemapModule (HDR format parameterized to OutColor's R32F): its HDR-input set is
 /// graph-baked from the imported out-color, so no host-side rebind happens on core switch.
 /// </summary>
 public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, WavefrontPTModule.Outputs>
@@ -123,7 +122,7 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                 counters     = bld.Write(counters,     ResourceUsage.StorageWriteCompute);
                 dispatchArgs = bld.Write(dispatchArgs, ResourceUsage.StorageWriteCompute);   // extend-args[0]
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordGenerate(cmd, f));
+            (CommandBuffer cmd, PassResources res, in RenderView f) => _pipe.RecordGenerate(cmd, f));
 
         // Connect (2.5, DECOUPLED): fire the occlusion ray per shadow record; add shadowLe if
         // visible. Connect(cb) is declared BETWEEN Extend(cb+1) and Shade(cb+1) so it overlaps
@@ -168,7 +167,7 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                         ? ResourceUsage.StorageRWCompute
                         : ResourceUsage.StorageConcurrentCompute);
                 },
-                (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+                (CommandBuffer cmd, PassResources res, in RenderView f) =>
                     _pipe.RecordConnect(cmd, f.FrameIndex, cb));
         }
 
@@ -239,7 +238,7 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                         }
                     }
                 },
-                (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+                (CommandBuffer cmd, PassResources res, in RenderView f) =>
                     _pipe.RecordExtend(cmd, f.FrameIndex, bb));
 
             // Previous bounce's Connect, slotted here so it overlaps Extend(bb) (see above).
@@ -292,7 +291,7 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                     if (!useAsync)
                         shadowRad = bld.Write(shadowRad, ResourceUsage.StorageRWCompute);
                 },
-                (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+                (CommandBuffer cmd, PassResources res, in RenderView f) =>
                 {
                     for (uint c = 0; c < SHADE_CLASSES; c++)
                         _pipe.RecordShade(cmd, f.FrameIndex, bb, c);
@@ -324,7 +323,7 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                     psRadiance = bld.Write(psRadiance, ResourceUsage.StorageRWCompute);   // continue accumulation
                     psRng      = bld.Write(psRng,      ResourceUsage.StorageRWCompute);   // advances the stream
                 },
-                (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordTail(cmd, f.FrameIndex));
+                (CommandBuffer cmd, PassResources res, in RenderView f) => _pipe.RecordTail(cmd, f.FrameIndex));
         }
 
         // ---- Finalize: accumulate radiance, normalize into out-color ----
@@ -337,10 +336,10 @@ public sealed class WavefrontPTModule : IGraphModule<WavefrontPTModule.Inputs, W
                 accum    = bld.Write(accum,    ResourceUsage.StorageRWCompute);
                 outColor = bld.Write(outColor, ResourceUsage.StorageWriteCompute);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordFinalize(cmd, f));
+            (CommandBuffer cmd, PassResources res, in RenderView f) => _pipe.RecordFinalize(cmd, f));
 
-        // ---- Tonemap: the shared TonemapModule (HDR format parameterized to PtOutColor's
-        // R32F). Its HDR-input set is GRAPH-BAKED 
+        // ---- Tonemap: the shared TonemapModule, HDR format parameterized to OutColor's R32F. Its
+        // HDR-input set is graph-baked from the imported out-color.
         var tonemapModule = new TonemapModule(_tonemap, inp.OutColor._format);
         tonemapModule.Build(scope, new TonemapModule.Input(outColor, inp.FinalColor), out var tm);
 

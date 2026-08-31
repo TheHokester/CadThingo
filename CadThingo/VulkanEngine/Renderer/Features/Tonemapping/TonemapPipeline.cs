@@ -1,7 +1,7 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
@@ -51,17 +51,17 @@ public sealed unsafe class TonemapPipeline : GraphicsPipeline
     public PassSetSpec PassSet =>
         new(PassSetIndex, DescriptorSetLayouts[PassSetIndex], ReflectedBindings(PassSetIndex));
 
-    public TonemapPipeline(GpuContext gpu, Renderer renderer) : base( gpu, renderer) { }
+    public TonemapPipeline(GpuContext gpu) : base( gpu) { }
 
     // The graph writes only the view into the pass set, so the sampler is pinned here.
-    protected override Sampler? ImmutableSamplerFor(in BindingDesc binding) 
-        => binding.Name == "hdrInput" ? Renderer.gBufferSampler : null;
+    protected override Sampler? ImmutableSamplerFor(in BindingDesc binding)
+        => binding.Name == "hdrInput" ? Gfx.Samplers.PointClamp : null;
 
     protected override SpecValues? Specialization =>
         new SpecValues().Set("TONEMAP_OPERATOR", (uint)Operator);
 
     // TonemapModule passes its graph-baked HDR set (see PassSet).
-    internal void Record(CommandBuffer cmd, Renderer.FrameContext ctx, ImageView finalColor, DescriptorSet hdrSet)
+    internal void Record(CommandBuffer cmd, RenderView ctx, ImageView finalColor, DescriptorSet hdrSet)
     {
         BeginRendering(cmd,
             ctx.RenderExtent,

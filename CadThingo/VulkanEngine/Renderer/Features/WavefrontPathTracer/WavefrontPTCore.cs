@@ -1,6 +1,11 @@
-using System.Numerics;
+﻿using System.Numerics;
+using System.Runtime.CompilerServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
+using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
+using CadThingo.VulkanEngine.Renderer.Features.Shared;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
-using CadThingo.VulkanEngine.Renderer.RenderCores;
 using Silk.NET.Vulkan;
 
 // The graph type shares its name with its namespace; alias so bare `FrameGraph`
@@ -22,11 +27,35 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 /// camera-snapshot / accumulator-reset bookkeeping. <see cref="Render"/> mirrors the PT skeleton:
 /// camera-motion restart, per-frame light/material refresh, UpdatePerFrame, then graph.Execute.
 /// </summary>
-internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
+internal sealed class WavefrontPTCore : IRenderCore, IGraphCore,
+                                        ISelfRegisteringFeature<WavefrontPTCore>, INeedsGpu,
+                                        INeedsFeature<ISharedPipelines>, INeedsFeature<IIblProvider>,INeedsFeature<IPathTracingProvider>
 {
-    private readonly Renderer            _host;
-    private readonly WavefrontPTPipeline _pipe;
-    private WavefrontGraph?              _graph;
+    public static FeatureDesc Desc =>
+        new(Order: 50, Gate: _ => true, Make: () => new WavefrontPTCore());
+
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<WavefrontPTCore>();
+
+    private GpuContext _gpu;
+    GpuContext INeedsGpu.Gpu { set => _gpu = value; }
+
+    // The tonemap this core's graph ends with - one shared instance, injected not constructed.
+    private ISharedPipelines _shared = null!;
+    ISharedPipelines INeedsFeature<ISharedPipelines>.Dependency { set => _shared = value; }
+
+    // The accumulator / out-color pair and the restart flag every tracer shares.
+    private IPathTracingProvider _pt = null!;
+    IPathTracingProvider INeedsFeature<IPathTracingProvider>.Dependency { set => _pt = value; }
+    //ibl feature import needed by a pipeline
+    private IIblProvider _ibl = null;
+    IIblProvider INeedsFeature<IIblProvider>.Dependency { set => _ibl = value; }
+
+    // Last snapshot the host handed over, re-read on every Resize.
+    private HostTargets _targets;
+
+    private WavefrontPTPipeline _pipe = null!;
+    private WavefrontGraph?     _graph;
 
     // Previous-frame camera snapshot -- any change restarts progressive integration (same scheme
     // as PathTraceCoreBase). Identity/zero defaults force a restart on first activation.
@@ -37,27 +66,30 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
     public string Name => "PathTrace (Wavefront)";
     public Renderer.RenderMode Mode => Renderer.RenderMode.RayWavefront;
 
-    public WavefrontPTCore(Renderer host)
+    /// <summary>Exposed only for the settings panel + the stats readback, which read its counters.</summary>
+    internal WavefrontPTPipeline Pipeline => _pipe;
+
+    public void Initialize()
     {
-        _host = host;
-        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
-        _pipe = host.wavefrontPipeline;
-        BuildGraph();
+        // Shares the accumulator / out-color images with the megakernel via FeaturePTIO and the
+        // scene buffers via the scene set; the SoA working set is pipeline-owned. Technique-private,
+        // so this core builds it rather than the host.
+        _pipe = new WavefrontPTPipeline(_gpu, _ibl, _pt);
+        _pipe.Initialize();
     }
 
     /// <summary>(Re)build the wavefront chain as the <see cref="WavefrontGraph"/>. Imports the
-    /// pipeline-owned set-4 buffers + the host accumulator / out-color / FinalColor (re-read here
-    /// so a resize picks up the fresh handles). Called from the ctor + on every resize.</summary>
+    /// pipeline-owned set-4 buffers + the shared accumulator / out-color + the host FinalColor
+    /// (re-read here so a resize picks up the fresh handles). Called on every resize.</summary>
     private void BuildGraph()
     {
         _graph?.Dispose();
-        var fg = new WavefrontGraph(_host.gfx);
+        var fg = new WavefrontGraph(_gpu.Gfx);
 
-        var module = new WavefrontPTModule(_pipe, _host.tonemapPipeline);
+        var module = new WavefrontPTModule(_pipe, _shared.Tonemap);
         module.Build(fg.RootScope().Child("Wavefront"),
             new WavefrontPTModule.Inputs(
-                _host.renderTargets.PtAccumulator, _host.renderTargets.PtOutColor,
-                _host.renderTargets.FinalColor),
+                _pt.Accumulator, _pt.OutColor, _targets.FinalColor),
             out var o);
 
         fg.MarkOutput(o.Final);
@@ -68,11 +100,11 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
         // buffer handles) back to the pipeline for its record-time binds.
         _pipe.SetGraphSharedSet(fg.GraphSharedSet);
 
-        // accumulator + out-color are registry-owned (FeaturePTIO), re-registered by the host as soon
-        // as RebuildRenderTargets reallocates them - which is what keeps the bound descriptor and the
-        // handle the graph imported in lockstep. Getting that wrong previously caused the bars /
-        // background / firefly corruption after a render-extent change. All that is left here is
-        // dropping the sample count, since the fresh images invalidate any accumulation.
+        // accumulator + out-color are registry-owned (FeaturePTIO). PathTracingSystem reallocates and
+        // re-registers them earlier in the same resize pump, which keeps the bound descriptor and the
+        // handle the graph imported in lockstep. Break that and a render-extent change shows up as
+        // bars / background / firefly corruption. Only the sample count needs dropping here, since
+        // the fresh images invalidate any accumulation.
         _pipe.MarkAccumulatorDirty();
     }
 
@@ -83,50 +115,50 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
     /// <summary>Resize: reallocate the SoA working set to the new extent (which rewrites set 4 +
     /// marks the accumulator dirty), then rebuild the graph so it imports the fresh buffers + the
     /// freshly-reallocated PT/Final targets.</summary>
-    public void Resize(Extent2D extent)
+    public void Resize(in HostTargets targets)
     {
-        _pipe.ReallocSet4(extent);
+        _targets = targets;
+        _pipe.ReallocSet4(targets.Extent);
         BuildGraph();
     }
 
     public void Render(in RenderFrame frame)
     {
         var cmd    = frame.Cmd;
-        var ctx    = frame.Frame;
-        var camera = _host.Camera;
-        var scene  = _host.Scene;
-        uint currentFrame = ctx.FrameIndex;
+        var view   = frame.View;
+        var camera = view.Camera;
+        uint currentFrame = view.FrameIndex;
 
         // Camera motion -> restart accumulation (structural compare against last frame's snapshot).
         if (camera != null)
         {
-            var view = camera.GetViewMatrix();
+            var camView = camera.GetViewMatrix();
             var pos  = camera.GetPosition();
             var fov  = camera.Fov;
-            if (view != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
+            if (camView != _lastCamView || pos != _lastCamPos || fov != _lastCamFov)
             {
-                _host.MarkAccumulatorDirty();
-                _lastCamView = view; _lastCamPos = pos; _lastCamFov = fov;
+                _pt.MarkAccumulatorDirty();
+                _lastCamView = camView; _lastCamPos = pos; _lastCamFov = fov;
             }
         }
 
-        // Per-frame SSBO refresh -- lights (for the UBO count + future NEE) AND materials (so
-        // inspector edits land; resolveHit reads materials/textures every bounce).
-        uint lightCount = _host.UpdateLights(currentFrame, scene);
-        _host.UpdateMaterials(currentFrame, scene);
+        // Lights + materials were packed by the draw loop's extraction (resolveHit reads materials
+        // and textures every bounce, so inspector edits land through that); the count only feeds
+        // the pipeline's frame UBO.
+        uint lightCount = view.LightCount;
 
-        // Bridge the host's dirty signal into the pipeline's accumulator reset.
-        if (_host.AccumulatorDirty)
+        // Bridge the shared dirty signal into this pipeline's accumulator reset.
+        if (_pt.AccumulatorDirty)
         {
             _pipe.MarkAccumulatorDirty();
-            _host.ClearAccumulatorDirty();
+            _pt.ClearAccumulatorDirty();
         }
 
-        _pipe.UpdatePerFrame(currentFrame, camera!, lightCount, ctx.RenderExtent);
+        _pipe.UpdatePerFrame(currentFrame, camera!, lightCount, view.RenderExtent);
 
         // Record Generate -> (PrepExtend->Extend->PrepShade->Shade->PrepConnect->Connect) x8 ->
         // Finalize -> Tonemap; every barrier derived from the usage table.
-        _graph!.Execute(cmd, ctx);
+        _graph!.Execute(cmd, view);
 
         // TEMP/debug: copy the per-bounce indirect args to the readback staging so the Stats panel
         // can show compaction in-app. Remove with the pipeline's _argsReadback feature.
@@ -148,7 +180,9 @@ internal sealed class WavefrontPTCore : IRenderCore, IGraphCore
 
     public void Dispose()
     {
+        // Graph first: its passes hold a reference to the pipeline they record with.
         _graph?.Dispose();
         _graph = null;
+        _pipe?.Dispose();
     }
 }

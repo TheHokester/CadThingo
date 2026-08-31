@@ -1,8 +1,7 @@
-using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
 using CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 using Silk.NET.Vulkan;
-using FrameContext = CadThingo.VulkanEngine.Renderer.Renderer.FrameContext;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 
@@ -23,7 +22,7 @@ namespace CadThingo.VulkanEngine.Renderer.Features.ReSTIR;
 /// "Import for barriers, bind for access" (as in WavefrontPTModule): the tracer touches the
 /// accumulator / out-color through the pipeline-owned descriptor sets; the graph imports the SAME
 /// handles only so it can sequence Trace -> Tonemap from the declared usages. Tonemap is the
-/// composed TonemapModule (HDR format parameterized to PtOutColor's R32F): its HDR-input set is
+/// composed TonemapModule (HDR format parameterized to OutColor's R32F): its HDR-input set is
 /// graph-baked from the imported out-color, so no host-side rebind happens on core switch.
 /// </summary>
 internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReStirDIModule.Outputs>
@@ -84,7 +83,7 @@ internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReSti
                 gbufB    = bld.Write(gbufB,    ResourceUsage.StorageRT);
                 sceneRad = bld.Write(sceneRad, ResourceUsage.StorageRT);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.Record(cmd, f));
+            (CommandBuffer cmd, PassResources res, in RenderView f) => _pipe.Record(cmd, f));
 
         // ---- BuildTemporal (compute): reconstruct the surface from the G-buffer Trace wrote, build
         // the unified DI reservoir (RIS) + temporally reuse the reprojected prev reservoir, write the
@@ -99,7 +98,7 @@ internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReSti
                 resA = bld.Write(resA, ResourceUsage.StorageRWCompute);
                 resB = bld.Write(resB, ResourceUsage.StorageRWCompute);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordBuildTemporal(cmd, f));
+            (CommandBuffer cmd, PassResources res, in RenderView f) => _pipe.RecordBuildTemporal(cmd, f));
 
         // ---- SpatialShade (compute): spatially reuse same-frame neighbour reservoirs, shade the
         // analytic sample (opaque shadow ray), add to sceneRadiance, fold into the accumulator.
@@ -115,7 +114,7 @@ internal sealed class ReStirDIModule : IGraphModule<ReStirDIModule.Inputs, ReSti
                 accum    = bld.Write(accum,    ResourceUsage.StorageRWCompute);    // += progressive
                 outColor = bld.Write(outColor, ResourceUsage.StorageWriteCompute);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) => _pipe.RecordSpatialShade(cmd, f));
+            (CommandBuffer cmd, PassResources res, in RenderView f) => _pipe.RecordSpatialShade(cmd, f));
 
         // ---- Tonemap: composed TonemapModule; HDR-input set graph-baked from out-color. ----
         var tonemapModule = new TonemapModule(_tonemap, inp.OutColor._format);

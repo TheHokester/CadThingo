@@ -1,6 +1,5 @@
-using CadThingo.VulkanEngine.Renderer.FrameGraph;
+﻿using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using Silk.NET.Vulkan;
-using FrameContext = CadThingo.VulkanEngine.Renderer.Renderer.FrameContext;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Tonemapping;
 
@@ -33,7 +32,7 @@ public sealed class TonemapModule : IGraphModule<TonemapModule.Input, TonemapMod
 
     private readonly TonemapPipeline _tonemap;
     // The expected upstream HDR format for the wire-time port check. Defaults to the deferred
-    // chain's R16F scene-colour transient; the PT graph cores pass PtOutColor's R32F. The shader
+    // chain's R16F scene-colour transient; the PT graph cores pass OutColor's R32F. The shader
     // just samples a float4, so any float colour format tonemaps correctly.
     private readonly Format _hdrFormat;
 
@@ -67,7 +66,7 @@ public sealed class TonemapModule : IGraphModule<TonemapModule.Input, TonemapMod
                 b.Read(hdr, ResourceUsage.SampledFragment, "hdrInput");
                 final = b.Write(final, ResourceUsage.ColorAttachment);
             },
-            (CommandBuffer cmd, PassResources res, in FrameContext f) =>
+            (CommandBuffer cmd, PassResources res, in RenderView f) =>
                 _tonemap.Record(cmd, f, res.View(final), res.PassSet));
 
         outputs = new Output(final);

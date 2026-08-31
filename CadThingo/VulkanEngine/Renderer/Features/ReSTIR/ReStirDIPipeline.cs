@@ -1,11 +1,12 @@
-using System.IO;
+﻿using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -64,7 +65,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     private Pipeline _buildTemporalPipeline;   // BuildTemporal compute (reservoir build + temporal)
     private Pipeline _spatialPipeline;         // SpatialShade compute (spatial reuse + shade)
 
-    public ReStirDIPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public ReStirDIPipeline(GpuContext gpu, IIblProvider ibl, IPathTracingProvider pt) : base(gpu, ibl, pt) { }
 
     // Public handles for the graph module to import (barrier ordering across passes + frames).
     public Buffer ReservoirA    => _resA;
@@ -162,10 +163,11 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         return pipeline;
     }
 
+    // Only the extent-independent resources. The per-pixel working set is allocated by
+    // ReallocReStirBuffers, which the core drives from its Resize (primed once at boot).
     protected override void CreateResources()
     {
-        base.CreateResources();   // per-frame UBO
-        AllocBuffers(Renderer.RenderExtent);
+        base.CreateResources();
     }
 
     // ---- ReSTIR working-set buffers (extent-sized, device-local, ping-ponged) -------------------
@@ -191,9 +193,10 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
         _resA = default; _resB = default; _gbufA = default; _gbufB = default; _sceneRad = default;
     }
 
-    /// <summary>Resize path: reallocate the per-pixel working set to the new extent. Resets the
-    /// history gate. Called by the core's Resize before the graph rebuild, which re-bakes the
-    /// graph-owned set 2 from the fresh buffer handles (see GraphSharedSpec).</summary>
+    /// <summary>Allocates the per-pixel working set at <paramref name="extent"/>, freeing any
+    /// previous one. Resets the history gate. Called by the core's Resize before the graph rebuild,
+    /// which re-bakes the graph-owned set 2 from the fresh buffer handles (see GraphSharedSpec).
+    /// This is the only construction site - the first call comes from the boot-time resize.</summary>
     public void ReallocReStirBuffers(Extent2D extent)
     {
         FreeBuffers();
@@ -237,11 +240,11 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     /// <summary>Records the BuildTemporal compute pass: reconstruct the surface from the G-buffer,
     /// build the unified DI reservoir (RIS) + temporal reuse, write the cur reservoir. Runs after
     /// Trace (G-buffer RAW), before SpatialShade (reservoir RAW).</summary>
-    public void RecordBuildTemporal(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void RecordBuildTemporal(CommandBuffer cmd, in RenderView ctx)
         => RecordComputePass(cmd, ctx, _buildTemporalPipeline);
 
     /// <summary>Records the SpatialShade compute pass: spatial reuse + deferred shade + accumulation.</summary>
-    public void RecordSpatialShade(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void RecordSpatialShade(CommandBuffer cmd, in RenderView ctx)
         => RecordComputePass(cmd, ctx, _spatialPipeline);
 
     // Binds the SAME descriptor sets the Trace pass uses on the shared layout, pushes the per-frame
@@ -249,7 +252,7 @@ internal sealed unsafe class ReStirDIPipeline : RTPipeline
     // which buffers each actually touches is decided by its shader's declared bindings. The scene set
     // carries the frame-UBO arena slot, so its bind supplies the same dynamic offset the RT Trace
     // pass uses. envCube (FeatureEnv) binds at set 4 for the passes that sample the background.
-    private void RecordComputePass(CommandBuffer cmd, in Renderer.FrameContext ctx, Pipeline pipeline)
+    private void RecordComputePass(CommandBuffer cmd, in RenderView ctx, Pipeline pipeline)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, pipeline);
 

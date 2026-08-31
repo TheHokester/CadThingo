@@ -2,7 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Deferred;
@@ -31,12 +31,11 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         new("Deferred/CullDraws", ["Main"], [], []);
 
     // Per-frame buffers owned by this pipeline. .
-    private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
-    private UboBuffer[] IndirectCountBuffers   = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] IndirectCmdBuffers     = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] IndirectCountBuffers   = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     public Buffer GetIndirectCmdBuffer  (uint frame) => IndirectCmdBuffers[frame].buffer;
     public Buffer GetIndirectCountBuffer(uint frame) => IndirectCountBuffers[frame].buffer;
-    public Buffer GetRenderablesBuffer  (uint frame) => Renderer.gpuScene.GetRenderablesBuffer(frame);
 
     // Pass-set contract for the deferred FrameGraph. The four
     // storage buffers this compute shader binds are all graph resources -- the input renderable
@@ -65,7 +64,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
 
     // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
     // still matches the reflected size.
-    public DrawCullPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public DrawCullPipeline(GpuContext gpu) : base(gpu) { }
 
     public override void Dispose()
     {
@@ -93,12 +92,12 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
                 $"CullPushConstants is {sizeof(CullPushConstants)} bytes but CullDraws.slang " +
                 $"reflects {reflected}");
 
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             // Indirect-command buffer also needs IndirectBuffer usage so the
             // vkCmdDraw...IndirectCount call can read it without validation errors.
             Gfx.CreateMappedStorageBuffer(
-                (ulong)(Renderer.MAX_INSTANCES * (uint)sizeof(DrawIndexedIndirectCommandGpu)),
+                RenderConfig.MAX_INSTANCES * (uint)sizeof(DrawIndexedIndirectCommandGpu),
                 ref IndirectCmdBuffers[i],
                 BufferUsageFlags.IndirectBufferBit);
 
@@ -119,14 +118,18 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
     /// <summary>CPU side of the cull pass.
     ///apply the view-dependent back-to-front sort
     /// to the BLEND candidates, read the opaque count, and record the frustum-cull
-    /// dispatch + barriers.</summary> 
+    /// dispatch + barriers. Both the candidates and the opaque count come from the frame's
+    /// <see cref="RenderView"/> - extraction already ran in the draw loop.</summary>
     /// <returns>The opaque count as a uint</returns>
-    public uint Record(CommandBuffer cmd, uint frameIndex, Camera cam, DescriptorSet passSet)
+    public uint Record(CommandBuffer cmd, in RenderView view, DescriptorSet passSet)
     {
+        uint frameIndex = view.FrameIndex;
+        Camera cam      = view.Camera;
+
         // View-dependent transparent sort
         _transparentDraws.Clear();
         Matrix4x4 viewMat = cam != null ? cam.GetViewMatrix() : Matrix4x4.Identity;
-        foreach (var c in Renderer.gpuScene.TransparentCandidates)
+        foreach (var c in view.TransparentCandidates)
         {
             var worldOrigin = new Vector4(c.Model.M41, c.Model.M42, c.Model.M43, 1f);
             float viewZ = Vector4.Transform(worldOrigin, viewMat).Z;
@@ -136,7 +139,7 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         }
         _transparentDraws.Sort((a, b) => a.ViewDepth.CompareTo(b.ViewDepth));
 
-        uint count = Renderer.gpuScene.ExtractedRenderableCount;
+        uint count = view.RenderableCount;
         LastRenderableCount = count;
         if (count == 0) return 0;
 
@@ -168,10 +171,9 @@ public sealed unsafe class DrawCullPipeline : ComputePipeline
         // Build frustum from the camera's view*proj. Deliberately use a non-Y-flipped
         // projection here: the visible volume is the same in both conventions, and
         // Frustum.FromViewProjection assumes standard row-major Vulkan NDC.
-        Matrix4x4 view = cam.GetViewMatrix();
         Matrix4x4 proj = cam.GetProjectionMatrix(
-            (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
-        Matrix4x4 vp   = view * proj;
+            (float)view.RenderExtent.Width / view.RenderExtent.Height, 0.1f, 100.0f);
+        Matrix4x4 vp   = viewMat * proj;
         var frustum    = Frustum.FromViewProjection(vp, vulkanNDC: true);
 
         var push = new CullPushConstants

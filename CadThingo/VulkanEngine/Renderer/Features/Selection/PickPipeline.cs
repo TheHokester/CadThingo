@@ -2,7 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Selection;
@@ -47,7 +47,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
 
     // Push-constant range is reflected in Initialize; CreateResources asserts the C# mirror
     // still matches the reflected size.
-    public PickPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public PickPipeline(GpuContext gpu) : base(gpu) { }
 
     public override void Dispose()
     {
@@ -129,7 +129,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
     /// picking runs out-of-band before this frame's BeginFrame, so that set still
     /// holds the TLAS state that produced the image the user clicked on.</summary>
     public void Record(CommandBuffer cmd, in Matrix4x4 invViewProj, Vector3 camPos,
-                       Vector2 screenSize, uint pixelX, uint pixelY)
+                       RenderView f, uint pixelX, uint pixelY)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, PipelineHandle);
 
@@ -138,7 +138,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
         uint zeroOffset = 0;
         var sets = stackalloc DescriptorSet[2]
         {
-            Registry.SceneSet(Renderer.currentFrame),
+            Registry.SceneSet(f.FrameIndex),
             DescriptorSets[SetResult][0],
         };
         Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Compute, PipelineLayoutHandle, 0, 2, sets, 1, &zeroOffset);
@@ -147,7 +147,7 @@ public sealed unsafe class PickPipeline : ComputePipeline
         {
             InvViewProj = invViewProj,
             CamPos      = new Vector4(camPos, 1f),
-            ScreenSize  = screenSize,
+            ScreenSize  = new Vector2(f.RenderExtent.Width, f.RenderExtent.Height),
             PixelX      = pixelX,
             PixelY      = pixelY,
         };

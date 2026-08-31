@@ -5,6 +5,8 @@ using System.Runtime.InteropServices;
 // using CadThingo.GraphicsPipeline;
 using CadThingo.VulkanEngine;
 using CadThingo.VulkanEngine.Renderer;
+using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.Features.TextureCompression;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 
@@ -120,9 +122,12 @@ public unsafe class ResourceManager
     }
     Dictionary<Type, Dictionary<string, ResourceData>> _refCounts = new();
 
-    // Global vertex/index buffers — all meshes are packed into these shared device-local buffers.
-    // Indices are rebased by the current vertex-write offset on upload so draws use vertexOffset=0.
-    private Renderer.Renderer _renderer;
+    private GpuContext _gpu; 
+    private GraphicsDevice _gfx;
+    private DescriptorRegistry _registry;
+    private Vk vk;
+    private Device device;
+    
 
     private Buffer globalVertexBuffer;
     private SubAlloc globalVertexBufferAlloc;
@@ -132,41 +137,30 @@ public unsafe class ResourceManager
     private SubAlloc globalIndexBufferAlloc;
     private int indexWriteOffset;    // in indices
 
-    // Free-list of returned ranges keyed by (offset, count), sorted ascending by
-    // offset and coalesced on insert. UploadMesh first-fits the free-list before
-    // bumping the watermark. FreeMesh inserts back. The two lists stay
-    // independent because the VB and IB ranges for a single mesh land in
-    // separate-sized slots most of the time.
+    //freed ranges within the global VB/IB
     private readonly List<(int offset, int count)> _vbFreeList = new();
     private readonly List<(int offset, int count)> _ibFreeList = new();
 
     private const int MAX_VERTICES = 1 << 23;   // 4M vertices
     private const int MAX_INDICES  = 1 << 25;   // 16M indices
 
-    // Bindless texture table — every Texture registered here gets a stable int index that
-    // PbrMaterial entries reference. The renderer's bindless descriptor set sees this slot
-    // through the StructuredBuffer<Texture2D> array binding. Indices never shift mid-run;
-    // freed slots go onto _bindlessFree for reuse.
-    private readonly List<Texture>          _bindlessTable        = new();
-    private readonly Stack<int>             _bindlessFree         = new();
-    // Reverse index — same Texture handle should ever only consume one slot.
-    // Without this, materials referencing the same glTF image (very common with
-    // KHR_materials_clearcoat where coat / roughness / normal often share an
-    // ORM-style atlas) would burn through bindless slots redundantly.
+  
+    //Bindless texture table storing slot mappings on Descriptor registry to textures
+    //slot to texture is reverse table for free
     private readonly Dictionary<Texture, int> _bindlessIndexByTexture = new();
-
+    private readonly Dictionary<int, Texture> _slotToTexture        = new();
+    
+    //=========================================================================
+    //====== Vertex Buffer accessors ==========================================
+    //=========================================================================
     public Buffer GlobalVertexBuffer => globalVertexBuffer;
     public Buffer GlobalIndexBuffer  => globalIndexBuffer;
     
-    // Total vertices uploaded so far. Used as a conservative MaxVertex for AS builds —
+    // Total vertices uploaded so far. Used as a conservative MaxVertex for AS builds 
     // safe because every mesh's index range is rebased into [0, VertexHighWater).
     public int VertexHighWater => vertexWriteOffset;
 
-    // CPU-side mesh geometry (object-space positions + local 0-based indices),
-    // keyed by the mesh's index-buffer offset (Mesh.offset, unique per live
-    // mesh). Retained at upload so the pathtracer can extract emissive triangles
-    // in world space — the global VB/IB are device-local and can't be read back.
-    // Released by FreeMesh.
+    // CPU-side mesh geometry keyed by index buffer offest so that pathtracers can extract emissive geometry. 
     private readonly Dictionary<int, (Vector3[] positions, uint[] indices)> _meshCpuGeometry = new();
 
     /// <summary>Object-space positions + local (0-based) indices for a mesh,
@@ -186,73 +180,60 @@ public unsafe class ResourceManager
     }
 
 
-    private Vk vk;
-    private Device device;
-    private DescriptorPool descriptorPool;
-    private DescriptorSet[] bindlessDescriptorSets = new DescriptorSet[(int)Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    private Sampler defaultBindlessSampler;
     
-    internal const uint MAX_MATERIALS         = 256;
-    internal const uint MAX_INSTANCES         = 4096;
-    // 9 = the worst-case fields-with-textures count on PbrMaterial after the
-    // KHR extensions (5 core + transmission + 3× clearcoat). Sized for the
-    // worst case so a clearcoated/transmissive asset can't exhaust the table.
-    internal const uint MAX_BINDLESS_TEXTURES = MAX_MATERIALS * 9;
     
-    DescriptorSetLayout MaterialBindlessLayout;
+    //9 = worst case unique textures per material
+    internal const uint MAX_BINDLESS_TEXTURES = RenderConfig.MAX_MATERIALS * 9;
     
-    private UboBuffer[] MaterialStorageBuffers = new UboBuffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-    private UboBuffer[] InstanceStorageBuffers = new UboBuffer[Renderer.Renderer.MAX_CONCURRENT_FRAMES];
+    
+    private UboBuffer[] MaterialStorageBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] InstanceStorageBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
-    // GPU block-compression encoder for material textures. Lives here rather than on
-    // GraphicsDevice: it compiles a shader at construction, and the RHI layer has no business
-    // reaching up into the shader layer. Lazy, so runs that never load a BC asset never build
-    // the PSO (and never touch slang).
-    private Renderer.Features.TextureCompression.BcEncoder? _bcEncoder;
-    internal Renderer.Features.TextureCompression.BcEncoder BcEncoder => _bcEncoder ??= new(
-        (_renderer ?? throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called")).Gpu);
+    //GPU side block-texture compressor, not null is feature is enabled on device. 
+    private BcEncoder? _bcEncoder;
+
+    internal BcEncoder BcEncoder => _bcEncoder ??= new(_gpu);
 
 
-    public void Initialize(Renderer.Renderer renderer)
+    public void Initialize(GpuContext gpu)
     {
-        _renderer = renderer;
-        vk = renderer.vk;
-        device = renderer.device;
+        _gpu = gpu;
+        _gfx = gpu.Gfx;
+        _registry = gpu.Registry;
+        vk = _gfx.Vk;
+        device = _gfx.Device;
         ulong vbSize = (ulong)(MAX_VERTICES * sizeof(Vertex));
-        ulong ibSize = (ulong)(MAX_INDICES  * sizeof(uint));
+        ulong ibSize = (MAX_INDICES  * sizeof(uint));
 
-        // StorageBufferBit so the PBR lighting shadow-ray alpha-test path can bind
-        // these as ByteAddressBuffers and pull UVs / indices at hit time.
-        // High residency priority: the global VB/IB back every raster draw AND every
-        // path-trace hit (bound as ByteAddressBuffers + AS build input) — keep this
-        // live geometry resident ahead of cold resources under WDDM budget pressure.
-        renderer.CreateBuffer(vbSize,
+        //VB and IB creation, StorageBuffer bit so they can be accessed as ByteAddressBuffers within SceneSet 
+        _gfx.CreateBuffer(vbSize,
             BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
             BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
             out globalVertexBuffer, out globalVertexBufferAlloc, Renderer.GpuMemoryAllocator.PriorityHigh);
 
-        renderer.CreateBuffer(ibSize,
+        _gfx.CreateBuffer(ibSize,
             BufferUsageFlags.IndexBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.ShaderDeviceAddressBit |
             BufferUsageFlags.StorageBufferBit |
             BufferUsageFlags.AccelerationStructureBuildInputReadOnlyBitKhr,
             MemoryPropertyFlags.DeviceLocalBit,
             out globalIndexBuffer, out globalIndexBufferAlloc, Renderer.GpuMemoryAllocator.PriorityHigh);
         
-        CreateBindlessDescriptorSetLayout();
-        for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
-            renderer.CreateMappedStorageBuffer((ulong)(Renderer.Renderer.MAX_MATERIALS * (uint)sizeof(PbrMaterial)),     ref MaterialStorageBuffers[i], preferDeviceLocal: true);
-            renderer.CreateMappedStorageBuffer((ulong)(Renderer.Renderer.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)), ref InstanceStorageBuffers[i], preferDeviceLocal: true);
+            _gfx.CreateMappedStorageBuffer(RenderConfig.MAX_MATERIALS * (uint)sizeof(PbrMaterial),     ref MaterialStorageBuffers[i], preferDeviceLocal: true);
+            _gfx.CreateMappedStorageBuffer(RenderConfig.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU), ref InstanceStorageBuffers[i], preferDeviceLocal: true);
         }
-        CreateDefaultBindlessSampler();
-        CreateBindlessDescriptorSets();
+        //register resourcemanager owned resourced into sceneset.
+        _registry.RegisterBufferPerFrame("sceneMaterials",  MaterialStorageBuffers.Select(b => b.buffer).ToArray(), RenderConfig.MAX_MATERIALS * (uint)sizeof(PbrMaterial));                                                                        
+        _registry.RegisterBufferPerFrame("sceneInstances",  InstanceStorageBuffers.Select(b => b.buffer).ToArray(), RenderConfig.MAX_INSTANCES * (uint)sizeof(InstanceDataGPU));                                                                    
+        _registry.RegisterSampler("sceneSamplers", DefaultSampler, 0);
     }
 
     public Mesh UploadMesh(Vertex[] vertices, uint[] indices)
     {
-        if (_renderer == null)
+        if (_gfx == null)
             throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called");
 
         int vbOffset = AllocateRange(_vbFreeList, vertices.Length, ref vertexWriteOffset, MAX_VERTICES, "vertex");
@@ -271,9 +252,9 @@ public unsafe class ResourceManager
         ulong ibDstOffset = (ulong)(ibOffset * sizeof(uint));
 
         fixed (Vertex* vPtr = vertices)
-            _renderer.UploadBufferData(globalVertexBuffer, (long)vbDstOffset, vPtr, vbBytes);
+            _gfx.UploadBufferData(globalVertexBuffer, (long)vbDstOffset, vPtr, vbBytes);
         fixed (uint* iPtr = rebased)
-            _renderer.UploadBufferData(globalIndexBuffer, (long)ibDstOffset, iPtr, ibBytes);
+            _gfx.UploadBufferData(globalIndexBuffer, (long)ibDstOffset, iPtr, ibBytes);
 
         // Bounding sphere in mesh-local space — center = AABB center, radius =
         // max distance from center to any vertex. Looser than Welzl's but O(n)
@@ -393,27 +374,21 @@ public unsafe class ResourceManager
     {
         ReleaseAll();
         _bcEncoder?.Dispose();
-        if (_renderer != null)
+        if (_gfx != null)
         {
-            _renderer.DestroyBuffer(globalVertexBuffer, globalVertexBufferAlloc);
-            _renderer.DestroyBuffer(globalIndexBuffer,  globalIndexBufferAlloc);
+            _gfx.DestroyBuffer(globalVertexBuffer, globalVertexBufferAlloc);
+            _gfx.DestroyBuffer(globalIndexBuffer,  globalIndexBufferAlloc);
 
-            vk!.DestroySampler(device, defaultBindlessSampler, null);
-            for (int i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
+            for (int i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             {
-                _renderer.DestroyBuffer(MaterialStorageBuffers[i].buffer, MaterialStorageBuffers[i].alloc);
-                _renderer.DestroyBuffer(InstanceStorageBuffers[i].buffer, InstanceStorageBuffers[i].alloc);
+                _gfx.DestroyBuffer(MaterialStorageBuffers[i].buffer, MaterialStorageBuffers[i].alloc);
+                _gfx.DestroyBuffer(InstanceStorageBuffers[i].buffer, InstanceStorageBuffers[i].alloc);
             }
 
-            // Bindless descriptor set layout is created in CreateBindlessDescriptorSetLayout
-            // and owned here — GeometryPipeline borrows it via GetBindlessLayout.
-            if (MaterialBindlessLayout.Handle != 0)
-                vk!.DestroyDescriptorSetLayout(device, MaterialBindlessLayout, null);
         }
     }
-    public DescriptorSetLayout GetBindlessLayout() => MaterialBindlessLayout;
-    public DescriptorSet GetBindlessSet(uint frameIndex) => bindlessDescriptorSets[frameIndex];
-    internal Sampler DefaultSampler => defaultBindlessSampler;
+    /// <summary>Sampler every bindless material texture is read through. Device-owned.</summary>
+    internal Sampler DefaultSampler => _gfx.Samplers.LinearRepeat;
     public Buffer GetMaterialBuffer(int frameIndex) => MaterialStorageBuffers[frameIndex].buffer;
     public Buffer GetInstanceBuffer(uint frameIndex) => InstanceStorageBuffers[frameIndex].buffer;
     public void* GetMaterialMapped(uint frameIndex) => MaterialStorageBuffers[frameIndex].mapped;
@@ -427,34 +402,14 @@ public unsafe class ResourceManager
     /// </summary>
     public int RegisterBindless(Texture tex)
     {
-        if (_renderer == null)
-            throw new InvalidOperationException("ResourceManager.Initialize(renderer) not called");
-
-        // Same Texture handle → same bindless index. Reference equality is what
-        // we want here — the resource manager already dedups Texture instances
-        // by id at the load layer, so identical content shares the same handle.
         if (_bindlessIndexByTexture.TryGetValue(tex, out int existing))
-            return existing;
+            return existing;                                   // dedup hit: no slot, no manifest (unchanged)
 
-        int index;
-        if (_bindlessFree.Count > 0)
-        {
-            index = _bindlessFree.Pop();
-            _bindlessTable[index] = tex;
-        }
-        else
-        {
-            index = _bindlessTable.Count;
-            _bindlessTable.Add(tex);
-        }
-
-        _bindlessIndexByTexture[tex] = index;
-        _renderer.WriteBindlessTexture(index, tex, bindlessDescriptorSets, 2);
-        // Only newly-allocated slots land on the manifest; dedup hits returned
-        // above without writing a fresh descriptor, so the caller-file doesn't
-        // own those slots and shouldn't unregister them later.
-        _activeManifest?.BindlessIndices.Add(index);
-        return index;
+        int slot = _gpu.Registry.RegisterBindlessTexture(tex.View); // registry allocates + queues the write
+        _bindlessIndexByTexture[tex] = slot;
+        _slotToTexture[slot] = tex;                             // reverse map for Unregister cleanup
+        _activeManifest?.BindlessIndices.Add(slot);
+        return slot;
     }
 
     /// <summary>
@@ -464,29 +419,18 @@ public unsafe class ResourceManager
     /// freed VkImage. Future <see cref="RegisterBindless"/> can reuse the slot.
     /// No-op if the slot wasn't currently allocated.
     /// </summary>
-    public void UnregisterBindless(int index, Texture fallback)
+    public void UnregisterBindless(int slot, Texture fallback)
     {
-        if (_renderer == null) return;
-        if (index < 0 || index >= _bindlessTable.Count) return;
-
-        var existing = _bindlessTable[index];
-        if (existing == null) return; // already freed
-
-        _bindlessTable[index] = null!;
-        _bindlessIndexByTexture.Remove(existing);
-        _bindlessFree.Push(index);
-
-        // Point the descriptor at a known-good default. Validation would yell
-        // if a shader sampled a slot whose underlying VkImage we destroyed
-        // before this rewrite landed — callers must DeviceWaitIdle first.
-        _renderer.WriteBindlessTexture(index, fallback, bindlessDescriptorSets, 2);
+        if (!_slotToTexture.Remove(slot, out var tex)) return;
+        _bindlessIndexByTexture.Remove(tex);
+        _gpu.Registry.UnregisterBindlessTexture(slot, fallback.View); // parks fallback + recycles slot
     }
 
     /// <summary>
     /// Opens a manifest-capture scope. While the returned IDisposable is alive,
     /// every Load&lt;T&gt; and every newly-allocated bindless slot is appended
     /// to <paramref name="manifest"/>. Nesting / concurrency are not supported
-    /// — only one capture may be active at a time.
+    /// - only one capture may be active at a time.
     /// </summary>
     public IDisposable BeginManifestCapture(LoadManifest manifest)
     {
@@ -502,191 +446,6 @@ public unsafe class ResourceManager
         public ManifestScope(ResourceManager rm) => _rm = rm;
         public void Dispose() => _rm._activeManifest = null;
     }
-    
-    private void CreateBindlessDescriptorSetLayout()
-    {
-        var bindings = new DescriptorSetLayoutBinding[]
-        {
-            new()
-            {
-                Binding = 0,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
-            },
-            new()
-            {
-                Binding = 1,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                StageFlags = ShaderStageFlags.VertexBit|ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
-            },
-            new()
-            {
-                Binding = 2,
-                DescriptorType = DescriptorType.SampledImage,
-                DescriptorCount = MAX_MATERIALS * 5,
-                StageFlags = ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
-            }, 
-            new()
-            {
-                Binding = 3,
-                DescriptorType = DescriptorType.Sampler,
-                DescriptorCount = 8,
-                StageFlags = ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
-            }
-        };
-
-        // Make the shared bindless set bindable from the RT-pipeline path tracer's
-        // hit/miss/raygen stages too — but only when ray tracing pipelines are
-        // actually supported, since declaring RT stage bits on a device without
-        // the extension is invalid.
-        if (_renderer.RayTracePipelineSupported)
-        {
-            var rt = ShaderStageFlags.RaygenBitKhr | ShaderStageFlags.MissBitKhr |
-                     ShaderStageFlags.ClosestHitBitKhr | ShaderStageFlags.AnyHitBitKhr;
-            for (int i = 0; i < bindings.Length; i++) bindings[i].StageFlags |= rt;
-        }
-
-
-
-        DescriptorSetLayoutBindingFlagsCreateInfo flagsCreateInfo = new()
-            { SType = StructureType.DescriptorSetLayoutBindingFlagsCreateInfo };
-        var flags = stackalloc DescriptorBindingFlags[bindings.Length];
-
-        fixed (DescriptorSetLayoutBinding* pBindings = bindings)
-        {
-            if (_renderer.descriptorIndexEnabled)
-            {
-                // Only the bindless texture array (binding 2) needs UpdateAfterBind +
-                // PartiallyBound — RegisterBindless writes new texture slots while the set
-                // is live. The two storage buffers (bindings 0,1) and sampler (3) are
-                // written once at setup, so they don't need UpdateAfterBind (which would
-                // require descriptorBindingStorageBufferUpdateAfterBind / SamplerUpdateAfterBind
-                // features that we don't request).
-                flags[0] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-                flags[1] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-                flags[2] = DescriptorBindingFlags.UpdateAfterBindBit |
-                           DescriptorBindingFlags.UpdateUnusedWhilePendingBit |
-                           DescriptorBindingFlags.PartiallyBoundBit;
-                flags[3] = DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
-
-                flagsCreateInfo.BindingCount = (uint)bindings.Length;
-                flagsCreateInfo.PBindingFlags = flags;
-            }
-
-            DescriptorSetLayoutCreateInfo layoutInfo = new()
-            {
-                SType = StructureType.DescriptorSetLayoutCreateInfo,
-                BindingCount = (uint)bindings.Length,
-                PBindings = pBindings,
-            };
-            if (_renderer.descriptorIndexEnabled)
-            {
-                layoutInfo.Flags |= DescriptorSetLayoutCreateFlags.UpdateAfterBindPoolBit;
-                layoutInfo.PNext = &flagsCreateInfo;
-            }
-
-            if (vk!.CreateDescriptorSetLayout(device, &layoutInfo, null, out MaterialBindlessLayout) !=
-                Result.Success)
-                throw new Exception("Failed to create geometry material descriptor set layout");
-        }
-    }
-    
-    // Allocates one bindless descriptor set per frame in flight from the main pool. Writes the
-    // per-frame StorageBuffer<PbrMaterial> + StorageBuffer<InstanceData> bindings, plus the shared
-    // sampler at samplers[0]. Texture array (binding 2) is populated lazily by RegisterBindless.
-    private void CreateBindlessDescriptorSets()
-    {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = MaterialBindlessLayout;
-
-        DescriptorSetAllocateInfo alloc = new()
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = _renderer.descriptorPool,
-            DescriptorSetCount = Renderer.Renderer.MAX_CONCURRENT_FRAMES,
-            PSetLayouts = layouts,
-        };
-        fixed (DescriptorSet* pSets = bindlessDescriptorSets)
-        {
-            if (vk!.AllocateDescriptorSets(device, &alloc, pSets) != Result.Success)
-                throw new Exception("Failed to allocate bindless descriptor sets");
-        }
-
-        for (var i = 0; i < Renderer.Renderer.MAX_CONCURRENT_FRAMES; i++)
-        {
-            DescriptorBufferInfo matInfo = new()
-            {
-                Buffer = MaterialStorageBuffers[i].buffer, Offset = 0,
-                Range = (ulong)(MAX_MATERIALS * (uint)sizeof(PbrMaterial)),
-            };
-            DescriptorBufferInfo instInfo = new()
-            {
-                Buffer = InstanceStorageBuffers[i].buffer, Offset = 0,
-                Range = (ulong)(MAX_INSTANCES * (uint)sizeof(InstanceDataGPU)),
-            };
-            DescriptorImageInfo samplerInfo = new()
-            {
-                Sampler = defaultBindlessSampler,
-            };
-
-            var writes = stackalloc WriteDescriptorSet[3];
-            writes[0] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = bindlessDescriptorSets[i],
-                DstBinding = 0,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &matInfo,
-            };
-            writes[1] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = bindlessDescriptorSets[i],
-                DstBinding = 1,
-                DescriptorType = DescriptorType.StorageBuffer,
-                DescriptorCount = 1,
-                PBufferInfo = &instInfo,
-            };
-            writes[2] = new WriteDescriptorSet
-            {
-                SType = StructureType.WriteDescriptorSet,
-                DstSet = bindlessDescriptorSets[i],
-                DstBinding = 3,
-                DstArrayElement = 0,
-                DescriptorType = DescriptorType.Sampler,
-                DescriptorCount = 1,
-                PImageInfo = &samplerInfo,
-            };
-            vk!.UpdateDescriptorSets(device, 3, writes, 0, null);
-        }
-    }
-    private void CreateDefaultBindlessSampler()
-    {
-        SamplerCreateInfo samplerInfo = new()
-        {
-            SType = StructureType.SamplerCreateInfo,
-            MagFilter = Filter.Linear,
-            MinFilter = Filter.Linear,
-            AddressModeU = SamplerAddressMode.Repeat,
-            AddressModeV = SamplerAddressMode.Repeat,
-            AddressModeW = SamplerAddressMode.Repeat,
-            MipmapMode = SamplerMipmapMode.Linear,
-            AnisotropyEnable = true,
-            MaxAnisotropy = 16,
-            BorderColor = BorderColor.FloatOpaqueBlack,
-            UnnormalizedCoordinates = false,
-            CompareEnable = false,
-            CompareOp = CompareOp.Always,
-            MinLod = 0.0f, 
-            MaxLod = Vk.LodClampNone,
-        };
-        if (vk!.CreateSampler(device, &samplerInfo, null, out defaultBindlessSampler) != Result.Success)
-            throw new Exception("Failed to create default bindless sampler");
-    }
-    
     
     
     ///<summary>load a resource of type T with the given ID</summary>

@@ -1,4 +1,6 @@
-using CadThingo.VulkanEngine.Renderer.RenderCores;
+﻿using System.Runtime.CompilerServices;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle;
+using CadThingo.VulkanEngine.Renderer.FeatureLifecycle.RenderFeatureInterfaces;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
@@ -10,15 +12,17 @@ namespace CadThingo.VulkanEngine.Renderer.Features.Forward;
 /// the host post-stack stays valid). It exists so the enum -> core mapping is total without
 /// inventing behaviour; the real forward+ chain lands here later as its own module/graph.
 /// </summary>
-internal sealed class ForwardPlusCore : IRenderCore
+internal sealed class ForwardPlusCore : IRenderCore, ISelfRegisteringFeature<ForwardPlusCore>
 {
-    private readonly Renderer _host;
+    public static FeatureDesc Desc =>
+        new(Order: 40, Gate: _ => true, Make: () => new ForwardPlusCore());
 
-    public ForwardPlusCore(Renderer host)
-    {
-        _host = host;
-        host.RegisterCore(this);   // cores add themselves to the host's render-core registry
-    }
+    [ModuleInitializer]
+    internal static void _Reg() => FeatureCatalog.Register<ForwardPlusCore>();
+
+    // Nothing to build - the technique is a stub. Kept explicit rather than defaulted so the
+    // no-op is a decision rather than an omission.
+    public void Initialize() { }
 
     public string Name => "Forward+ (stub)";
     public Renderer.RenderMode Mode => Renderer.RenderMode.ForwardPlus;
@@ -30,7 +34,7 @@ internal sealed class ForwardPlusCore : IRenderCore
     // No-op frame (matches the former empty DrawRayQueried). FinalColor is untouched.
     public void Render(in RenderFrame frame) { }
 
-    public void Resize(Extent2D extent) { }
+    public void Resize(in HostTargets targets) { }
 
     public void Dispose() { }
 }

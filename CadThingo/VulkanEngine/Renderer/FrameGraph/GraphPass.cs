@@ -1,4 +1,4 @@
-﻿using CadThingo.VulkanEngine.Renderer.Shaders;
+﻿using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.FrameGraph;
@@ -6,7 +6,7 @@ namespace CadThingo.VulkanEngine.Renderer.FrameGraph;
 public enum PassType { Graphics, Compute, RayTrace, Transfer}
 
 public delegate void PassSetup(GraphBuilder b);
-public delegate void PassExecute(CommandBuffer cmd, PassResources resources, in Renderer.FrameContext frame);
+public delegate void PassExecute(CommandBuffer cmd, PassResources resources, in RenderView frame);
 
 /// <summary>
 /// What a pipeline hands the graph so its pass-local descriptor set can be graph-baked.

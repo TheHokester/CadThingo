@@ -1,7 +1,7 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Vulkan;
 
 namespace CadThingo.VulkanEngine.Renderer.Features.IBL;
@@ -33,12 +33,12 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
     // tone-mapped with everything else.
     protected override Format[] ColorAttachmentFormats { get; } = new[] { Format.R16G16B16A16Sfloat };
 
-    public SkyboxPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer)
+    public SkyboxPipeline(GpuContext gpu) : base(gpu)
     {
         DepthAttachmentFormat = Gfx.FindDepthFormat();
     }
 
-    private UboBuffer[] FrameUniformBuffers = new UboBuffer[Renderer.MAX_CONCURRENT_FRAMES];
+    private UboBuffer[] FrameUniformBuffers = new UboBuffer[RenderConfig.MAX_CONCURRENT_FRAMES];
 
     public override void Dispose()
     {
@@ -52,7 +52,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
         public readonly ImageView Depth = depth;
     }
     
-    internal void Record(CommandBuffer cmd, in Renderer.FrameContext ctx , Attachments attachments)
+    internal void Record(CommandBuffer cmd, in RenderView ctx , Attachments attachments)
     {
         if (!ImGui.EditorState.SkyboxEnabled) return;
 
@@ -142,25 +142,25 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
 
     protected override void CreateResources()
     {
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
             Gfx.CreateMappedUniformBuffer(sizeof(SkyboxUBO), ref FrameUniformBuffers[i]);
     }
 
     protected override void CreateDescriptorSets()
     {
-        var layouts = stackalloc DescriptorSetLayout[(int)Renderer.MAX_CONCURRENT_FRAMES];
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
+        var layouts = stackalloc DescriptorSetLayout[(int)RenderConfig.MAX_CONCURRENT_FRAMES];
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++) layouts[i] = DescriptorSetLayouts[0];
 
         DescriptorSetAllocateInfo allocInfo = new()
         {
             SType              = StructureType.DescriptorSetAllocateInfo,
             DescriptorPool     = Gfx.DescriptorPool,
-            DescriptorSetCount = Renderer.MAX_CONCURRENT_FRAMES,
+            DescriptorSetCount = RenderConfig.MAX_CONCURRENT_FRAMES,
             PSetLayouts        = layouts,
         };
 
         DescriptorSets    = new DescriptorSet[1][];
-        DescriptorSets[0] = new DescriptorSet[Renderer.MAX_CONCURRENT_FRAMES];
+        DescriptorSets[0] = new DescriptorSet[RenderConfig.MAX_CONCURRENT_FRAMES];
         fixed (DescriptorSet* pSets = DescriptorSets[0])
         {
             if (Vk.AllocateDescriptorSets(Device, &allocInfo, pSets) != Result.Success)
@@ -171,7 +171,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
     protected override void WriteDescriptors()
     {
         // Only the private UBO (set 0). envCube is registry-owned on FeatureEnv (set 3).
-        for (var i = 0; i < Renderer.MAX_CONCURRENT_FRAMES; i++)
+        for (var i = 0; i < RenderConfig.MAX_CONCURRENT_FRAMES; i++)
         {
             DescriptorBufferInfo frameInfo = new()
             {
@@ -195,18 +195,18 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
 
     // Per-frame upload
 
-    public void UpdatePerFrame(uint frameIndex, Camera camera, float intensity)
+    public void UpdatePerFrame(RenderView f, float intensity)
     {
         SkyboxUBO ubo = new();
-        if (camera != null)
+        if (f.Camera != null)
         {
-            var proj = camera.GetProjectionMatrix(
-                (float)Renderer.renderExtent.Width / Renderer.renderExtent.Height, 0.1f, 100.0f);
+            var proj = f.Camera.GetProjectionMatrix(
+                (float)f.RenderExtent.Width / f.RenderExtent.Height, 0.1f, 100.0f);
             proj.M22 *= -1;
-            var view = camera.GetViewMatrix();
+            var view = f.Camera.GetViewMatrix();
             var vp   = view * proj;
             Matrix4x4.Invert(vp, out ubo.invViewProj);
-            ubo.camPos = new Vector4(camera.GetPosition(), 1.0f);
+            ubo.camPos = new Vector4(f.Camera.GetPosition(), 1.0f);
         }
         else
         {
@@ -215,7 +215,7 @@ public sealed unsafe class SkyboxPipeline : GraphicsPipeline
         }
         ubo.intensity = intensity;
 
-        void* data = FrameUniformBuffers[frameIndex].mapped;
+        void* data = FrameUniformBuffers[f.FrameIndex].mapped;
         new System.Span<SkyboxUBO>(data, 1).Fill(ubo);
     }
 }

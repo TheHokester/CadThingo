@@ -1,8 +1,9 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -25,6 +26,9 @@ namespace CadThingo.VulkanEngine.Renderer.Features.PathTracer;
 //  control to build one PSO per camera mode at init.
 public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
 {
+    
+    IIblProvider _ibl;
+    IPathTracingProvider _pt;
     // Matches PTCompute.slang::PathFrameUBO byte-for-byte.
     [StructLayout(LayoutKind.Sequential)]
     private struct PathFrameUBO
@@ -96,7 +100,11 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     private uint _accumSamples;
     private bool _accumDirty = true;
 
-    public PTComputePipeline(GpuContext gpu, Renderer renderer) : base( gpu, renderer) { }
+    public PTComputePipeline(GpuContext gpu, IIblProvider ibl, IPathTracingProvider pt) : base(gpu)
+    {
+        _ibl = ibl;
+        _pt  = pt;
+    }
 
     /// <summary>Force the next dispatch to overwrite (not add to) the
     /// accumulator. Call from input / scene-edit handlers.</summary>
@@ -227,14 +235,14 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
             screenSize               = new Vector2(renderExtent.Width, renderExtent.Height),
             fov                      = fovRad,
             tanHalfFov               = tanHalfFov,
-            prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels,
+            prefilteredCubeMipLevels = _ibl.PrefilteredCubeMipLevels,
             scaleIBLAmbient          = EditorState.IblIntensity,
             focusDistance            = FocusDistance,
             aperture                 = Aperture,
             paniniDistance           = PaniniDistance,
             verticalCompression      = VerticalCompression,
-            emissiveTriCount         = Renderer.EmissiveTriangleCount,
-            totalEmissivePower       = Renderer.TotalEmissivePower,
+            emissiveTriCount         = _pt.EmissiveTriangleCount,
+            totalEmissivePower       = _pt.TotalEmissivePower,
         };
         return reset;
     }
@@ -248,7 +256,7 @@ public sealed unsafe class PTComputePipeline : PipelineBase, IPathTracerCamera
     ///   - Transitioning the accumulator and outColor images to GENERAL
     ///     before this call (and to ShaderReadOnly afterwards if Tonemap
     ///     samples outColor as a CombinedImageSampler).</summary>
-    public void Record(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void Record(CommandBuffer cmd, in RenderView ctx)
     {
         // Orthographic falls back to Pinhole until the helper lands in PTUtils.
         int modeIdx = (int)Mode;

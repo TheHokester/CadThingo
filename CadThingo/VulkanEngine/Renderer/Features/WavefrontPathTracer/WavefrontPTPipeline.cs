@@ -1,11 +1,12 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using CadThingo.VulkanEngine.ImGui;
 using CadThingo.VulkanEngine.Renderer.Descriptors;
+using CadThingo.VulkanEngine.Renderer.Features.IBL;
 using CadThingo.VulkanEngine.Renderer.FrameGraph;
 using CadThingo.VulkanEngine.Renderer.Pipelines;
-using CadThingo.VulkanEngine.Renderer.Shaders;
 using CadThingo.VulkanEngine.Renderer.Features.PathTracer;
+using CadThingo.VulkanEngine.Renderer.Slang;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 
@@ -28,6 +29,8 @@ namespace CadThingo.VulkanEngine.Renderer.Features.WavefrontPathTracer;
 //  single reflected 16-byte ComputeBit push range for WavefrontPush).
 public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 {
+    private IIblProvider _ibl;
+    IPathTracingProvider _pt;
     // Matches WavefrontBindings / PTUtils PathFrameUBO byte-for-byte (same as
     // PTComputePipeline's private copy).
     [StructLayout(LayoutKind.Sequential)]
@@ -234,7 +237,11 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
 
     // The single 16-byte ComputeBit range for WavefrontPush is reflected from Program by
     // Initialize; CreateResources asserts the C# mirror still matches it.
-    public WavefrontPTPipeline(GpuContext gpu, Renderer renderer) : base(gpu, renderer) { }
+    public WavefrontPTPipeline(GpuContext gpu, IIblProvider ibl, IPathTracingProvider pt) : base(gpu)
+    {
+        _ibl = ibl;
+        _pt  = pt;
+    }
 
 
     // ---- Descriptor-set layouts. Scene (set 0) + FeatureEnv (4) + FeaturePTIO (5) come from the
@@ -359,7 +366,8 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
                 $"WavefrontPathTracer/Shade must reflect exactly one {sizeof(WavefrontPush)}-byte push " +
                 $"range for WavefrontPush; got [{string.Join(", ", PushConstantRanges.Select(p => p.Size))}]");
 
-        AllocSet4(PathCount(Renderer.RenderExtent));
+        // The SoA working set is extent-sized, so it is allocated by ReallocSet4, which the core
+        // drives from its Resize (primed once at boot).
 
         // TEMP/debug compaction readback staging (host-visible, mapped). See _argsReadback.
         Gfx.CreateMappedStorageBuffer(DispatchArgsBytes, ref _argsReadback, BufferUsageFlags.TransferDstBit);
@@ -444,8 +452,9 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
         }
     }
 
-    /// <summary>Resize path: reallocate the SoA working set to the new extent + rewrite set 4.
-    /// Marks the accumulator dirty (the freshly-allocated memory holds garbage).</summary>
+    /// <summary>Allocates the SoA working set at <paramref name="extent"/> + rewrites set 4, freeing
+    /// any previous one. Marks the accumulator dirty (the fresh memory holds garbage). The only
+    /// construction site - the first call comes from the boot-time resize.</summary>
     public void ReallocSet4(Extent2D extent)
     {
         FreeSet4();
@@ -491,14 +500,14 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
             screenSize               = new Vector2(renderExtent.Width, renderExtent.Height),
             fov                      = fovRad,
             tanHalfFov               = tanHalfFov,
-            prefilteredCubeMipLevels = Renderer.Ibl.prefilteredCubeMipLevels,
+            prefilteredCubeMipLevels = _ibl.PrefilteredCubeMipLevels,
             scaleIBLAmbient          = EditorState.IblIntensity,
             focusDistance            = FocusDistance,
             aperture                 = Aperture,
             paniniDistance           = PaniniDistance,
             verticalCompression      = VerticalCompression,
-            emissiveTriCount         = Renderer.EmissiveTriangleCount,
-            totalEmissivePower       = Renderer.TotalEmissivePower,
+            emissiveTriCount         = _pt.EmissiveTriangleCount,
+            totalEmissivePower       = _pt.TotalEmissivePower,
         };
         // Push once per frame; every BindSets this frame reuses the returned dynamic offset.
         // Safe here: the registry reset this frame's arena slice in BeginFrame, before Render.
@@ -539,7 +548,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
     /// <summary>Dense primary-ray generation (one PSO per camera mode).</summary>
-    public void RecordGenerate(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void RecordGenerate(CommandBuffer cmd, in RenderView ctx)
     {
         int modeIdx = (int)Mode;
         if (modeIdx < 0 || modeIdx >= _generatePsos.Length) modeIdx = 0;
@@ -591,7 +600,7 @@ public sealed unsafe class WavefrontPTPipeline : PipelineBase, IPathTracerCamera
     }
 
     /// <summary>Dense finalize: accumulate radiance, normalize into outColor.</summary>
-    public void RecordFinalize(CommandBuffer cmd, in Renderer.FrameContext ctx)
+    public void RecordFinalize(CommandBuffer cmd, in RenderView ctx)
     {
         Vk.CmdBindPipeline(cmd, PipelineBindPoint.Compute, _finalizePso);
         BindSets(cmd, ctx.FrameIndex);
